@@ -1,11 +1,23 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
-*.egg
 dist/
 build/
 .venv/
+
+# Testing
 .pytest_cache/
-.mypy_cache/
-*.so
-.env
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Fixture vault (created by tests)
+fixture_vault/
