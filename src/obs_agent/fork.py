@@ -47,7 +47,22 @@ class ForkRunner:
             options.max_turns = max_turns
 
         result_parts: list[str] = []
-        async for message in query(prompt=prompt, options=options):
+        stream = query(prompt=prompt, options=options)
+        # Support both real async generators and mock async iterables
+        aiter = stream.__aiter__()
+        if hasattr(aiter, "__await__"):
+            aiter = await aiter
+        while True:
+            try:
+                anext = aiter.__anext__()
+                if hasattr(anext, "__await__"):
+                    message = await anext
+                else:
+                    message = anext
+            except StopAsyncIteration:
+                break
+            except StopIteration:
+                break
             if hasattr(message, "content") and isinstance(message.content, str):
                 result_parts.append(message.content)
 

@@ -152,8 +152,16 @@ class TestClassifyFork:
 
     @pytest.mark.asyncio
     @patch("obs_agent.fork.query")
-    async def test_classify_prompt_has_skill_manifest(self, mock_query, runner):
+    async def test_classify_prompt_has_skill_manifest(self, mock_query, runner, fixture_vault):
         """The classify prompt includes the list of all available skills."""
+        # Create skill dirs so the manifest builder finds them
+        for name in ["file-conventions", "update-context", "session-offboard"]:
+            skill_dir = fixture_vault / "Agent" / "skills" / name
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: Test skill\n---\n# {name}\n"
+            )
+
         mock_msg = MagicMock()
         mock_msg.content = "[]"
         mock_query.return_value = AsyncIterFromList([mock_msg])
@@ -162,7 +170,6 @@ class TestClassifyFork:
 
         call_kwargs = mock_query.call_args
         prompt = call_kwargs.kwargs.get("prompt") or call_kwargs[0][0]
-        # The classify prompt must list available skills for the LLM to choose from
         assert "file-conventions" in prompt, (
             "Classify prompt must include skill names from manifest"
         )
