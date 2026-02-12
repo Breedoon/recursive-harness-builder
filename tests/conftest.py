@@ -9,6 +9,21 @@ import pytest
 from obs_agent.config import OBSConfig
 
 
+class AsyncIterFromList:
+    """Helper to create async iterables from lists for mocking SDK query()."""
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._items:
+            raise StopAsyncIteration
+        return self._items.pop(0)
+
+
 @pytest.fixture
 def fixture_vault(tmp_path: Path) -> Path:
     """Path to a fixture vault for testing.

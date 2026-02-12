@@ -15,6 +15,7 @@ import pytest
 
 from obs_agent.config import OBSConfig
 from obs_agent.fork import ForkRunner
+from tests.conftest import AsyncIterFromList
 
 
 # --- Initialization ---
@@ -54,8 +55,7 @@ class TestForkRun:
     @patch("obs_agent.fork.query")
     async def test_fork_options_include_session(self, mock_query, runner):
         """run() passes resume=session_id to the SDK for cache reuse."""
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(return_value=iter([]))
+        mock_query.return_value = AsyncIterFromList([])
 
         await runner.run("Do something")
 
@@ -67,8 +67,7 @@ class TestForkRun:
     @patch("obs_agent.fork.query")
     async def test_fork_options_set_fork_flag(self, mock_query, runner):
         """run() sets fork_session=True so original session is preserved."""
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(return_value=iter([]))
+        mock_query.return_value = AsyncIterFromList([])
 
         await runner.run("Do something")
 
@@ -80,8 +79,7 @@ class TestForkRun:
     @patch("obs_agent.fork.query")
     async def test_fork_inherits_system_prompt(self, mock_query, runner):
         """Forked session uses the same system prompt for KV cache reuse."""
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(return_value=iter([]))
+        mock_query.return_value = AsyncIterFromList([])
 
         await runner.run("Do something", system_prompt="You are an assistant.")
 
@@ -93,8 +91,7 @@ class TestForkRun:
     @patch("obs_agent.fork.query")
     async def test_fork_max_turns(self, mock_query, runner):
         """run() respects the max_turns parameter for safety."""
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(return_value=iter([]))
+        mock_query.return_value = AsyncIterFromList([])
 
         await runner.run("Do something", max_turns=3)
 
@@ -106,8 +103,7 @@ class TestForkRun:
     @patch("obs_agent.fork.query")
     async def test_fork_passes_prompt(self, mock_query, runner):
         """run() passes the task prompt to the SDK query function."""
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(return_value=iter([]))
+        mock_query.return_value = AsyncIterFromList([])
 
         await runner.run("Analyze this conversation")
 
@@ -133,10 +129,7 @@ class TestClassifyFork:
         # Mock the SDK to return a response listing skill names
         mock_msg = MagicMock()
         mock_msg.content = '[{"skill": "daily-planning"}, {"skill": "update-context"}]'
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(
-            return_value=iter([mock_msg])
-        )
+        mock_query.return_value = AsyncIterFromList([mock_msg])
 
         result = await runner.classify("help me plan my day")
         assert isinstance(result, list)
@@ -150,10 +143,7 @@ class TestClassifyFork:
         """classify() returns empty list for simple queries needing no skills."""
         mock_msg = MagicMock()
         mock_msg.content = "[]"
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(
-            return_value=iter([mock_msg])
-        )
+        mock_query.return_value = AsyncIterFromList([mock_msg])
 
         result = await runner.classify("what time is it")
         assert isinstance(result, list)
@@ -166,10 +156,7 @@ class TestClassifyFork:
         """The classify prompt includes the list of all available skills."""
         mock_msg = MagicMock()
         mock_msg.content = "[]"
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(
-            return_value=iter([mock_msg])
-        )
+        mock_query.return_value = AsyncIterFromList([mock_msg])
 
         await runner.classify("help me organize my notes")
 
@@ -200,10 +187,7 @@ class TestSearchFork:
         """search() returns a dict with a results list."""
         mock_msg = MagicMock()
         mock_msg.content = '{"results": [{"file": "Agent/context.md", "excerpt": "goals"}]}'
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(
-            return_value=iter([mock_msg])
-        )
+        mock_query.return_value = AsyncIterFromList([mock_msg])
 
         result = await runner.search("goals")
         assert isinstance(result, dict)
@@ -216,10 +200,7 @@ class TestSearchFork:
         """Each search result includes a file path."""
         mock_msg = MagicMock()
         mock_msg.content = '{"results": [{"file": "Agent/context.md", "excerpt": "goals for Q1", "relevance": "directly relevant"}]}'
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(
-            return_value=iter([mock_msg])
-        )
+        mock_query.return_value = AsyncIterFromList([mock_msg])
 
         result = await runner.search("goals")
         for item in result["results"]:
@@ -242,10 +223,7 @@ class TestExtractMemoryFork:
         """extract_memory prompt references the session-offboard procedure."""
         mock_msg = MagicMock()
         mock_msg.content = "Memory extraction complete."
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(
-            return_value=iter([mock_msg])
-        )
+        mock_query.return_value = AsyncIterFromList([mock_msg])
 
         await runner.extract_memory()
 
@@ -264,10 +242,7 @@ class TestExtractMemoryFork:
         """extract_memory prompt instructs writing to Agent/memory/YYYY-MM-DD.md."""
         mock_msg = MagicMock()
         mock_msg.content = "Memory extraction complete."
-        mock_query.return_value = AsyncMock()
-        mock_query.return_value.__aiter__ = AsyncMock(
-            return_value=iter([mock_msg])
-        )
+        mock_query.return_value = AsyncIterFromList([mock_msg])
 
         await runner.extract_memory()
 
