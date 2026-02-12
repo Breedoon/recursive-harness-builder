@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "obs-agent"
+version = "0.1.0"
+description = "Personal AI assistant backed by Obsidian vault"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.1.33",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "httpx>=0.28.0",
+    "sse-starlette>=2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-timeout>=2.3.0",
+]
+
+[project.scripts]
+obs-agent = "obs_agent.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "e2e: end-to-end tests that call real API",
+]
+testpaths = ["tests"]
