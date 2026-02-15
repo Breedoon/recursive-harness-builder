@@ -334,12 +334,15 @@ async def async_main() -> None:
         else:
             print("Warning: Could not start daemon. Continuing anyway.")
 
+    # Allow custom prompt for eval testing (avoids "> " colliding with markdown blockquotes)
+    prompt = os.environ.get("OBS_EVAL_PROMPT", "> ")
+
     print(f"OBS Agent CLI (daemon: {base_url})")
     print("Type your message, or /quit to exit. (Esc+Enter for newline)\n")
 
     try:
         while True:
-            user_input = await channel.read_input("> ")
+            user_input = await channel.read_input(prompt)
             if user_input is None:
                 print("\nGoodbye.")
                 break

@@ -1,12 +1,18 @@
 """Shared test fixtures for OBS Agent."""
 
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
 import pytest
 
 from obs_agent.config import OBSConfig
+
+# Persistent fixture vault at project root (created by scripts/clone_vault.sh)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_FIXTURE_VAULT = _PROJECT_ROOT / "fixture_vault"
+_CLONE_SCRIPT = _PROJECT_ROOT / "scripts" / "clone_vault.sh"
 
 
 class AsyncIterFromList:
@@ -167,3 +173,37 @@ def e2e_vault(tmp_path: Path) -> Path:
 def e2e_config(e2e_vault: Path) -> OBSConfig:
     """Config pointing at the E2E fixture vault."""
     return OBSConfig(vault_path=e2e_vault)
+
+
+def _ensure_fixture_vault() -> Path:
+    """Ensure fixture_vault/ exists by running clone_vault.sh if needed."""
+    if _FIXTURE_VAULT.is_dir():
+        return _FIXTURE_VAULT
+    if not _CLONE_SCRIPT.exists():
+        raise FileNotFoundError(f"Clone script not found: {_CLONE_SCRIPT}")
+    result = subprocess.run(
+        [str(_CLONE_SCRIPT)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"clone_vault.sh failed: {result.stderr}")
+    if not _FIXTURE_VAULT.is_dir():
+        raise RuntimeError("clone_vault.sh ran but fixture_vault/ still missing")
+    return _FIXTURE_VAULT
+
+
+@pytest.fixture(scope="session")
+def eval_vault() -> Path:
+    """Path to the persistent fixture vault (full clone of real vault).
+
+    Calls scripts/clone_vault.sh on first use. Session-scoped so the clone
+    only happens once per test run.
+    """
+    return _ensure_fixture_vault()
+
+
+@pytest.fixture(scope="session")
+def eval_config(eval_vault: Path) -> OBSConfig:
+    """OBSConfig for eval tests: real vault clone, daemon port 7833."""
+    return OBSConfig(vault_path=eval_vault, daemon_port=7833)

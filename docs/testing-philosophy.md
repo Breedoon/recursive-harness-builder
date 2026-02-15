@@ -1,4 +1,8 @@
-# Testing Philosophy
+# Testing Philosophy (SUPERSEDED)
+
+> **This document is superseded by the Evaluations section in CLAUDE.md.**
+> The eval infrastructure in `tests/evals/` replaces the test layers described below.
+> Kept for historical reference only.
 
 ## Core Principle
 

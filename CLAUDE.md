@@ -68,63 +68,72 @@ All design docs, skills, and the implementation plan live in the vault — not h
 - **Templates** — structural templates live in `Assets/Templates/`, reference don't inline
 - Full reference: `T/Agent/skills/file-conventions/SKILL.md`
 
-## Testing Philosophy
+## Evaluations (Evals) — THE ONLY PROOF THAT THE SYSTEM WORKS
 
-**Low confidence culture: assume code is broken until proven otherwise.**
+### What Are Evals?
 
-### The Hard Rule
+Evals are markdown scenario files in `tests/evals/scenarios/`. Each describes a user
+journey. An interactive Claude SDK judge agent (`ClaudeSDKClient` + MCP tools) executes
+the scenario against the real CLI with a real vault clone, then judges PASS/FAIL.
 
-**NEVER declare a feature working based on mocked tests alone.** The verification command is:
+### The Eval Commandments
+
+1. **EVALS ARE NOT OPTIONAL.** Every feature change MUST pass all evals before being
+   declared done. Running unit tests alone is theater. Running mocked "E2E" tests is
+   a lie. Only evals prove the system works.
+
+2. **IF AN EVAL CAN'T RUN, FIX THAT FIRST.** If the eval infrastructure is broken,
+   if the vault clone is missing, if the daemon won't start — these are P0 blockers.
+   Do not work around them. Do not skip them. Fix them.
+
+3. **NEVER MOCK THE SDK IN AN EVAL.** Evals use the real SDK, real daemon, real CLI.
+   If you patch, mock, or fake anything in the eval path, you are writing a unit test.
+
+4. **NEVER USE `anthropic.Anthropic()` FOR JUDGING.** The SDK uses subscription auth.
+   There is no API key. The judge uses `ClaudeSDKClient` with MCP tools. If you write
+   `import anthropic` in eval code, you are doing it wrong.
+
+5. **THE JUDGE IS AN SDK AGENT.** The judge agent uses `ClaudeSDKClient` with MCP tools
+   (`send_message`, `read_output`) to interact with the CLI. It follows a scenario and
+   returns VERDICT: PASS or VERDICT: FAIL. No heuristics, no `len > 5`, no regex.
+
+6. **READ THE EVAL OUTPUT.** A passing eval is not a green checkmark to ignore. Read
+   the judge's reasoning. If the judge passed for wrong reasons, the eval is broken.
+
+7. **EVAL RESULTS ARE NON-DETERMINISTIC AND THAT'S OK.** LLM outputs vary. If an eval
+   fails once but passes on retry, that's acceptable. Consistent failure = broken feature.
+
+### Running Tests
 
 ```bash
-# This is the ONLY command that proves the system works:
-.venv/bin/pytest tests/ -q --tb=short  # ALL tests, including E2E — no -m filter
+# Unit tests (fast, mocked):
+.venv/bin/pytest tests/ -q -m "not eval and not integration"
+
+# Live integration (real HTTP + SDK, no CLI):
+.venv/bin/pytest tests/ -q -m integration --timeout=300
+
+# Evals (real CLI + vault + SDK judge):
+.venv/bin/pytest tests/evals/ -v -m eval --timeout=600
+
+# EVERYTHING:
+.venv/bin/pytest tests/ -v --timeout=600
 ```
 
-If you run `-m "not e2e"` you are running theater. 295 mocked tests passing while the real daemon crashes is not "tests passing" — it's lying. Do not report mocked test results as verification. Do not skip E2E tests to save time or credits. The user has explicitly authorized spending credits on real SDK tests.
+### Test Layers
+
+| Layer | Proof Value | Where |
+|-------|-------------|-------|
+| **Evals** | HIGHEST — real CLI + vault + SDK judge | `tests/evals/` |
+| **Live Integration** | Medium — real HTTP + SDK | `tests/test_integration_live.py` |
+| **Unit** | Low — mocked logic, routing | `tests/test_*.py` |
 
 ### Spike Before You Build
 
-**Before implementing any feature that uses an SDK API you haven't used before, write a 10-line spike script that proves the API actually works.** Run it. If it crashes, the feature cannot be built as planned.
+**Before implementing any feature that uses an SDK API you haven't used before, write a 10-line spike script that proves the API actually works.** Run it. If it crashes, the feature cannot be built as planned. Plans that use unverified SDK features are not plans — they are hopes.
 
-Example of what should have happened before Step 5 (MCP tools):
-```python
-# spike_mcp.py — run this BEFORE writing tools.py
-from claude_agent_sdk import tool, create_sdk_mcp_server, ClaudeAgentOptions, query
-# ... 10 lines proving mcp_servers actually works with query() ...
-```
+### Eval Guardian Agent
 
-This would have caught the `ProcessTransport is not ready for writing` crash in 30 seconds instead of after 3 agents spent 20 minutes implementing and "testing" a broken feature. **Plans that use unverified SDK features are not plans — they are hopes.** Research comes before planning, not after shipping.
-
-### Test Layers (all required for new features)
-
-1. **Unit tests** — fast, mocked, test individual functions. Useful for refactoring safety and structure. **Not proof that anything works.**
-2. **Integration tests** — TestClient or real uvicorn, mocked SDK. Tests HTTP wiring. **Still not proof.**
-3. **Real E2E tests** — real uvicorn + real SDK + real HTTP, LLM-as-judge verification. **This is the proof.** Every new feature MUST have at least one.
-4. **Terminal E2E with pexpect** — the highest-confidence layer. Spawns the real CLI, types messages, tests queuing/interrupt timing. Catches bugs all other layers miss (stdin threading, queue drain timing, race conditions).
-
-### What Mocked Tests Are Good For
-
-- Verifying argument parsing, config resolution, pure functions
-- Refactoring safety (does the interface still match?)
-- Fast CI feedback on structural regressions
-
-### What Mocked Tests Cannot Do
-
-- Prove the SDK accepts the options you're passing
-- Prove the daemon doesn't crash on real requests
-- Prove SSE streaming works end-to-end
-- Prove anything about real system behavior
-
-A test that mocks `query()` and asserts the mock returned what you told it to return is not a test. It's a tautology.
-
-### Specific Rules
-
-- **No API key gating** — SDK uses subscription auth. E2E tests should not check for ANTHROPIC_API_KEY.
-- **LLM-as-judge** — For E2E tests with real SDK responses, use Haiku to evaluate response quality instead of brittle string matching.
-- **Mocked tests create false confidence** — 295 passing mocked tests shipped a daemon crash on the very first real request. If a human would test it by typing in the terminal, write a pexpect test.
-- Mock objects MUST match real SDK types — `mock_msg.content = [TextBlock(text="...")]` not `"string"`
-- Full reference: `docs/testing-philosophy.md`
+The `.claude/agents/eval-guardian.md` agent has **veto power** over eval quality. It does not write evals — it reviews scenarios, runs them, reads judge output, and blocks until satisfied. It is deliberately adversarial. It catches theater testing, manipulated assertions, and contrived scenarios. If the Eval Guardian blocks, fix what it found.
 
 ## Planning Rules
 
