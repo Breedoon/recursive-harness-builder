@@ -67,6 +67,14 @@ def _build_skills(config: OBSConfig) -> str:
             entry += f" (trigger: {triggers})"
         lines.append(entry)
 
+    lines.append("")
+    lines.append("### find_skills (tool)")
+    lines.append(
+        "Call this tool when a complex query requires specific vault operation skills "
+        "(searching, editing, reasoning over different content). It analyzes your query "
+        "and returns relevant skill instructions. Use for multi-step vault operations."
+    )
+
     return "\n".join(lines)
 
 

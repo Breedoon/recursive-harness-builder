@@ -12,9 +12,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from claude_agent_sdk import TextBlock
 
 from obs_agent.config import OBSConfig
-from obs_agent.fork import ForkRunner
+from obs_agent.fork import ForkRunner, classify_without_fork
 from tests.conftest import AsyncIterFromList
 
 
@@ -128,7 +129,7 @@ class TestClassifyFork:
         """classify() returns a list of skill name strings."""
         # Mock the SDK to return a response listing skill names
         mock_msg = MagicMock()
-        mock_msg.content = '[{"skill": "daily-planning"}, {"skill": "update-context"}]'
+        mock_msg.content = [TextBlock(text='[{"skill": "daily-planning"}, {"skill": "update-context"}]')]
         mock_query.return_value = AsyncIterFromList([mock_msg])
 
         result = await runner.classify("help me plan my day")
@@ -142,7 +143,7 @@ class TestClassifyFork:
     async def test_classify_returns_empty_for_simple(self, mock_query, runner):
         """classify() returns empty list for simple queries needing no skills."""
         mock_msg = MagicMock()
-        mock_msg.content = "[]"
+        mock_msg.content = [TextBlock(text="[]")]
         mock_query.return_value = AsyncIterFromList([mock_msg])
 
         result = await runner.classify("what time is it")
@@ -163,7 +164,7 @@ class TestClassifyFork:
             )
 
         mock_msg = MagicMock()
-        mock_msg.content = "[]"
+        mock_msg.content = [TextBlock(text="[]")]
         mock_query.return_value = AsyncIterFromList([mock_msg])
 
         await runner.classify("help me organize my notes")
@@ -193,7 +194,7 @@ class TestSearchFork:
     async def test_search_returns_structured_results(self, mock_query, runner):
         """search() returns a dict with a results list."""
         mock_msg = MagicMock()
-        mock_msg.content = '{"results": [{"file": "Agent/context.md", "excerpt": "goals"}]}'
+        mock_msg.content = [TextBlock(text='{"results": [{"file": "Agent/context.md", "excerpt": "goals"}]}')]
         mock_query.return_value = AsyncIterFromList([mock_msg])
 
         result = await runner.search("goals")
@@ -206,7 +207,7 @@ class TestSearchFork:
     async def test_search_results_have_file_paths(self, mock_query, runner):
         """Each search result includes a file path."""
         mock_msg = MagicMock()
-        mock_msg.content = '{"results": [{"file": "Agent/context.md", "excerpt": "goals for Q1", "relevance": "directly relevant"}]}'
+        mock_msg.content = [TextBlock(text='{"results": [{"file": "Agent/context.md", "excerpt": "goals for Q1", "relevance": "directly relevant"}]}')]
         mock_query.return_value = AsyncIterFromList([mock_msg])
 
         result = await runner.search("goals")
@@ -229,7 +230,7 @@ class TestExtractMemoryFork:
     async def test_extract_memory_prompt_follows_offboard(self, mock_query, runner):
         """extract_memory prompt references the session-offboard procedure."""
         mock_msg = MagicMock()
-        mock_msg.content = "Memory extraction complete."
+        mock_msg.content = [TextBlock(text="Memory extraction complete.")]
         mock_query.return_value = AsyncIterFromList([mock_msg])
 
         await runner.extract_memory()
@@ -248,7 +249,7 @@ class TestExtractMemoryFork:
     async def test_extract_memory_mentions_daily_log(self, mock_query, runner):
         """extract_memory prompt instructs writing to Agent/memory/YYYY-MM-DD.md."""
         mock_msg = MagicMock()
-        mock_msg.content = "Memory extraction complete."
+        mock_msg.content = [TextBlock(text="Memory extraction complete.")]
         mock_query.return_value = AsyncIterFromList([mock_msg])
 
         await runner.extract_memory()
@@ -259,3 +260,88 @@ class TestExtractMemoryFork:
         assert "memory" in prompt.lower(), (
             "Extract prompt must mention daily memory log"
         )
+
+
+# --- Classify Without Fork ---
+
+
+class TestClassifyWithoutFork:
+    """classify_without_fork() works without a session_id for first messages."""
+
+    @pytest.mark.asyncio
+    @patch("obs_agent.fork.query")
+    async def test_returns_skill_names(self, mock_query, config):
+        """classify_without_fork returns a list of skill names."""
+        mock_msg = MagicMock()
+        mock_msg.content = [TextBlock(text='[{"skill": "update-context"}]')]
+
+        async def mock_gen(*args, **kwargs):
+            yield mock_msg
+
+        mock_query.side_effect = mock_gen
+
+        result = await classify_without_fork("update my context", config)
+        assert isinstance(result, list)
+        assert "update-context" in result
+
+    @pytest.mark.asyncio
+    @patch("obs_agent.fork.query")
+    async def test_returns_empty_for_simple(self, mock_query, config):
+        """classify_without_fork returns empty list for simple queries."""
+        mock_msg = MagicMock()
+        mock_msg.content = [TextBlock(text="[]")]
+
+        async def mock_gen(*args, **kwargs):
+            yield mock_msg
+
+        mock_query.side_effect = mock_gen
+
+        result = await classify_without_fork("hello", config)
+        assert result == []
+
+    @pytest.mark.asyncio
+    @patch("obs_agent.fork.query")
+    async def test_does_not_use_fork_options(self, mock_query, config):
+        """classify_without_fork does not set resume or fork_session."""
+        mock_msg = MagicMock()
+        mock_msg.content = [TextBlock(text="[]")]
+
+        async def mock_gen(*args, **kwargs):
+            yield mock_msg
+
+        mock_query.side_effect = mock_gen
+
+        await classify_without_fork("hello", config)
+
+        call_kwargs = mock_query.call_args
+        options = call_kwargs.kwargs.get("options") or call_kwargs[1].get("options")
+        # Should not have resume or fork_session set
+        assert not getattr(options, "resume", None)
+        assert not getattr(options, "fork_session", None)
+
+
+# --- Build Skill Manifest (Static) ---
+
+
+class TestBuildSkillManifest:
+    """ForkRunner.build_skill_manifest is a static method taking config."""
+
+    def test_is_static_method(self):
+        """build_skill_manifest can be called without a ForkRunner instance."""
+        assert callable(ForkRunner.build_skill_manifest)
+
+    def test_returns_string(self, config):
+        """build_skill_manifest returns a string."""
+        result = ForkRunner.build_skill_manifest(config)
+        assert isinstance(result, str)
+
+    def test_finds_skills_in_vault(self, fixture_vault, config):
+        """build_skill_manifest lists skills from the skills directory."""
+        skill_dir = fixture_vault / "Agent" / "skills" / "test-skill"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: test-skill\ndescription: A test skill\n---\n# Test\n"
+        )
+
+        result = ForkRunner.build_skill_manifest(config)
+        assert "test-skill" in result

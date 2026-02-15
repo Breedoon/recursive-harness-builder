@@ -1,9 +1,10 @@
-"""Tests for obs_agent.session - Step 5 TDD (RED phase).
+"""Tests for obs_agent.session - Step 5 TDD.
 
 These tests define the SessionManager contract for:
 - Session lifecycle (init, resume, fresh start)
 - Cache window management (58 min resume window)
 - SDK options assembly (hooks + system prompt + resume)
+- Client lifecycle (get_client, disconnect, reconnect)
 - Context loading on fresh sessions
 
 See implementation-plan.md Step 5 and decisions:
@@ -19,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from obs_agent.config import OBSConfig
+from obs_agent.hooks import HookState, HookPipeline
 from obs_agent.session import SessionManager
 
 
@@ -42,6 +44,12 @@ class TestSessionManagerInit:
         """Fresh SessionManager has no last-activity timestamp."""
         mgr = SessionManager(config=config)
         assert mgr.last_activity is None
+
+    def test_starts_with_no_client(self, config):
+        """Fresh SessionManager has no SDK client."""
+        mgr = SessionManager(config=config)
+        assert mgr._client is None
+        assert mgr._connected is False
 
 
 # --- Session ID Tracking ---
@@ -242,3 +250,211 @@ class TestSessionReset:
         mgr.set_session_id("sess-xyz-789")
         mgr.reset()
         assert mgr.should_resume() is False
+
+    def test_reset_clears_client(self, config):
+        """reset() clears the client reference."""
+        mgr = SessionManager(config=config)
+        mgr._client = MagicMock()
+        mgr._connected = True
+        mgr.reset()
+        assert mgr._client is None
+        assert mgr._connected is False
+
+
+# --- Hook State Wiring ---
+
+
+class TestHookStateWiring:
+    """SessionManager wires HookState into ClaudeAgentOptions hooks."""
+
+    def test_default_hook_state(self, config):
+        """SessionManager creates a default HookState if none provided."""
+        mgr = SessionManager(config=config)
+        assert isinstance(mgr.hook_state, HookState)
+
+    def test_accepts_custom_hook_state(self, config):
+        """SessionManager accepts an explicit HookState."""
+        state = HookState()
+        mgr = SessionManager(config=config, hook_state=state)
+        assert mgr.hook_state is state
+
+    def test_options_have_non_empty_pre_tool_use(self, config):
+        """create_options() returns options with non-empty PreToolUse hooks."""
+        mgr = SessionManager(config=config)
+
+        with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+            options = mgr.create_options()
+
+        assert options.hooks is not None
+        assert "PreToolUse" in options.hooks
+        assert len(options.hooks["PreToolUse"]) > 0
+
+    def test_options_have_non_empty_post_tool_use(self, config):
+        """create_options() returns options with non-empty PostToolUse hooks."""
+        mgr = SessionManager(config=config)
+
+        with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+            options = mgr.create_options()
+
+        assert options.hooks is not None
+        assert "PostToolUse" in options.hooks
+        assert len(options.hooks["PostToolUse"]) > 0
+
+    def test_pre_tool_use_contains_hook_pipeline(self, config):
+        """PreToolUse matchers contain a HookPipeline callable."""
+        mgr = SessionManager(config=config)
+
+        with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+            options = mgr.create_options()
+
+        pre_matchers = options.hooks["PreToolUse"]
+        assert len(pre_matchers) == 1
+        assert len(pre_matchers[0].hooks) == 1
+        assert isinstance(pre_matchers[0].hooks[0], HookPipeline)
+
+    def test_backward_compatible_no_hook_state(self, config):
+        """Existing tests still work without providing hook_state."""
+        mgr = SessionManager(config=config)
+        assert mgr.session_id is None
+        assert mgr.last_activity is None
+
+        with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+            options = mgr.create_options()
+
+        assert options.system_prompt == "prompt"
+        assert options.hooks is not None
+
+
+# --- CWD Configuration ---
+
+
+class TestOptionsConfiguration:
+    """create_options() includes CWD configuration."""
+
+    def test_create_options_sets_cwd_to_vault(self, config):
+        """Options include cwd pointing to vault path."""
+        mgr = SessionManager(config=config)
+
+        with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+            options = mgr.create_options()
+
+        assert options.cwd == str(config.vault_path)
+
+
+# --- Client Lifecycle ---
+
+
+class TestClientLifecycle:
+    """SessionManager manages ClaudeSDKClient lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_get_client_creates_client(self, config):
+        """get_client() creates and connects a ClaudeSDKClient."""
+        mgr = SessionManager(config=config)
+
+        mock_client = AsyncMock()
+        with patch("obs_agent.session.ClaudeSDKClient") as MockClass:
+            MockClass.return_value = mock_client
+            with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+                client = await mgr.get_client()
+
+        assert client is mock_client
+        mock_client.connect.assert_called_once()
+        assert mgr._connected is True
+
+    @pytest.mark.asyncio
+    async def test_get_client_reuses_within_window(self, config):
+        """get_client() reuses an existing connected client."""
+        mgr = SessionManager(config=config)
+
+        mock_client = AsyncMock()
+        with patch("obs_agent.session.ClaudeSDKClient") as MockClass:
+            MockClass.return_value = mock_client
+            with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+                client1 = await mgr.get_client()
+                client2 = await mgr.get_client()
+
+        assert client1 is client2
+        # connect called only once (reused)
+        assert mock_client.connect.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_get_client_reconnects_on_cache_expiry(self, config):
+        """get_client() disconnects and creates fresh client when cache expires."""
+        mgr = SessionManager(config=config)
+
+        mock_client1 = AsyncMock()
+        mock_client2 = AsyncMock()
+        call_count = 0
+
+        def make_client(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return mock_client1 if call_count == 1 else mock_client2
+
+        with patch("obs_agent.session.ClaudeSDKClient", side_effect=make_client):
+            with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+                client1 = await mgr.get_client()
+
+                # Simulate session set + cache expiry
+                mgr.set_session_id("sess-old")
+                mgr.last_activity = time.time() - 7200  # 2 hours ago
+
+                client2 = await mgr.get_client()
+
+        assert client1 is not client2
+        mock_client1.disconnect.assert_called_once()
+        mock_client2.connect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cleans_up(self, config):
+        """disconnect() disconnects the client and clears reference."""
+        mgr = SessionManager(config=config)
+
+        mock_client = AsyncMock()
+        with patch("obs_agent.session.ClaudeSDKClient") as MockClass:
+            MockClass.return_value = mock_client
+            with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+                await mgr.get_client()
+
+        await mgr.disconnect()
+
+        assert mgr._client is None
+        assert mgr._connected is False
+        mock_client.disconnect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_handles_errors(self, config):
+        """disconnect() doesn't raise if client.disconnect() fails."""
+        mgr = SessionManager(config=config)
+
+        mock_client = AsyncMock()
+        mock_client.disconnect.side_effect = Exception("connection died")
+
+        with patch("obs_agent.session.ClaudeSDKClient") as MockClass:
+            MockClass.return_value = mock_client
+            with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+                await mgr.get_client()
+
+        # Should not raise
+        await mgr.disconnect()
+        assert mgr._client is None
+
+    @pytest.mark.asyncio
+    async def test_async_reset_disconnects_and_clears(self, config):
+        """async_reset() disconnects and clears all state."""
+        mgr = SessionManager(config=config)
+
+        mock_client = AsyncMock()
+        with patch("obs_agent.session.ClaudeSDKClient") as MockClass:
+            MockClass.return_value = mock_client
+            with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+                await mgr.get_client()
+
+        mgr.set_session_id("sess-123")
+        await mgr.async_reset()
+
+        assert mgr._client is None
+        assert mgr._connected is False
+        assert mgr.session_id is None
+        assert mgr.last_activity is None

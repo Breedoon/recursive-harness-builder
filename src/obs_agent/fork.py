@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-from claude_agent_sdk import ClaudeAgentOptions, query
+from claude_agent_sdk import ClaudeAgentOptions, TextBlock, query
+
+from obs_agent.metrics import log_result
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -47,24 +49,16 @@ class ForkRunner:
             options.max_turns = max_turns
 
         result_parts: list[str] = []
-        stream = query(prompt=prompt, options=options)
-        # Support both real async generators and mock async iterables
-        aiter = stream.__aiter__()
-        if hasattr(aiter, "__await__"):
-            aiter = await aiter
-        while True:
-            try:
-                anext = aiter.__anext__()
-                if hasattr(anext, "__await__"):
-                    message = await anext
-                else:
-                    message = anext
-            except StopAsyncIteration:
-                break
-            except StopIteration:
-                break
-            if hasattr(message, "content") and isinstance(message.content, str):
-                result_parts.append(message.content)
+        last_message = None
+        async for message in query(prompt=prompt, options=options):
+            last_message = message
+            if hasattr(message, "content") and isinstance(message.content, list):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        result_parts.append(block.text)
+
+        if last_message is not None:
+            log_result(last_message, label="fork")
 
         return "\n".join(result_parts)
 
@@ -75,7 +69,7 @@ class ForkRunner:
         of skill name strings (may be empty for simple queries).
         """
         # Build the skill manifest for the classify prompt
-        manifest = self._build_skill_manifest()
+        manifest = ForkRunner.build_skill_manifest(self.config)
 
         prompt = (
             f"Classify this user message and determine which vault skills are needed.\n\n"
@@ -135,12 +129,13 @@ class ForkRunner:
 
         return await self.run(prompt, max_turns=10)
 
-    def _build_skill_manifest(self) -> str:
+    @staticmethod
+    def build_skill_manifest(config: OBSConfig) -> str:
         """Build a text manifest of all available skills for classification."""
         from obs_agent.prompt import _read_file, _parse_frontmatter
 
         lines = []
-        skills_dir = self.config.skills_dir
+        skills_dir = config.skills_dir
         if skills_dir.is_dir():
             for skill_dir in sorted(skills_dir.iterdir()):
                 if skill_dir.is_dir():
@@ -187,3 +182,37 @@ class ForkRunner:
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
         return {"results": []}
+
+
+async def classify_without_fork(user_message: str, config: OBSConfig) -> list[str]:
+    """Classify skills for first message when no session_id exists yet.
+
+    Uses a standalone (non-forked) query since there's no session to fork from.
+    """
+    manifest = ForkRunner.build_skill_manifest(config)
+
+    prompt = (
+        f"Classify this user message and determine which vault skills are needed.\n\n"
+        f"## Available Skills\n{manifest}\n\n"
+        f"## User Message\n{user_message}\n\n"
+        f"Respond with ONLY a JSON array of skill objects, e.g. "
+        f'[{{"skill": "file-conventions"}}, {{"skill": "update-context"}}]. '
+        f"If no skills are needed, respond with []."
+    )
+
+    options = ClaudeAgentOptions(max_turns=1)
+
+    result_parts: list[str] = []
+    last_message = None
+    async for message in query(prompt=prompt, options=options):
+        last_message = message
+        if hasattr(message, "content") and isinstance(message.content, list):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    result_parts.append(block.text)
+
+    if last_message is not None:
+        log_result(last_message, label="classify")
+
+    response = "\n".join(result_parts)
+    return ForkRunner._parse_skill_list(response)

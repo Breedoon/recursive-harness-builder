@@ -13,6 +13,7 @@ dependencies = [
     "uvicorn>=0.34.0",
     "httpx>=0.28.0",
     "sse-starlette>=2.2.0",
+    "prompt-toolkit>=3.0.0",
 ]
 
 [project.optional-dependencies]

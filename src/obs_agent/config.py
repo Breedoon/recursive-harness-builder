@@ -30,6 +30,8 @@ class OBSConfig:
     daemon_host: str = "127.0.0.1"
     daemon_port: int = 7832
     cache_window_seconds: int = 3480  # 58 minutes
+    classification_threshold: int = 100
+    max_queue_continuations: int = 3
 
     # --- Class Methods ---
 
@@ -46,6 +48,10 @@ class OBSConfig:
             kwargs["daemon_port"] = int(port)
         if window := os.environ.get("OBS_CACHE_WINDOW"):
             kwargs["cache_window_seconds"] = int(window)
+        if threshold := os.environ.get("OBS_CLASSIFICATION_THRESHOLD"):
+            kwargs["classification_threshold"] = int(threshold)
+        if max_cont := os.environ.get("OBS_MAX_QUEUE_CONTINUATIONS"):
+            kwargs["max_queue_continuations"] = int(max_cont)
 
         return cls(**kwargs)
 
