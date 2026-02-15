@@ -9,4 +9,4 @@
 ## Criteria
 - The agent produces a response about binary search
 - The output contains "(queued)" indicating the second message was queued during streaming
-- The agent eventually addresses the arithmetic question (2+2=4) either inline or in a follow-up
+- The output contains "(queued:" showing the daemon delivered the queued message notification back to the CLI

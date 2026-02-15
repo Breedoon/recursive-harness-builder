@@ -66,8 +66,11 @@ class CLIPlatform:
             maxread=65536,
         )
 
-        # Wait for the CLI to be ready
+        # Wait for the CLI to be ready, then consume the initial prompt.
+        # Without consuming the prompt, the first expect(OBS_EVAL>) would match
+        # the initial prompt instead of the post-response prompt.
         self._child.expect("Type your message", timeout=60)
+        self._child.expect(self._prompt_pattern, timeout=30)
 
     async def send(self, text: str) -> str:
         """Send a message and wait for the next prompt, returning output."""

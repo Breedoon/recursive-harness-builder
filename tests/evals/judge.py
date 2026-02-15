@@ -148,14 +148,18 @@ async def _drive_concurrent_steps(
             transcript_parts.append(f"[sleep {step.wait_seconds}s]")
             await asyncio.sleep(step.wait_seconds)
 
-    # After all steps, wait for any remaining output
-    try:
-        final_output = await platform.wait_for_prompt(timeout=120)
-        if final_output:
-            transcript_parts.append(f"AGENT (final): {final_output}")
-    except Exception:
-        # Timeout waiting for prompt is OK for interrupt scenarios
-        pass
+    # After all steps, collect remaining output. Try multiple prompts
+    # to capture continuation responses (e.g., queued message replies).
+    for attempt in range(3):
+        try:
+            timeout = 120 if attempt == 0 else 60
+            output = await platform.wait_for_prompt(timeout=timeout)
+            if output:
+                label = "AGENT (final)" if attempt == 0 else f"AGENT (continuation {attempt})"
+                transcript_parts.append(f"{label}: {output}")
+        except Exception:
+            # Timeout is expected — no more prompts coming
+            break
 
     return "\n\n".join(transcript_parts)
 
