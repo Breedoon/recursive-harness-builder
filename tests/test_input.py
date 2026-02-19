@@ -61,9 +61,9 @@ class TestSimpleChannel:
     def test_print_status(self, capsys):
         """print_status prints dim ANSI text with parentheses."""
         ch = SimpleChannel()
-        ch.print_status("Read: Agent/context.md")
+        ch.print_status("Read: CLAUDE.md")
         captured = capsys.readouterr()
-        assert "(Read: Agent/context.md)" in captured.out
+        assert "(Read: CLAUDE.md)" in captured.out
         assert "\033[2m" in captured.out
         assert "\033[0m" in captured.out
 

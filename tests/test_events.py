@@ -96,8 +96,8 @@ class TestSummarizeToolUse:
     def test_read_with_vault_path(self):
         """Read tool with vault path gets shortened."""
         vault = str(_DEFAULT_VAULT)
-        result = summarize_tool_use("Read", {"file_path": f"{vault}/Agent/context.md"})
-        assert result == "Read: Agent/context.md"
+        result = summarize_tool_use("Read", {"file_path": f"{vault}/CLAUDE.md"})
+        assert result == "Read: CLAUDE.md"
 
     def test_read_with_non_vault_path(self):
         """Read tool with non-vault path preserves full path."""
@@ -122,8 +122,8 @@ class TestSummarizeToolUse:
     def test_grep_with_pattern_and_path(self):
         """Grep tool includes pattern and path."""
         vault = str(_DEFAULT_VAULT)
-        result = summarize_tool_use("Grep", {"pattern": "skills", "path": f"{vault}/Agent/"})
-        assert result == "Grep: pattern='skills' path=Agent/"
+        result = summarize_tool_use("Grep", {"pattern": "skills", "path": f"{vault}/.claude/"})
+        assert result == "Grep: pattern='skills' path=.claude/"
 
     def test_grep_empty_pattern(self):
         """Grep tool with empty pattern returns fallback."""
@@ -138,8 +138,8 @@ class TestSummarizeToolUse:
     def test_glob_with_pattern_and_path(self):
         """Glob tool includes pattern and path."""
         vault = str(_DEFAULT_VAULT)
-        result = summarize_tool_use("Glob", {"pattern": "**/*.md", "path": f"{vault}/Agent/"})
-        assert result == "Glob: '**/*.md' in Agent/"
+        result = summarize_tool_use("Glob", {"pattern": "**/*.md", "path": f"{vault}/.claude/"})
+        assert result == "Glob: '**/*.md' in .claude/"
 
     def test_glob_empty_pattern(self):
         """Glob tool with empty pattern returns fallback."""
@@ -148,8 +148,8 @@ class TestSummarizeToolUse:
 
     def test_bash_with_command(self):
         """Bash tool shows truncated command."""
-        result = summarize_tool_use("Bash", {"command": "ls -la Agent/"})
-        assert result == "Bash: ls -la Agent/"
+        result = summarize_tool_use("Bash", {"command": "ls -la .claude/"})
+        assert result == "Bash: ls -la .claude/"
 
     def test_bash_truncates_long_command(self):
         """Bash tool truncates commands longer than 80 chars."""
@@ -200,6 +200,46 @@ class TestSummarizeToolUse:
         assert result.startswith("Edit: ")
         assert "file_path=/tmp/x" in result
 
+    def test_self_fork_foreground(self):
+        """self_fork shows task description."""
+        result = summarize_tool_use("self_fork", {"task": "Summarize meeting notes", "background": False})
+        assert result == "Fork: Summarize meeting notes"
+
+    def test_self_fork_background(self):
+        """self_fork with background=true shows '(bg)' prefix."""
+        result = summarize_tool_use("self_fork", {"task": "Research topic", "background": True})
+        assert result == "Fork (bg): Research topic"
+
+    def test_self_fork_truncates_long_task(self):
+        """self_fork truncates task descriptions longer than 80 chars."""
+        long_task = "a" * 100
+        result = summarize_tool_use("self_fork", {"task": long_task})
+        assert result.startswith("Fork: ")
+        assert result.endswith("...")
+        assert len(result) < 100
+
+    def test_self_fork_empty_task(self):
+        """self_fork with empty task returns just prefix."""
+        result = summarize_tool_use("self_fork", {"task": ""})
+        assert result == "Fork"
+
+    def test_task_tool_with_prompt(self):
+        """Task tool shows the prompt."""
+        result = summarize_tool_use("Task", {"prompt": "Explore the codebase"})
+        assert result == "Task: Explore the codebase"
+
+    def test_task_tool_truncates_long_prompt(self):
+        """Task tool truncates prompts longer than 80 chars."""
+        long_prompt = "x" * 100
+        result = summarize_tool_use("Task", {"prompt": long_prompt})
+        assert result.startswith("Task: ")
+        assert result.endswith("...")
+
+    def test_task_tool_empty_prompt(self):
+        """Task tool with empty prompt returns just 'Task'."""
+        result = summarize_tool_use("Task", {"prompt": ""})
+        assert result == "Task"
+
 
 # --- _shorten_path ---
 
@@ -210,8 +250,8 @@ class TestShortenPath:
     def test_strips_vault_prefix(self):
         """Strips the default vault path prefix."""
         vault = str(_DEFAULT_VAULT)
-        result = _shorten_path(f"{vault}/Agent/context.md")
-        assert result == "Agent/context.md"
+        result = _shorten_path(f"{vault}/CLAUDE.md")
+        assert result == "CLAUDE.md"
 
     def test_strips_trailing_slash(self):
         """Handles paths immediately under vault root."""

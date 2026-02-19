@@ -19,5 +19,8 @@ htmlcov/
 # OS
 .DS_Store
 
+# Secrets
+.env
+
 # Fixture vault (created by tests)
 fixture_vault/

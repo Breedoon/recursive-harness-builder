@@ -1,15 +1,12 @@
-"""Tests for obs_agent.hooks - Step 4 TDD (RED phase).
+"""Tests for obs_agent.hooks - Hook contracts.
 
-These tests define the Hook contracts for:
 - PreToolUse: guards immutable files and .env from writes
 - Stop: triggers memory extraction via fork
 - PreCompact: triggers extraction then denies compaction
-- UserPromptSubmit: classifies skills and injects SKILL.md content
+- HookPipeline: extensible middleware that chains check functions
+- HookState: shared state for message queuing and interrupt
 
-See implementation-plan.md Step 4 and decisions:
-- D018: Forks for subtasks
-- D019: Skill injection via fork classification
-- D022: No compaction - flush and restart
+See implementation-plan.md Step 4 and decisions D018, D022.
 """
 
 import asyncio
@@ -100,12 +97,12 @@ class TestPreToolUseImmutableGuard:
 class TestPreToolUseAllowed:
     """PreToolUse hook allows legitimate operations."""
 
-    def test_allows_write_to_agent_files(self, config):
-        """Allows Write tool for Agent/ directory files."""
+    def test_allows_write_to_vault_files(self, config):
+        """Allows Write tool for vault files."""
         result = on_pre_tool_use(
             tool_name="Write",
             tool_input={
-                "file_path": str(config.vault_path / "Agent" / "context.md"),
+                "file_path": str(config.vault_path / "CLAUDE.md"),
                 "content": "updated context",
             },
             config=config,
@@ -113,12 +110,12 @@ class TestPreToolUseAllowed:
         # Should return None or empty dict (allow)
         assert result is None or result == {}
 
-    def test_allows_edit_to_agent_files(self, config):
-        """Allows Edit tool for Agent/ directory files."""
+    def test_allows_edit_to_claude_files(self, config):
+        """Allows Edit tool for .claude/ directory files."""
         result = on_pre_tool_use(
             tool_name="Edit",
             tool_input={
-                "file_path": str(config.vault_path / "Agent" / "topics" / "goals.md"),
+                "file_path": str(config.vault_path / ".claude" / "topics" / "goals.md"),
                 "old_string": "old goal",
                 "new_string": "new goal",
             },
@@ -227,77 +224,6 @@ class TestPreCompactHook:
         # Must return deny to prevent SDK compaction (D022)
         assert result is not None
         assert "deny" in str(result).lower() or result.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
-
-
-# --- UserPromptSubmit Hook ---
-
-
-class TestUserPromptSubmitHook:
-    """UserPromptSubmit hook classifies user message and injects skills."""
-
-    @pytest.mark.asyncio
-    async def test_triggers_classify(self, config):
-        """Hook calls fork runner's classify method with the user message."""
-        # Import here since the function may not exist on the stub
-        from obs_agent.hooks import on_user_prompt_submit
-
-        mock_fork_runner = MagicMock()
-        mock_fork_runner.classify = AsyncMock(return_value=["file-conventions"])
-
-        await on_user_prompt_submit(
-            user_message="help me organize my vault",
-            config=config,
-            fork_runner=mock_fork_runner,
-        )
-
-        mock_fork_runner.classify.assert_called_once_with("help me organize my vault")
-
-    @pytest.mark.asyncio
-    async def test_reads_skill_files(self, config, fixture_vault):
-        """After classify returns skill names, hook reads SKILL.md files."""
-        from obs_agent.hooks import on_user_prompt_submit
-
-        # Create a skill file in the fixture vault
-        skill_dir = fixture_vault / "Agent" / "skills" / "file-conventions"
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(
-            "---\nname: file-conventions\n---\n# File Conventions\nMaster reference.\n"
-        )
-
-        mock_fork_runner = MagicMock()
-        mock_fork_runner.classify = AsyncMock(return_value=["file-conventions"])
-
-        result = await on_user_prompt_submit(
-            user_message="help me organize my vault",
-            config=config,
-            fork_runner=mock_fork_runner,
-        )
-
-        # Result should contain the skill content to inject
-        assert result is not None
-        assert isinstance(result, (str, dict))
-        # The skill content should be included somehow
-        result_str = str(result)
-        assert "file-conventions" in result_str.lower() or "File Conventions" in result_str, (
-            "Hook must return skill content for injection"
-        )
-
-    @pytest.mark.asyncio
-    async def test_no_skills_returns_empty(self, config):
-        """When classify returns no skills, hook returns None or empty."""
-        from obs_agent.hooks import on_user_prompt_submit
-
-        mock_fork_runner = MagicMock()
-        mock_fork_runner.classify = AsyncMock(return_value=[])
-
-        result = await on_user_prompt_submit(
-            user_message="what time is it",
-            config=config,
-            fork_runner=mock_fork_runner,
-        )
-
-        # No skills needed = no injection
-        assert result is None or result == "" or result == {}
 
 
 # ---------------------------------------------------------------------------

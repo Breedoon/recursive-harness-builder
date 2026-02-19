@@ -105,6 +105,26 @@ def summarize_tool_use(tool_name: str, tool_input: dict) -> str:
         query = tool_input.get("query", "")
         return f"WebSearch: '{query}'" if query else "WebSearch"
 
+    if tool_name == "self_fork":
+        task = tool_input.get("task", "")
+        background = tool_input.get("background", False)
+        prefix = "Fork (bg)" if background else "Fork"
+        if task:
+            truncated = task[:80]
+            if len(task) > 80:
+                truncated += "..."
+            return f"{prefix}: {truncated}"
+        return prefix
+
+    if tool_name == "Task":
+        prompt = tool_input.get("prompt", "")
+        if prompt:
+            truncated = prompt[:80]
+            if len(prompt) > 80:
+                truncated += "..."
+            return f"Task: {truncated}"
+        return "Task"
+
     # Unknown tool: dump first 3 args
     if tool_input:
         items = list(tool_input.items())[:3]

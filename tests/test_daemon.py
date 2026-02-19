@@ -1,11 +1,9 @@
-"""Tests for obs_agent.daemon - Steps 9-10 TDD.
+"""Tests for obs_agent.daemon - HTTP API contract.
 
-These tests define the Daemon HTTP API contract:
 - GET /health returns status
 - POST /chat accepts messages and returns responses
 - POST /chat/stream returns SSE events
 - Session management (init, resume)
-- Hook integration (UserPromptSubmit skill injection)
 - Error handling for invalid requests
 
 Uses FastAPI TestClient for synchronous testing.
@@ -268,36 +266,11 @@ class TestChatStream:
 
 
 class TestStreamStatusEvents:
-    """SSE stream includes status events for tool use, thinking, and classification."""
+    """SSE stream includes status events for tool use and thinking."""
 
-    @patch("obs_agent.daemon.classify_without_fork")
     @patch("obs_agent.session.SessionManager.get_client")
-    def test_skill_classify_status_event(self, mock_get_client, mock_classify, config):
-        """SSE stream emits event: status for skill classification."""
-        mock_classify.return_value = []
-
-        mock_msg = MagicMock()
-        mock_msg.content = [TextBlock(text="Hello")]
-        mock_msg.session_id = None
-
-        mock_get_client.return_value = _make_mock_client([mock_msg])
-
-        application = create_app(config)
-        client = TestClient(application)
-        long_msg = "x" * 150  # Over 100 char threshold
-        response = client.post("/chat/stream", json={"message": long_msg})
-        body = response.text
-
-        assert "event: status" in body
-        # Find skill_classify in the status events
-        assert '"type":"skill_classify"' in body or '"type": "skill_classify"' in body
-
-    @patch("obs_agent.daemon.classify_without_fork")
-    @patch("obs_agent.session.SessionManager.get_client")
-    def test_tool_use_status_event(self, mock_get_client, mock_classify, config):
+    def test_tool_use_status_event(self, mock_get_client, config):
         """SSE stream emits event: status for tool use blocks."""
-        mock_classify.return_value = []
-
         mock_msg = MagicMock()
         mock_msg.content = [
             ToolUseBlock(id="tu-1", name="Read", input={"file_path": "/tmp/test.md"}),
@@ -316,12 +289,9 @@ class TestStreamStatusEvents:
         # Should have a tool_use status event
         assert '"type":"tool_use"' in body or '"type": "tool_use"' in body
 
-    @patch("obs_agent.daemon.classify_without_fork")
     @patch("obs_agent.session.SessionManager.get_client")
-    def test_thinking_status_event(self, mock_get_client, mock_classify, config):
+    def test_thinking_status_event(self, mock_get_client, config):
         """SSE stream emits event: status for thinking blocks."""
-        mock_classify.return_value = []
-
         mock_msg = MagicMock()
         mock_msg.content = [
             ThinkingBlock(thinking="Let me think...", signature="sig"),
@@ -339,12 +309,9 @@ class TestStreamStatusEvents:
         assert "event: status" in body
         assert '"type":"thinking"' in body or '"type": "thinking"' in body
 
-    @patch("obs_agent.daemon.classify_without_fork")
     @patch("obs_agent.session.SessionManager.get_client")
-    def test_tool_use_summary_in_status(self, mock_get_client, mock_classify, config):
+    def test_tool_use_summary_in_status(self, mock_get_client, config):
         """tool_use status event includes summarized tool info."""
-        mock_classify.return_value = []
-
         mock_msg = MagicMock()
         mock_msg.content = [
             ToolUseBlock(id="tu-1", name="Grep", input={"pattern": "hello"}),
@@ -363,12 +330,9 @@ class TestStreamStatusEvents:
         assert "Grep:" in body
         assert "hello" in body
 
-    @patch("obs_agent.daemon.classify_without_fork")
     @patch("obs_agent.session.SessionManager.get_client")
-    def test_status_events_mixed_with_text(self, mock_get_client, mock_classify, config):
+    def test_status_events_mixed_with_text(self, mock_get_client, config):
         """Status events and text data events coexist in the stream."""
-        mock_classify.return_value = []
-
         mock_msg = MagicMock()
         mock_msg.content = [
             ToolUseBlock(id="tu-1", name="Read", input={"file_path": "/tmp/x"}),
@@ -452,78 +416,6 @@ class TestRequestModels:
         resp = ChatResponse(response="hello back", session_id="sess-1")
         assert resp.response == "hello back"
         assert resp.session_id == "sess-1"
-
-
-# --- First-Message Skill Classification ---
-
-
-class TestFirstMessageClassification:
-    """First message (no session_id) still gets skill classification."""
-
-    @patch("obs_agent.daemon.classify_without_fork")
-    @patch("obs_agent.session.SessionManager.get_client")
-    def test_first_message_classifies_via_chat(self, mock_get_client, mock_classify, config):
-        """POST /chat classifies skills on first message (no session)."""
-        mock_classify.return_value = []
-
-        mock_msg = MagicMock()
-        mock_msg.content = [TextBlock(text="Hello!")]
-        mock_msg.session_id = None
-
-        mock_get_client.return_value = _make_mock_client([mock_msg])
-
-        application = create_app(config)
-        client = TestClient(application)
-        long_msg = "x" * 150  # Over 100 char threshold
-        response = client.post("/chat", json={"message": long_msg})
-        assert response.status_code == 200
-        mock_classify.assert_called_once()
-
-    @patch("obs_agent.daemon.classify_without_fork")
-    @patch("obs_agent.session.SessionManager.get_client")
-    def test_first_message_classifies_via_stream(self, mock_get_client, mock_classify, config):
-        """POST /chat/stream classifies skills on first message (no session)."""
-        mock_classify.return_value = []
-
-        mock_msg = MagicMock()
-        mock_msg.content = [TextBlock(text="Hello!")]
-        mock_msg.session_id = None
-
-        mock_get_client.return_value = _make_mock_client([mock_msg])
-
-        application = create_app(config)
-        client = TestClient(application)
-        long_msg = "x" * 150  # Over 100 char threshold
-        response = client.post("/chat/stream", json={"message": long_msg})
-        assert response.status_code == 200
-        mock_classify.assert_called_once()
-
-    @patch("obs_agent.daemon.on_user_prompt_submit")
-    @patch("obs_agent.session.SessionManager.get_client")
-    def test_second_message_uses_fork_runner(self, mock_get_client, mock_on_submit, config):
-        """POST /chat uses ForkRunner.classify (via hook) when session_id exists."""
-        mock_on_submit.return_value = None
-
-        mock_msg = MagicMock()
-        mock_msg.content = [TextBlock(text="Response")]
-        mock_msg.session_id = "sess-123"
-
-        mock_get_client.return_value = _make_mock_client([mock_msg])
-
-        application = create_app(config)
-        client = TestClient(application)
-
-        # First message sets session_id (long enough to trigger classification)
-        long_msg = "x" * 150
-        client.post("/chat", json={"message": long_msg})
-
-        # Reset mocks for second call
-        mock_get_client.return_value = _make_mock_client([mock_msg])
-        mock_on_submit.reset_mock()
-
-        # Second message should use fork-based hook (long enough to trigger classification)
-        client.post("/chat", json={"message": long_msg})
-        mock_on_submit.assert_called_once()
 
 
 # --- Enqueue Endpoint ---
@@ -650,93 +542,6 @@ class TestAppStateWiring:
         """SessionManager uses the same HookState as app.state."""
         application = create_app(config)
         assert application.state.session_manager.hook_state is application.state.hook_state
-
-
-# --- Conditional Classification ---
-
-
-class TestConditionalClassification:
-    """Classification is skipped for short messages."""
-
-    @patch("obs_agent.daemon.classify_without_fork")
-    @patch("obs_agent.session.SessionManager.get_client")
-    def test_short_message_skips_classification(self, mock_get_client, mock_classify, config):
-        """Messages under threshold skip classification entirely."""
-        mock_msg = MagicMock()
-        mock_msg.content = [TextBlock(text="Hi!")]
-        mock_msg.session_id = None
-
-        mock_get_client.return_value = _make_mock_client([mock_msg])
-
-        application = create_app(config)
-        client = TestClient(application)
-        response = client.post("/chat", json={"message": "hi"})
-        assert response.status_code == 200
-        mock_classify.assert_not_called()
-
-    @patch("obs_agent.daemon.classify_without_fork")
-    @patch("obs_agent.session.SessionManager.get_client")
-    def test_long_message_triggers_classification(self, mock_get_client, mock_classify, config):
-        """Messages over threshold trigger classification."""
-        mock_classify.return_value = []
-
-        mock_msg = MagicMock()
-        mock_msg.content = [TextBlock(text="Response")]
-        mock_msg.session_id = None
-
-        mock_get_client.return_value = _make_mock_client([mock_msg])
-
-        application = create_app(config)
-        client = TestClient(application)
-        long_msg = "x" * 150  # Over 100 char threshold
-        response = client.post("/chat", json={"message": long_msg})
-        assert response.status_code == 200
-        mock_classify.assert_called_once()
-
-    @patch("obs_agent.daemon.classify_without_fork")
-    @patch("obs_agent.session.SessionManager.get_client")
-    def test_short_message_skips_classification_stream(self, mock_get_client, mock_classify, config):
-        """Short messages skip classification in /chat/stream too."""
-        mock_msg = MagicMock()
-        mock_msg.content = [TextBlock(text="Hi!")]
-        mock_msg.session_id = None
-
-        mock_get_client.return_value = _make_mock_client([mock_msg])
-
-        application = create_app(config)
-        client = TestClient(application)
-        response = client.post("/chat/stream", json={"message": "hi"})
-        assert response.status_code == 200
-        body = response.text
-        # Should NOT have skill_classify event
-        assert "skill_classify" not in body
-        mock_classify.assert_not_called()
-
-    @patch("obs_agent.daemon.classify_without_fork")
-    @patch("obs_agent.session.SessionManager.get_client")
-    def test_long_message_triggers_classification_stream(self, mock_get_client, mock_classify, config):
-        """Long messages trigger classification in /chat/stream."""
-        mock_classify.return_value = []
-
-        mock_msg = MagicMock()
-        mock_msg.content = [TextBlock(text="Response")]
-        mock_msg.session_id = None
-
-        mock_get_client.return_value = _make_mock_client([mock_msg])
-
-        application = create_app(config)
-        client = TestClient(application)
-        long_msg = "x" * 150
-        response = client.post("/chat/stream", json={"message": long_msg})
-        body = response.text
-        assert "skill_classify" in body
-        mock_classify.assert_called_once()
-
-    def test_classification_threshold_configurable(self, fixture_vault):
-        """Custom threshold is respected."""
-        from obs_agent.config import OBSConfig
-        cfg = OBSConfig(vault_path=fixture_vault, classification_threshold=50)
-        assert cfg.classification_threshold == 50
 
 
 # --- Queue Continuation ---

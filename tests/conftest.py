@@ -7,6 +7,20 @@ from pathlib import Path
 
 import pytest
 
+# ---------------------------------------------------------------------------
+# Load .env file for credentials (Telegram API keys, session, etc.)
+# Only sets variables not already in the environment.
+# ---------------------------------------------------------------------------
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _key, _, _val = _line.partition("=")
+            _key, _val = _key.strip(), _val.strip()
+            if _key and _val and _key not in os.environ:
+                os.environ[_key] = _val
+
 from obs_agent.config import OBSConfig
 
 # Persistent fixture vault at project root (created by scripts/clone_vault.sh)
@@ -43,15 +57,15 @@ def fixture_vault(tmp_path: Path) -> Path:
 
     # Create minimal vault structure for unit tests
     vault = tmp_path / "vault"
-    agent = vault / "Agent"
-    (agent / "system").mkdir(parents=True)
-    (agent / "skills").mkdir(parents=True)
-    (agent / "memory").mkdir(parents=True)
+    claude = vault / ".claude"
+    (claude / "system").mkdir(parents=True)
+    (claude / "skills").mkdir(parents=True)
+    (claude / "memory").mkdir(parents=True)
 
-    (agent / "context.md").write_text("# Agent Context\n\nTest context.\n")
-    (agent / "memory.md").write_text("# Memory\n\nParent note for memory entries.\n")
-    (agent / "skills.md").write_text("# Skills\n\nParent note for skills.\n")
-    (agent / "system.md").write_text("# System\n\nParent note for system docs.\n")
+    (vault / "CLAUDE.md").write_text("# OBS Agent\n\nTest context.\n")
+    (claude / "memory.md").write_text("# Memory\n\nParent note for memory entries.\n")
+    (claude / "skills.md").write_text("# Skills\n\nParent note for skills.\n")
+    (claude / "system.md").write_text("# System\n\nParent note for system docs.\n")
 
     return vault
 
@@ -59,7 +73,7 @@ def fixture_vault(tmp_path: Path) -> Path:
 @pytest.fixture
 def config(fixture_vault: Path) -> OBSConfig:
     """OBSConfig pointing at the fixture vault."""
-    return OBSConfig(vault_path=fixture_vault)
+    return OBSConfig(vault_path=fixture_vault, telegram_allowed_user_ids=[12345])
 
 
 @pytest.fixture
@@ -74,14 +88,14 @@ def e2e_vault(tmp_path: Path) -> Path:
         return Path(env_path)
 
     vault = tmp_path / "vault"
-    agent = vault / "Agent"
+    claude = vault / ".claude"
 
     # Core directories
-    (agent / "system" / "sessions").mkdir(parents=True)
-    (agent / "skills").mkdir(parents=True)
-    (agent / "memory").mkdir(parents=True)
-    (agent / "topics").mkdir(parents=True)
-    (agent / "drafts").mkdir(parents=True)
+    (claude / "system" / "sessions").mkdir(parents=True)
+    (claude / "skills").mkdir(parents=True)
+    (claude / "memory").mkdir(parents=True)
+    (claude / "topics").mkdir(parents=True)
+    (claude / "drafts").mkdir(parents=True)
 
     # Misc/Meeting Notes (immutable test data)
     meeting_notes = vault / "Misc" / "Meeting Notes"
@@ -102,21 +116,22 @@ def e2e_vault(tmp_path: Path) -> Path:
         "# Algorithms\n\nNotes on algorithms.\n"
     )
 
-    # Agent context
-    (agent / "context.md").write_text(
-        "# Agent Context\n\n"
-        "## Current Focus\n"
+    # CLAUDE.md at vault root
+    (vault / "CLAUDE.md").write_text(
+        "# OBS Agent\n\n"
+        "## Context\n\n"
+        "### Current Focus\n"
         "Setting up the OBS Agent system.\n\n"
-        "## Active Threads\n"
+        "### Active Threads\n"
         "- Building the agent MVP\n"
         "- Testing vault operations\n\n"
-        "## Recent Decisions\n"
+        "### Recent Decisions\n"
         "- Using fork-based architecture (D018)\n"
     )
 
     # Parent notes
-    (agent / "memory.md").write_text("# Memory\n\nParent note for daily memory logs.\n")
-    (agent / "skills.md").write_text(
+    (claude / "memory.md").write_text("# Memory\n\nParent note for daily memory logs.\n")
+    (claude / "skills.md").write_text(
         "# Skills\n\n"
         "## Core Skills\n"
         "- file-conventions\n"
@@ -128,16 +143,16 @@ def e2e_vault(tmp_path: Path) -> Path:
         "- vault-search\n"
         "- git-commit\n"
     )
-    (agent / "system.md").write_text("# System\n\nParent note for system docs.\n")
+    (claude / "system.md").write_text("# System\n\nParent note for system docs.\n")
 
     # Core skill files
     for skill_name, desc in [
         ("file-conventions", "Master reference for vault file operations"),
-        ("update-context", "Persist learnings to context.md and topics"),
+        ("update-context", "Persist learnings to CLAUDE.md and topics"),
         ("manage-summaries", "Lazy-append one-line summaries to parent notes"),
         ("create-reference", "Create reference cards for external content"),
     ]:
-        skill_dir = agent / "skills" / skill_name
+        skill_dir = claude / "skills" / skill_name
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(
             f"---\nname: {skill_name}\n"
@@ -157,7 +172,7 @@ def e2e_vault(tmp_path: Path) -> Path:
         ("split-document", "Split growing files into directories"),
         ("proactive-behavior", "Connect dots and anticipate needs"),
     ]:
-        skill_dir = agent / "skills" / skill_name
+        skill_dir = claude / "skills" / skill_name
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(
             f"---\nname: {skill_name}\n"

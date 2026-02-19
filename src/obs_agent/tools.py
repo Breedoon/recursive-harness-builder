@@ -1,70 +1,155 @@
 """MCP tools for OBS Agent.
 
 Provides in-process MCP tools that the Claude Agent SDK exposes to the model.
-Currently: find_skills - on-demand skill classification and loading.
+Currently: self_fork - agent-controlled session forking for subtasks.
 
-See decisions D018 (forking) and D019 (skill classification).
+See decisions D018 (forking as core primitive).
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import TYPE_CHECKING, Callable
 
-from claude_agent_sdk import tool, create_sdk_mcp_server
+from claude_agent_sdk import ClaudeAgentOptions, TextBlock, query, tool, create_sdk_mcp_server
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
+    from obs_agent.hooks import HookState
+
+logger = logging.getLogger("obs_agent.tools")
 
 
-def create_obs_tools(config: OBSConfig, get_session_id: Callable[[], str | None]):
+def create_obs_tools(
+    config: OBSConfig,
+    get_session_id: Callable[[], str | None],
+    hook_state: HookState | None = None,
+):
     """Create the OBS Agent MCP tool server.
 
     get_session_id is a callable that returns the current session_id
     (closure over daemon state).
+
+    hook_state is optional — when provided, background forks enqueue
+    their results to hook_state.message_queue for delivery at the next
+    hook boundary.
     """
 
+    # Use hook_state.background_tasks if available, else local set (for GC prevention)
+    _background_tasks: set[asyncio.Task] = hook_state.background_tasks if hook_state is not None else set()
+
+    async def _run_fork_background(task_text: str, max_turns: int, session_id: str) -> None:
+        """Run a fork in the background and enqueue the result."""
+        try:
+            options = ClaudeAgentOptions(
+                resume=session_id,
+                fork_session=True,
+                max_turns=max_turns,
+                permission_mode="bypassPermissions",
+                cwd=str(config.vault_path),
+            )
+
+            result_parts: list[str] = []
+            async for message in query(prompt=task_text, options=options):
+                if hasattr(message, "content") and isinstance(message.content, list):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            result_parts.append(block.text)
+
+            text = "\n".join(result_parts) or "(fork returned no output)"
+            if hook_state is not None:
+                hook_state.message_queue.put_nowait(
+                    f'[Background fork completed: "{task_text}"]: {text}'
+                )
+            logger.info("Background fork completed: %s", task_text[:80])
+        except Exception as exc:
+            error_msg = f'[Background fork error: "{task_text}"]: {type(exc).__name__}: {exc}'
+            if hook_state is not None:
+                hook_state.message_queue.put_nowait(error_msg)
+            logger.error("Background fork failed: %s — %s", task_text[:80], exc)
+
     @tool(
-        "find_skills",
-        "Search for vault skills relevant to a complex query. Use when you need "
-        "specific instructions for vault operations like searching, editing, or "
-        "reasoning over different content types.",
-        {"query": str},
+        "self_fork",
+        "Fork this conversation to perform a subtask. The fork inherits full "
+        "conversation history and prompt cache. Use for: research, file analysis, "
+        "multi-step operations, or any task where a copy of yourself should work "
+        "independently. Set background=true to run the fork without blocking — "
+        "results are delivered via the message queue when the fork completes. "
+        "Returns the fork's text response (or a launch confirmation if background).",
+        {
+            "task": {
+                "type": "string",
+                "description": "What the forked session should accomplish",
+            },
+            "max_turns": {
+                "type": "integer",
+                "description": "Maximum turns for the fork (default 3, max 10)",
+            },
+            "background": {
+                "type": "boolean",
+                "description": "Run the fork in the background (default false). "
+                "Results are delivered via the message queue when the fork completes.",
+            },
+        },
     )
-    async def find_skills(args: dict) -> dict:
-        query_text = args["query"]
+    async def self_fork(args: dict) -> dict:
+        task_text = args["task"]
+        max_turns = min(int(args.get("max_turns", 3)), 10)
+        background = bool(args.get("background", False))
         session_id = get_session_id()
 
-        if session_id:
-            from obs_agent.fork import ForkRunner
-
-            runner = ForkRunner(config=config, session_id=session_id)
-            skill_names = await runner.classify(query_text)
-        else:
-            from obs_agent.fork import classify_without_fork
-
-            skill_names = await classify_without_fork(query_text, config)
-
-        if not skill_names:
+        if not session_id:
             return {
                 "content": [
-                    {"type": "text", "text": "No specific skills needed for this query."}
+                    {
+                        "type": "text",
+                        "text": "Cannot fork: no active session yet (need at least one completed turn)",
+                    }
                 ]
             }
 
-        from obs_agent.prompt import _read_file
+        if background:
+            if hook_state is None:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Cannot run background fork: no message queue available (hook_state not configured)",
+                        }
+                    ]
+                }
+            task = asyncio.create_task(_run_fork_background(task_text, max_turns, session_id))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f'Background fork launched for: "{task_text}". '
+                        "Results will be delivered via the message queue when complete.",
+                    }
+                ]
+            }
 
-        parts: list[str] = []
-        for name in skill_names:
-            content = _read_file(config.skill_path(name))
-            if content:
-                parts.append(f"## Skill: {name}\n\n{content}")
-
-        result = (
-            "\n\n---\n\n".join(parts)
-            if parts
-            else "Skills identified but files not found."
+        # Foreground (blocking) fork — existing behavior
+        options = ClaudeAgentOptions(
+            resume=session_id,
+            fork_session=True,
+            max_turns=max_turns,
+            permission_mode="bypassPermissions",
+            cwd=str(config.vault_path),
         )
-        return {"content": [{"type": "text", "text": result}]}
 
-    server = create_sdk_mcp_server("obs-agent", tools=[find_skills])
+        result_parts: list[str] = []
+        async for message in query(prompt=task_text, options=options):
+            if hasattr(message, "content") and isinstance(message.content, list):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        result_parts.append(block.text)
+
+        text = "\n".join(result_parts) or "(fork returned no output)"
+        return {"content": [{"type": "text", "text": text}]}
+
+    server = create_sdk_mcp_server("obs-agent", tools=[self_fork])
     return server

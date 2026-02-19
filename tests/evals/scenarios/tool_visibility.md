@@ -1,7 +1,7 @@
 # Tool Visibility
 
 ## Steps
-1. Send: "List the files in my Agent/skills directory"
+1. Send: "List the files in my .claude/skills directory"
    Wait: 90
 
 ## Criteria

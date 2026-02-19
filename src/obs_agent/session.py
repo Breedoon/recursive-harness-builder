@@ -18,6 +18,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 from obs_agent.hooks import HookState, create_hook_matchers
 from obs_agent.prompt import build_system_prompt
+from obs_agent.tools import create_obs_tools
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -69,15 +70,22 @@ class SessionManager:
         return elapsed < self.config.cache_window_seconds
 
     def _build_options(self) -> ClaudeAgentOptions:
-        """Build ClaudeAgentOptions with system prompt, hooks, and resume."""
+        """Build ClaudeAgentOptions with system prompt, hooks, MCP tools, and resume."""
         system_prompt = build_system_prompt(self.config)
 
         hook_matchers = create_hook_matchers(self.config, self.hook_state)
 
+        # Create MCP tool server with session_id getter closure and hook_state
+        # for background fork result delivery
+        tool_server = create_obs_tools(self.config, lambda: self._session_id, hook_state=self.hook_state)
+
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
             hooks=hook_matchers,
+            mcp_servers={"obs-agent": tool_server},
             cwd=str(self.config.vault_path),
+            permission_mode="bypassPermissions",
+            setting_sources=["project"],
         )
 
         # Resume if within cache window, otherwise fresh

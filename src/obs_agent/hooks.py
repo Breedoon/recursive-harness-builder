@@ -3,11 +3,10 @@
 - PreToolUse: guards immutable files and .env from writes
 - Stop: triggers memory extraction via fork
 - PreCompact: triggers extraction then denies compaction (D022)
-- UserPromptSubmit: classifies skills and injects SKILL.md content
 - HookPipeline: extensible middleware that chains check functions
 - HookState: shared state for message queuing and interrupt
 
-See decisions D018, D019, D022.
+See decisions D018, D022.
 """
 
 from __future__ import annotations
@@ -28,7 +27,6 @@ from claude_agent_sdk.types import (
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
-    from obs_agent.fork import ForkRunner
 
 
 # Write-mutating tool names that the guard should check
@@ -106,36 +104,6 @@ async def on_pre_compact(
     return _deny("Compaction denied: memories flushed, restart with fresh session")
 
 
-async def on_user_prompt_submit(
-    user_message: str,
-    *,
-    config: OBSConfig,
-    fork_runner: ForkRunner,
-) -> str | None:
-    """UserPromptSubmit hook: classify skills and inject SKILL.md content.
-
-    Per D019: fork to classify, then read SKILL.md files and return
-    content for injection into the session.
-    """
-    # Fork to classify what skills are needed
-    skill_names = await fork_runner.classify(user_message)
-
-    if not skill_names:
-        return None
-
-    # Read the skill files and assemble content for injection
-    from obs_agent.prompt import _read_file
-
-    parts: list[str] = []
-    for name in skill_names:
-        skill_path = config.skill_path(name)
-        content = _read_file(skill_path)
-        if content:
-            parts.append(f"## Skill: {name}\n\n{content}")
-
-    return "\n\n---\n\n".join(parts) if parts else None
-
-
 # ---------------------------------------------------------------------------
 # Hook Pipeline: extensible middleware for SDK hook callbacks
 # ---------------------------------------------------------------------------
@@ -162,6 +130,7 @@ class HookState:
     status_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     interrupt_flag: bool = False
     session_id: str | None = None
+    background_tasks: set[asyncio.Task] = field(default_factory=set)
 
 
 class HookPipeline:

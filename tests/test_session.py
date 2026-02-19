@@ -10,7 +10,7 @@ These tests define the SessionManager contract for:
 See implementation-plan.md Step 5 and decisions:
 - D014: SDK cache for continuity (~58 min window)
 - D022: No compaction - flush and restart
-- D025: context.md as orientation document
+- D025: CLAUDE.md as orientation document
 """
 
 import time
@@ -22,6 +22,13 @@ import pytest
 from obs_agent.config import OBSConfig
 from obs_agent.hooks import HookState, HookPipeline
 from obs_agent.session import SessionManager
+
+
+@pytest.fixture(autouse=True)
+def _mock_obs_tools():
+    """Patch create_obs_tools for all session tests (avoids MCP server creation)."""
+    with patch("obs_agent.session.create_obs_tools", return_value=MagicMock()):
+        yield
 
 
 # --- Initialization ---
@@ -198,7 +205,7 @@ class TestContextLoading:
     def test_fresh_session_loads_updated_context(self, config, fixture_vault):
         """Fresh start reads the latest context.md content."""
         # Write specific content to context.md
-        context_file = fixture_vault / "Agent" / "context.md"
+        context_file = fixture_vault / "CLAUDE.md"
         context_file.write_text("# Context\n\nFresh session test marker ABC.\n")
 
         mgr = SessionManager(config=config)
@@ -329,7 +336,7 @@ class TestHookStateWiring:
 
 
 class TestOptionsConfiguration:
-    """create_options() includes CWD configuration."""
+    """create_options() includes CWD and setting_sources configuration."""
 
     def test_create_options_sets_cwd_to_vault(self, config):
         """Options include cwd pointing to vault path."""
@@ -339,6 +346,40 @@ class TestOptionsConfiguration:
             options = mgr.create_options()
 
         assert options.cwd == str(config.vault_path)
+
+    def test_create_options_sets_setting_sources(self, config):
+        """Options include setting_sources=["project"] for native skill loading."""
+        mgr = SessionManager(config=config)
+
+        with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+            options = mgr.create_options()
+
+        assert options.setting_sources == ["project"]
+
+    def test_create_options_sets_mcp_servers(self, config):
+        """Options include mcp_servers with the obs-agent tool server."""
+        mgr = SessionManager(config=config)
+
+        with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+            options = mgr.create_options()
+
+        assert options.mcp_servers is not None
+        assert "obs-agent" in options.mcp_servers
+
+    def test_create_obs_tools_receives_hook_state(self, config):
+        """create_obs_tools is called with hook_state from SessionManager."""
+        state = HookState()
+        mgr = SessionManager(config=config, hook_state=state)
+
+        with patch("obs_agent.session.create_obs_tools") as mock_create:
+            mock_create.return_value = MagicMock()
+            with patch("obs_agent.session.build_system_prompt", return_value="prompt"):
+                mgr.create_options()
+
+        mock_create.assert_called_once()
+        call_kwargs = mock_create.call_args
+        # hook_state should be passed as keyword argument
+        assert call_kwargs.kwargs.get("hook_state") is state
 
 
 # --- Client Lifecycle ---

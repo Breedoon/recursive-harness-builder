@@ -312,9 +312,9 @@ class TestRenderStatus:
     def test_renders_summary_as_dim_text(self, capsys):
         """_render_status prints summary in dim ANSI text."""
         channel = SimpleChannel()
-        _render_status(['{"type":"tool_use","summary":"Read: Agent/context.md"}'], channel)
+        _render_status(['{"type":"tool_use","summary":"Read: CLAUDE.md"}'], channel)
         captured = capsys.readouterr()
-        assert "(Read: Agent/context.md)" in captured.out
+        assert "(Read: CLAUDE.md)" in captured.out
         # ANSI dim code
         assert "\033[2m" in captured.out
         # ANSI reset code

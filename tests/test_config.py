@@ -43,82 +43,43 @@ class TestVaultPathResolution:
         assert cfg.vault_path == other
 
 
-# --- Agent Directory Paths ---
+# --- Claude Directory Paths ---
 
 
-class TestAgentPaths:
-    """Config provides paths to all Agent subdirectories and files."""
+class TestClaudePaths:
+    """Config provides paths to all .claude subdirectories and files."""
 
-    def test_agent_path(self, config, fixture_vault):
-        """agent_path points to Agent/ inside vault."""
-        assert config.agent_path == fixture_vault / "Agent"
+    def test_claude_path(self, config, fixture_vault):
+        """claude_path points to .claude/ inside vault."""
+        assert config.claude_path == fixture_vault / ".claude"
 
     def test_context_path(self, config, fixture_vault):
-        """context_path points to Agent/context.md."""
-        assert config.context_path == fixture_vault / "Agent" / "context.md"
+        """context_path points to CLAUDE.md at vault root."""
+        assert config.context_path == fixture_vault / "CLAUDE.md"
 
     def test_skills_dir(self, config, fixture_vault):
-        """skills_dir points to Agent/skills/."""
-        assert config.skills_dir == fixture_vault / "Agent" / "skills"
+        """skills_dir points to .claude/skills/."""
+        assert config.skills_dir == fixture_vault / ".claude" / "skills"
 
     def test_memory_dir(self, config, fixture_vault):
-        """memory_dir points to Agent/memory/."""
-        assert config.memory_dir == fixture_vault / "Agent" / "memory"
+        """memory_dir points to .claude/memory/."""
+        assert config.memory_dir == fixture_vault / ".claude" / "memory"
 
     def test_system_dir(self, config, fixture_vault):
-        """system_dir points to Agent/system/."""
-        assert config.system_dir == fixture_vault / "Agent" / "system"
+        """system_dir points to .claude/system/."""
+        assert config.system_dir == fixture_vault / ".claude" / "system"
 
     def test_topics_dir(self, config, fixture_vault):
-        """topics_dir points to Agent/topics/."""
-        assert config.topics_dir == fixture_vault / "Agent" / "topics"
+        """topics_dir points to .claude/topics/."""
+        assert config.topics_dir == fixture_vault / ".claude" / "topics"
 
     def test_drafts_dir(self, config, fixture_vault):
-        """drafts_dir points to Agent/drafts/."""
-        assert config.drafts_dir == fixture_vault / "Agent" / "drafts"
+        """drafts_dir points to .claude/drafts/."""
+        assert config.drafts_dir == fixture_vault / ".claude" / "drafts"
 
     def test_memory_parent_note(self, config, fixture_vault):
-        """memory_parent_note points to Agent/memory.md."""
-        assert config.memory_parent_note == fixture_vault / "Agent" / "memory.md"
-
-    def test_skills_manifest(self, config, fixture_vault):
-        """skills_manifest points to Agent/skills.md."""
-        assert config.skills_manifest == fixture_vault / "Agent" / "skills.md"
-
-
-# --- Skill Paths ---
-
-
-class TestSkillPaths:
-    """Config resolves paths to individual skill SKILL.md files."""
-
-    CORE_SKILLS = [
-        "update-context",
-        "manage-summaries",
-        "create-reference",
-        "file-conventions",
-    ]
-
-    def test_core_skill_names(self, config):
-        """core_skills returns the list of always-loaded skill names."""
-        assert config.core_skills == self.CORE_SKILLS
-
-    def test_skill_path_resolution(self, config, fixture_vault):
-        """skill_path() resolves a skill name to its SKILL.md path."""
-        path = config.skill_path("file-conventions")
-        assert path == fixture_vault / "Agent" / "skills" / "file-conventions" / "SKILL.md"
-
-    def test_all_core_skill_paths(self, config, fixture_vault):
-        """All core skill paths resolve correctly."""
-        for name in self.CORE_SKILLS:
-            path = config.skill_path(name)
-            assert path.parent.name == name
-            assert path.name == "SKILL.md"
-
-    def test_deeper_skill_path(self, config, fixture_vault):
-        """Deeper skills (not core) also resolve via skill_path()."""
-        path = config.skill_path("session-offboard")
-        assert path == fixture_vault / "Agent" / "skills" / "session-offboard" / "SKILL.md"
+        """memory_parent_note points to .claude/memory.md."""
+        assert config.memory_parent_note == fixture_vault / ".claude" / "memory.md"
 
 
 # --- Daemon Settings ---
@@ -173,6 +134,26 @@ class TestSessionSettings:
         assert cfg.cache_window_seconds == 1800
 
 
+class TestBgForkTimeout:
+    """Config provides background fork timeout settings."""
+
+    def test_default_bg_fork_timeout(self):
+        """Default background fork timeout is 600 seconds."""
+        cfg = OBSConfig()
+        assert cfg.bg_fork_timeout == 600.0
+
+    def test_bg_fork_timeout_from_constructor(self):
+        """bg_fork_timeout can be overridden via constructor."""
+        cfg = OBSConfig(bg_fork_timeout=300.0)
+        assert cfg.bg_fork_timeout == 300.0
+
+    def test_bg_fork_timeout_from_env(self, monkeypatch):
+        """OBS_BG_FORK_TIMEOUT env var overrides default timeout."""
+        monkeypatch.setenv("OBS_BG_FORK_TIMEOUT", "900")
+        cfg = OBSConfig.from_env()
+        assert cfg.bg_fork_timeout == 900.0
+
+
 # --- Immutable Paths ---
 
 
@@ -197,7 +178,7 @@ class TestImmutablePaths:
 
     def test_is_immutable_non_matching(self, config, fixture_vault):
         """is_immutable() returns False for normal vault paths."""
-        normal_path = fixture_vault / "Agent" / "context.md"
+        normal_path = fixture_vault / "CLAUDE.md"
         assert config.is_immutable(normal_path) is False
 
 
@@ -218,18 +199,69 @@ class TestVaultValidation:
         with pytest.raises(FileNotFoundError):
             cfg.validate()
 
-    def test_validate_fails_for_missing_agent_dir(self, tmp_path):
-        """validate() raises when Agent/ directory is missing."""
+    def test_validate_fails_for_missing_claude_dir(self, tmp_path):
+        """validate() raises when .claude/ directory is missing."""
         vault = tmp_path / "empty_vault"
         vault.mkdir()
         cfg = OBSConfig(vault_path=vault)
         with pytest.raises(FileNotFoundError):
             cfg.validate()
 
-    def test_validate_fails_for_missing_context(self, tmp_path):
-        """validate() raises when Agent/context.md is missing."""
+    def test_validate_fails_for_missing_claude_md(self, tmp_path):
+        """validate() raises when CLAUDE.md is missing."""
         vault = tmp_path / "vault"
-        (vault / "Agent").mkdir(parents=True)
+        (vault / ".claude").mkdir(parents=True)
         cfg = OBSConfig(vault_path=vault)
         with pytest.raises(FileNotFoundError):
             cfg.validate()
+
+
+# --- Telegram Settings ---
+
+
+class TestTelegramSettings:
+    """Config provides Telegram bot settings."""
+
+    def test_default_token_is_none(self):
+        """Default Telegram bot token is None."""
+        cfg = OBSConfig()
+        assert cfg.telegram_bot_token is None
+
+    def test_default_allowed_users_empty(self):
+        """Default allowed user IDs is empty list."""
+        cfg = OBSConfig()
+        assert cfg.telegram_allowed_user_ids == []
+
+    def test_token_from_env(self, monkeypatch):
+        """OBS_TELEGRAM_BOT_TOKEN env var sets the token."""
+        monkeypatch.setenv("OBS_TELEGRAM_BOT_TOKEN", "test-token-123")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_bot_token == "test-token-123"
+
+    def test_allowed_users_from_env(self, monkeypatch):
+        """OBS_TELEGRAM_ALLOWED_USERS env var sets allowed user IDs."""
+        monkeypatch.setenv("OBS_TELEGRAM_ALLOWED_USERS", "111,222,333")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_allowed_user_ids == [111, 222, 333]
+
+    def test_allowed_users_with_spaces(self, monkeypatch):
+        """OBS_TELEGRAM_ALLOWED_USERS handles spaces in CSV."""
+        monkeypatch.setenv("OBS_TELEGRAM_ALLOWED_USERS", "111, 222, 333")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_allowed_user_ids == [111, 222, 333]
+
+    def test_allowed_users_single(self, monkeypatch):
+        """OBS_TELEGRAM_ALLOWED_USERS works with a single user."""
+        monkeypatch.setenv("OBS_TELEGRAM_ALLOWED_USERS", "42")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_allowed_user_ids == [42]
+
+    def test_token_from_constructor(self):
+        """Token can be set via constructor."""
+        cfg = OBSConfig(telegram_bot_token="my-token")
+        assert cfg.telegram_bot_token == "my-token"
+
+    def test_allowed_users_from_constructor(self):
+        """Allowed users can be set via constructor."""
+        cfg = OBSConfig(telegram_allowed_user_ids=[1, 2, 3])
+        assert cfg.telegram_allowed_user_ids == [1, 2, 3]
