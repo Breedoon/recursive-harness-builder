@@ -1,5 +1,9 @@
 # Telegram HTML Format
 
+## Intent
+- Validate that Telegram formatting is readable and properly rendered, not leaked as raw tags.
+- Flag suspicious formatting artifacts even if the content is otherwise correct.
+
 ## Steps
 1. Send: "Show me a Python function that implements bubble sort. Use markdown formatting: bold headings, a numbered list explaining the algorithm steps, inline code for variable names like `arr` and `n`, and a fenced code block for the implementation."
    Wait: 90

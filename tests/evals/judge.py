@@ -77,6 +77,11 @@ def _build_judge_prompt_sequential(scenario: EvalScenario) -> str:
         steps_text += f"   (Wait up to {step.wait_seconds}s for response)\n"
 
     criteria_text = "\n".join(f"- {c}" for c in scenario.criteria)
+    intent_text = (
+        "\n".join(f"- {item}" for item in scenario.intent)
+        if scenario.intent
+        else "- No extra intent notes provided."
+    )
 
     return f"""You are evaluating the OBS Agent by running a test scenario.
 
@@ -87,17 +92,24 @@ Use the send_message tool to interact with the agent. Follow these steps IN ORDE
 
 {steps_text}
 
+## Intent Context
+{intent_text}
+
 After completing all steps, evaluate the agent's responses against these criteria:
 
 ## Pass Criteria
 {criteria_text}
 
 ## Verdict
-After evaluating, output your analysis and then a final verdict line:
+After evaluating, output these sections in order:
+1. CRITERIA CHECK: brief pass/fail explanation per criterion
+2. INTENT CHECK: whether behavior matched the scenario intent (even beyond literal criteria)
+3. NOTES: suspicious behavior, unclear evidence, odd output, or quality concerns even if you still pass
+- If there are no concerns, write exactly: NOTES: none
 - If ALL criteria are met: VERDICT: PASS
 - If ANY criterion is not met: VERDICT: FAIL
 
-Include a brief explanation of why each criterion passed or failed.
+Be strict: if output is technically passing but behavior seems off for the intent, call it out in NOTES.
 """
 
 
@@ -106,6 +118,11 @@ def _build_judge_prompt_transcript(
 ) -> str:
     """Build prompt for transcript-based judging (harness already drove interaction)."""
     criteria_text = "\n".join(f"- {c}" for c in scenario.criteria)
+    intent_text = (
+        "\n".join(f"- {item}" for item in scenario.intent)
+        if scenario.intent
+        else "- No extra intent notes provided."
+    )
 
     return f"""You are evaluating an OBS Agent CLI interaction transcript.
 
@@ -119,14 +136,20 @@ def _build_judge_prompt_transcript(
 ## Pass Criteria
 {criteria_text}
 
+## Intent Context
+{intent_text}
+
 ## Instructions
 Read the transcript carefully. Evaluate whether each criterion is met based on
-what actually happened in the interaction. Output your analysis and then a final
-verdict line:
+what actually happened in the interaction. Output these sections in order:
+1. CRITERIA CHECK: brief pass/fail explanation per criterion
+2. INTENT CHECK: whether behavior matched the scenario intent (even beyond literal criteria)
+3. NOTES: suspicious behavior, unclear evidence, odd output, or quality concerns even if you still pass
+- If there are no concerns, write exactly: NOTES: none
 - If ALL criteria are met: VERDICT: PASS
 - If ANY criterion is not met: VERDICT: FAIL
 
-Include a brief explanation of why each criterion passed or failed.
+Be strict: if output is technically passing but behavior seems off for the intent, call it out in NOTES.
 """
 
 

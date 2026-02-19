@@ -1,5 +1,9 @@
 # Telegram Queue While Busy
 
+## Intent
+- Verify the agent handles a second message while the first is still running.
+- Flag ordering anomalies, swallowed follow-ups, or mismatched responses even if both topics appear.
+
 ## Steps
 1. SendNowait: "List all the skills available to you. Be thorough and describe each one in detail."
 2. Sleep: 4

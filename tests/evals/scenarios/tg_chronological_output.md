@@ -1,5 +1,9 @@
 # Telegram Chronological Output
 
+## Intent
+- Ensure observable chronology: tool/status lines and text should make sense together as one timeline.
+- Flag odd sequencing (for example duplicate done sentinels, disjointed tool text, or off-order content) even if the strict criteria pass.
+
 ## Steps
 1. Send: "Read CLAUDE.md and then give me a 2-sentence summary. End your response with the exact token CHRONO_CHECK_OK."
    Wait: 120

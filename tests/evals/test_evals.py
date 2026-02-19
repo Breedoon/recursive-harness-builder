@@ -47,7 +47,12 @@ def cli_scenario_ids() -> list[str]:
 
 def telegram_scenario_ids() -> list[str]:
     """Scenario IDs for Telegram evals (tg_* only)."""
-    return [s for s in _all_scenario_ids() if s.startswith("tg_")]
+    scenarios = [s for s in _all_scenario_ids() if s.startswith("tg_")]
+    raw_filter = os.environ.get("OBS_TG_SCENARIOS", "").strip()
+    if not raw_filter:
+        return scenarios
+    wanted = {item.strip() for item in raw_filter.split(",") if item.strip()}
+    return [s for s in scenarios if s in wanted]
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +148,7 @@ def _stop_telegram_bot(proc: subprocess.Popen) -> None:
 
 @pytest.mark.eval
 @pytest.mark.telegram
+@pytest.mark.timeout(1800)
 @pytest.mark.skipif(
     not _tg_creds_available,
     reason="Telegram credentials not configured (need TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION, TELEGRAM_TEST_BOT_USERNAME, OBS_TELEGRAM_TEST_BOT_TOKEN)",
@@ -171,6 +177,7 @@ async def test_eval_telegram_all(eval_vault: Path) -> None:
         failures: list[str] = []
 
         for i, scenario_name in enumerate(scenarios):
+            print(f"[telegram-eval] start: {scenario_name}")
             scenario_path = SCENARIO_DIR / f"{scenario_name}.md"
             scenario = parse_scenario(scenario_path)
 
@@ -179,15 +186,29 @@ async def test_eval_telegram_all(eval_vault: Path) -> None:
             await platform.connect()
             try:
                 # Reset the bot session before each scenario so runs are isolated.
-                await platform.send("/new")
+                await platform.send_control("/new")
                 result = await run_judge(scenario, platform)
             finally:
                 await platform.close()
 
+            print(f"[telegram-eval] judgment: {scenario_name}\n{result.judgment}\n")
+            notes_line = next(
+                (
+                    line.strip()
+                    for line in result.judgment.splitlines()
+                    if line.strip().upper().startswith("NOTES:")
+                ),
+                "",
+            )
+            if notes_line and notes_line.lower() != "notes: none":
+                print(f"[telegram-eval] caution: {scenario_name} -> {notes_line}")
             if not result.passed:
                 failures.append(
                     f"EVAL FAILED (telegram): {scenario_name}\n\n{result.judgment}"
                 )
+                print(f"[telegram-eval] fail: {scenario_name}")
+            else:
+                print(f"[telegram-eval] pass: {scenario_name}")
 
             # Drain period between scenarios: sleep to let any late bot
             # responses arrive, then the next platform.connect() starts fresh

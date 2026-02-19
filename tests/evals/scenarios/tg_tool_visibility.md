@@ -1,5 +1,9 @@
 # Telegram Tool Visibility
 
+## Intent
+- Confirm tool/status visibility is inline and understandable to a human operator.
+- Flag responses where tool activity appears hidden, too vague, or disconnected from output chronology.
+
 ## Steps
 1. Send: "List the files in my .claude/skills directory and tell me how many skills I have."
    Wait: 120

@@ -1,5 +1,9 @@
 # Telegram Auth Guard
 
+## Intent
+- Verify authorized users are accepted and receive normal replies.
+- Flag any sign of auth confusion, silent drops, or odd rejection behavior.
+
 ## Steps
 1. Send: "Hello, are you there? Please respond with a greeting."
    Wait: 60

@@ -83,15 +83,15 @@ class TelegramPlatform:
 
         logger.info("TelegramPlatform connected to %s", self._bot_username)
 
-    async def _collect_response(self, timeout: float) -> str:
-        """Collect all response chunks until no new message for _SETTLE_SECONDS.
+    async def _collect_response(self, timeout: float, *, require_done: bool = True) -> str:
+        """Collect all response chunks until done sentinel or timeout.
 
-        Waits up to `timeout` for the first message, then keeps collecting
-        until either:
-        - a '(done)' sentinel arrives, or
-        - no new message for _SETTLE_SECONDS.
+        Waits up to `timeout` for the first message, then keeps collecting:
+        - if require_done=True: until '(done)' or timeout budget exhausted
+        - if require_done=False: until idle settle window expires
 
-        Returns all chunks concatenated with newlines.
+        This avoids truncating multi-turn Telegram outputs where there may be
+        multi-second gaps between chunks.
         """
         chunks: list[str] = []
 
@@ -107,17 +107,35 @@ class TelegramPlatform:
         if first.strip() == _DONE_SENTINEL:
             return "\n".join(chunks)
 
-        # Collect additional chunks until done sentinel or settling window expires
+        if not require_done:
+            # Control commands (e.g. /new) do not emit (done).
+            while True:
+                try:
+                    more = await asyncio.wait_for(
+                        self._response_queue.get(), timeout=_SETTLE_SECONDS
+                    )
+                    chunks.append(more)
+                except asyncio.TimeoutError:
+                    break
+            return "\n".join(chunks)
+
+        # Collect additional chunks until done sentinel or overall timeout.
+        deadline = asyncio.get_running_loop().time() + timeout
         while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
             try:
                 more = await asyncio.wait_for(
-                    self._response_queue.get(), timeout=_SETTLE_SECONDS
+                    self._response_queue.get(),
+                    timeout=min(_SETTLE_SECONDS, remaining),
                 )
                 chunks.append(more)
                 if more.strip() == _DONE_SENTINEL:
                     break
             except asyncio.TimeoutError:
-                break
+                # No chunk in this idle window; keep waiting until deadline.
+                continue
 
         return "\n".join(chunks)
 
@@ -138,7 +156,23 @@ class TelegramPlatform:
 
         await self._client.send_message(self._bot_entity, text)
 
-        response = await self._collect_response(timeout=self._timeout)
+        response = await self._collect_response(timeout=self._timeout, require_done=True)
+        self._last_output = response
+        return response
+
+    async def send_control(self, text: str, timeout: float = 20.0) -> str:
+        """Send a control command that is not expected to emit '(done)'."""
+        if self._client is None:
+            raise RuntimeError("TelegramPlatform not connected")
+
+        while not self._response_queue.empty():
+            try:
+                self._response_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        await self._client.send_message(self._bot_entity, text)
+        response = await self._collect_response(timeout=timeout, require_done=False)
         self._last_output = response
         return response
 
@@ -154,7 +188,7 @@ class TelegramPlatform:
 
     async def wait_for_prompt(self, timeout: int = 120) -> str:
         """Wait for the next bot message(s), collecting multi-message responses."""
-        response = await self._collect_response(timeout=timeout)
+        response = await self._collect_response(timeout=timeout, require_done=True)
         self._last_output = response
         return response
 

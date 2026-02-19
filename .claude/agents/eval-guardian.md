@@ -95,6 +95,8 @@ For every eval scenario, ask these questions. ALL must be YES for approval.
 ### 4. Judge Quality — "Did the judge pass for the right reasons?"
 
 - Read the actual judge output (the VERDICT + reasoning)
+- Ensure the judge included a NOTES section and that it is plausible
+- Treat `VERDICT: PASS` with non-empty NOTES as a caution state requiring human review
 - Did the judge evaluate the criteria, or did it rubber-stamp?
 - Did the judge see real vault content / real tool use / real behavior?
 - If the judge passed with vague reasoning ("the response seems fine"), that's a FAIL

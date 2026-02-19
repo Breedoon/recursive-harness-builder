@@ -10,6 +10,10 @@ Step types:
 Format:
     # Scenario Name
 
+    ## Intent
+    - What the scenario is trying to validate beyond literal criteria
+    - What should be flagged as suspicious even if criteria pass
+
     ## Steps
     1. Send: "message here"
        Wait: 60
@@ -44,6 +48,7 @@ class EvalScenario:
     """Parsed eval scenario."""
 
     name: str
+    intent: list[str] = field(default_factory=list)
     steps: list[EvalStep] = field(default_factory=list)
     criteria: list[str] = field(default_factory=list)
 
@@ -62,6 +67,7 @@ def parse_scenario(path: Path) -> EvalScenario:
 
     steps: list[EvalStep] = []
     criteria: list[str] = []
+    intent: list[str] = []
 
     section: str | None = None
     for line in lines:
@@ -73,6 +79,8 @@ def parse_scenario(path: Path) -> EvalScenario:
                 section = "steps"
             elif "criter" in heading:
                 section = "criteria"
+            elif "intent" in heading:
+                section = "intent"
             else:
                 section = None
             continue
@@ -106,5 +114,9 @@ def parse_scenario(path: Path) -> EvalScenario:
             crit_match = re.match(r'^[-*]\s+(.+)', stripped)
             if crit_match:
                 criteria.append(crit_match.group(1).strip())
+        elif section == "intent":
+            intent_match = re.match(r'^[-*]\s+(.+)', stripped)
+            if intent_match:
+                intent.append(intent_match.group(1).strip())
 
-    return EvalScenario(name=name, steps=steps, criteria=criteria)
+    return EvalScenario(name=name, intent=intent, steps=steps, criteria=criteria)

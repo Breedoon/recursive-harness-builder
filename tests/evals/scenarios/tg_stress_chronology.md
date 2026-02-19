@@ -1,5 +1,9 @@
 # Telegram Stress Chronology
 
+## Intent
+- Stress mixed workload + follow-ups and verify nothing is lost.
+- Flag subtle anomalies (late/misdirected replies, partial intent coverage, suspicious extra sentinels) even if baseline criteria pass.
+
 ## Steps
 1. SendNowait: "Read CLAUDE.md and list 5 major sections with one-line explanations."
 2. Sleep: 4

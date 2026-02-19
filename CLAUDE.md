@@ -123,6 +123,11 @@ the scenario against the real CLI with a real vault clone, then judges PASS/FAIL
    "can the agent respond to hello." If a scenario can pass with a dumb echo bot, it is
    not an eval.
 
+10. **PASS WITH CONCERNS MUST BE SURFACED.** Judges must report suspicious or
+   off-intent behavior even when criteria pass. Every scenario should include an
+   `Intent` section, and judge output must include a `NOTES` section. `VERDICT: PASS`
+   does not mean "looks good" unless `NOTES: none`.
+
 ### Running Tests
 
 ```bash

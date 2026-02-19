@@ -1,5 +1,9 @@
 # Telegram Message Split
 
+## Intent
+- Ensure long outputs remain coherent across split Telegram messages.
+- Flag if the output looks truncated, duplicated oddly, or semantically broken at chunk boundaries.
+
 ## Steps
 1. Send: "Write a detailed explanation of 5 major milestones in computing history: Babbage's Analytical Engine, Turing's contributions, ENIAC, the transistor, and the Internet. Write 2-3 paragraphs per milestone. Make it comprehensive."
    Wait: 120
