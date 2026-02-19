@@ -152,12 +152,12 @@ class TestSummarizeToolUse:
         assert result == "Bash: ls -la .claude/"
 
     def test_bash_truncates_long_command(self):
-        """Bash tool truncates commands longer than 80 chars."""
-        long_cmd = "a" * 100
+        """Bash tool truncates commands longer than 200 chars."""
+        long_cmd = "a" * 300
         result = summarize_tool_use("Bash", {"command": long_cmd})
         assert result.startswith("Bash: ")
         assert result.endswith("...")
-        assert len(result) < 100  # Should be truncated
+        assert len(result) == 200
 
     def test_bash_empty_command(self):
         """Bash tool with empty command returns fallback."""
@@ -180,25 +180,26 @@ class TestSummarizeToolUse:
         assert result == "WebSearch"
 
     def test_unknown_tool_with_args(self):
-        """Unknown tool dumps first 3 args."""
+        """Unknown tool emits structured payload for visibility."""
         result = summarize_tool_use("SomeTool", {"arg1": "val1", "arg2": "val2", "arg3": "val3", "arg4": "val4"})
-        assert result.startswith("SomeTool: ")
-        assert "arg1=val1" in result
-        assert "arg2=val2" in result
-        assert "arg3=val3" in result
-        # arg4 should not be included (only first 3)
-        assert "arg4" not in result
+        payload = json.loads(result)
+        assert payload["tool"] == "SomeTool"
+        assert payload["input"]["arg1"] == "val1"
+        assert payload["input"]["arg2"] == "val2"
+        assert payload["input"]["arg3"] == "val3"
+        assert payload["input"]["arg4"] == "val4"
 
     def test_unknown_tool_no_args(self):
-        """Unknown tool with no args returns just tool name."""
+        """Unknown tool with no args still emits structured payload."""
         result = summarize_tool_use("UnknownTool", {})
-        assert result == "UnknownTool"
+        assert json.loads(result) == {"tool": "UnknownTool"}
 
     def test_edit_tool_dumps_args(self):
-        """Edit tool dumps its args (treated as unknown)."""
+        """Edit tool uses unknown-tool structured fallback."""
         result = summarize_tool_use("Edit", {"file_path": "/tmp/x", "old_string": "a", "new_string": "b"})
-        assert result.startswith("Edit: ")
-        assert "file_path=/tmp/x" in result
+        payload = json.loads(result)
+        assert payload["tool"] == "Edit"
+        assert payload["input"]["file_path"] == "/tmp/x"
 
     def test_self_fork_foreground(self):
         """self_fork shows task description."""
@@ -211,12 +212,12 @@ class TestSummarizeToolUse:
         assert result == "Fork (bg): Research topic"
 
     def test_self_fork_truncates_long_task(self):
-        """self_fork truncates task descriptions longer than 80 chars."""
-        long_task = "a" * 100
+        """self_fork truncates task descriptions longer than 200 chars."""
+        long_task = "a" * 300
         result = summarize_tool_use("self_fork", {"task": long_task})
         assert result.startswith("Fork: ")
         assert result.endswith("...")
-        assert len(result) < 100
+        assert len(result) == 200
 
     def test_self_fork_empty_task(self):
         """self_fork with empty task returns just prefix."""
@@ -229,11 +230,12 @@ class TestSummarizeToolUse:
         assert result == "Task: Explore the codebase"
 
     def test_task_tool_truncates_long_prompt(self):
-        """Task tool truncates prompts longer than 80 chars."""
-        long_prompt = "x" * 100
+        """Task tool truncates prompts longer than 200 chars."""
+        long_prompt = "x" * 300
         result = summarize_tool_use("Task", {"prompt": long_prompt})
         assert result.startswith("Task: ")
         assert result.endswith("...")
+        assert len(result) == 200
 
     def test_task_tool_empty_prompt(self):
         """Task tool with empty prompt returns just 'Task'."""

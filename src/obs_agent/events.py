@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass, field
 
 from obs_agent.config import _DEFAULT_VAULT
 
+_SUMMARY_LIMIT = 200
+
 
 @dataclass(frozen=True)
 class StatusEvent:
@@ -56,6 +58,15 @@ def _shorten_path(path: str) -> str:
     return path
 
 
+def _truncate(text: str, *, limit: int = _SUMMARY_LIMIT) -> str:
+    """Truncate tool summaries to a consistent max length."""
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3] + "..."
+
+
 def summarize_tool_use(tool_name: str, tool_input: dict) -> str:
     """Create a structured summary of a tool use.
 
@@ -69,7 +80,7 @@ def summarize_tool_use(tool_name: str, tool_input: dict) -> str:
     if tool_name == "Read":
         file_path = tool_input.get("file_path", "")
         short = _shorten_path(file_path)
-        return f"Read: {short}" if short else "Read: file"
+        return _truncate(f"Read: {short}") if short else "Read: file"
 
     if tool_name == "Grep":
         pattern = tool_input.get("pattern", "")
@@ -80,57 +91,45 @@ def summarize_tool_use(tool_name: str, tool_input: dict) -> str:
             parts.append(f"pattern='{pattern}'")
         if short_path:
             parts.append(f"path={short_path}")
-        return f"Grep: {' '.join(parts)}" if parts else "Grep"
+        return _truncate(f"Grep: {' '.join(parts)}") if parts else "Grep"
 
     if tool_name == "Glob":
         pattern = tool_input.get("pattern", "")
         path = tool_input.get("path", "")
         short_path = _shorten_path(path) if path else ""
         if pattern and short_path:
-            return f"Glob: '{pattern}' in {short_path}"
+            return _truncate(f"Glob: '{pattern}' in {short_path}")
         if pattern:
-            return f"Glob: '{pattern}'"
+            return _truncate(f"Glob: '{pattern}'")
         return "Glob"
 
     if tool_name == "Bash":
         command = tool_input.get("command", "")
         if command:
-            truncated = command[:80]
-            if len(command) > 80:
-                truncated += "..."
-            return f"Bash: {truncated}"
+            return _truncate(f"Bash: {command}")
         return "Bash"
 
     if tool_name == "WebSearch":
         query = tool_input.get("query", "")
-        return f"WebSearch: '{query}'" if query else "WebSearch"
+        return _truncate(f"WebSearch: '{query}'") if query else "WebSearch"
 
     if tool_name == "self_fork":
         task = tool_input.get("task", "")
         background = tool_input.get("background", False)
         prefix = "Fork (bg)" if background else "Fork"
         if task:
-            truncated = task[:80]
-            if len(task) > 80:
-                truncated += "..."
-            return f"{prefix}: {truncated}"
+            return _truncate(f"{prefix}: {task}")
         return prefix
 
     if tool_name == "Task":
         prompt = tool_input.get("prompt", "")
         if prompt:
-            truncated = prompt[:80]
-            if len(prompt) > 80:
-                truncated += "..."
-            return f"Task: {truncated}"
+            return _truncate(f"Task: {prompt}")
         return "Task"
 
-    # Unknown tool: dump first 3 args
+    # Unknown tool: dump structured input for observability.
     if tool_input:
-        items = list(tool_input.items())[:3]
-        args_str = " ".join(f"{k}={v}" for k, v in items)
-        truncated = args_str[:80]
-        if len(args_str) > 80:
-            truncated += "..."
-        return f"{tool_name}: {truncated}"
-    return tool_name
+        payload = {"tool": tool_name, "input": tool_input}
+    else:
+        payload = {"tool": tool_name}
+    return _truncate(json.dumps(payload, ensure_ascii=True, default=str))

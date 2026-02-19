@@ -38,12 +38,18 @@ class TextEvent:
 
 
 @dataclass
+class TurnEndEvent:
+    """Signals that one SDK assistant message has fully streamed."""
+    pass
+
+
+@dataclass
 class DoneEvent:
     """Signals the end of the response stream."""
     pass
 
 
-RunnerEvent = TextEvent | StatusEvent | DoneEvent
+RunnerEvent = TextEvent | StatusEvent | TurnEndEvent | DoneEvent
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +176,8 @@ class ConversationRunner:
                 except asyncio.QueueEmpty:
                     break
 
+            yield TurnEndEvent()
+
         if last_message is not None:
             log_result(last_message, label="conversation")
 
@@ -225,6 +233,8 @@ class ConversationRunner:
                         yield status_event
                     except asyncio.QueueEmpty:
                         break
+
+                yield TurnEndEvent()
 
         # 5. Background fork wait loop
         while self._hook_state.background_tasks:
@@ -292,6 +302,8 @@ class ConversationRunner:
                         yield status_event
                     except asyncio.QueueEmpty:
                         break
+
+                yield TurnEndEvent()
 
         # 6. Drain remaining queue for next turn
         self._pending_messages = _drain_queue(self._hook_state.message_queue)

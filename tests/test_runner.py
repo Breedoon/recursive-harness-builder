@@ -12,7 +12,13 @@ from claude_agent_sdk import TextBlock, ThinkingBlock, ToolUseBlock
 
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
-from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent, _drain_queue
+from obs_agent.runner import (
+    ConversationRunner,
+    DoneEvent,
+    TextEvent,
+    TurnEndEvent,
+    _drain_queue,
+)
 
 
 def _make_mock_client(messages: list) -> AsyncMock:
@@ -90,6 +96,7 @@ class TestRunnerBasicResponse:
         events = await _collect_events(runner, "test")
 
         assert isinstance(events[-1], DoneEvent)
+        assert any(isinstance(e, TurnEndEvent) for e in events)
 
     @patch("obs_agent.session.SessionManager.get_client")
     async def test_captures_session_id(self, mock_get_client, config):
@@ -287,3 +294,27 @@ class TestRunnerRemainingPending:
 
         # Should have remaining pending from the overflow
         assert len(runner.remaining_pending) > 0
+
+
+class TestRunnerTurnBoundaries:
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_turn_end_emitted_once_per_sdk_message(self, mock_get_client, config):
+        msg1 = MagicMock()
+        msg1.content = [TextBlock(text="first")]
+        msg1.session_id = None
+
+        msg2 = MagicMock()
+        msg2.content = [TextBlock(text="second")]
+        msg2.session_id = None
+
+        mock_get_client.return_value = _make_mock_client([msg1, msg2])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        events = await _collect_events(runner, "hello")
+
+        turn_end_events = [e for e in events if isinstance(e, TurnEndEvent)]
+        assert len(turn_end_events) == 2
