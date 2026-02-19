@@ -31,6 +31,7 @@ logger = logging.getLogger("obs_agent.eval.telegram")
 
 # How long to wait for additional message chunks after the last one
 _SETTLE_SECONDS = 3.0
+_DONE_SENTINEL = "(done)"
 
 
 class TelegramPlatform:
@@ -86,7 +87,10 @@ class TelegramPlatform:
         """Collect all response chunks until no new message for _SETTLE_SECONDS.
 
         Waits up to `timeout` for the first message, then keeps collecting
-        until the bot stops sending (no message for _SETTLE_SECONDS).
+        until either:
+        - a '(done)' sentinel arrives, or
+        - no new message for _SETTLE_SECONDS.
+
         Returns all chunks concatenated with newlines.
         """
         chunks: list[str] = []
@@ -100,13 +104,18 @@ class TelegramPlatform:
         except asyncio.TimeoutError:
             return "(timeout: no response from bot)"
 
-        # Collect additional chunks until settling window expires
+        if first.strip() == _DONE_SENTINEL:
+            return "\n".join(chunks)
+
+        # Collect additional chunks until done sentinel or settling window expires
         while True:
             try:
                 more = await asyncio.wait_for(
                     self._response_queue.get(), timeout=_SETTLE_SECONDS
                 )
                 chunks.append(more)
+                if more.strip() == _DONE_SENTINEL:
+                    break
             except asyncio.TimeoutError:
                 break
 

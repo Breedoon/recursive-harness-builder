@@ -178,6 +178,8 @@ async def test_eval_telegram_all(eval_vault: Path) -> None:
             platform = TelegramPlatform()
             await platform.connect()
             try:
+                # Reset the bot session before each scenario so runs are isolated.
+                await platform.send("/new")
                 result = await run_judge(scenario, platform)
             finally:
                 await platform.close()
