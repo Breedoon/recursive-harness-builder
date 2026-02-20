@@ -131,6 +131,7 @@ class HookState:
     interrupt_flag: bool = False
     session_id: str | None = None
     background_tasks: set[asyncio.Task] = field(default_factory=set)
+    last_result_data: dict | None = None  # last ResultMessage metrics
 
 
 class HookPipeline:

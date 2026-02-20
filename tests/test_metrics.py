@@ -28,12 +28,12 @@ class TestLogResult:
         msg = MagicMock()
         msg.total_cost_usd = 0.01
         msg.duration_ms = 2000
-        usage = MagicMock()
-        usage.input_tokens = 100
-        usage.output_tokens = 50
-        usage.cache_creation_input_tokens = 80
-        usage.cache_read_input_tokens = 20
-        msg.usage = usage
+        msg.usage = {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 80,
+            "cache_read_input_tokens": 20,
+        }
 
         with caplog.at_level(logging.INFO, logger="obs_agent.metrics"):
             log_result(msg, label="chat")

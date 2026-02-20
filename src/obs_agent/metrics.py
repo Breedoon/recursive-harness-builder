@@ -31,17 +31,17 @@ def log_result(message: Any, *, label: str = "query") -> None:
             parts.append(f"duration={duration}ms")
 
         usage = getattr(message, "usage", None)
-        if usage is not None and not isinstance(usage, (int, float, str, bool)):
-            input_t = getattr(usage, "input_tokens", None)
+        if isinstance(usage, dict):
+            input_t = usage.get("input_tokens")
             if isinstance(input_t, int):
                 parts.append(f"input_tokens={input_t}")
-            output_t = getattr(usage, "output_tokens", None)
+            output_t = usage.get("output_tokens")
             if isinstance(output_t, int):
                 parts.append(f"output_tokens={output_t}")
-            cache_create = getattr(usage, "cache_creation_input_tokens", None)
+            cache_create = usage.get("cache_creation_input_tokens")
             if isinstance(cache_create, int):
                 parts.append(f"cache_creation={cache_create}")
-            cache_read = getattr(usage, "cache_read_input_tokens", None)
+            cache_read = usage.get("cache_read_input_tokens")
             if isinstance(cache_read, int):
                 parts.append(f"cache_read={cache_read}")
 

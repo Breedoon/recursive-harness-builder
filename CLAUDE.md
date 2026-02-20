@@ -149,6 +149,21 @@ the scenario against the real CLI with a real vault clone, then judges PASS/FAIL
    `Intent` section, and judge output must include a `NOTES` section. `VERDICT: PASS`
    does not mean "looks good" unless `NOTES: none`.
 
+11. **BRAINSTORM FALSIFIABILITY BEFORE WRITING CRITERIA.** Before drafting any eval,
+   spend a minute asking: "If this feature is completely broken, what would the output
+   look like? Would my criteria still pass?" Write down the failure modes. Then write
+   criteria that explicitly reject them. Example: a context-usage tool that returns
+   zeroes and 100% remaining is broken — criteria must say "non-zero" and "NOT 100%",
+   not just "reports a number" and "mentions a percentage."
+
+12. **TREAT THE JUDGE AS A SMART COLLABORATOR, NOT A CHECKBOX MACHINE.** The judge
+   is a capable LLM. Give it real context: what the feature does, why the user wants
+   it, what correct output looks like, and what broken output looks like. The Intent
+   section should explain the purpose and expected behavior in enough detail that the
+   judge can independently spot problems — not just verify structural presence. Tell
+   the judge what "suspicious" means for this specific feature so it can exercise
+   judgment, not just pattern-match.
+
 ### Running Tests
 
 ```bash
