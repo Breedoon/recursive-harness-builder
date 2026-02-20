@@ -1,5 +1,8 @@
 # OBS Agent MVP - Implementation Plan
 
+> Historical plan snapshot (initial MVP sequencing).
+> Current runtime behavior and testing policy have evolved; see `CLAUDE.md` and `docs/architecture.md` for live state.
+
 ## Context
 
 We're building a personal AI assistant backed by this Obsidian vault. The design phase produced: [[Agent/system/architecture|architecture]], [[Agent/system/conventions|conventions]], [[Agent/system/decisions|25 design decisions]], and [[Agent/skills|11 skills]]. Research on [[Agent/system/research/openclaw|OpenClaw]], [[Agent/system/research/claude-mem|claude-mem]], and [[Agent/system/research/claude-sdk|Claude Agent SDK]] informed the approach.

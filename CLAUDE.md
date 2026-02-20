@@ -10,9 +10,12 @@ Personal AI assistant backed by an Obsidian vault. Uses the Claude Agent SDK for
 | **Obsidian vault** | `/Users/breedoon/Library/Mobile Documents/iCloud~md~obsidian/Documents/T` |
 | **Vault shorthand** | `T/` in all vault references below |
 
-## Vault Documentation (READ THESE)
+## Documentation Entry Points
 
-All design docs, skills, and the implementation plan live in the vault — not here.
+Primary context and skills still live in the vault, but this repo now contains a
+maintained mirror/reference set under `docs/` for implementation work.
+
+### Vault Docs (source context + skills)
 
 | Document | Vault Path | What It Contains |
 |----------|-----------|-----------------|
@@ -27,6 +30,19 @@ All design docs, skills, and the implementation plan live in the vault — not h
 | **claude-mem research** | `T/.claude/system/research/claude-mem.md` | Observer pattern, knowledge extraction |
 | **Claude SDK research** | `T/.claude/system/research/claude-sdk.md` | Hooks, sessions, forking, MCP tools API |
 | **Context** | `T/CLAUDE.md` | Agent's current brain state |
+
+### Repo Docs (implementation + reference)
+
+| Document | Repo Path | What It Contains |
+|----------|-----------|-----------------|
+| **Architecture (current runtime)** | `docs/architecture.md` | Current runtime architecture (CLI + daemon + Telegram + eval stack) |
+| **Telegram flow plan** | `docs/plans/2026-02-19-telegram-message-flow-design.md` | Chronological Telegram behavior + observability decisions |
+| **Design intent (historical)** | `docs/design-intent.md` | Original intent capture from design phase |
+| **Implementation plan (historical MVP)** | `docs/implementation-plan.md` | Initial MVP sequencing; not a live roadmap |
+| **Testing philosophy (historical, superseded)** | `docs/testing-philosophy.md` | Archived lessons; live testing policy is in this `CLAUDE.md` |
+| **Specs** | `docs/specs/` | Focused specs and investigations (e.g. agent self-awareness) |
+
+Quick map: `docs/README.md`
 
 ## Implementation
 
@@ -59,7 +75,12 @@ All design docs, skills, and the implementation plan live in the vault — not h
 │   ├── fork.py                  # Fork runner (generic fork + extract_memory)
 │   ├── session.py               # Session lifecycle (ClaudeSDKClient manager)
 │   ├── daemon.py                # FastAPI server (uses ClaudeSDKClient via session)
-│   └── cli.py                   # CLI client
+│   ├── cli.py                   # CLI client
+│   ├── runner.py                # Shared conversation orchestration
+│   ├── telegram.py              # Telegram adapter runtime
+│   ├── telegram_format.py       # Telegram HTML conversion + splitting
+│   └── telegram_main.py         # Telegram entrypoint (loads .env + starts bot)
+├── docs/                        # Architecture/plans/research/specs mirror
 └── tests/                       # Unit + eval + integration tests
 ```
 
@@ -137,10 +158,16 @@ the scenario against the real CLI with a real vault clone, then judges PASS/FAIL
 # Live integration (real HTTP + SDK, no CLI):
 .venv/bin/pytest tests/ -q -m integration --timeout=300
 
-# Evals (real CLI + vault + SDK judge) — ~12 min for all 12 scenarios:
+# Full evals (CLI + Telegram; requires Telegram creds for tg_*):
 .venv/bin/pytest tests/evals/ -v -m eval --timeout=300
 
-# EVERYTHING (~10 min total):
+# Telegram evals only (single aggregate test):
+.venv/bin/pytest tests/evals/test_evals.py::test_eval_telegram_all -v -s -m "eval and telegram" --timeout=300
+
+# Optional: run only selected Telegram scenarios (comma-separated)
+OBS_TG_SCENARIOS=tg_auth_guard,tg_tool_visibility .venv/bin/pytest tests/evals/test_evals.py::test_eval_telegram_all -v -s -m "eval and telegram" --timeout=300
+
+# EVERYTHING (duration varies; much longer when Telegram evals run):
 .venv/bin/pytest tests/ -v --timeout=300
 ```
 
@@ -162,40 +189,54 @@ The `.claude/agents/eval-guardian.md` agent has **veto power** over eval quality
 
 In the first eval build, the guardian caught 5 real bugs (PATH inheritance, prompt collision, concurrent test design, `@tool()` args, `mcp_servers` format). In the second round (vault migration + new evals), the guardian caught 4 more issues (vault_write needed separate read-back step, context_awareness criteria too vague, skills_awareness had unjudgeable criterion, immutable_guard needed control write to prove hook works). It also caught that fixture_vault was stale after the vault migration.
 
-### Eval Architecture: Dual-Mode Judge
+### Eval Architecture: Platform + Mode Split
 
-Sequential scenarios (basic_chat, tool_visibility, vault_file_access, session_continuity, vault_write, context_awareness, skills_awareness, immutable_guard, fork_tool, background_fork):
+CLI sequential scenarios (all `Send:` steps):
 - All steps are `Send:` — judge drives CLI via MCP tools (`send_message`, `read_output`)
 
-Concurrent scenarios (queue_message, interrupt):
+CLI concurrent scenarios (`SendNowait`/`Sleep` present):
 - Steps include `SendNowait:` and `Sleep:` for timing control
 - pexpect harness drives CLI directly, captures transcript
 - Judge evaluates transcript post-hoc (no MCP tools needed)
+
+Telegram scenarios (`tg_*`):
+- Run sequentially in one aggregate test (`test_eval_telegram_all`) to avoid chat pollution
+- Harness starts real Telegram bot process with `OBS_VAULT_PATH=<eval_vault>`
+- Telethon userbot drives real Telegram messages
+- Scenario output includes per-scenario judge text, including `CRITERIA CHECK`, `INTENT CHECK`, and `NOTES`
 
 This split exists because MCP tool calls are sequential — the judge can't send a message while waiting for a previous response.
 
 ### Eval Timing
 
-- **12 scenarios total**, ~12 min full suite
-- Per-test timeout: 300s (longest scenario vault_write+immutable_guard have 210s/180s of waits)
-- Scenarios are sequential — no parallelism between eval tests
+- **20 scenarios total** (12 CLI + 8 Telegram)
+- Telegram aggregate test is marked with a higher per-test timeout because it runs all Telegram scenarios serially
+- Scenarios are intentionally sequential to preserve causality and avoid cross-test message contamination
 
-### Current Eval Coverage (12 scenarios)
+### Current Eval Coverage (20 scenarios)
 
-| Eval | Tests | Mode |
+| Eval | Tests | Platform/Mode |
 |------|-------|------|
-| basic_chat | Agent responds coherently | Sequential |
-| tool_visibility | Agent lists `.claude/skills/` | Sequential |
-| vault_file_access | Agent reads `CLAUDE.md` | Sequential |
-| session_continuity | Two-turn recall | Sequential |
-| vault_write | Agent creates + reads back a file | Sequential |
-| context_awareness | Agent knows identity/threads from system prompt | Sequential |
-| skills_awareness | Agent lists skills from system prompt | Sequential |
-| immutable_guard | Control write succeeds, Meeting Notes write blocked | Sequential |
-| fork_tool | Fork inherits parent conversation history | Sequential |
-| background_fork | Background fork runs without blocking, results via queue | Sequential |
-| queue_message | Queued message during streaming | Concurrent |
-| interrupt | /stop during streaming | Concurrent |
+| basic_chat | Agent responds coherently | CLI Sequential |
+| tool_visibility | Agent lists `.claude/skills/` | CLI Sequential |
+| vault_file_access | Agent reads `CLAUDE.md` | CLI Sequential |
+| session_continuity | Two-turn recall | CLI Sequential |
+| vault_write | Agent creates + reads back a file | CLI Sequential |
+| context_awareness | Agent knows identity/threads from system prompt | CLI Sequential |
+| skills_awareness | Agent lists skills from system prompt | CLI Sequential |
+| immutable_guard | Control write succeeds, Meeting Notes write blocked | CLI Sequential |
+| fork_tool | Fork inherits parent conversation history | CLI Sequential |
+| background_fork | Background fork runs without blocking, results via queue | CLI Sequential |
+| queue_message | Queued message during streaming | CLI Concurrent |
+| interrupt | /stop during streaming | CLI Concurrent |
+| tg_auth_guard | Authorized-user Telegram flow | Telegram Sequential |
+| tg_background_auto_delivery | Background fork auto-delivery in Telegram | Telegram Sequential |
+| tg_chronological_output | Chronological tool/text + done sentinel in Telegram | Telegram Sequential |
+| tg_html_format | Telegram rendering correctness | Telegram Sequential |
+| tg_message_split | Long split-message coherence | Telegram Sequential |
+| tg_queue_while_busy | Telegram queue behavior under concurrent inputs | Telegram Sequential |
+| tg_stress_chronology | Mixed workload chronology stress | Telegram Sequential |
+| tg_tool_visibility | Inline tool observability in Telegram | Telegram Sequential |
 
 ### Known Gaps (work in progress)
 

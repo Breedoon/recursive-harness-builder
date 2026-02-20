@@ -1,5 +1,8 @@
 # Design Intent Reference
 
+> Historical design-intent capture from early project phases.
+> Use `CLAUDE.md` + `docs/architecture.md` for current operational behavior.
+
 Extracted from the original design session transcript (`9dd1f79f-d961-4c3a-9eea-e003569eccbe.jsonl`). This document captures user preferences, implicit expectations, changes in thinking, and nuances that may not be fully captured in the vault design docs.
 
 ---

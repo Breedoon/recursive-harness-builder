@@ -2,124 +2,99 @@
 
 ## Overview
 
-An agentic personal assistant using the Claude Agent SDK for Python, with this Obsidian vault as its knowledge base. Runs locally, processes requests via CLI (Telegram later), maintains a structured knowledge graph of goals, decisions, people, meetings, and context.
+OBS Agent is a local Claude Agent SDK runtime backed by an Obsidian vault.
+It has three main interaction surfaces:
 
-## Core Principles
+1. CLI (`obs_agent.cli`)
+2. HTTP daemon (`obs_agent.daemon`)
+3. Telegram adapter (`obs_agent.telegram`)
 
-1. **The vault is a knowledge graph, not a data lake** - store pointers with context, not raw bulk data
-2. **Agent knowledge lives inside the vault** (as markdown); runtime code lives outside
-3. **Universal document lifecycle** - files start small, grow, split into directories
-4. **Lazy generation** - summaries and indexes built on first touch, not upfront
-5. **Skills over code** - prefer markdown instructions guiding agent judgment over rigid scripts
-6. **Git as safety net** - version control for catastrophic recovery, not for working memory
+The architecture optimizes for reliability and observability over UI polish.
 
-## File Split
+## Core Runtime Components
 
-| What | Where | Why |
-|------|-------|-----|
-| Python runtime (agent, tools, config) | `/Users/breedoon/Documents/obs/` | Traditional code, own git repo, not browsed in Obsidian |
-| Agent knowledge (memory, skills, context) | Vault: `T/Agent/` | Needs Obsidian indexing, backlinks, search |
-| Session transcripts (JSONL) | SDK default (`~/.claude/projects/`) | Large, not useful to browse in Obsidian |
-| Vault content (journal, notes, meetings) | Vault: `T/` (existing structure) | Already there, stays as-is |
+| Component | File(s) | Responsibility |
+|-----------|---------|----------------|
+| Config | `src/obs_agent/config.py` | Paths, daemon settings, Telegram settings, immutable rules |
+| Session manager | `src/obs_agent/session.py` | ClaudeSDK client lifecycle, reconnect/reset, session_id tracking |
+| Hooks + state | `src/obs_agent/hooks.py` | Immutable guard, interrupt handling, queue injection, shared state |
+| MCP tools | `src/obs_agent/tools.py` | `self_fork` foreground/background behavior |
+| Runner | `src/obs_agent/runner.py` | Shared conversation orchestration, queue continuation, background fork wake-up |
+| Events | `src/obs_agent/events.py` | Status event schema + tool summary formatting |
+| Daemon | `src/obs_agent/daemon.py` | HTTP + SSE API over runner |
+| CLI | `src/obs_agent/cli.py` | Interactive terminal client |
+| Telegram | `src/obs_agent/telegram.py` | Telegram adapter with per-turn message flow + background poller |
+| Telegram entrypoint | `src/obs_agent/telegram_main.py` | Loads `.env`, validates config, starts Telegram bot |
 
-## File Access
+## Vault Model
 
-- **Direct filesystem** for most reads/writes. Obsidian's file watcher picks up changes automatically.
-- **Obsidian CLI/URI** only for creating files from Templater templates (daily/weekly/monthly journal entries that use `tp.*` syntax).
-- Agent has full read/write access to the vault directory.
+- Primary vault path defaults to `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/T`
+- Agent structure is `.claude/` inside the vault (skills, system docs, memory, drafts)
+- Runtime code is in this repo; persistent agent memory/context is in vault markdown
 
-## Session Management
+## Message / Queue Flow
 
-- Leverage Claude Agent SDK's built-in prompt caching (~1 hour window)
-- Within cache window: continue previous session seamlessly
-- Cache expired: start fresh session, load `Agent/context.md` + core skills
-- **Auto-offboarding**: before cache expiry, a skill triggers persisting important context to vault files
-- **Context compaction**: when approaching context limits, summarize current conversation and persist key information
-- Goal: feels like one long-running session to the user
+### Shared Queue Model
 
-## Memory System
+`HookState` exposes:
 
-### Core Context (`Agent/context.md`)
-Always loaded at session start. Contains current priorities, active threads, recent decisions, index of topic files. This is the root - everything is reachable from here.
+- `message_queue`: queued user/fork messages for continuation/background delivery
+- `status_queue`: status events to surface tool/queue activity
+- `interrupt_flag`: cooperative interrupt at tool boundaries
+- `background_tasks`: active background fork tasks
 
-### Topic Files (`Agent/topics/`)
-Created on demand when a section in `context.md` exceeds ~15-20 lines. Standard structure:
-- **Current** section: active state
-- **History** section: append-only timestamped changes with links to relevant vault files
-- **References** section: contextual wiki links
+### Runner Behavior
 
-History is explicit in the files (append-only), not reliant on git archaeology.
+`ConversationRunner.run()` performs:
 
-### Wiki-Style Linking
-All references use contextual wiki links: `[[path/to/file|why this is relevant]]`. Obsidian backlinks provide reverse navigation.
+1. Optional pending-message injection at turn start
+2. Main response streaming
+3. Continuation loop for queued user messages
+4. Background fork wake-up loop
+5. Final queue drain for next turn
 
-## Summary & Indexing
+Event stream emitted to adapters:
 
-### Parent Notes
-Each content directory has a sibling parent note (e.g., `Meeting Notes.md` next to `Meeting Notes/`). Parent notes contain:
-- Conventions for the directory
-- Curated one-line summaries (lazy-appended when agent touches a file)
-- Archive links for overflow
+- `TextEvent`
+- `StatusEvent`
+- `TurnEndEvent` (boundary per SDK assistant message)
+- `DoneEvent`
 
-### Three-Tier Detail
+## Telegram Architecture (Current)
 
-| Tier | Detail | Location | When |
-|------|--------|----------|------|
-| 0 | One-line summary | Parent note | On first touch (MVP) |
-| 1 | Detailed summary (~paragraph + key points) | `_summaries.md` in directory | On touch if original > 2KB (post-MVP) |
-| 2 | Full original | The file itself | Already exists |
+The Telegram adapter intentionally uses a simple, robust model:
 
-### Reference Cards
-For external data (sessions, articles, videos) that has no native vault markdown: a reference card in the vault with type, source, capture date, summary, and links. Reference cards follow the same universal lifecycle.
+1. Fragment reassembly for Telegram auto-split user messages
+2. Per-chat lock serialization (prevents in-chat out-of-order processing)
+3. Per-turn flush: inline tool/status + text in chronological order
+4. `(done)` sentinel at run completion (notification enabled)
+5. Background queue poller every 3s for idle auto-delivery
 
-## Git & Version Control
+Important implementation notes:
 
-Two-layer commit strategy:
+- Content chunks are sent with `disable_notification=True`
+- `(done)` is sent with `disable_notification=False`
+- Single-user assumption remains in auto-delivery routing (`_last_chat_id` + `_last_bot`)
 
-1. **Obsidian Git plugin** - auto-commits every 15 minutes when Obsidian is open. Background safety net for manual edits. Message: `vault backup: YYYY-MM-DD HH:mm:ss`.
-2. **Agent commits** - explicit commits with descriptive messages after meaningful operations (session offboard, document processing, context updates).
+## Testing Architecture
 
-Storage impact is negligible: git delta-compresses text diffs efficiently. Commit frequency has near-zero effect on `.git` size - what matters is total new content created, not how often it's captured.
+The test stack is layered, but evals are the primary correctness gate.
 
-`.gitignore` excludes only `.DS_Store`. Everything else (including `.obsidian/` config and `.trash/`) is tracked.
+- Unit: `tests/test_*.py`
+- Integration: `tests/*integration*.py`
+- Evals: `tests/evals/`
+  - CLI scenarios
+  - Telegram scenarios (`tg_*`) via Telethon + real bot process
 
-## Skills System
+Judge output now includes:
 
-### Core Skills (always referenced in system prompt)
-1. `update-context.md` - Persist session learnings to context and topic files
-2. `manage-summaries.md` - Generate and append summaries to parent notes
-3. `create-reference.md` - Create reference cards for external content
-4. `file-conventions.md` - Master reference for all vault file conventions
+- `CRITERIA CHECK`
+- `INTENT CHECK`
+- `NOTES` (suspicious/off behavior even on pass)
 
-### Deeper Skills (loaded on demand via core skill references)
-- `split-topic.md`, `session-offboard.md`, `process-meeting.md`, `daily-planning.md`
+## What This Architecture Prioritizes
 
-### Routing
-Core skills listed in system prompt with trigger descriptions. Each core skill references deeper skills for sub-tasks. Agent judgment determines which apply. Future: dedicated skill router from separate project.
-
-## MVP Scope
-
-### Build
-1. Python project skeleton with Claude Agent SDK
-2. `Agent/` folder: `context.md`, core skills, `drafts/`
-3. Git setup for the vault (`.gitignore`, initial commit)
-4. Session continuity via SDK caching + basic offboarding
-5. `Misc/Meeting Notes.md` parent note as proof of concept
-
-### Don't Build Yet
-- Telegram bot
-- People tracking
-- Decision records (beyond this design log)
-- Tier 1 detailed summaries
-- External data pipelines
-- Template versioning
-- Embeddings
-- Bulk indexing
-
-### Success Criteria
-- CLI session works, agent updates `context.md` appropriately
-- Agent follows skills for file conventions
-- Meeting notes get lazily summarized in parent note
-- Sessions feel continuous within cache window
-- Vault is under Git
-- File structure is clean and navigable
+1. Deterministic behavior over clever orchestration
+2. Human-observable chronology for long-running tool/fork work
+3. End-to-end evaluation over mocked confidence
+4. Simpler control loops (polling + locks) over high-complexity event machinery
