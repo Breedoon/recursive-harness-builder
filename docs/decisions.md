@@ -2,7 +2,7 @@
 
 Decisions made during the design of the OBS Agent system. Each entry records what was decided, what alternatives were considered, and why.
 
-D001-D017 were made during the [[Agent/system/sessions/2026-02-11-initial-design|initial design session on 2026-02-11]] (architecture & conventions phase). D018-D025 were made in the same session during the implementation planning phase, informed by research into [[Agent/system/research/openclaw|OpenClaw]], [[Agent/system/research/claude-mem|claude-mem]], and the [[Agent/system/research/claude-sdk|Claude Agent SDK]]. D026-D031 were made on 2026-02-12 during the message queuing, interrupt, hook pipeline, and observability implementation.
+D001-D017 were made during the [[Agent/system/sessions/2026-02-11-initial-design|initial design session on 2026-02-11]] (architecture & conventions phase). D018-D025 were made in the same session during the implementation planning phase, informed by research into [[Agent/system/research/openclaw|OpenClaw]], [[Agent/system/research/claude-mem|claude-mem]], and the [[Agent/system/research/claude-sdk|Claude Agent SDK]]. D026-D031 were made on 2026-02-12 during the message queuing, interrupt, hook pipeline, and observability implementation. D032-D038 were made on 2026-02-19 during Telegram flow simplification, eval hardening, and production startup reliability fixes.
 
 ---
 
@@ -236,3 +236,54 @@ D001-D017 were made during the [[Agent/system/sessions/2026-02-11-initial-design
 - Manual testing only (catches bugs but not automated)
 - Selenium/Playwright-style browser automation (wrong tool for CLI)
 **Rationale**: 263 passing mocked tests shipped two critical bugs (queue messages never reaching the agent, stdin consumed by orphaned threads). Both were immediately obvious in manual testing and caught instantly by pexpect tests. LLM-as-judge avoids brittle string matching — criteria are human-readable and robust to model output variations. The combination of pexpect (tests the plumbing) + LLM judge (tests the intelligence) is the gold standard for agent E2E. See `docs/testing-philosophy.md` for the full testing layer reference.
+
+---
+
+## D032: Telegram Per-Turn Chronological Messaging (No Editable Status Message)
+**Decision**: Telegram output is sent as per-turn messages with inline status/tool visibility, flushed on runner `TurnEndEvent`, instead of using a separate editable status message plus end-of-turn text dump.
+**Alternatives considered**:
+- Editable status message (`StatusMessageManager`) + final response message
+- One Telegram message per low-level block/event
+**Rationale**: The editable status model was unreliable under concurrency and harder to reason about. Per-turn flushes preserve chronology while reducing rate-limit/edit conflicts and keeping output easy to audit in human order.
+
+## D033: Per-Chat Lock + Simple Polling for Background Queue Auto-Delivery
+**Decision**: Telegram processing is serialized per chat with `asyncio.Lock`, and background queue delivery uses a simple 3-second poller when the chat is idle.
+**Alternatives considered**:
+- No lock (allow races with `concurrent_updates=True`)
+- Event-driven wake/coalescing infrastructure (OpenClaw-like heartbeat system)
+**Rationale**: The lock removes common ordering races with minimal complexity. Polling is operationally simple and robust for the current single-user production shape; it provides background auto-delivery without introducing a larger scheduling subsystem.
+
+## D034: `(done)` Sentinel as Completion Contract for Telegram
+**Decision**: Every Telegram run sends content silently (`disable_notification=True`) and emits a final `(done)` message with notification enabled.
+**Alternatives considered**:
+- Track and notify only the exact final content chunk
+- No explicit completion marker
+**Rationale**: `(done)` is a low-complexity, explicit completion signal that is easy for humans and eval harnesses to detect. It avoids fragile “true last chunk” logic while preserving clear operator awareness.
+
+## D035: Observability-First Tool Summaries
+**Decision**: Tool summaries are standardized to 200-character truncation and unknown tools fall back to structured payload visibility instead of opaque labels.
+**Alternatives considered**:
+- Shorter, prettified summaries with limited detail
+- Unknown-tool summaries with minimal metadata
+**Rationale**: For this system, lack of visibility is a higher risk than verbose logs. Standardized 200-char summaries preserve consistency while exposing enough context to understand what the agent actually did.
+
+## D036: Telegram Evals as Single Sequential Aggregate Test
+**Decision**: Telegram scenarios (`tg_*`) run sequentially within one aggregate test (`test_eval_telegram_all`) using a real bot process + Telethon client, with `/new` reset between scenarios.
+**Alternatives considered**:
+- Parametrized per-scenario async Telegram tests
+- Mocked Telegram adapter tests as primary validation
+**Rationale**: Shared external state (chat history, bot process) makes parallel parametrized execution flaky and cross-contaminating. A single sequential aggregate run preserves causality and supports reliable real-message verification.
+
+## D037: Intent-Aware Judge Output with Mandatory `NOTES`
+**Decision**: Eval scenarios include an `Intent` section and judge output is required to include `CRITERIA CHECK`, `INTENT CHECK`, and `NOTES` even when verdict is PASS.
+**Alternatives considered**:
+- Criteria-only pass/fail reporting
+- Human post-hoc review without structured judge notes
+**Rationale**: Criteria-only verdicts can miss “technically passing but clearly off” behavior. Intent + notes create a first-class channel for suspicious observations and improve decision quality without forcing failures on every soft anomaly.
+
+## D038: Production Telegram Entrypoint Loads `.env` Directly
+**Decision**: `telegram_main.py` loads `.env` into `os.environ` (if keys are unset) before `OBSConfig.from_env()`.
+**Alternatives considered**:
+- Require shell-exported env vars for production startup
+- Add a new dependency solely for dotenv loading
+**Rationale**: Manual shell export semantics are error-prone and differed from test/eval startup behavior. A lightweight built-in loader aligns production with harness behavior and removes startup friction without adding a dependency.
