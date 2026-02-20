@@ -273,6 +273,50 @@ class TelegramBot:
                 disable_web_page_preview=True,
             )
 
+    async def handle_context(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /context - show session and context window info (no agent involved)."""
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+
+        lines: list[str] = []
+        sid = self._session_manager.session_id
+        lines.append(f"session_id: {sid or '(none)'}")
+
+        data = self._hook_state.last_result_data
+        if data:
+            lines.append(f"num_turns: {data.get('num_turns', '?')}")
+            cost = data.get("total_cost_usd")
+            lines.append(f"total_cost_usd: {cost if cost is not None else '?'}")
+            lines.append(f"duration_ms: {data.get('duration_ms', '?')}")
+
+            usage = data.get("usage")
+            if usage:
+                inp = usage.get("input_tokens") or 0
+                out = usage.get("output_tokens") or 0
+                cache_create = usage.get("cache_creation_input_tokens") or 0
+                cache_rd = usage.get("cache_read_input_tokens") or 0
+                total = inp + out + cache_create + cache_rd
+                pct = max(0.0, (1 - total / 200_000) * 100)
+                lines.append(f"input_tokens: {inp}")
+                lines.append(f"output_tokens: {out}")
+                lines.append(f"cache_creation: {cache_create}")
+                lines.append(f"cache_read: {cache_rd}")
+                lines.append(f"total_used: {total}")
+                lines.append(f"context_remaining: {pct:.1f}%")
+            else:
+                lines.append("(no usage data yet)")
+        else:
+            lines.append("(no session data yet)")
+
+        await update.effective_message.reply_text(
+            "\n".join(lines),
+            disable_web_page_preview=True,
+        )
+
     async def handle_stop(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -438,22 +482,40 @@ class TelegramBot:
             if len(error_detail) > 200:
                 error_detail = error_detail[:200] + "..."
 
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"(error: {error_detail})",
-                    disable_web_page_preview=True,
-                    disable_notification=False,
-                )
-            except Exception:
-                logger.exception("Failed to send error reply")
+            from obs_agent.runner import _is_recoverable
 
-            # Reset session on unrecoverable errors to avoid stuck state.
-            try:
-                await self._session_manager.async_reset()
-                logger.info("Session reset after error")
-            except Exception:
-                logger.warning("Session reset after error also failed", exc_info=True)
+            if _is_recoverable(exc):
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"(error: {error_detail} — session preserved)",
+                        disable_web_page_preview=True,
+                        disable_notification=False,
+                    )
+                except Exception:
+                    logger.exception("Failed to send error reply")
+
+                try:
+                    await self._session_manager.soft_reset()
+                    logger.info("Soft reset after recoverable error (session_id preserved)")
+                except Exception:
+                    logger.warning("Soft reset failed", exc_info=True)
+            else:
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"(error: {error_detail} — session reset)",
+                        disable_web_page_preview=True,
+                        disable_notification=False,
+                    )
+                except Exception:
+                    logger.exception("Failed to send error reply")
+
+                try:
+                    await self._session_manager.async_reset()
+                    logger.info("Full reset after unrecoverable error")
+                except Exception:
+                    logger.warning("Full reset failed", exc_info=True)
 
         finally:
             self._busy_chats.discard(chat_id)
@@ -547,6 +609,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.bot_data["obs_telegram_bot"] = bot
     app.add_handler(CommandHandler("new", bot.handle_new))
     app.add_handler(CommandHandler("stop", bot.handle_stop))
+    app.add_handler(CommandHandler("context", bot.handle_context))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     return app
 
@@ -558,6 +621,7 @@ async def _set_bot_commands(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("new", "Clear context and start a fresh session"),
         BotCommand("stop", "Interrupt the current response"),
+        BotCommand("context", "Show session and context window info"),
     ])
 
 

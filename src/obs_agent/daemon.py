@@ -9,11 +9,12 @@ See implementation-plan.md Steps 9-10 and decisions D014, D018, D022.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from obs_agent.commands import CommandRegistry
@@ -79,7 +80,6 @@ def create_app(config: OBSConfig) -> FastAPI:
         registry: CommandRegistry = application.state.commands
         result = await registry.execute("enqueue", message=request.message)
         if not result.success:
-            from fastapi.responses import JSONResponse
             return JSONResponse(status_code=422, content={"detail": result.message})
         return {
             "queued": True,
@@ -124,9 +124,16 @@ def create_app(config: OBSConfig) -> FastAPI:
         )
 
         result_parts: list[str] = []
-        async for event in runner.run(request.message):
-            if isinstance(event, TextEvent):
-                result_parts.append(event.text)
+        try:
+            async for event in runner.run(request.message):
+                if isinstance(event, TextEvent):
+                    result_parts.append(event.text)
+        except Exception as exc:
+            logger.exception("Error in /chat")
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"{type(exc).__name__}: {str(exc)[:200]}"},
+            )
 
         application.state.pending_messages = runner.remaining_pending
 
@@ -151,16 +158,22 @@ def create_app(config: OBSConfig) -> FastAPI:
         )
 
         async def event_generator():
-            async for event in runner.run(request.message):
-                if isinstance(event, TextEvent):
-                    for text_line in event.text.split("\n"):
-                        yield f"data: {text_line}\n"
-                    yield "\n"
-                elif isinstance(event, StatusEvent):
-                    yield event.to_sse()
-                elif isinstance(event, DoneEvent):
-                    application.state.pending_messages = runner.remaining_pending
-                    yield "data: [DONE]\n\n"
+            try:
+                async for event in runner.run(request.message):
+                    if isinstance(event, TextEvent):
+                        for text_line in event.text.split("\n"):
+                            yield f"data: {text_line}\n"
+                        yield "\n"
+                    elif isinstance(event, StatusEvent):
+                        yield event.to_sse()
+                    elif isinstance(event, DoneEvent):
+                        application.state.pending_messages = runner.remaining_pending
+                        yield "data: [DONE]\n\n"
+            except Exception as exc:
+                logger.exception("Error in SSE stream")
+                error_msg = f"{type(exc).__name__}: {str(exc)[:200]}"
+                yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
+                yield "data: [DONE]\n\n"
 
         return StreamingResponse(
             event_generator(),

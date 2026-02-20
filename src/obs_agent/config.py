@@ -25,6 +25,7 @@ class OBSConfig:
     cache_window_seconds: int = 3480  # 58 minutes
     max_queue_continuations: int = 3
     bg_fork_timeout: float = 600.0  # seconds to wait for background forks
+    max_buffer_size: int = 10 * 1024 * 1024  # 10 MB SDK JSON buffer limit
 
     # Telegram
     telegram_bot_token: str | None = None
@@ -49,6 +50,8 @@ class OBSConfig:
             kwargs["max_queue_continuations"] = int(max_cont)
         if bg_timeout := os.environ.get("OBS_BG_FORK_TIMEOUT"):
             kwargs["bg_fork_timeout"] = float(bg_timeout)
+        if buf_size := os.environ.get("OBS_MAX_BUFFER_SIZE"):
+            kwargs["max_buffer_size"] = int(buf_size)
         if tg_token := os.environ.get("OBS_TELEGRAM_BOT_TOKEN") or os.environ.get("OBS_TELEGRAM_PROD_BOT_TOKEN"):
             kwargs["telegram_bot_token"] = tg_token
         if tg_users := os.environ.get("OBS_TELEGRAM_ALLOWED_USERS") or os.environ.get("OBS_TELEGRAM_AUTHORIZED_USER_ID"):

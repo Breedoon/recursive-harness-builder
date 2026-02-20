@@ -8,7 +8,14 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from claude_agent_sdk import TextBlock, ThinkingBlock, ToolUseBlock
+from claude_agent_sdk import (
+    CLIConnectionError,
+    CLIJSONDecodeError,
+    ProcessError,
+    TextBlock,
+    ThinkingBlock,
+    ToolUseBlock,
+)
 
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
@@ -18,6 +25,7 @@ from obs_agent.runner import (
     TextEvent,
     TurnEndEvent,
     _drain_queue,
+    _is_recoverable,
 )
 
 
@@ -318,3 +326,178 @@ class TestRunnerTurnBoundaries:
 
         turn_end_events = [e for e in events if isinstance(e, TurnEndEvent)]
         assert len(turn_end_events) == 2
+
+
+# --- Error classification ---
+
+
+class TestIsRecoverable:
+    """Test _is_recoverable error classification logic."""
+
+    def test_process_error_not_recoverable(self):
+        assert not _is_recoverable(ProcessError("died", exit_code=1))
+
+    def test_cli_json_decode_error_recoverable(self):
+        assert _is_recoverable(
+            CLIJSONDecodeError("big json", ValueError("too big"))
+        )
+
+    def test_cli_connection_error_recoverable(self):
+        assert _is_recoverable(CLIConnectionError("lost"))
+
+    def test_generic_buffer_overflow_recoverable(self):
+        """SDK wraps CLIJSONDecodeError into generic Exception."""
+        exc = Exception(
+            "Failed to decode JSON: JSON message exceeded maximum buffer size"
+        )
+        assert _is_recoverable(exc)
+
+    def test_generic_process_exit_not_recoverable(self):
+        exc = Exception("Command failed with exit code 1 (process died)")
+        assert not _is_recoverable(exc)
+
+    def test_unknown_error_defaults_recoverable(self):
+        assert _is_recoverable(RuntimeError("something weird"))
+
+
+# --- Reconnect on stream errors ---
+
+
+class TestRunnerReconnectOnStreamError:
+    """Test that the runner reconnects on recoverable errors during streaming."""
+
+    @patch("obs_agent.session.SessionManager.reconnect")
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_reconnects_on_buffer_overflow(
+        self, mock_get_client, mock_reconnect, config
+    ):
+        """When receive_response raises a recoverable error, runner reconnects."""
+        # First client: query succeeds, but receive_response raises
+        failing_client = AsyncMock()
+        failing_client.query = AsyncMock()
+
+        async def failing_receive():
+            raise Exception("JSON message exceeded maximum buffer size")
+            yield  # noqa: unreachable — makes this an async generator
+
+        failing_client.receive_response = failing_receive
+        mock_get_client.return_value = failing_client
+
+        # Reconnect client: works normally
+        recovery_msg = MagicMock()
+        recovery_msg.content = [TextBlock(text="Recovered")]
+        recovery_msg.session_id = "sess-99"
+        recovery_client = _make_mock_client([recovery_msg])
+        mock_reconnect.return_value = recovery_client
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        events = await _collect_events(runner, "hello")
+
+        text_events = [e for e in events if isinstance(e, TextEvent)]
+        assert any("Recovered" in e.text for e in text_events)
+        mock_reconnect.assert_called_once()
+
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_raises_on_unrecoverable_error(self, mock_get_client, config):
+        """ProcessError re-raises without reconnect attempt."""
+        failing_client = AsyncMock()
+        failing_client.query = AsyncMock()
+
+        async def failing_receive():
+            raise ProcessError("CLI died", exit_code=1)
+            yield  # noqa: unreachable
+
+        failing_client.receive_response = failing_receive
+        mock_get_client.return_value = failing_client
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+
+        with pytest.raises(ProcessError):
+            await _collect_events(runner, "hello")
+
+    @patch("obs_agent.session.SessionManager.reconnect")
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_reconnect_failure_propagates(
+        self, mock_get_client, mock_reconnect, config
+    ):
+        """If reconnect itself fails, the error propagates to the caller."""
+        failing_client = AsyncMock()
+        failing_client.query = AsyncMock()
+
+        async def failing_receive():
+            raise CLIConnectionError("stream died")
+            yield  # noqa: unreachable
+
+        failing_client.receive_response = failing_receive
+        mock_get_client.return_value = failing_client
+        mock_reconnect.side_effect = RuntimeError("Cannot reconnect: no session_id")
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+
+        with pytest.raises(RuntimeError, match="no session_id"):
+            await _collect_events(runner, "hello")
+
+
+# --- SessionManager reconnect / soft_reset ---
+
+
+class TestSessionManagerReconnect:
+    async def test_reconnect_preserves_session_id(self, config):
+        from obs_agent.session import SessionManager
+
+        hook_state = HookState()
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr.set_session_id("sess-42")
+
+        with patch.object(session_mgr, "_build_options"), patch(
+            "obs_agent.session.ClaudeSDKClient"
+        ) as MockClient:
+            mock_instance = AsyncMock()
+            MockClient.return_value = mock_instance
+            mock_instance.connect = AsyncMock()
+
+            client = await session_mgr.reconnect()
+            assert session_mgr.session_id == "sess-42"
+            assert client is mock_instance
+
+    async def test_reconnect_fails_without_session_id(self, config):
+        from obs_agent.session import SessionManager
+
+        hook_state = HookState()
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+
+        with pytest.raises(RuntimeError, match="no session_id"):
+            await session_mgr.reconnect()
+
+    async def test_soft_reset_preserves_session_id(self, config):
+        from obs_agent.session import SessionManager
+
+        hook_state = HookState()
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr.set_session_id("sess-42")
+
+        await session_mgr.soft_reset()
+        assert session_mgr.session_id == "sess-42"
+        assert session_mgr._client is None
+
+    async def test_async_reset_clears_session_id(self, config):
+        from obs_agent.session import SessionManager
+
+        hook_state = HookState()
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr.set_session_id("sess-42")
+
+        await session_mgr.async_reset()
+        assert session_mgr.session_id is None

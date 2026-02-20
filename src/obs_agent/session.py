@@ -86,6 +86,7 @@ class SessionManager:
             cwd=str(self.config.vault_path),
             permission_mode="bypassPermissions",
             setting_sources=["project"],
+            max_buffer_size=self.config.max_buffer_size,
         )
 
         # Resume if within cache window, otherwise fresh
@@ -153,6 +154,37 @@ class SessionManager:
         # Mark client as stale — next get_client() will create fresh
         self._connected = False
         self._client = None
+
+    async def reconnect(self) -> ClaudeSDKClient:
+        """Reconnect to an existing session after a mid-stream error.
+
+        Preserves session_id so the CLI subprocess's conversation history
+        is retained, but creates a fresh Python-side client with
+        ``resume=session_id``.
+
+        Raises ``RuntimeError`` if no session_id exists to reconnect to.
+        """
+        if self._session_id is None:
+            raise RuntimeError("Cannot reconnect: no session_id")
+
+        async with self._lock:
+            await self._disconnect_unlocked()
+            # Ensure should_resume() returns True for the new options build.
+            self.last_activity = time.time()
+            options = self._build_options()
+            self._client = ClaudeSDKClient(options)
+            await asyncio.create_task(self._client.connect())
+            self._connected = True
+            return self._client
+
+    async def soft_reset(self) -> None:
+        """Disconnect client but preserve session_id for future reconnect.
+
+        Used after recoverable errors where the next user message should
+        silently reconnect to the same conversation.
+        """
+        await self.disconnect()
+        # NOTE: session_id and last_activity are intentionally NOT cleared.
 
     async def async_reset(self) -> None:
         """Async reset that also disconnects the client cleanly."""

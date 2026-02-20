@@ -1,6 +1,6 @@
 """ConversationRunner: core orchestration loop extracted from daemon.py.
 
-Manages the query → receive → continuation → background-fork-wait cycle.
+Manages the query -> receive -> continuation -> background-fork-wait cycle.
 Yields RunnerEvent objects that platform adapters (HTTP/SSE, Telegram, etc.)
 can consume and render in their own format.
 
@@ -14,7 +14,14 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, AsyncIterator
 
-from claude_agent_sdk import CLIConnectionError, TextBlock, ThinkingBlock, ToolUseBlock
+from claude_agent_sdk import (
+    CLIConnectionError,
+    CLIJSONDecodeError,
+    ProcessError,
+    TextBlock,
+    ThinkingBlock,
+    ToolUseBlock,
+)
 
 from obs_agent.events import StatusEvent, summarize_tool_use
 from obs_agent.hooks import HookState
@@ -50,6 +57,29 @@ class DoneEvent:
 
 
 RunnerEvent = TextEvent | StatusEvent | TurnEndEvent | DoneEvent
+
+
+# ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
+
+def _is_recoverable(exc: BaseException) -> bool:
+    """Classify whether an error is recoverable via session reconnect.
+
+    Recoverable: buffer overflow, connection issues, generic stream errors.
+    Unrecoverable: CLI process died (ProcessError), CLI not found.
+    """
+    if isinstance(exc, ProcessError):
+        return False
+    if isinstance(exc, (CLIJSONDecodeError, CLIConnectionError)):
+        return True
+    msg = str(exc).lower()
+    if "buffer size" in msg or "json" in msg:
+        return True
+    if "process" in msg and "exit code" in msg:
+        return False
+    # Default: try reconnect; worst case it fails and we re-raise.
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -98,11 +128,90 @@ class ConversationRunner:
         self._hook_state = hook_state
         self._config = config
         self._pending_messages = list(pending_messages) if pending_messages else []
+        self._client = None  # set during run()
+        self._last_message = None  # tracks last SDK message for metrics
 
     @property
     def remaining_pending(self) -> list[str]:
         """Messages left in the queue after run() completes (for next turn)."""
         return self._pending_messages
+
+    # ------------------------------------------------------------------
+    # Streaming helpers
+    # ------------------------------------------------------------------
+
+    async def _stream_response(self) -> AsyncIterator[RunnerEvent]:
+        """Stream one SDK response from ``self._client``, yielding events.
+
+        Updates ``self._last_message`` for each message received.
+        """
+        async for message in self._client.receive_response():
+            self._last_message = message
+            if hasattr(message, "session_id") and message.session_id:
+                self._session_mgr.set_session_id(message.session_id)
+            if hasattr(message, "content") and isinstance(message.content, list):
+                for block in message.content:
+                    if isinstance(block, ToolUseBlock):
+                        tool_name = getattr(block, "name", "")
+                        tool_input = getattr(block, "input", {}) or {}
+                        yield StatusEvent(
+                            type="tool_use",
+                            summary=summarize_tool_use(tool_name, tool_input),
+                        )
+                    elif isinstance(block, ThinkingBlock):
+                        yield StatusEvent(
+                            type="thinking",
+                            summary="thinking...",
+                        )
+                    elif isinstance(block, TextBlock):
+                        yield TextEvent(text=block.text)
+
+            # Drain status_queue after each message
+            while not self._hook_state.status_queue.empty():
+                try:
+                    yield self._hook_state.status_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+            yield TurnEndEvent()
+
+    async def _stream_or_reconnect(
+        self, retry_prompt: str,
+    ) -> AsyncIterator[RunnerEvent]:
+        """Stream response; on recoverable error reconnect and re-stream.
+
+        On unrecoverable errors (e.g. ``ProcessError``) the exception
+        propagates immediately.  On recoverable errors we reconnect via
+        ``SessionManager.reconnect()`` (preserves session_id), send
+        *retry_prompt* and stream again.  If the retry also fails the
+        exception propagates to the caller.
+        """
+        try:
+            async for event in self._stream_response():
+                yield event
+        except Exception as exc:
+            if not _is_recoverable(exc):
+                raise
+            logger.warning("Recoverable stream error, reconnecting: %s", exc)
+            self._client = await self._session_mgr.reconnect()
+            await self._client.query(f"(System: {retry_prompt})")
+            async for event in self._stream_response():
+                yield event
+
+    async def _query_or_reconnect(self, prompt: str) -> None:
+        """Send query; on recoverable error reconnect and retry."""
+        try:
+            await self._client.query(prompt)
+        except Exception as exc:
+            if not _is_recoverable(exc):
+                raise
+            logger.warning("Error sending query, reconnecting: %s", exc)
+            self._client = await self._session_mgr.reconnect()
+            await self._client.query(prompt)
+
+    # ------------------------------------------------------------------
+    # Main orchestration
+    # ------------------------------------------------------------------
 
     async def run(self, user_message: str) -> AsyncIterator[RunnerEvent]:
         """Execute one conversation turn, yielding events as they occur.
@@ -136,50 +245,41 @@ class ConversationRunner:
             )
 
         # 2. Get client and send query (with reconnect on connection loss)
-        client = await self._session_mgr.get_client()
+        self._client = await self._session_mgr.get_client()
         try:
-            await client.query(actual_message)
-        except CLIConnectionError:
-            logger.warning("Client connection lost, reconnecting")
+            await self._client.query(actual_message)
+        except Exception as exc:
+            if not _is_recoverable(exc):
+                raise
+            logger.warning("Connection lost on initial query, reconnecting: %s", exc)
             await self._session_mgr.disconnect()
-            client = await self._session_mgr.get_client()
-            await client.query(actual_message)
+            self._client = await self._session_mgr.get_client()
+            await self._client.query(actual_message)
 
-        # 3. Stream response
-        last_message = None
-        async for message in client.receive_response():
-            last_message = message
-            if hasattr(message, "session_id") and message.session_id:
-                self._session_mgr.set_session_id(message.session_id)
-            if hasattr(message, "content") and isinstance(message.content, list):
-                for block in message.content:
-                    if isinstance(block, ToolUseBlock):
-                        tool_name = getattr(block, "name", "")
-                        tool_input = getattr(block, "input", {}) or {}
-                        yield StatusEvent(
-                            type="tool_use",
-                            summary=summarize_tool_use(tool_name, tool_input),
-                        )
-                    elif isinstance(block, ThinkingBlock):
-                        yield StatusEvent(
-                            type="thinking",
-                            summary="thinking...",
-                        )
-                    elif isinstance(block, TextBlock):
-                        yield TextEvent(text=block.text)
+        # 3. Stream response (with reconnect on recoverable errors)
+        self._last_message = None
+        async for event in self._stream_or_reconnect(
+            "Connection interrupted. Continue where you left off."
+        ):
+            yield event
 
-            # Drain status_queue after each message
-            while not self._hook_state.status_queue.empty():
-                try:
-                    status_event = self._hook_state.status_queue.get_nowait()
-                    yield status_event
-                except asyncio.QueueEmpty:
-                    break
-
-            yield TurnEndEvent()
-
-        if last_message is not None:
-            log_result(last_message, label="conversation")
+        if self._last_message is not None:
+            log_result(self._last_message, label="conversation")
+            self._hook_state.last_result_data = {
+                "session_id": getattr(self._last_message, "session_id", None),
+                "num_turns": getattr(self._last_message, "num_turns", None),
+                "total_cost_usd": getattr(self._last_message, "total_cost_usd", None),
+                "duration_ms": getattr(self._last_message, "duration_ms", None),
+                "usage": None,
+            }
+            usage = getattr(self._last_message, "usage", None)
+            if isinstance(usage, dict):
+                self._hook_state.last_result_data["usage"] = {
+                    "input_tokens": usage.get("input_tokens"),
+                    "output_tokens": usage.get("output_tokens"),
+                    "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+                    "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+                }
 
         # 4. Continuation loop: process queued messages inline
         continuation_count = 0
@@ -189,12 +289,9 @@ class ConversationRunner:
                 break
             continuation_count += 1
 
-            prefix = "\n".join(
-                f"[Queued message from user]: {m}" for m in remaining
-            )
             continuation_prompt = (
-                f"{prefix}\n\n"
-                "(User sent these while you were responding. Address them briefly.)"
+                "\n".join(f"[Queued message from user]: {m}" for m in remaining)
+                + "\n\n(User sent these while you were responding. Address them briefly.)"
             )
 
             yield StatusEvent(
@@ -204,37 +301,11 @@ class ConversationRunner:
                 messages=remaining,
             )
 
-            await client.query(continuation_prompt)
-            async for cont_message in client.receive_response():
-                if hasattr(cont_message, "session_id") and cont_message.session_id:
-                    self._session_mgr.set_session_id(cont_message.session_id)
-                if hasattr(cont_message, "content") and isinstance(
-                    cont_message.content, list
-                ):
-                    for block in cont_message.content:
-                        if isinstance(block, ToolUseBlock):
-                            tool_name = getattr(block, "name", "")
-                            tool_input = getattr(block, "input", {}) or {}
-                            yield StatusEvent(
-                                type="tool_use",
-                                summary=summarize_tool_use(tool_name, tool_input),
-                            )
-                        elif isinstance(block, ThinkingBlock):
-                            yield StatusEvent(
-                                type="thinking",
-                                summary="thinking...",
-                            )
-                        elif isinstance(block, TextBlock):
-                            yield TextEvent(text=block.text)
-
-                while not self._hook_state.status_queue.empty():
-                    try:
-                        status_event = self._hook_state.status_queue.get_nowait()
-                        yield status_event
-                    except asyncio.QueueEmpty:
-                        break
-
-                yield TurnEndEvent()
+            await self._query_or_reconnect(continuation_prompt)
+            async for event in self._stream_or_reconnect(
+                "Connection interrupted. Continue where you left off."
+            ):
+                yield event
 
         # 5. Background fork wait loop
         while self._hook_state.background_tasks:
@@ -258,12 +329,9 @@ class ConversationRunner:
             if not bg_remaining:
                 continue
 
-            bg_prefix = "\n".join(
-                f"[Queued message from user]: {m}" for m in bg_remaining
-            )
             bg_prompt = (
-                f"{bg_prefix}\n\n"
-                "(Background fork results arrived. Process and summarize them.)"
+                "\n".join(f"[Queued message from user]: {m}" for m in bg_remaining)
+                + "\n\n(Background fork results arrived. Process and summarize them.)"
             )
 
             yield StatusEvent(
@@ -273,37 +341,11 @@ class ConversationRunner:
                 messages=bg_remaining,
             )
 
-            await client.query(bg_prompt)
-            async for bg_msg in client.receive_response():
-                if hasattr(bg_msg, "session_id") and bg_msg.session_id:
-                    self._session_mgr.set_session_id(bg_msg.session_id)
-                if hasattr(bg_msg, "content") and isinstance(
-                    bg_msg.content, list
-                ):
-                    for block in bg_msg.content:
-                        if isinstance(block, ToolUseBlock):
-                            tool_name = getattr(block, "name", "")
-                            tool_input = getattr(block, "input", {}) or {}
-                            yield StatusEvent(
-                                type="tool_use",
-                                summary=summarize_tool_use(tool_name, tool_input),
-                            )
-                        elif isinstance(block, ThinkingBlock):
-                            yield StatusEvent(
-                                type="thinking",
-                                summary="thinking...",
-                            )
-                        elif isinstance(block, TextBlock):
-                            yield TextEvent(text=block.text)
-
-                while not self._hook_state.status_queue.empty():
-                    try:
-                        status_event = self._hook_state.status_queue.get_nowait()
-                        yield status_event
-                    except asyncio.QueueEmpty:
-                        break
-
-                yield TurnEndEvent()
+            await self._query_or_reconnect(bg_prompt)
+            async for event in self._stream_or_reconnect(
+                "Connection interrupted. Continue where you left off."
+            ):
+                yield event
 
         # 6. Drain remaining queue for next turn
         self._pending_messages = _drain_queue(self._hook_state.message_queue)
