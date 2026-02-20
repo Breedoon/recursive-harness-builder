@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from obs_agent.events import StatusEvent
@@ -378,7 +378,8 @@ class TelegramBot:
                     disable_notification=disable_notification,
                 )
             except BadRequest as exc:
-                if "can't parse entities" in str(exc).lower():
+                msg_lower = str(exc).lower()
+                if "can't parse entities" in msg_lower:
                     logger.warning("HTML parse failed, sending plain text: %s", exc)
                     plain = re.sub(r"<[^>]+>", "", chunk)
                     await bot.send_message(
@@ -387,6 +388,20 @@ class TelegramBot:
                         disable_web_page_preview=True,
                         disable_notification=disable_notification,
                     )
+                elif "too long" in msg_lower:
+                    logger.warning(
+                        "Chunk too long (%d chars), re-splitting as plain text: %s",
+                        len(chunk), exc,
+                    )
+                    plain = re.sub(r"<[^>]+>", "", chunk)
+                    sub_chunks = split_message(plain)
+                    for sub in sub_chunks:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=sub,
+                            disable_web_page_preview=True,
+                            disable_notification=disable_notification,
+                        )
                 else:
                     raise
 
@@ -468,15 +483,22 @@ class TelegramBot:
                     disable_web_page_preview=True,
                 )
 
+        except TelegramError as exc:
+            # Telegram API error (BadRequest, NetworkError, etc.)
+            # The SDK session is perfectly fine — do NOT reset anything.
+            logger.warning("Telegram sending error (session untouched): %s", exc)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="(error sending message — try again)",
+                    disable_web_page_preview=True,
+                    disable_notification=False,
+                )
+            except Exception:
+                logger.exception("Failed to send error notification")
+
         except Exception as exc:
             logger.exception("Error in ConversationRunner")
-
-            # Deliver partial turn if available.
-            if turn_items:
-                try:
-                    await self._flush_turn(chat_id=chat_id, bot=bot, turn_items=turn_items)
-                except Exception:
-                    logger.exception("Failed to send partial turn before error")
 
             error_detail = f"{type(exc).__name__}: {exc}"
             if len(error_detail) > 200:

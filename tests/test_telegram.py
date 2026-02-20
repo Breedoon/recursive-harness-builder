@@ -12,6 +12,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telegram.error import BadRequest
 
 from obs_agent.events import StatusEvent
 from obs_agent.runner import DoneEvent, TextEvent, TurnEndEvent
@@ -316,3 +317,139 @@ class TestFragmentBuffer:
 
         await asyncio.gather(buf.add(u1, ctx), buf.add(u2, ctx))
         assert len(received) == 2
+
+
+# --- Error handling ---
+
+
+class TestTelegramErrorHandling:
+    """Verify that Telegram API errors don't nuke the SDK session."""
+
+    async def test_telegram_badrequest_handled_without_session_reset(self, config):
+        """BadRequest 'too long' is handled by _send_html fallback, not by crashing."""
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        events = [
+            TextEvent(text="x" * 5000),  # oversized
+            TurnEndEvent(),
+            DoneEvent(),
+        ]
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                for event in events:
+                    yield event
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            with patch.object(
+                bot._session_manager, "soft_reset", new_callable=AsyncMock
+            ) as mock_soft, patch.object(
+                bot._session_manager, "async_reset", new_callable=AsyncMock
+            ) as mock_full:
+                update = _make_update("test")
+                ctx = _make_context()
+
+                # First call: raise "too long", subsequent calls: succeed
+                call_count = 0
+
+                async def send_side_effect(**kwargs):
+                    nonlocal call_count
+                    call_count += 1
+                    if call_count == 1:
+                        raise BadRequest("Message is too long")
+
+                ctx.bot.send_message = AsyncMock(side_effect=send_side_effect)
+
+                await bot.handle_message(update, ctx)
+
+                # Neither session reset method should have been called
+                mock_soft.assert_not_called()
+                mock_full.assert_not_called()
+
+    async def test_telegram_error_propagated_no_reset(self, config):
+        """If a TelegramError escapes _send_html, the except block handles it
+        without any session reset."""
+        from telegram.error import TelegramError as TgError
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        events = [
+            TextEvent(text="hello"),
+            TurnEndEvent(),
+            DoneEvent(),
+        ]
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                for event in events:
+                    yield event
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            with patch.object(
+                bot._session_manager, "soft_reset", new_callable=AsyncMock
+            ) as mock_soft, patch.object(
+                bot._session_manager, "async_reset", new_callable=AsyncMock
+            ) as mock_full:
+                update = _make_update("test")
+                ctx = _make_context()
+
+                # All send_message calls raise a generic TelegramError
+                ctx.bot.send_message = AsyncMock(
+                    side_effect=TgError("network error")
+                )
+
+                await bot.handle_message(update, ctx)
+
+                # No session resets — only Telegram is broken, not SDK
+                mock_soft.assert_not_called()
+                mock_full.assert_not_called()
+
+    async def test_sdk_error_triggers_soft_reset(self, config):
+        """SDK errors (not Telegram) should trigger soft_reset."""
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                raise Exception("JSON message exceeded maximum buffer size")
+                yield  # noqa: unreachable
+
+            instance.run = mock_run
+
+            with patch.object(bot._session_manager, "soft_reset", new_callable=AsyncMock) as mock_soft:
+                update = _make_update("test")
+                ctx = _make_context()
+                await bot.handle_message(update, ctx)
+
+                mock_soft.assert_called_once()
+
+    async def test_process_error_triggers_full_reset(self, config):
+        """ProcessError should trigger async_reset (full session nuke)."""
+        from claude_agent_sdk import ProcessError
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                raise ProcessError("CLI died", exit_code=1)
+                yield  # noqa: unreachable
+
+            instance.run = mock_run
+
+            with patch.object(bot._session_manager, "async_reset", new_callable=AsyncMock) as mock_full:
+                update = _make_update("test")
+                ctx = _make_context()
+                await bot.handle_message(update, ctx)
+
+                mock_full.assert_called_once()

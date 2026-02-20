@@ -189,15 +189,15 @@ def split_message(html: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
         pre_closes = candidate.count("</pre>")
 
         if pre_opens > pre_closes:
-            # We'd split inside a code block — try to find the </pre> end
-            pre_end = remaining.find("</pre>", limit)
-            if pre_end != -1 and pre_end < limit * 2:
-                # Code block ends within a reasonable range — include it whole
+            # We'd split inside a code block.
+            # Only keep the block whole if it fits within the limit.
+            pre_end = remaining.find("</pre>")
+            if pre_end != -1 and pre_end + len("</pre>") <= limit:
                 split_pos = pre_end + len("</pre>")
                 chunks.append(remaining[:split_pos])
                 remaining = remaining[split_pos:].lstrip("\n")
                 continue
-            # Code block is too long — force split with fence close/reopen
+            # Code block too long — force split with fence close/reopen
             split_pos = remaining.rfind("\n", 0, limit - len("</pre>"))
             if split_pos > 0:
                 chunks.append(remaining[:split_pos] + "</pre>")

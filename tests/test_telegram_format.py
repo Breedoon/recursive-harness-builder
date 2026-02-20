@@ -381,3 +381,55 @@ class TestSplitMessage:
         # First chunk should end with </pre>, second should start with <pre>
         assert chunks[0].endswith("</pre>")
         assert chunks[1].startswith("<pre>")
+
+    # --- Stress tests: invariant checks ---
+
+    def test_no_chunk_exceeds_limit(self):
+        """INVARIANT: every chunk must be <= limit, regardless of content."""
+        limit = 200
+        cases = [
+            # Large pre block between limit and limit*2 (was the bug)
+            "<pre>" + "x" * 350 + "</pre>",
+            # Pre block with newlines
+            "<pre>" + "\n".join(f"line {i}: content" for i in range(50)) + "</pre>",
+            # Mixed content with pre block
+            "Intro text.\n\n<pre>" + "y" * 300 + "</pre>\n\nConclusion.",
+            # Multiple pre blocks
+            "<pre>" + "a" * 180 + "</pre>\n<pre>" + "b" * 180 + "</pre>",
+            # Pure text, long
+            "word " * 200,
+            # Entity-heavy content
+            "&amp; " * 200,
+            # No newlines at all
+            "x" * 1000,
+        ]
+        for text in cases:
+            chunks = split_message(text, limit=limit)
+            for i, chunk in enumerate(chunks):
+                assert len(chunk) <= limit, (
+                    f"Chunk {i} is {len(chunk)} chars (limit={limit}): "
+                    f"{chunk[:80]}..."
+                )
+
+    def test_no_chunk_exceeds_default_limit(self):
+        """Stress test at the real 4000-char default limit."""
+        # Simulate a large skill file dump inside a code fence
+        skill_content = "\n".join(f"- rule {i}: " + "x" * 60 for i in range(100))
+        text = f"<pre>{skill_content}</pre>"
+        chunks = split_message(text)
+        for i, chunk in enumerate(chunks):
+            assert len(chunk) <= 4000, (
+                f"Chunk {i} is {len(chunk)} chars (limit=4000)"
+            )
+
+    def test_content_preserved_after_split(self):
+        """All original content characters should survive splitting."""
+        text = "Hello\n\n" + "<pre>" + "x" * 500 + "</pre>" + "\n\nWorld"
+        chunks = split_message(text, limit=200)
+        rejoined = "".join(chunks)
+        # Strip tags and whitespace — content chars must survive
+        plain_original = text.replace("<pre>", "").replace("</pre>", "")
+        plain_rejoined = rejoined.replace("<pre>", "").replace("</pre>", "")
+        # Whitespace may change at split boundaries, so compare non-ws content
+        assert plain_original.replace("\n", "").replace(" ", "") == \
+               plain_rejoined.replace("\n", "").replace(" ", "")
