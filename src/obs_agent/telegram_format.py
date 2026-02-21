@@ -39,6 +39,10 @@ def md_to_telegram_html(text: str) -> str:
     """
     html = _md.render(text)
     html = _convert_to_telegram_html(html)
+    # markdown-it-py encodes " as &quot; (standard HTML). Telegram renders
+    # this literally as visible &quot; text, so decode it back. Telegram's
+    # HTML parser only requires <, >, and & to be encoded.
+    html = html.replace("&quot;", '"')
     return html.strip()
 
 

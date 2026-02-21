@@ -432,8 +432,8 @@ class TestTelegramErrorHandling:
 
                 mock_soft.assert_called_once()
 
-    async def test_process_error_triggers_full_reset(self, config):
-        """ProcessError should trigger async_reset (full session nuke)."""
+    async def test_process_error_preserves_session(self, config):
+        """ProcessError should trigger soft_reset (session preserved), NOT async_reset."""
         from claude_agent_sdk import ProcessError
 
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -447,9 +447,23 @@ class TestTelegramErrorHandling:
 
             instance.run = mock_run
 
-            with patch.object(bot._session_manager, "async_reset", new_callable=AsyncMock) as mock_full:
+            with patch.object(
+                bot._session_manager, "soft_reset", new_callable=AsyncMock
+            ) as mock_soft, patch.object(
+                bot._session_manager, "async_reset", new_callable=AsyncMock
+            ) as mock_full:
                 update = _make_update("test")
                 ctx = _make_context()
                 await bot.handle_message(update, ctx)
 
-                mock_full.assert_called_once()
+                # soft_reset called, async_reset NOT called
+                mock_soft.assert_called_once()
+                mock_full.assert_not_called()
+
+                # Error message says "session preserved", not "session reset"
+                sent_calls = ctx.bot.send_message.call_args_list
+                error_texts = [
+                    c.kwargs.get("text", "") for c in sent_calls
+                    if "error" in c.kwargs.get("text", "").lower()
+                ]
+                assert any("session preserved" in t for t in error_texts)

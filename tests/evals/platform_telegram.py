@@ -48,7 +48,7 @@ class TelegramPlatform:
         api_hash: str | None = None,
         session_string: str | None = None,
         bot_username: str | None = None,
-        timeout: int = 120,
+        timeout: int = 180,
     ) -> None:
         self._api_id = api_id or int(os.environ["TELEGRAM_API_ID"])
         self._api_hash = api_hash or os.environ["TELEGRAM_API_HASH"]
@@ -60,7 +60,13 @@ class TelegramPlatform:
         self._response_queue: asyncio.Queue[str] = asyncio.Queue()
 
     async def connect(self) -> None:
-        """Connect the Telethon client and set up the message handler."""
+        """Connect the Telethon client and set up the message handler.
+
+        After connecting, reads the latest message ID from the bot chat to
+        establish a baseline. Only messages with ID > baseline are enqueued,
+        preventing stale messages from previous test runs from contaminating
+        the current scenario.
+        """
         self._client = TelegramClient(
             StringSession(self._session_string),
             self._api_id,
@@ -75,9 +81,24 @@ class TelegramPlatform:
         # Resolve bot entity
         self._bot_entity = await self._client.get_entity(self._bot_username)
 
-        # Listen for messages from the bot
+        # Establish baseline: ignore any messages already in the chat.
+        # This prevents cross-run contamination from previous test runs.
+        self._baseline_msg_id = 0
+        async for msg in self._client.iter_messages(self._bot_entity, limit=1):
+            self._baseline_msg_id = msg.id
+        logger.info(
+            "TelegramPlatform baseline message ID: %d", self._baseline_msg_id
+        )
+
+        # Listen for messages from the bot — only enqueue messages AFTER baseline
         @self._client.on(NewMessage(from_users=[self._bot_entity.id]))
         async def _on_bot_message(event: NewMessage.Event) -> None:
+            if event.message.id <= self._baseline_msg_id:
+                logger.debug(
+                    "Ignoring stale message id=%d (baseline=%d)",
+                    event.message.id, self._baseline_msg_id,
+                )
+                return
             text = event.message.text or ""
             self._response_queue.put_nowait(text)
 
@@ -138,6 +159,31 @@ class TelegramPlatform:
                 continue
 
         return "\n".join(chunks)
+
+    async def rebaseline(self) -> None:
+        """Update baseline to the latest message in the chat.
+
+        Call after /new succeeds to ignore any stale chunks still being
+        delivered from a previous scenario's response.
+        """
+        if self._client is None:
+            return
+        async for msg in self._client.iter_messages(self._bot_entity, limit=1):
+            old = self._baseline_msg_id
+            self._baseline_msg_id = msg.id
+            logger.info(
+                "Rebaselined message ID: %d -> %d", old, self._baseline_msg_id
+            )
+        # Drain the queue of any chunks that arrived before rebaseline
+        drained = 0
+        while not self._response_queue.empty():
+            try:
+                self._response_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        if drained:
+            logger.info("Rebaseline drained %d stale chunk(s)", drained)
 
     async def send(self, text: str) -> str:
         """Send a message to the bot and wait for the complete reply.

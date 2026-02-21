@@ -433,3 +433,64 @@ class TestSplitMessage:
         # Whitespace may change at split boundaries, so compare non-ws content
         assert plain_original.replace("\n", "").replace(" ", "") == \
                plain_rejoined.replace("\n", "").replace(" ", "")
+
+    # --- 100K+ stress tests ---
+
+    def test_split_massive_mixed_content(self):
+        """100K+ chars of mixed HTML (code blocks, headers, lists, tables).
+
+        Every chunk must be <= 4000 chars and total content must be preserved.
+        """
+        sections: list[str] = []
+        for i in range(120):
+            sections.append(f"<b>Section {i}</b>\n")
+            sections.append("• " + "word " * 40 + "\n")
+            sections.append("• " + "data " * 40 + "\n\n")
+            sections.append(f"<pre>def func_{i}():\n")
+            sections.append("    " + "x = 1\n" * 20)
+            sections.append("</pre>\n\n")
+            sections.append(f"1. Step {i} " + "detail " * 30 + "\n")
+            sections.append(f"2. Step {i}b " + "more " * 30 + "\n\n")
+        text = "".join(sections)
+        assert len(text) > 100_000, f"Test payload is only {len(text)} chars"
+
+        chunks = split_message(text)
+        for i, chunk in enumerate(chunks):
+            assert len(chunk) <= 4000, (
+                f"Chunk {i} is {len(chunk)} chars (limit=4000): {chunk[:80]}..."
+            )
+        assert len(chunks) > 25, "Should produce many chunks for 100K+ content"
+
+        # Verify no empty chunks
+        for chunk in chunks:
+            assert chunk.strip(), "Empty chunk found"
+
+    def test_split_single_enormous_code_block(self):
+        """A single <pre> block of 50K+ chars — fence close/reopen across many splits.
+
+        Every chunk must be <= 4000 chars.
+        """
+        code_lines = [f"line_{i}: " + "x" * 60 for i in range(800)]
+        code_content = "\n".join(code_lines)
+        text = f"<pre>{code_content}</pre>"
+        assert len(text) > 50_000, f"Test payload is only {len(text)} chars"
+
+        chunks = split_message(text)
+        for i, chunk in enumerate(chunks):
+            assert len(chunk) <= 4000, (
+                f"Chunk {i} is {len(chunk)} chars (limit=4000): {chunk[:80]}..."
+            )
+        assert len(chunks) > 12, "Should produce many chunks for 50K+ code block"
+
+        # First chunk should start with <pre>, last should end with </pre>
+        assert chunks[0].startswith("<pre>"), "First chunk must start with <pre>"
+        assert chunks[-1].rstrip().endswith("</pre>"), "Last chunk must end with </pre>"
+
+        # Middle chunks should have fence close/reopen pattern
+        for i in range(1, len(chunks) - 1):
+            assert chunks[i].startswith("<pre>"), (
+                f"Middle chunk {i} must start with <pre>: {chunks[i][:40]}"
+            )
+            assert chunks[i].rstrip().endswith("</pre>"), (
+                f"Middle chunk {i} must end with </pre>: {chunks[i][-40:]}"
+            )

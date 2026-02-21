@@ -262,11 +262,15 @@ class TelegramBot:
         await self._ensure_background_poller(context.bot)
 
         chat_id = update.effective_message.chat_id
+        # Set interrupt BEFORE acquiring lock — if a response is in-progress
+        # (holding the lock), this causes it to exit at the next tool boundary,
+        # releasing the lock sooner.
+        self._hook_state.interrupt_flag = True
         lock = self._get_chat_lock(chat_id)
         async with lock:
             await self._session_manager.async_reset()
             self._pending_messages.clear()
-            self._hook_state.interrupt_flag = False
+            self._hook_state.reset()  # Drain queues, cancel background tasks
             logger.info("Session reset via /new from user %d", update.effective_user.id)
             await update.effective_message.reply_text(
                 "Session cleared. Starting fresh.",
@@ -417,6 +421,10 @@ class TelegramBot:
         html_text = self._render_turn_html(turn_items)
         if not html_text:
             return
+        logger.info(
+            "[flush_turn] sending %d chars (%d items) chat=%d",
+            len(html_text), len(turn_items), chat_id,
+        )
         await self._send_html(
             chat_id=chat_id,
             bot=bot,
@@ -445,20 +453,36 @@ class TelegramBot:
 
         turn_items: list[TextEvent | StatusEvent] = []
         done_sent = False
+        event_count = 0
+        turn_count = 0
         self._busy_chats.add(chat_id)
+        logger.info(
+            "[run_and_send] START chat=%d msg=%s",
+            chat_id, user_text[:80],
+        )
 
         try:
             async for event in runner.run(user_text):
+                event_count += 1
                 if isinstance(event, TextEvent | StatusEvent):
                     turn_items.append(event)
                     continue
 
                 if isinstance(event, TurnEndEvent):
+                    turn_count += 1
+                    logger.info(
+                        "[run_and_send] TurnEnd #%d items=%d chat=%d",
+                        turn_count, len(turn_items), chat_id,
+                    )
                     await self._flush_turn(chat_id=chat_id, bot=bot, turn_items=turn_items)
                     turn_items.clear()
                     continue
 
                 if isinstance(event, DoneEvent):
+                    logger.info(
+                        "[run_and_send] DoneEvent events=%d turns=%d chat=%d",
+                        event_count, turn_count, chat_id,
+                    )
                     # Safety flush in case a producer emitted text without TurnEndEvent.
                     if turn_items:
                         await self._flush_turn(chat_id=chat_id, bot=bot, turn_items=turn_items)
@@ -482,6 +506,7 @@ class TelegramBot:
                     disable_notification=False,
                     disable_web_page_preview=True,
                 )
+                done_sent = True
 
         except TelegramError as exc:
             # Telegram API error (BadRequest, NetworkError, etc.)
@@ -504,43 +529,37 @@ class TelegramBot:
             if len(error_detail) > 200:
                 error_detail = error_detail[:200] + "..."
 
-            from obs_agent.runner import _is_recoverable
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"(error: {error_detail} — session preserved)",
+                    disable_web_page_preview=True,
+                    disable_notification=False,
+                )
+            except Exception:
+                logger.exception("Failed to send error reply")
 
-            if _is_recoverable(exc):
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"(error: {error_detail} — session preserved)",
-                        disable_web_page_preview=True,
-                        disable_notification=False,
-                    )
-                except Exception:
-                    logger.exception("Failed to send error reply")
-
-                try:
-                    await self._session_manager.soft_reset()
-                    logger.info("Soft reset after recoverable error (session_id preserved)")
-                except Exception:
-                    logger.warning("Soft reset failed", exc_info=True)
-            else:
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"(error: {error_detail} — session reset)",
-                        disable_web_page_preview=True,
-                        disable_notification=False,
-                    )
-                except Exception:
-                    logger.exception("Failed to send error reply")
-
-                try:
-                    await self._session_manager.async_reset()
-                    logger.info("Full reset after unrecoverable error")
-                except Exception:
-                    logger.warning("Full reset failed", exc_info=True)
+            try:
+                await self._session_manager.soft_reset()
+                logger.info("Soft reset after error (session_id preserved)")
+            except Exception:
+                logger.warning("Soft reset failed", exc_info=True)
 
         finally:
             self._busy_chats.discard(chat_id)
+            # Always send the (done) sentinel so consumers (eval harness, etc.)
+            # know the turn is complete. Without this, _collect_response with
+            # require_done=True hangs until timeout on error paths.
+            if not done_sent:
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="(done)",
+                        disable_notification=False,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    logger.debug("Failed to send (done) sentinel in finally", exc_info=True)
 
     async def _process_message(
         self,
@@ -559,12 +578,18 @@ class TelegramBot:
         logger.info("Processing message from chat %d: %s", chat_id, user_text[:100])
 
         lock = self._get_chat_lock(chat_id)
+        logger.info(
+            "[process_message] lock.locked=%s busy=%s chat=%d",
+            lock.locked(), bool(self._busy_chats), chat_id,
+        )
         async with lock:
+            logger.info("[process_message] lock acquired chat=%d", chat_id)
             await self._run_and_send(
                 user_text=user_text,
                 chat_id=chat_id,
                 bot=context.bot,
             )
+            logger.info("[process_message] _run_and_send returned chat=%d", chat_id)
 
     async def _background_poller_loop(self) -> None:
         """Poll for queued background messages and auto-deliver when idle."""

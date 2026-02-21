@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, AsyncIterator
 from claude_agent_sdk import (
     CLIConnectionError,
     CLIJSONDecodeError,
+    CLINotFoundError,
     ProcessError,
     TextBlock,
     ThinkingBlock,
@@ -66,19 +67,15 @@ RunnerEvent = TextEvent | StatusEvent | TurnEndEvent | DoneEvent
 def _is_recoverable(exc: BaseException) -> bool:
     """Classify whether an error is recoverable via session reconnect.
 
-    Recoverable: buffer overflow, connection issues, generic stream errors.
-    Unrecoverable: CLI process died (ProcessError), CLI not found.
+    Almost everything is recoverable: even when the CLI process dies
+    (ProcessError), a new client with ``resume=session_id`` starts a fresh
+    process that loads conversation history from disk.
+
+    The only truly unrecoverable case is ``CLINotFoundError`` — the ``claude``
+    binary isn't installed, so no reconnect can succeed.
     """
-    if isinstance(exc, ProcessError):
+    if isinstance(exc, CLINotFoundError):
         return False
-    if isinstance(exc, (CLIJSONDecodeError, CLIConnectionError)):
-        return True
-    msg = str(exc).lower()
-    if "buffer size" in msg or "json" in msg:
-        return True
-    if "process" in msg and "exit code" in msg:
-        return False
-    # Default: try reconnect; worst case it fails and we re-raise.
     return True
 
 
@@ -180,11 +177,12 @@ class ConversationRunner:
     ) -> AsyncIterator[RunnerEvent]:
         """Stream response; on recoverable error reconnect and re-stream.
 
-        On unrecoverable errors (e.g. ``ProcessError``) the exception
+        On unrecoverable errors (e.g. ``CLINotFoundError``) the exception
         propagates immediately.  On recoverable errors we reconnect via
         ``SessionManager.reconnect()`` (preserves session_id), send
-        *retry_prompt* and stream again.  If the retry also fails the
-        exception propagates to the caller.
+        *retry_prompt* and stream again.  If reconnect fails (e.g. no
+        session_id yet), falls back to a fresh session via disconnect +
+        get_client.  If the retry also fails the exception propagates.
         """
         try:
             async for event in self._stream_response():
@@ -192,8 +190,20 @@ class ConversationRunner:
         except Exception as exc:
             if not _is_recoverable(exc):
                 raise
-            logger.warning("Recoverable stream error, reconnecting: %s", exc)
-            self._client = await self._session_mgr.reconnect()
+            logger.warning("Stream error, attempting reconnect: %s", exc)
+            try:
+                self._client = await self._session_mgr.reconnect()
+            except Exception:
+                logger.warning(
+                    "Reconnect failed (no session_id?), falling back to fresh session",
+                    exc_info=True,
+                )
+                await self._session_mgr.disconnect()
+                try:
+                    self._client = await self._session_mgr.get_client()
+                except Exception:
+                    logger.error("Fresh session also failed", exc_info=True)
+                    raise exc from None
             await self._client.query(f"(System: {retry_prompt})")
             async for event in self._stream_response():
                 yield event
@@ -205,8 +215,20 @@ class ConversationRunner:
         except Exception as exc:
             if not _is_recoverable(exc):
                 raise
-            logger.warning("Error sending query, reconnecting: %s", exc)
-            self._client = await self._session_mgr.reconnect()
+            logger.warning("Error sending query, attempting reconnect: %s", exc)
+            try:
+                self._client = await self._session_mgr.reconnect()
+            except Exception:
+                logger.warning(
+                    "Reconnect failed (no session_id?), falling back to fresh session",
+                    exc_info=True,
+                )
+                await self._session_mgr.disconnect()
+                try:
+                    self._client = await self._session_mgr.get_client()
+                except Exception:
+                    logger.error("Fresh session also failed", exc_info=True)
+                    raise exc from None
             await self._client.query(prompt)
 
     # ------------------------------------------------------------------
@@ -245,7 +267,15 @@ class ConversationRunner:
             )
 
         # 2. Get client and send query (with reconnect on connection loss)
-        self._client = await self._session_mgr.get_client()
+        try:
+            self._client = await self._session_mgr.get_client()
+        except Exception as exc:
+            if not _is_recoverable(exc):
+                raise
+            logger.warning("Connection failed on get_client, reconnecting: %s", exc)
+            await self._session_mgr.disconnect()
+            self._client = await self._session_mgr.get_client()
+
         try:
             await self._client.query(actual_message)
         except Exception as exc:

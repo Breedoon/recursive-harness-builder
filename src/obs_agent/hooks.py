@@ -133,6 +133,33 @@ class HookState:
     background_tasks: set[asyncio.Task] = field(default_factory=set)
     last_result_data: dict | None = None  # last ResultMessage metrics
 
+    def reset(self) -> None:
+        """Clear all queued state for a fresh session.
+
+        Called by /new to prevent cross-scenario contamination from
+        stale background fork results or queued messages.
+        """
+        # Drain message queue
+        while not self.message_queue.empty():
+            try:
+                self.message_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        # Drain status queue
+        while not self.status_queue.empty():
+            try:
+                self.status_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        # Cancel running background tasks
+        for task in self.background_tasks:
+            if not task.done():
+                task.cancel()
+        self.background_tasks.clear()
+        self.interrupt_flag = False
+        self.session_id = None
+        self.last_result_data = None
+
 
 class HookPipeline:
     """Chains multiple check functions into a single SDK HookCallback.

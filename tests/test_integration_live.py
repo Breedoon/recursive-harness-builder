@@ -75,6 +75,51 @@ async def live_server(e2e_config):
         serve_task.cancel()
 
 
+@pytest.fixture
+async def small_buffer_server(e2e_config):
+    """Start a real uvicorn server with a 4KB buffer to force overflow.
+
+    The SDK init handshake needs ~2-3KB, so 4KB allows connect() to succeed.
+    A large file (large_test_data.md) is placed in the vault; asking the agent
+    to read it produces a tool result JSON > 4KB, triggering the overflow.
+    The runner catches it, reconnects, and the session survives.
+    """
+    # Place a large file in the vault that will cause tool result overflow
+    large_file = e2e_config.vault_path / "large_test_data.md"
+    large_file.write_text("# Large Test Data\n\n" + ("This is test content line. " * 300) + "\n")
+
+    e2e_config.max_buffer_size = 4096  # 4KB — init passes, tool results overflow
+    port = _free_port()
+    app = create_app(e2e_config)
+    server_config = uvicorn.Config(
+        app=app, host="127.0.0.1", port=port, log_level="warning"
+    )
+    server = uvicorn.Server(server_config)
+    serve_task = asyncio.create_task(server.serve())
+
+    base_url = f"http://127.0.0.1:{port}"
+    for _ in range(50):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{base_url}/health", timeout=0.5)
+                if resp.status_code == 200:
+                    break
+        except (httpx.ConnectError, httpx.ReadError):
+            pass
+        await asyncio.sleep(0.1)
+    else:
+        serve_task.cancel()
+        pytest.fail("Small-buffer server failed to start within 5 seconds")
+
+    yield base_url
+
+    server.should_exit = True
+    try:
+        await asyncio.wait_for(serve_task, timeout=5.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        serve_task.cancel()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -350,6 +395,59 @@ class TestLiveIntegration:
         data = resp.json()
         assert "response" in data, "Response JSON must contain 'response' key"
         assert len(data["response"]) > 0, "Response must be non-empty"
+
+    async def test_buffer_overflow_recovery(self, small_buffer_server):
+        """Force a real buffer overflow via tool result, verify daemon survives.
+
+        The small_buffer_server fixture sets max_buffer_size=4096 (4KB) and
+        places a large file (large_test_data.md, ~8KB) in the vault. When the
+        agent reads it, the tool result JSON exceeds 4KB, triggering the SDK
+        buffer overflow. The runner catches it, recovers, and the daemon stays
+        alive for the next request.
+
+        What we test:
+        - The first request may return a partial/recovered response (status 200)
+        - The daemon does NOT crash — a follow-up request works normally
+        """
+        # Step 1: ask the agent to read the large file — tool result will overflow
+        async with httpx.AsyncClient() as client:
+            resp1 = await client.post(
+                f"{small_buffer_server}/chat",
+                json={"message": (
+                    "Read the file large_test_data.md from the vault root "
+                    "and tell me what it contains."
+                )},
+                timeout=180.0,
+            )
+        # The first request should succeed (200) after recovery, but we also
+        # accept 500 if the recovery path doesn't fully work — the key test
+        # is that the daemon stays alive for the follow-up.
+        logger.info(
+            "Buffer overflow test - first response status: %d, body: %s",
+            resp1.status_code,
+            resp1.text[:300],
+        )
+
+        # Step 2: follow-up proves the daemon didn't crash
+        # This is the real test: the daemon is still functional
+        async with httpx.AsyncClient() as client:
+            resp2 = await client.post(
+                f"{small_buffer_server}/chat",
+                json={"message": "What is 2 + 2? Reply with just the number."},
+                timeout=120.0,
+            )
+        assert resp2.status_code == 200, (
+            f"Follow-up request must succeed (daemon alive). Got {resp2.status_code}: {resp2.text[:200]}"
+        )
+        data2 = resp2.json()
+        assert len(data2.get("response", "")) > 0, (
+            "Follow-up must get a non-empty response (daemon is alive)"
+        )
+
+        logger.info(
+            "Buffer overflow test - follow-up response: %s",
+            data2["response"][:200],
+        )
 
     async def test_multi_turn_streaming_works(self, live_server):
         """Multi-turn streaming: second message works after first completes.

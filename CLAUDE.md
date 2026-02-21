@@ -150,19 +150,46 @@ the scenario against the real CLI with a real vault clone, then judges PASS/FAIL
    does not mean "looks good" unless `NOTES: none`.
 
 11. **BRAINSTORM FALSIFIABILITY BEFORE WRITING CRITERIA.** Before drafting any eval,
-   spend a minute asking: "If this feature is completely broken, what would the output
-   look like? Would my criteria still pass?" Write down the failure modes. Then write
-   criteria that explicitly reject them. Example: a context-usage tool that returns
-   zeroes and 100% remaining is broken — criteria must say "non-zero" and "NOT 100%",
-   not just "reports a number" and "mentions a percentage."
+   ask: "If this feature is completely broken, what would the output look like? Would
+   my criteria still pass?" Write criteria that test **behavioral outcomes**, not string
+   matching. Bad: "response does not contain '(session reset)'" — the code can change
+   the string while still nuking the session. Good: "the agent recalls details from the
+   first message in its second response, proving the conversation actually continued."
+   Test what a user would notice, not what an implementation detail looks like.
 
-12. **TREAT THE JUDGE AS A SMART COLLABORATOR, NOT A CHECKBOX MACHINE.** The judge
-   is a capable LLM. Give it real context: what the feature does, why the user wants
-   it, what correct output looks like, and what broken output looks like. The Intent
-   section should explain the purpose and expected behavior in enough detail that the
-   judge can independently spot problems — not just verify structural presence. Tell
-   the judge what "suspicious" means for this specific feature so it can exercise
-   judgment, not just pattern-match.
+12. **THE JUDGE IS INTELLIGENT. WRITE FOR INTELLIGENCE, NOT FOR A REGEX ENGINE.**
+   The judge is a capable LLM — treat it like a smart QA engineer, not a checkbox
+   machine. The Intent section is the judge's primary weapon. It should explain:
+   - What this feature is and why it matters to the user
+   - What a normal successful interaction looks like from the user's perspective
+   - What a broken system would produce (give 2-3 concrete failure modes)
+   - What "suspicious but technically passing" looks like
+
+   **Criteria should be mostly behavioral and broad.** A few specific structural checks
+   are fine, but the criteria should not over-constrain the judge. Trust it to evaluate
+   whether the interaction felt like a working system, not just whether strings matched.
+   The best criteria read like what a user would check, not what a `grep` would check.
+
+   **Example of a rich Intent (session resilience eval):**
+   ```
+   ## Intent
+   This tests whether the agent's session survives errors. The system recovers from
+   SDK crashes by reconnecting to the same session — the user should never notice
+   anything broke. A working system: user sends message, something crashes internally,
+   user sends a follow-up, agent responds and remembers the previous conversation.
+   A broken system: the follow-up gets a blank-slate response with no memory of what
+   came before, or the agent says "starting fresh" or introduces itself again, or the
+   follow-up gets no response at all. Suspicious: agent responds to the follow-up but
+   is vague or generic in a way that could mean it lost context and is just being polite.
+   ```
+
+   **Example of good vs bad criteria:**
+   - Bad: `Response does not contain "(session reset)" or "error"` (tests a string)
+   - Bad: `Response is longer than 100 characters` (tests nothing meaningful)
+   - Good: `The agent's second response references specific content from the first
+     exchange, proving conversational memory survived` (tests real behavior)
+   - Good: `The response reads like a continuation of an ongoing conversation, not
+     like a fresh introduction or a cold start` (trusts the judge's intelligence)
 
 ### Running Tests
 

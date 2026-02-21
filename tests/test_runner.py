@@ -11,6 +11,7 @@ import pytest
 from claude_agent_sdk import (
     CLIConnectionError,
     CLIJSONDecodeError,
+    CLINotFoundError,
     ProcessError,
     TextBlock,
     ThinkingBlock,
@@ -332,10 +333,16 @@ class TestRunnerTurnBoundaries:
 
 
 class TestIsRecoverable:
-    """Test _is_recoverable error classification logic."""
+    """Test _is_recoverable error classification logic.
 
-    def test_process_error_not_recoverable(self):
-        assert not _is_recoverable(ProcessError("died", exit_code=1))
+    Policy: everything is recoverable EXCEPT CLINotFoundError (claude binary missing).
+    Even ProcessError (CLI died) is recoverable because resume=session_id starts
+    a fresh process that loads conversation history from disk.
+    """
+
+    def test_process_error_is_recoverable(self):
+        """ProcessError IS recoverable — reconnect with resume=session_id."""
+        assert _is_recoverable(ProcessError("died", exit_code=1))
 
     def test_cli_json_decode_error_recoverable(self):
         assert _is_recoverable(
@@ -352,12 +359,17 @@ class TestIsRecoverable:
         )
         assert _is_recoverable(exc)
 
-    def test_generic_process_exit_not_recoverable(self):
+    def test_generic_process_exit_recoverable(self):
+        """Even generic process-exit messages are recoverable."""
         exc = Exception("Command failed with exit code 1 (process died)")
-        assert not _is_recoverable(exc)
+        assert _is_recoverable(exc)
 
     def test_unknown_error_defaults_recoverable(self):
         assert _is_recoverable(RuntimeError("something weird"))
+
+    def test_cli_not_found_error_not_recoverable(self):
+        """CLINotFoundError is the ONLY unrecoverable case — claude binary missing."""
+        assert not _is_recoverable(CLINotFoundError("claude not found"))
 
 
 # --- Reconnect on stream errors ---
@@ -401,14 +413,48 @@ class TestRunnerReconnectOnStreamError:
         assert any("Recovered" in e.text for e in text_events)
         mock_reconnect.assert_called_once()
 
+    @patch("obs_agent.session.SessionManager.reconnect")
     @patch("obs_agent.session.SessionManager.get_client")
-    async def test_raises_on_unrecoverable_error(self, mock_get_client, config):
-        """ProcessError re-raises without reconnect attempt."""
+    async def test_process_error_attempts_reconnect(
+        self, mock_get_client, mock_reconnect, config
+    ):
+        """ProcessError is now recoverable — reconnect IS attempted."""
         failing_client = AsyncMock()
         failing_client.query = AsyncMock()
 
         async def failing_receive():
             raise ProcessError("CLI died", exit_code=1)
+            yield  # noqa: unreachable
+
+        failing_client.receive_response = failing_receive
+        mock_get_client.return_value = failing_client
+
+        # Reconnect succeeds and returns a working client
+        recovery_msg = MagicMock()
+        recovery_msg.content = [TextBlock(text="Recovered after crash")]
+        recovery_msg.session_id = "sess-recovered"
+        recovery_client = _make_mock_client([recovery_msg])
+        mock_reconnect.return_value = recovery_client
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        events = await _collect_events(runner, "hello")
+
+        text_events = [e for e in events if isinstance(e, TextEvent)]
+        assert any("Recovered" in e.text for e in text_events)
+        mock_reconnect.assert_called_once()
+
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_cli_not_found_raises_immediately(self, mock_get_client, config):
+        """CLINotFoundError re-raises without reconnect attempt."""
+        failing_client = AsyncMock()
+        failing_client.query = AsyncMock()
+
+        async def failing_receive():
+            raise CLINotFoundError("claude not found")
             yield  # noqa: unreachable
 
         failing_client.receive_response = failing_receive
@@ -420,15 +466,15 @@ class TestRunnerReconnectOnStreamError:
         session_mgr = SessionManager(config=config, hook_state=hook_state)
         runner = ConversationRunner(session_mgr, hook_state, config)
 
-        with pytest.raises(ProcessError):
+        with pytest.raises(CLINotFoundError):
             await _collect_events(runner, "hello")
 
     @patch("obs_agent.session.SessionManager.reconnect")
     @patch("obs_agent.session.SessionManager.get_client")
-    async def test_reconnect_failure_propagates(
+    async def test_reconnect_failure_propagates_original_error(
         self, mock_get_client, mock_reconnect, config
     ):
-        """If reconnect itself fails, the error propagates to the caller."""
+        """If reconnect fails, the ORIGINAL stream error propagates to the caller."""
         failing_client = AsyncMock()
         failing_client.query = AsyncMock()
 
@@ -446,7 +492,7 @@ class TestRunnerReconnectOnStreamError:
         session_mgr = SessionManager(config=config, hook_state=hook_state)
         runner = ConversationRunner(session_mgr, hook_state, config)
 
-        with pytest.raises(RuntimeError, match="no session_id"):
+        with pytest.raises(CLIConnectionError, match="stream died"):
             await _collect_events(runner, "hello")
 
 
