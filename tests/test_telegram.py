@@ -63,8 +63,8 @@ class TestTelegramBotAuth:
             ctx = _make_context()
             await bot.handle_message(update, ctx)
 
-        # One content message + one done sentinel
-        assert ctx.bot.send_message.call_count == 2
+        # receipt + working + content + done
+        assert ctx.bot.send_message.call_count == 4
 
     async def test_disallowed_user_rejected(self, config):
         config.telegram_allowed_user_ids = [99999]
@@ -101,17 +101,17 @@ class TestTelegramMessageFlow:
             ctx = _make_context()
             await bot.handle_message(update, ctx)
 
-        assert ctx.bot.send_message.call_count == 2
+        assert ctx.bot.send_message.call_count == 4
 
-        first = ctx.bot.send_message.call_args_list[0].kwargs
-        assert first["parse_mode"] == "HTML"
-        assert first["disable_notification"] is True
-        assert "<i>Read: CLAUDE.md</i>" in first["text"]
-        assert "Hello from tool run" in first["text"]
-
-        second = ctx.bot.send_message.call_args_list[1].kwargs
-        assert second["text"] == "(done)"
-        assert second["disable_notification"] is False
+        calls = [c.kwargs for c in ctx.bot.send_message.call_args_list]
+        assert calls[0]["text"] == "(received)"
+        assert calls[1]["text"] == "(working)"
+        assert calls[2]["parse_mode"] == "HTML"
+        assert calls[2]["disable_notification"] is True
+        assert "<i>Read: CLAUDE.md</i>" in calls[2]["text"]
+        assert "Hello from tool run" in calls[2]["text"]
+        assert calls[3]["text"] == "(done)"
+        assert calls[3]["disable_notification"] is False
 
     async def test_sends_one_content_message_per_turn(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -137,10 +137,13 @@ class TestTelegramMessageFlow:
             ctx = _make_context()
             await bot.handle_message(update, ctx)
 
-        assert ctx.bot.send_message.call_count == 3
-        assert "turn one" in ctx.bot.send_message.call_args_list[0].kwargs["text"]
-        assert "turn two" in ctx.bot.send_message.call_args_list[1].kwargs["text"]
-        assert ctx.bot.send_message.call_args_list[2].kwargs["text"] == "(done)"
+        assert ctx.bot.send_message.call_count == 5
+        calls = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
+        assert calls[0] == "(received)"
+        assert calls[1] == "(working)"
+        assert "turn one" in calls[2]
+        assert "turn two" in calls[3]
+        assert calls[4] == "(done)"
 
 
 class TestPerChatLock:
@@ -370,9 +373,8 @@ class TestTelegramErrorHandling:
                 mock_soft.assert_not_called()
                 mock_full.assert_not_called()
 
-    async def test_telegram_error_propagated_no_reset(self, config):
-        """If a TelegramError escapes _send_html, the except block handles it
-        without any session reset."""
+    async def test_telegram_error_retried_no_reset(self, config):
+        """Transient Telegram errors are retried and do not reset the SDK session."""
         from telegram.error import TelegramError as TgError
 
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -401,12 +403,19 @@ class TestTelegramErrorHandling:
                 update = _make_update("test")
                 ctx = _make_context()
 
-                # All send_message calls raise a generic TelegramError
-                ctx.bot.send_message = AsyncMock(
-                    side_effect=TgError("network error")
-                )
+                # Fail the first send, then succeed. Retry path should recover.
+                call_count = 0
 
-                await bot.handle_message(update, ctx)
+                async def send_side_effect(**kwargs):
+                    nonlocal call_count
+                    call_count += 1
+                    if call_count == 1:
+                        raise TgError("network error")
+
+                ctx.bot.send_message = AsyncMock(side_effect=send_side_effect)
+
+                with patch("obs_agent.telegram.asyncio.sleep", new_callable=AsyncMock):
+                    await bot.handle_message(update, ctx)
 
                 # No session resets — only Telegram is broken, not SDK
                 mock_soft.assert_not_called()
@@ -467,3 +476,49 @@ class TestTelegramErrorHandling:
                     if "error" in c.kwargs.get("text", "").lower()
                 ]
                 assert any("session preserved" in t for t in error_texts)
+
+    async def test_transient_transport_error_does_not_truncate_run(self, config):
+        """A mid-stream Telegram send failure should retry and finish the turn."""
+        from telegram.error import TelegramError as TgError
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        events = [
+            TextEvent(text="chunk-1"),
+            TurnEndEvent(),
+            TextEvent(text="chunk-2"),
+            TurnEndEvent(),
+            TextEvent(text="FINAL_MARKER"),
+            TurnEndEvent(),
+            DoneEvent(),
+        ]
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                for event in events:
+                    yield event
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            update = _make_update("test")
+            ctx = _make_context()
+
+            call_count = 0
+
+            async def send_side_effect(**kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 4:
+                    raise TgError("temporary transport failure")
+
+            ctx.bot.send_message = AsyncMock(side_effect=send_side_effect)
+
+            with patch("obs_agent.telegram.asyncio.sleep", new_callable=AsyncMock):
+                await bot.handle_message(update, ctx)
+
+            texts = [c.kwargs.get("text", "") for c in ctx.bot.send_message.call_args_list]
+            assert any("FINAL_MARKER" in t for t in texts)
+            assert texts[-1] == "(done)"

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from obs_agent.events import StatusEvent
@@ -233,6 +233,47 @@ class TelegramBot:
             except asyncio.CancelledError:
                 pass
 
+    async def _send_plain_with_retry(
+        self,
+        *,
+        chat_id: int,
+        bot,
+        text: str,
+        disable_notification: bool,
+        parse_mode: ParseMode | None = None,
+    ) -> None:
+        """Send one Telegram message with retry/backoff on transport errors."""
+        attempt = 0
+        while True:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=True,
+                    disable_notification=disable_notification,
+                )
+                return
+            except RetryAfter as exc:
+                delay = max(float(exc.retry_after), 1.0)
+                attempt += 1
+                logger.warning(
+                    "Telegram rate limit chat=%d attempt=%d retry_in=%.1fs",
+                    chat_id, attempt, delay,
+                )
+                await asyncio.sleep(delay)
+            except BadRequest:
+                # Caller handles permanent payload errors (e.g. bad HTML entities).
+                raise
+            except TelegramError as exc:
+                attempt += 1
+                delay = min(30.0, 2 ** min(attempt, 5))
+                logger.warning(
+                    "Telegram send failed chat=%d attempt=%d retry_in=%.1fs: %s",
+                    chat_id, attempt, delay, exc,
+                )
+                await asyncio.sleep(delay)
+
     async def handle_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -374,11 +415,11 @@ class TelegramBot:
             if index > 0:
                 await asyncio.sleep(_CHUNK_DELAY_SECONDS)
             try:
-                await bot.send_message(
+                await self._send_plain_with_retry(
                     chat_id=chat_id,
+                    bot=bot,
                     text=chunk,
                     parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
                     disable_notification=disable_notification,
                 )
             except BadRequest as exc:
@@ -386,13 +427,14 @@ class TelegramBot:
                 if "can't parse entities" in msg_lower:
                     logger.warning("HTML parse failed, sending plain text: %s", exc)
                     plain = re.sub(r"<[^>]+>", "", chunk)
-                    await bot.send_message(
+                    await self._send_plain_with_retry(
                         chat_id=chat_id,
+                        bot=bot,
                         text=plain,
-                        disable_web_page_preview=True,
                         disable_notification=disable_notification,
                     )
-                elif "too long" in msg_lower:
+                    continue
+                if "too long" in msg_lower:
                     logger.warning(
                         "Chunk too long (%d chars), re-splitting as plain text: %s",
                         len(chunk), exc,
@@ -400,14 +442,14 @@ class TelegramBot:
                     plain = re.sub(r"<[^>]+>", "", chunk)
                     sub_chunks = split_message(plain)
                     for sub in sub_chunks:
-                        await bot.send_message(
+                        await self._send_plain_with_retry(
                             chat_id=chat_id,
+                            bot=bot,
                             text=sub,
-                            disable_web_page_preview=True,
                             disable_notification=disable_notification,
                         )
-                else:
-                    raise
+                    continue
+                raise
 
     async def _flush_turn(
         self,
@@ -462,6 +504,12 @@ class TelegramBot:
         )
 
         try:
+            await self._send_plain_with_retry(
+                chat_id=chat_id,
+                bot=bot,
+                text="(working)",
+                disable_notification=True,
+            )
             async for event in runner.run(user_text):
                 event_count += 1
                 if isinstance(event, TextEvent | StatusEvent):
@@ -488,11 +536,11 @@ class TelegramBot:
                         await self._flush_turn(chat_id=chat_id, bot=bot, turn_items=turn_items)
                         turn_items.clear()
 
-                    await bot.send_message(
+                    await self._send_plain_with_retry(
                         chat_id=chat_id,
+                        bot=bot,
                         text="(done)",
                         disable_notification=False,
-                        disable_web_page_preview=True,
                     )
                     done_sent = True
                     break
@@ -500,27 +548,13 @@ class TelegramBot:
             self._pending_messages = runner.remaining_pending
 
             if not done_sent:
-                await bot.send_message(
+                await self._send_plain_with_retry(
                     chat_id=chat_id,
+                    bot=bot,
                     text="(done)",
                     disable_notification=False,
-                    disable_web_page_preview=True,
                 )
                 done_sent = True
-
-        except TelegramError as exc:
-            # Telegram API error (BadRequest, NetworkError, etc.)
-            # The SDK session is perfectly fine — do NOT reset anything.
-            logger.warning("Telegram sending error (session untouched): %s", exc)
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="(error sending message — try again)",
-                    disable_web_page_preview=True,
-                    disable_notification=False,
-                )
-            except Exception:
-                logger.exception("Failed to send error notification")
 
         except Exception as exc:
             logger.exception("Error in ConversationRunner")
@@ -530,10 +564,10 @@ class TelegramBot:
                 error_detail = error_detail[:200] + "..."
 
             try:
-                await bot.send_message(
+                await self._send_plain_with_retry(
                     chat_id=chat_id,
+                    bot=bot,
                     text=f"(error: {error_detail} — session preserved)",
-                    disable_web_page_preview=True,
                     disable_notification=False,
                 )
             except Exception:
@@ -552,11 +586,11 @@ class TelegramBot:
             # require_done=True hangs until timeout on error paths.
             if not done_sent:
                 try:
-                    await bot.send_message(
+                    await self._send_plain_with_retry(
                         chat_id=chat_id,
+                        bot=bot,
                         text="(done)",
                         disable_notification=False,
-                        disable_web_page_preview=True,
                     )
                 except Exception:
                     logger.debug("Failed to send (done) sentinel in finally", exc_info=True)
@@ -582,6 +616,15 @@ class TelegramBot:
             "[process_message] lock.locked=%s busy=%s chat=%d",
             lock.locked(), bool(self._busy_chats), chat_id,
         )
+        try:
+            await self._send_plain_with_retry(
+                chat_id=chat_id,
+                bot=context.bot,
+                text="(received)",
+                disable_notification=True,
+            )
+        except Exception:
+            logger.debug("Failed to send receipt marker", exc_info=True)
         async with lock:
             logger.info("[process_message] lock acquired chat=%d", chat_id)
             await self._run_and_send(
@@ -605,7 +648,8 @@ class TelegramBot:
                     continue
 
                 queued = _drain_queue(self._hook_state.message_queue)
-                if not queued:
+                has_pending = bool(self._pending_messages)
+                if not queued and not has_pending:
                     continue
 
                 lock = self._get_chat_lock(chat_id)
@@ -615,7 +659,10 @@ class TelegramBot:
                         self._hook_state.message_queue.put_nowait(message)
                     continue
 
-                logger.info("Auto-delivering %d queued message(s)", len(queued))
+                logger.info(
+                    "Auto-delivering queued updates queued=%d pending=%d",
+                    len(queued), len(self._pending_messages),
+                )
                 async with lock:
                     # Re-check idle under lock, otherwise requeue.
                     if self._busy_chats:
@@ -627,7 +674,7 @@ class TelegramBot:
                         user_text=_AUTO_DELIVERY_PROMPT,
                         chat_id=chat_id,
                         bot=bot,
-                        extra_pending=queued,
+                        extra_pending=queued if queued else None,
                     )
 
             except asyncio.CancelledError:
