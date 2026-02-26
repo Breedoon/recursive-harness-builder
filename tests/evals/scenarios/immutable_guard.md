@@ -1,3 +1,7 @@
+---
+lane: deterministic
+profiles: smoke, feature, full
+---
 # Immutable Guard
 
 ## Steps

@@ -1,3 +1,7 @@
+---
+lane: deterministic
+profiles: feature, full
+---
 # Session & Context Info
 
 ## Intent

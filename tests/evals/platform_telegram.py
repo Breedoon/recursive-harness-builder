@@ -29,8 +29,14 @@ from telethon.sessions import StringSession
 
 logger = logging.getLogger("obs_agent.eval.telegram")
 
-# How long to wait for additional message chunks after the last one
-_SETTLE_SECONDS = 3.0
+# Default timeout tuning:
+# - First bot response can legitimately take some time
+# - After first content, long idle without `(done)` usually means transport
+#   desync or missing sentinel, so fail fast instead of idling for minutes
+_DEFAULT_FIRST_MESSAGE_TIMEOUT = 90.0
+_DEFAULT_DONE_TIMEOUT = 120.0
+_DEFAULT_IDLE_QUIESCENCE_TIMEOUT = 30.0
+_CONTROL_SETTLE_SECONDS = 3.0
 _DONE_SENTINEL = "(done)"
 
 
@@ -49,12 +55,18 @@ class TelegramPlatform:
         session_string: str | None = None,
         bot_username: str | None = None,
         timeout: int = 180,
+        first_message_timeout: float = _DEFAULT_FIRST_MESSAGE_TIMEOUT,
+        done_timeout: float = _DEFAULT_DONE_TIMEOUT,
+        idle_quiescence_timeout: float = _DEFAULT_IDLE_QUIESCENCE_TIMEOUT,
     ) -> None:
         self._api_id = api_id or int(os.environ["TELEGRAM_API_ID"])
         self._api_hash = api_hash or os.environ["TELEGRAM_API_HASH"]
         self._session_string = session_string or os.environ["TELEGRAM_SESSION"]
         self._bot_username = bot_username or os.environ["TELEGRAM_TEST_BOT_USERNAME"]
         self._timeout = timeout
+        self._first_message_timeout = first_message_timeout
+        self._done_timeout = done_timeout
+        self._idle_quiescence_timeout = idle_quiescence_timeout
         self._client: TelegramClient | None = None
         self._last_output = ""
         self._response_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -104,26 +116,38 @@ class TelegramPlatform:
 
         logger.info("TelegramPlatform connected to %s", self._bot_username)
 
-    async def _collect_response(self, timeout: float, *, require_done: bool = True) -> str:
+    async def _collect_response(
+        self,
+        timeout: float,
+        *,
+        require_done: bool = True,
+        first_message_timeout: float | None = None,
+        done_timeout: float | None = None,
+        idle_quiescence_timeout: float | None = None,
+    ) -> str:
         """Collect all response chunks until done sentinel or timeout.
 
-        Waits up to `timeout` for the first message, then keeps collecting:
-        - if require_done=True: until '(done)' or timeout budget exhausted
-        - if require_done=False: until idle settle window expires
-
-        This avoids truncating multi-turn Telegram outputs where there may be
-        multi-second gaps between chunks.
+        Timeout model:
+        - Wait up to first_message_timeout for first bot message
+        - For control commands (require_done=False), collect until short settle idle
+        - For normal turns (require_done=True):
+          - Wait for `(done)` up to done_timeout (capped by `timeout`)
+          - If idle >= idle_quiescence_timeout before `(done)`, fail fast
+            with a structured timeout marker
         """
         chunks: list[str] = []
+        first_budget = min(timeout, first_message_timeout or self._first_message_timeout)
+        done_budget = min(timeout, done_timeout or self._done_timeout)
+        idle_budget = idle_quiescence_timeout or self._idle_quiescence_timeout
 
-        # Wait for the first message with the full timeout
+        # Wait for the first message
         try:
             first = await asyncio.wait_for(
-                self._response_queue.get(), timeout=timeout
+                self._response_queue.get(), timeout=first_budget
             )
             chunks.append(first)
         except asyncio.TimeoutError:
-            return "(timeout: no response from bot)"
+            return f"(timeout: no response from bot after {first_budget:.0f}s)"
 
         if first.strip() == _DONE_SENTINEL:
             return "\n".join(chunks)
@@ -133,30 +157,35 @@ class TelegramPlatform:
             while True:
                 try:
                     more = await asyncio.wait_for(
-                        self._response_queue.get(), timeout=_SETTLE_SECONDS
+                        self._response_queue.get(), timeout=_CONTROL_SETTLE_SECONDS
                     )
                     chunks.append(more)
                 except asyncio.TimeoutError:
                     break
             return "\n".join(chunks)
 
-        # Collect additional chunks until done sentinel or overall timeout.
-        deadline = asyncio.get_running_loop().time() + timeout
+        # Collect additional chunks until done sentinel, with bounded done + idle budgets.
+        done_deadline = asyncio.get_running_loop().time() + done_budget
         while True:
-            remaining = deadline - asyncio.get_running_loop().time()
+            remaining = done_deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                break
+                return (
+                    f"(timeout: missing (done) sentinel after {done_budget:.0f}s; "
+                    f"{len(chunks)} chunk(s) received)"
+                )
             try:
                 more = await asyncio.wait_for(
                     self._response_queue.get(),
-                    timeout=min(_SETTLE_SECONDS, remaining),
+                    timeout=min(idle_budget, remaining),
                 )
                 chunks.append(more)
                 if more.strip() == _DONE_SENTINEL:
                     break
             except asyncio.TimeoutError:
-                # No chunk in this idle window; keep waiting until deadline.
-                continue
+                return (
+                    f"(timeout: missing (done) sentinel after {idle_budget:.0f}s idle; "
+                    f"{len(chunks)} chunk(s) received)"
+                )
 
         return "\n".join(chunks)
 

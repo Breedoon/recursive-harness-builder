@@ -1,3 +1,9 @@
+---
+lane: deterministic
+profiles: feature, full
+idle_quiescence_timeout: 240
+response_timeout: 420
+---
 # Telegram Message Split
 
 ## Intent
@@ -14,7 +20,7 @@ A broken system looks like:
 Suspicious: the response is short enough to fit in a single Telegram message (under 4000 chars), which means the splitting logic was never actually exercised. A proper test of message splitting requires content long enough to force multiple messages. Also suspicious: the response mentions the milestones by name but gives only a sentence each instead of the requested detail — that's technically responsive but dodges the stress test.
 
 ## Steps
-1. Send: "Write a detailed explanation of 10 major milestones in computing history: (1) Babbage's Analytical Engine, (2) Ada Lovelace's first algorithm, (3) Turing's contributions and the Turing machine, (4) ENIAC and the dawn of electronic computing, (5) the transistor and integrated circuits, (6) ARPANET and the birth of the Internet, (7) the personal computer revolution, (8) the World Wide Web, (9) smartphones and mobile computing, (10) modern AI and machine learning. Write at least 2 detailed paragraphs per milestone with historical context and significance. Include at least one code example or technical diagram where appropriate."
+1. Send: "Write a long, structured report about 10 milestones in computing history: (1) Babbage's Analytical Engine, (2) Ada Lovelace's first algorithm, (3) Turing and the Turing machine, (4) ENIAC, (5) transistor + integrated circuits, (6) ARPANET, (7) personal computer revolution, (8) World Wide Web, (9) smartphones/mobile computing, (10) modern AI/ML. For each milestone, include one substantial paragraph plus a short bullet list of key impacts. Include one small code example section. Target at least 5000 characters total."
    Wait: 180
 
 ## Criteria

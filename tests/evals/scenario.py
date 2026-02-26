@@ -51,12 +51,93 @@ class EvalScenario:
     intent: list[str] = field(default_factory=list)
     steps: list[EvalStep] = field(default_factory=list)
     criteria: list[str] = field(default_factory=list)
+    lane: str | None = None
+    profiles: list[str] = field(default_factory=list)
+    first_message_timeout: float | None = None
+    done_timeout: float | None = None
+    idle_quiescence_timeout: float | None = None
+    response_timeout: float | None = None
+    continuation_timeouts: list[int] = field(default_factory=list)
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+def _parse_frontmatter(lines: list[str]) -> tuple[dict[str, str], list[str]]:
+    """Parse optional simple YAML-like frontmatter.
+
+    Supported format at top of file:
+
+    ---
+    key: value
+    key2: value2
+    ---
+    """
+    if not lines or lines[0].strip() != "---":
+        return {}, lines
+
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, lines
+
+    raw_meta = lines[1:end]
+    content = lines[end + 1 :]
+    metadata: dict[str, str] = {}
+    for line in raw_meta:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        metadata[key.strip().lower()] = value.strip()
+    return metadata, content
+
+
+def _parse_csv_list(value: str) -> list[str]:
+    """Parse simple comma-separated list syntax."""
+    cleaned = value.strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    return [item.strip().strip("'\"") for item in cleaned.split(",") if item.strip()]
+
+
+def _parse_float(metadata: dict[str, str], key: str) -> float | None:
+    value = metadata.get(key)
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _parse_int_list(metadata: dict[str, str], key: str) -> list[int]:
+    value = metadata.get(key)
+    if not value:
+        return []
+    out: list[int] = []
+    for item in _parse_csv_list(value):
+        try:
+            out.append(int(item))
+        except ValueError:
+            continue
+    return out
 
 
 def parse_scenario(path: Path) -> EvalScenario:
     """Parse a scenario markdown file into an EvalScenario."""
     text = path.read_text()
-    lines = text.strip().splitlines()
+    raw_lines = text.splitlines()
+    metadata, lines = _parse_frontmatter(raw_lines)
+
+    # For parsing body sections, trim trailing/leading empty lines only.
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
 
     # Extract name from first heading
     name = path.stem
@@ -119,4 +200,27 @@ def parse_scenario(path: Path) -> EvalScenario:
             if intent_match:
                 intent.append(intent_match.group(1).strip())
 
-    return EvalScenario(name=name, intent=intent, steps=steps, criteria=criteria)
+    lane = metadata.get("lane")
+    if lane:
+        lane = lane.lower()
+    profiles = _parse_csv_list(metadata.get("profiles", ""))
+    continuation_timeouts = _parse_int_list(metadata, "continuation_timeouts")
+    first_message_timeout = _parse_float(metadata, "first_message_timeout")
+    done_timeout = _parse_float(metadata, "done_timeout")
+    idle_quiescence_timeout = _parse_float(metadata, "idle_quiescence_timeout")
+    response_timeout = _parse_float(metadata, "response_timeout")
+
+    return EvalScenario(
+        name=name,
+        intent=intent,
+        steps=steps,
+        criteria=criteria,
+        lane=lane,
+        profiles=profiles,
+        first_message_timeout=first_message_timeout,
+        done_timeout=done_timeout,
+        idle_quiescence_timeout=idle_quiescence_timeout,
+        response_timeout=response_timeout,
+        continuation_timeouts=continuation_timeouts,
+        metadata=metadata,
+    )

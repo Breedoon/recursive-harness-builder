@@ -1,7 +1,13 @@
+---
+lane: judge
+profiles: feature, full
+---
 # Telegram Chronological Output
 
 ## Intent
 - Ensure observable chronology: tool/status lines and text should make sense together as one timeline.
+- Broken behavior example: duplicated/misaligned done sentinels or disjoint turn ordering.
+- Suspicious behavior: subtle ordering drift where content is mostly correct but timeline markers are inconsistent.
 - Flag odd sequencing (for example duplicate done sentinels, disjointed tool text, or off-order content) even if the strict criteria pass.
 
 ## Steps

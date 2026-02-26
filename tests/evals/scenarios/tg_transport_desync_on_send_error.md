@@ -1,3 +1,7 @@
+---
+lane: judge
+profiles: feature, full
+---
 # Telegram Transport Desync On Send Error
 
 ## Intent

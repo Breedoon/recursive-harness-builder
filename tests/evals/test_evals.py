@@ -1,7 +1,14 @@
 """Parametrized eval tests.
 
-Each .md file in tests/evals/scenarios/ is a scenario. The judge agent
-drives the real CLI via pexpect and evaluates responses against criteria.
+Each .md file in tests/evals/scenarios/ is a scenario.
+
+CLI scenarios run in one of two lanes:
+- deterministic lane: explicit assertions, no judge
+- judge lane: SDK judge evaluates behavior against criteria
+
+Telegram scenarios also route by lane:
+- deterministic lane: explicit transcript assertions
+- judge lane: SDK judge behavior checks
 
 CLI evals: run all scenarios EXCEPT tg_* prefixed (Telegram-specific).
 Telegram evals: run tg_* scenarios sequentially in a single test function.
@@ -14,6 +21,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+from functools import lru_cache
 import os
 import signal
 import subprocess
@@ -24,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.evals.deterministic import run_deterministic
 from tests.evals.judge import run_judge
 from tests.evals.platform import CLIPlatform
 from tests.evals.scenario import parse_scenario
@@ -31,8 +40,18 @@ from tests.evals.scenario import parse_scenario
 SCENARIO_DIR = Path(__file__).parent / "scenarios"
 
 # Seconds to wait between Telegram scenarios to drain stale bot responses.
-# Must be generous — large output scenarios can leave the bot busy for a while.
-_INTER_SCENARIO_DRAIN_SECONDS = 10
+# Kept configurable for flaky environments.
+_INTER_SCENARIO_DRAIN_SECONDS = float(
+    os.environ.get("OBS_TG_INTER_SCENARIO_DRAIN_SECONDS", "5")
+)
+_PROFILE_FILTER = os.environ.get("OBS_EVAL_PROFILE", "").strip().lower()
+_LANE_FILTER = os.environ.get("OBS_EVAL_LANE", "").strip().lower()
+_CLI_EVALS_ENABLED = os.environ.get("OBS_EVAL_ENABLE_CLI", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _all_scenario_ids() -> list[str]:
@@ -42,9 +61,41 @@ def _all_scenario_ids() -> list[str]:
     return [p.stem for p in sorted(SCENARIO_DIR.glob("*.md"))]
 
 
+@lru_cache(maxsize=None)
+def _load_scenario(scenario_id: str):
+    """Parse and cache a scenario by ID."""
+    return parse_scenario(SCENARIO_DIR / f"{scenario_id}.md")
+
+
+def _matches_profile(scenario_id: str) -> bool:
+    """Filter by OBS_EVAL_PROFILE if scenario metadata defines profiles."""
+    if not _PROFILE_FILTER:
+        return True
+    scenario = _load_scenario(scenario_id)
+    if not scenario.profiles:
+        # When a profile is explicitly requested, untagged scenarios are excluded.
+        return False
+    return _PROFILE_FILTER in {p.lower() for p in scenario.profiles}
+
+
+def _matches_lane(scenario_id: str) -> bool:
+    """Filter by OBS_EVAL_LANE if set (`judge` or `deterministic`)."""
+    if not _LANE_FILTER:
+        return True
+    scenario = _load_scenario(scenario_id)
+    if not scenario.lane:
+        return False
+    return scenario.lane.lower() == _LANE_FILTER
+
+
 def cli_scenario_ids() -> list[str]:
     """Scenario IDs for CLI evals (exclude tg_* Telegram-specific ones)."""
-    return [s for s in _all_scenario_ids() if not s.startswith("tg_")]
+    if not _CLI_EVALS_ENABLED:
+        return []
+    return [
+        s for s in _all_scenario_ids()
+        if not s.startswith("tg_") and _matches_profile(s) and _matches_lane(s)
+    ]
 
 
 # Heavy-output scenarios that stress the bot/Telegram pipeline. These run LAST
@@ -58,7 +109,10 @@ def telegram_scenario_ids() -> list[str]:
     Heavy-output scenarios are moved to the end so their long generation
     times and many-chunk deliveries don't contaminate lighter scenarios.
     """
-    scenarios = [s for s in _all_scenario_ids() if s.startswith("tg_")]
+    scenarios = [
+        s for s in _all_scenario_ids()
+        if s.startswith("tg_") and _matches_profile(s) and _matches_lane(s)
+    ]
     raw_filter = os.environ.get("OBS_TG_SCENARIOS", "").strip()
     if raw_filter:
         wanted = {item.strip() for item in raw_filter.split(",") if item.strip()}
@@ -76,9 +130,11 @@ def telegram_scenario_ids() -> list[str]:
 @pytest.mark.eval
 @pytest.mark.parametrize("scenario_name", cli_scenario_ids() or ["_no_scenarios_found"])
 async def test_eval(scenario_name: str, eval_vault: Path, eval_config) -> None:
-    """Run a single eval scenario through the judge agent (CLI platform)."""
+    """Run a single CLI eval scenario via its configured lane."""
     if scenario_name == "_no_scenarios_found":
-        pytest.skip("No scenario files found in tests/evals/scenarios/")
+        if not _CLI_EVALS_ENABLED:
+            pytest.skip("CLI evals disabled. Set OBS_EVAL_ENABLE_CLI=1 to run.")
+        pytest.skip("No CLI scenario files found in tests/evals/scenarios/")
 
     scenario_path = SCENARIO_DIR / f"{scenario_name}.md"
     scenario = parse_scenario(scenario_path)
@@ -88,11 +144,22 @@ async def test_eval(scenario_name: str, eval_vault: Path, eval_config) -> None:
         daemon_port=eval_config.daemon_port,
     )
     try:
-        result = await run_judge(scenario, platform)
+        lane = (scenario.lane or "judge").lower()
+        if lane == "deterministic":
+            result = await run_deterministic(scenario_name, scenario, platform)
+            assert result.passed, (
+                f"EVAL FAILED: {scenario_name}\n\n"
+                f"Deterministic details: {result.details}\n\n"
+                f"Transcript:\n{result.transcript}"
+            )
+            return
+        if lane == "judge":
+            result = await run_judge(scenario, platform)
+            assert result.passed, f"EVAL FAILED: {scenario_name}\n\n{result.judgment}"
+            return
+        pytest.fail(f"Unknown lane '{lane}' in {scenario_name}.md")
     finally:
         await platform.close()
-
-    assert result.passed, f"EVAL FAILED: {scenario_name}\n\n{result.judgment}"
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +224,20 @@ def _start_telegram_bot(vault_path: Path) -> tuple[subprocess.Popen, Path]:
             f"log: {log_text[-2000:]}"
         )
     return proc, log_file
+
+
+def _telegram_platform_kwargs(scenario) -> dict:
+    """Build TelegramPlatform kwargs from optional scenario metadata."""
+    kwargs: dict = {}
+    if scenario.response_timeout is not None:
+        kwargs["timeout"] = int(scenario.response_timeout)
+    if scenario.first_message_timeout is not None:
+        kwargs["first_message_timeout"] = scenario.first_message_timeout
+    if scenario.done_timeout is not None:
+        kwargs["done_timeout"] = scenario.done_timeout
+    if scenario.idle_quiescence_timeout is not None:
+        kwargs["idle_quiescence_timeout"] = scenario.idle_quiescence_timeout
+    return kwargs
 
 
 def _stop_telegram_bot(proc: subprocess.Popen, log_file: Path | None = None) -> None:
@@ -254,7 +335,7 @@ async def test_eval_telegram_all(eval_vault: Path) -> None:
             scenario = parse_scenario(scenario_path)
 
             # Fresh platform per scenario to drain stale messages
-            platform = TelegramPlatform()
+            platform = TelegramPlatform(**_telegram_platform_kwargs(scenario))
             await platform.connect()
             try:
                 # Reset the bot session before each scenario so runs are isolated.
@@ -289,25 +370,43 @@ async def test_eval_telegram_all(eval_vault: Path) -> None:
                 if drained:
                     print(f"[telegram-eval] drained {drained} stale message(s)")
 
-                result = await run_judge(scenario, platform)
+                lane = (scenario.lane or "judge").lower()
+                if lane == "deterministic":
+                    det = await run_deterministic(scenario_name, scenario, platform)
+                    judgment_text = (
+                        f"VERDICT: {'PASS' if det.passed else 'FAIL'}\n"
+                        f"DETAILS: {det.details}"
+                    )
+                    passed = det.passed
+                    transcript = det.transcript
+                elif lane == "judge":
+                    result = await run_judge(scenario, platform)
+                    judgment_text = result.judgment
+                    passed = result.passed
+                    transcript = ""
+                else:
+                    raise RuntimeError(
+                        f"Unknown lane '{lane}' in Telegram scenario {scenario_name}.md"
+                    )
             finally:
                 await platform.close()
 
-            print(f"[telegram-eval] judgment: {scenario_name}\n{result.judgment}\n")
+            print(f"[telegram-eval] judgment: {scenario_name}\n{judgment_text}\n")
             notes_line = next(
                 (
                     line.strip()
-                    for line in result.judgment.splitlines()
+                    for line in judgment_text.splitlines()
                     if line.strip().upper().startswith("NOTES:")
                 ),
                 "",
             )
             if notes_line and notes_line.lower() != "notes: none":
                 print(f"[telegram-eval] caution: {scenario_name} -> {notes_line}")
-            if not result.passed:
-                failures.append(
-                    f"EVAL FAILED (telegram): {scenario_name}\n\n{result.judgment}"
-                )
+            if not passed:
+                failure_details = f"EVAL FAILED (telegram): {scenario_name}\n\n{judgment_text}"
+                if transcript:
+                    failure_details += f"\n\nTranscript:\n{transcript}"
+                failures.append(failure_details)
                 print(f"[telegram-eval] fail: {scenario_name}")
             else:
                 print(f"[telegram-eval] pass: {scenario_name}")

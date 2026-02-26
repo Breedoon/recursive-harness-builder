@@ -5,8 +5,9 @@ This folder mixes live reference docs and historical planning artifacts.
 ## Start Here (Live)
 
 1. `../CLAUDE.md` - canonical project policy, testing rules, run commands
-2. `architecture.md` - current runtime architecture (CLI/daemon/Telegram/evals)
-3. `plans/2026-02-19-telegram-message-flow-design.md` - Telegram chronology + observability design
+2. `evals-program.md` - live eval program status (tiers, open questions, pending master eval)
+3. `architecture.md` - current runtime architecture (CLI/daemon/Telegram/evals)
+4. `plans/2026-02-19-telegram-message-flow-design.md` - Telegram chronology + observability design
 
 ## Historical / Context
 

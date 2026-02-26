@@ -1,3 +1,8 @@
+---
+lane: deterministic
+profiles: feature, full
+continuation_timeouts: 60,20
+---
 # Telegram Queue While Busy
 
 ## Intent

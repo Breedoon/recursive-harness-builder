@@ -1,3 +1,7 @@
+---
+lane: deterministic
+profiles: feature, full
+---
 # Vault Write
 
 ## Steps

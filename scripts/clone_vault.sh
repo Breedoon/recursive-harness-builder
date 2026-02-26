@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # clone_vault.sh
-# Copies the real Obsidian vault to fixture_vault/ in the project root.
-# Skips if fixture_vault/ already exists. Used by eval tests.
+# Creates/bootstraps the fixture_vault/ template in the project root.
+# Skips if fixture_vault/ already exists.
+# Eval runs should use an ephemeral copy of this template (see tests/conftest.py).
 
 set -euo pipefail
 

@@ -1,4 +1,14 @@
+---
+lane: judge
+profiles: feature, full
+---
 # Background Fork
+
+## Intent
+- Validate true background fork behavior: quick foreground response plus later result delivery.
+- Broken behavior example: agent blocks waiting for the fork and never answers the immediate arithmetic request.
+- Broken behavior example: agent claims fork launched but cannot later provide CLAUDE-grounded fork output.
+- Suspicious behavior: generic third-turn summary without concrete CLAUDE details.
 
 ## Steps
 1. Send: "Hello, just confirming you can hear me. Reply with a short greeting."

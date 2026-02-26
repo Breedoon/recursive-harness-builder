@@ -1,3 +1,7 @@
+---
+lane: deterministic
+profiles: smoke, feature, full
+---
 # Telegram Auth Guard
 
 ## Intent

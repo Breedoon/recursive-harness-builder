@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import re
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -29,6 +30,14 @@ from claude_agent_sdk import (
 
 from tests.evals.platform import Platform
 from tests.evals.scenario import EvalScenario, EvalStep
+
+_DEFAULT_CONTINUATION_TIMEOUTS = [60, 30]
+_REQUIRED_JUDGMENT_SECTIONS = [
+    "CRITERIA CHECK",
+    "INTENT CHECK",
+    "NOTES",
+    "VERDICT",
+]
 
 
 @dataclass
@@ -101,16 +110,34 @@ After completing all steps, evaluate the agent's responses against these criteri
 {criteria_text}
 
 ## Verdict
-After evaluating, output these sections in order:
-1. CRITERIA CHECK: brief pass/fail explanation per criterion
-2. INTENT CHECK: whether behavior matched the scenario intent (even beyond literal criteria)
-3. NOTES: suspicious behavior, unclear evidence, odd output, or quality concerns even if you still pass
+After evaluating, you MUST output exactly these headings in this order:
+CRITERIA CHECK:
+- One bullet per pass criterion, each marked PASS or FAIL with a short reason.
+INTENT CHECK:
+- State whether behavior matched scenario intent beyond literal criteria.
+NOTES:
+- suspicious behavior, unclear evidence, odd output, or quality concerns even if you still pass.
 - If there are no concerns, write exactly: NOTES: none
-- If ALL criteria are met: VERDICT: PASS
-- If ANY criterion is not met: VERDICT: FAIL
+VERDICT:
+- Write exactly one of: PASS or FAIL
+
+If ALL criteria are met: VERDICT must be PASS.
+If ANY criterion is not met: VERDICT must be FAIL.
 
 Be strict: if output is technically passing but behavior seems off for the intent, call it out in NOTES.
 """
+
+
+def _is_timeout_output(output: str) -> bool:
+    """Detect explicit timeout markers returned by platform adapters."""
+    return output.strip().lower().startswith("(timeout:")
+
+
+def _continuation_timeouts(scenario: EvalScenario) -> list[int]:
+    """Continuation prompt timeouts for concurrent scenarios."""
+    if scenario.continuation_timeouts:
+        return scenario.continuation_timeouts
+    return list(_DEFAULT_CONTINUATION_TIMEOUTS)
 
 
 def _build_judge_prompt_transcript(
@@ -141,13 +168,21 @@ def _build_judge_prompt_transcript(
 
 ## Instructions
 Read the transcript carefully. Evaluate whether each criterion is met based on
-what actually happened in the interaction. Output these sections in order:
-1. CRITERIA CHECK: brief pass/fail explanation per criterion
-2. INTENT CHECK: whether behavior matched the scenario intent (even beyond literal criteria)
-3. NOTES: suspicious behavior, unclear evidence, odd output, or quality concerns even if you still pass
+what actually happened in the interaction.
+
+You MUST output exactly these headings in this order:
+CRITERIA CHECK:
+- One bullet per pass criterion, each marked PASS or FAIL with a short reason.
+INTENT CHECK:
+- State whether behavior matched scenario intent beyond literal criteria.
+NOTES:
+- suspicious behavior, unclear evidence, odd output, or quality concerns even if you still pass.
 - If there are no concerns, write exactly: NOTES: none
-- If ALL criteria are met: VERDICT: PASS
-- If ANY criterion is not met: VERDICT: FAIL
+VERDICT:
+- Write exactly one of: PASS or FAIL
+
+If ALL criteria are met: VERDICT must be PASS.
+If ANY criterion is not met: VERDICT must be FAIL.
 
 Be strict: if output is technically passing but behavior seems off for the intent, call it out in NOTES.
 """
@@ -171,12 +206,13 @@ async def _drive_concurrent_steps(
             transcript_parts.append(f"[sleep {step.wait_seconds}s]")
             await asyncio.sleep(step.wait_seconds)
 
-    # After all steps, collect remaining output. Try multiple prompts
-    # to capture continuation responses (e.g., queued message replies).
-    for attempt in range(3):
+    # After all steps, collect continuation outputs with bounded per-attempt
+    # timeouts. This avoids long idle stalls when no more output is coming.
+    for attempt, timeout in enumerate(_continuation_timeouts(scenario)):
         try:
-            timeout = 120 if attempt == 0 else 60
             output = await platform.wait_for_prompt(timeout=timeout)
+            if _is_timeout_output(output):
+                break
             if output:
                 label = "AGENT (final)" if attempt == 0 else f"AGENT (continuation {attempt})"
                 transcript_parts.append(f"{label}: {output}")
@@ -193,14 +229,16 @@ async def _run_sdk_judge(prompt: str, use_mcp: bool = False, platform: Platform 
         system_prompt = (
             "You are a test evaluator. Follow the scenario steps exactly, "
             "using the send_message tool for each step. After all steps, "
-            "analyze the responses and output VERDICT: PASS or VERDICT: FAIL. "
+            "analyze the responses and output the required sections exactly: "
+            "CRITERIA CHECK, INTENT CHECK, NOTES, VERDICT. "
             "Be thorough but concise in your analysis."
         )
     else:
         system_prompt = (
             "You are a test evaluator. Read the provided transcript and "
-            "evaluate it against the criteria. Output VERDICT: PASS or "
-            "VERDICT: FAIL. Be thorough but concise in your analysis."
+            "evaluate it against the criteria. Output the required sections "
+            "exactly: CRITERIA CHECK, INTENT CHECK, NOTES, VERDICT. "
+            "Be thorough but concise in your analysis."
         )
 
     options_kwargs: dict = {
@@ -227,6 +265,54 @@ async def _run_sdk_judge(prompt: str, use_mcp: bool = False, platform: Platform 
     return "\n".join(judgment_parts)
 
 
+def _has_section(judgment: str, section: str) -> bool:
+    return bool(re.search(rf"(?im)^\s*{re.escape(section)}\s*:", judgment))
+
+
+def _extract_verdict(judgment: str) -> str | None:
+    match = re.search(r"(?im)^\s*VERDICT\s*:\s*(PASS|FAIL)\b", judgment)
+    if not match:
+        return None
+    return match.group(1).upper()
+
+
+def _enforce_judgment_structure(judgment: str) -> tuple[bool, str]:
+    """Validate required judgment sections and verdict format.
+
+    Returns (is_valid, normalized_judgment_with_harness_notes_if_any).
+    """
+    # The judge sometimes wraps section headers in markdown bold.
+    # Normalize for parsing so we accept either plain or bold headings.
+    parsing_text = judgment.replace("**", "")
+
+    issues: list[str] = []
+    for section in _REQUIRED_JUDGMENT_SECTIONS:
+        if not _has_section(parsing_text, section):
+            issues.append(f"missing required section: {section}:")
+
+    verdict = _extract_verdict(parsing_text)
+    if verdict is None:
+        issues.append("missing parseable verdict line (expected 'VERDICT: PASS|FAIL')")
+
+    for section in ("CRITERIA CHECK", "INTENT CHECK", "NOTES"):
+        if not _has_section(parsing_text, section):
+            continue
+        block = re.search(
+            rf"(?is)^\s*{re.escape(section)}\s*:(.*?)(?=^\s*(?:CRITERIA CHECK|INTENT CHECK|NOTES|VERDICT)\s*:|\Z)",
+            parsing_text,
+            re.MULTILINE,
+        )
+        if block and not block.group(1).strip():
+            issues.append(f"empty section: {section}:")
+
+    if not issues:
+        return True, judgment
+
+    harness_notes = ["HARNESS FORMAT CHECK:", *[f"- {i}" for i in issues]]
+    normalized = judgment.rstrip() + "\n\n" + "\n".join(harness_notes)
+    return False, normalized
+
+
 async def run_judge(scenario: EvalScenario, platform: Platform) -> EvalResult:
     """Run the judge agent against a scenario using the given platform.
 
@@ -243,10 +329,12 @@ async def run_judge(scenario: EvalScenario, platform: Platform) -> EvalResult:
         prompt = _build_judge_prompt_transcript(scenario, transcript)
         judgment = await _run_sdk_judge(prompt, use_mcp=False)
 
-    passed = "VERDICT: PASS" in judgment.upper()
+    is_structured, judgment_with_checks = _enforce_judgment_structure(judgment)
+    verdict = _extract_verdict(judgment.replace("**", ""))
+    passed = bool(is_structured and verdict == "PASS")
 
     return EvalResult(
         scenario=scenario.name,
         passed=passed,
-        judgment=judgment,
+        judgment=judgment_with_checks,
     )

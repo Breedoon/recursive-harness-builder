@@ -1,3 +1,7 @@
+---
+lane: judge
+profiles: feature, full
+---
 # Telegram Large Output Resilience
 
 ## Intent

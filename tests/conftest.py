@@ -1,6 +1,7 @@
 """Shared test fixtures for OBS Agent."""
 
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -27,6 +28,14 @@ from obs_agent.config import OBSConfig
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _FIXTURE_VAULT = _PROJECT_ROOT / "fixture_vault"
 _CLONE_SCRIPT = _PROJECT_ROOT / "scripts" / "clone_vault.sh"
+_DEFAULT_REAL_VAULT = (
+    Path.home()
+    / "Library"
+    / "Mobile Documents"
+    / "iCloud~md~obsidian"
+    / "Documents"
+    / "T"
+)
 
 
 class AsyncIterFromList:
@@ -208,14 +217,91 @@ def _ensure_fixture_vault() -> Path:
     return _FIXTURE_VAULT
 
 
+def _resolve_real_vault_path() -> Path:
+    """Resolve real vault path for safety checks."""
+    raw = os.environ.get("OBS_REAL_VAULT_PATH", "").strip()
+    return Path(raw) if raw else _DEFAULT_REAL_VAULT
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    """Best-effort same-path comparison without requiring existence."""
+    return a.expanduser().resolve(strict=False) == b.expanduser().resolve(strict=False)
+
+
+def _ensure_template_clean_if_requested(template: Path) -> None:
+    """Optional guard: fail if template fixture has uncommitted git changes."""
+    required = os.environ.get("OBS_EVAL_REQUIRE_CLEAN_TEMPLATE", "").strip().lower()
+    if required not in {"1", "true", "yes"}:
+        return
+    if not (template / ".git").is_dir():
+        return
+    result = subprocess.run(
+        ["git", "-C", str(template), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to check template vault git status ({template}): {result.stderr}"
+        )
+    if result.stdout.strip():
+        raise RuntimeError(
+            "Template fixture vault has uncommitted changes. "
+            "Refresh/clean it before running evals."
+        )
+
+
+def _materialize_eval_vault(template: Path) -> tuple[Path, Path]:
+    """Copy template fixture into a per-run ephemeral vault."""
+    run_root = Path(tempfile.mkdtemp(prefix="obs_eval_vault_run_"))
+    eval_vault = run_root / "vault"
+    shutil.copytree(template, eval_vault, symlinks=True)
+    return run_root, eval_vault
+
+
+def _assert_eval_vault_guardrails(eval_vault: Path, template: Path) -> None:
+    """Prevent accidental use of the real vault path for eval runs."""
+    real_vault = _resolve_real_vault_path()
+    if _same_path(eval_vault, real_vault):
+        raise RuntimeError(f"Unsafe eval vault path (real vault): {eval_vault}")
+    if _same_path(template, real_vault):
+        raise RuntimeError(
+            "Unsafe fixture template path points to real vault. "
+            "Set OBS_EVAL_TEMPLATE_VAULT to a safe template copy."
+        )
+    if _same_path(eval_vault, template):
+        raise RuntimeError("Eval vault must be an ephemeral copy, not the template path")
+
+
 @pytest.fixture(scope="session")
 def eval_vault() -> Path:
-    """Path to the persistent fixture vault (full clone of real vault).
+    """Session-local ephemeral vault copy used by eval tests.
 
-    Calls scripts/clone_vault.sh on first use. Session-scoped so the clone
-    only happens once per test run.
+    Source template:
+    - OBS_EVAL_TEMPLATE_VAULT (if set), else project fixture_vault/
+
+    Safety:
+    - Fail fast if real vault path is selected as template/target.
+    - Optional clean-template guard via OBS_EVAL_REQUIRE_CLEAN_TEMPLATE=1.
     """
-    return _ensure_fixture_vault()
+    template_raw = os.environ.get("OBS_EVAL_TEMPLATE_VAULT", "").strip()
+    if template_raw:
+        template = Path(template_raw)
+        if not template.is_dir():
+            raise FileNotFoundError(
+                f"OBS_EVAL_TEMPLATE_VAULT does not exist or is not a directory: {template}"
+            )
+    else:
+        template = _ensure_fixture_vault()
+
+    _ensure_template_clean_if_requested(template)
+    run_root, vault = _materialize_eval_vault(template)
+    _assert_eval_vault_guardrails(vault, template)
+    try:
+        yield vault
+    finally:
+        shutil.rmtree(run_root, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")

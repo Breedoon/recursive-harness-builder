@@ -1,7 +1,12 @@
+---
+lane: judge
+profiles: feature, full
+---
 # Telegram Stress Chronology
 
 ## Intent
 - Stress mixed workload + follow-ups and verify nothing is lost.
+- Broken behavior example: one or more user intents silently dropped or answered out of order.
 - Flag subtle anomalies (late/misdirected replies, partial intent coverage, suspicious extra sentinels) even if baseline criteria pass.
 
 ## Steps

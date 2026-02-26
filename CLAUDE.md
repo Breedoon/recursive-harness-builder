@@ -36,6 +36,7 @@ maintained mirror/reference set under `docs/` for implementation work.
 | Document | Repo Path | What It Contains |
 |----------|-----------|-----------------|
 | **Architecture (current runtime)** | `docs/architecture.md` | Current runtime architecture (CLI + daemon + Telegram + eval stack) |
+| **Evals program status (live)** | `docs/evals-program.md` | Tier system, current behavior, pending master eval, open questions |
 | **Telegram flow plan** | `docs/plans/2026-02-19-telegram-message-flow-design.md` | Chronological Telegram behavior + observability decisions |
 | **Design intent (historical)** | `docs/design-intent.md` | Original intent capture from design phase |
 | **Implementation plan (historical MVP)** | `docs/implementation-plan.md` | Initial MVP sequencing; not a live roadmap |
@@ -103,29 +104,36 @@ by the SDK via `setting_sources=["project"]` which reads `.claude/skills/` from 
 ### What Are Evals?
 
 Evals are markdown scenario files in `tests/evals/scenarios/`. Each describes a user
-journey. An interactive Claude SDK judge agent (`ClaudeSDKClient` + MCP tools) executes
-the scenario against the real CLI with a real vault clone, then judges PASS/FAIL.
+journey. Depending on lane, scenarios run with deterministic assertions or an interactive
+Claude SDK judge (`ClaudeSDKClient`) against real runtime adapters (Telegram by default,
+CLI when explicitly enabled), using a real ephemeral vault clone.
+
+### Eval Program Status (Entry Point)
+
+- Detailed status and open questions: `docs/evals-program.md`
+- Highest-priority pending item: define and implement Tier 2 "master eval" scenario
+- CLI eval lane is deprecating and is opt-in only (`OBS_EVAL_ENABLE_CLI=1`)
 
 ### The Eval Commandments
 
-1. **EVALS ARE NOT OPTIONAL.** Every feature change MUST pass all evals before being
-   declared done. Running unit tests alone is theater. Running mocked "E2E" tests is
-   a lie. Only evals prove the system works.
+1. **EVALS ARE NOT OPTIONAL.** Every feature change MUST pass the required eval tier
+   before being declared done. Running unit tests alone is theater. Running mocked
+   "E2E" tests is a lie. Only evals prove the system works.
 
 2. **IF AN EVAL CAN'T RUN, FIX THAT FIRST.** If the eval infrastructure is broken,
    if the vault clone is missing, if the daemon won't start — these are P0 blockers.
    Do not work around them. Do not skip them. Fix them.
 
-3. **NEVER MOCK THE SDK IN AN EVAL.** Evals use the real SDK, real daemon, real CLI.
+3. **NEVER MOCK THE SDK IN AN EVAL.** Evals use the real SDK and real runtime adapters.
    If you patch, mock, or fake anything in the eval path, you are writing a unit test.
 
 4. **NEVER USE `anthropic.Anthropic()` FOR JUDGING.** The SDK uses subscription auth.
    There is no API key. The judge uses `ClaudeSDKClient` with MCP tools. If you write
    `import anthropic` in eval code, you are doing it wrong.
 
-5. **THE JUDGE IS AN SDK AGENT.** The judge agent uses `ClaudeSDKClient` with MCP tools
-   (`send_message`, `read_output`) to interact with the CLI. It follows a scenario and
-   returns VERDICT: PASS or VERDICT: FAIL. No heuristics, no `len > 5`, no regex.
+5. **THE JUDGE IS AN SDK AGENT.** The judge uses `ClaudeSDKClient` to evaluate scenario
+   behavior (directly or from transcript). It returns VERDICT: PASS or VERDICT: FAIL.
+   No heuristics, no `len > 5`, no regex.
 
 6. **READ THE EVAL OUTPUT.** A passing eval is not a green checkmark to ignore. Read
    the judge's reasoning. If the judge passed for wrong reasons, the eval is broken.
@@ -200,10 +208,22 @@ the scenario against the real CLI with a real vault clone, then judges PASS/FAIL
 # Live integration (real HTTP + SDK, no CLI):
 .venv/bin/pytest tests/ -q -m integration --timeout=300
 
-# Full evals (CLI + Telegram; requires Telegram creds for tg_*):
+# Default eval run (Telegram lane; CLI evals are disabled unless enabled):
 .venv/bin/pytest tests/evals/ -v -m eval --timeout=300
 
-# Telegram evals only (single aggregate test):
+# Enable CLI eval scenarios explicitly:
+OBS_EVAL_ENABLE_CLI=1 .venv/bin/pytest tests/evals/ -v -m eval --timeout=300
+
+# Tier 0 smoke profile (fast default):
+OBS_EVAL_PROFILE=smoke .venv/bin/pytest tests/evals/ -v -m eval --timeout=300
+
+# Tier 1 feature profile (targeted loop; subsystem filter pending):
+OBS_EVAL_PROFILE=feature .venv/bin/pytest tests/evals/ -v -m eval --timeout=300
+
+# Tier 2 fallback (current full profile until dedicated master scenario is implemented):
+OBS_EVAL_PROFILE=full .venv/bin/pytest tests/evals/ -v -m eval --timeout=1800
+
+# Telegram aggregate test only:
 .venv/bin/pytest tests/evals/test_evals.py::test_eval_telegram_all -v -s -m "eval and telegram" --timeout=300
 
 # Optional: run only selected Telegram scenarios (comma-separated)
@@ -217,7 +237,7 @@ OBS_TG_SCENARIOS=tg_auth_guard,tg_tool_visibility .venv/bin/pytest tests/evals/t
 
 | Layer | Proof Value | Where |
 |-------|-------------|-------|
-| **Evals** | HIGHEST — real CLI + vault + SDK judge | `tests/evals/` |
+| **Evals** | HIGHEST — real runtime adapters + vault + deterministic/judge checks | `tests/evals/` |
 | **Live Integration** | Medium — real HTTP + SDK | `tests/test_integration_live.py` |
 | **Unit** | Low — mocked logic, routing | `tests/test_*.py` |
 
@@ -251,38 +271,12 @@ This split exists because MCP tool calls are sequential — the judge can't send
 
 ### Eval Timing
 
-- **20 scenarios total** (12 CLI + 8 Telegram)
-- Telegram aggregate test is marked with a higher per-test timeout because it runs all Telegram scenarios serially
-- Scenarios are intentionally sequential to preserve causality and avoid cross-test message contamination
-
-### Current Eval Coverage (20 scenarios)
-
-| Eval | Tests | Platform/Mode |
-|------|-------|------|
-| basic_chat | Agent responds coherently | CLI Sequential |
-| tool_visibility | Agent lists `.claude/skills/` | CLI Sequential |
-| vault_file_access | Agent reads `CLAUDE.md` | CLI Sequential |
-| session_continuity | Two-turn recall | CLI Sequential |
-| vault_write | Agent creates + reads back a file | CLI Sequential |
-| context_awareness | Agent knows identity/threads from system prompt | CLI Sequential |
-| skills_awareness | Agent lists skills from system prompt | CLI Sequential |
-| immutable_guard | Control write succeeds, Meeting Notes write blocked | CLI Sequential |
-| fork_tool | Fork inherits parent conversation history | CLI Sequential |
-| background_fork | Background fork runs without blocking, results via queue | CLI Sequential |
-| queue_message | Queued message during streaming | CLI Concurrent |
-| interrupt | /stop during streaming | CLI Concurrent |
-| tg_auth_guard | Authorized-user Telegram flow | Telegram Sequential |
-| tg_background_auto_delivery | Background fork auto-delivery in Telegram | Telegram Sequential |
-| tg_chronological_output | Chronological tool/text + done sentinel in Telegram | Telegram Sequential |
-| tg_html_format | Telegram rendering correctness | Telegram Sequential |
-| tg_message_split | Long split-message coherence | Telegram Sequential |
-| tg_queue_while_busy | Telegram queue behavior under concurrent inputs | Telegram Sequential |
-| tg_stress_chronology | Mixed workload chronology stress | Telegram Sequential |
-| tg_tool_visibility | Inline tool observability in Telegram | Telegram Sequential |
-
-### Known Gaps (work in progress)
-
-- Missing: memory offboard, error handling, fork tool eval verification.
+- Runtime varies by profile and scenario selection.
+- Telegram aggregate runs serially by design to avoid chat contamination.
+- Some stress scenarios intentionally run longer due to large-output/concurrency coverage.
+- For the current scenario inventory and open performance questions, use:
+  - `docs/evals-program.md`
+  - `tests/evals/README.md`
 
 ### Pexpect Gotchas
 
