@@ -127,6 +127,31 @@ class ConversationRunner:
         self._pending_messages = list(pending_messages) if pending_messages else []
         self._client = None  # set during run()
         self._last_message = None  # tracks last SDK message for metrics
+        self._last_result_message = None  # latest ResultMessage-like payload
+        self._last_assistant_usage: dict | None = None  # latest assistant step usage
+
+    def _refresh_last_result_data(self) -> None:
+        """Refresh hook_state.last_result_data from the latest SDK result-like message."""
+        result_msg = self._last_result_message or self._last_message
+        if result_msg is None:
+            return
+        self._hook_state.last_result_data = {
+            "session_id": getattr(result_msg, "session_id", None),
+            "num_turns": getattr(result_msg, "num_turns", None),
+            "total_cost_usd": getattr(result_msg, "total_cost_usd", None),
+            "duration_ms": getattr(result_msg, "duration_ms", None),
+            "usage": None,
+        }
+        usage = self._last_assistant_usage
+        if not isinstance(usage, dict):
+            usage = getattr(result_msg, "usage", None)
+        if isinstance(usage, dict):
+            self._hook_state.last_result_data["usage"] = {
+                "input_tokens": usage.get("input_tokens"),
+                "output_tokens": usage.get("output_tokens"),
+                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+                "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+            }
 
     @property
     def remaining_pending(self) -> list[str]:
@@ -144,9 +169,17 @@ class ConversationRunner:
         """
         async for message in self._client.receive_response():
             self._last_message = message
+            if (
+                getattr(message, "num_turns", None) is not None
+                and getattr(message, "total_cost_usd", None) is not None
+            ):
+                self._last_result_message = message
             if hasattr(message, "session_id") and message.session_id:
                 self._session_mgr.set_session_id(message.session_id)
             if hasattr(message, "content") and isinstance(message.content, list):
+                usage = getattr(message, "usage", None)
+                if message.content and isinstance(usage, dict):
+                    self._last_assistant_usage = usage
                 for block in message.content:
                     if isinstance(block, ToolUseBlock):
                         tool_name = getattr(block, "name", "")
@@ -156,9 +189,11 @@ class ConversationRunner:
                             summary=summarize_tool_use(tool_name, tool_input),
                         )
                     elif isinstance(block, ThinkingBlock):
+                        thinking_text = getattr(block, "thinking", "") or ""
+                        thinking_text = thinking_text.strip()
                         yield StatusEvent(
                             type="thinking",
-                            summary="thinking...",
+                            summary=thinking_text or "thinking...",
                         )
                     elif isinstance(block, TextBlock):
                         yield TextEvent(text=block.text)
@@ -288,6 +323,8 @@ class ConversationRunner:
 
         # 3. Stream response (with reconnect on recoverable errors)
         self._last_message = None
+        self._last_result_message = None
+        self._last_assistant_usage = None
         async for event in self._stream_or_reconnect(
             "Connection interrupted. Continue where you left off."
         ):
@@ -295,21 +332,7 @@ class ConversationRunner:
 
         if self._last_message is not None:
             log_result(self._last_message, label="conversation")
-            self._hook_state.last_result_data = {
-                "session_id": getattr(self._last_message, "session_id", None),
-                "num_turns": getattr(self._last_message, "num_turns", None),
-                "total_cost_usd": getattr(self._last_message, "total_cost_usd", None),
-                "duration_ms": getattr(self._last_message, "duration_ms", None),
-                "usage": None,
-            }
-            usage = getattr(self._last_message, "usage", None)
-            if isinstance(usage, dict):
-                self._hook_state.last_result_data["usage"] = {
-                    "input_tokens": usage.get("input_tokens"),
-                    "output_tokens": usage.get("output_tokens"),
-                    "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
-                    "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
-                }
+            self._refresh_last_result_data()
 
         # 4. Continuation loop: process queued messages inline
         continuation_count = 0
@@ -336,6 +359,7 @@ class ConversationRunner:
                 "Connection interrupted. Continue where you left off."
             ):
                 yield event
+            self._refresh_last_result_data()
 
         # 5. Background fork wait loop
         while self._hook_state.background_tasks:
@@ -376,6 +400,7 @@ class ConversationRunner:
                 "Connection interrupted. Continue where you left off."
             ):
                 yield event
+            self._refresh_last_result_data()
 
         # 6. Drain remaining queue for next turn
         self._pending_messages = _drain_queue(self._hook_state.message_queue)

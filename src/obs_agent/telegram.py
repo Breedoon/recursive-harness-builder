@@ -2,11 +2,11 @@
 
 Receives messages from Telegram, processes them through ConversationRunner,
 and sends chronological per-turn updates. Key behavior:
-- FragmentBuffer reassembles user text auto-split by Telegram (>4096 chars)
+- FragmentBuffer reassembles Telegram auto-split long user text only
 - Per-turn flush: text + status events are interleaved in arrival order
 - Per-chat lock serialization (keeps replies ordered within a chat)
 - Background queue poller auto-delivers queued results every 3 seconds
-- Final "(done)" sentinel is sent with notification enabled
+- Final idle context summary is sent with notification enabled once the queue is empty
 """
 
 from __future__ import annotations
@@ -24,6 +24,13 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from obs_agent.context_probe import probe_context_via_claude_cli
+from obs_agent.context_stats import (
+    apply_context_probe,
+    build_context_snapshot,
+    format_context_snapshot_compact,
+    format_context_snapshot_lines,
+)
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent, TurnEndEvent
@@ -39,7 +46,10 @@ logger = logging.getLogger("obs_agent.telegram")
 _CHUNK_DELAY_SECONDS = 1.0
 
 # FragmentBuffer: max gap between consecutive message_ids to be considered fragments
-_FRAGMENT_MAX_GAP_SECONDS = 1.5
+_FRAGMENT_MAX_GAP_SECONDS = 0.35
+
+# Only near-limit chunks should be considered Telegram auto-split fragments.
+_FRAGMENT_MIN_PART_LENGTH = 4000
 
 # Background queue polling interval
 _BACKGROUND_POLL_SECONDS = 3.0
@@ -87,7 +97,8 @@ class FragmentBuffer:
 
     When a user pastes text longer than 4096 chars, Telegram auto-splits it
     into multiple updates with consecutive message_ids sent in rapid succession.
-    This buffer collects fragments within a time window and concatenates them.
+    This buffer only merges near-limit chunks so separate quick human messages
+    are not misclassified as fragments.
 
     IMPORTANT: add() blocks (awaits) until the message is fully processed.
     This keeps processing within the python-telegram-bot handler context,
@@ -126,6 +137,7 @@ class FragmentBuffer:
             is_fragment = (
                 message_id == pending.last_message_id + 1
                 and (now - pending.last_seen) < self._gap
+                and len(pending.parts[-1]) >= _FRAGMENT_MIN_PART_LENGTH
             )
             if is_fragment:
                 pending.parts.append(text)
@@ -274,6 +286,44 @@ class TelegramBot:
                 )
                 await asyncio.sleep(delay)
 
+    def _format_system_html(self, text: str) -> str:
+        return f"<u><i>{html.escape(text)}</i></u>"
+
+    def _format_status_html(self, text: str) -> str:
+        return f"<i>{html.escape(text)}</i>"
+
+    async def _send_system_message(
+        self,
+        *,
+        chat_id: int,
+        bot,
+        text: str,
+        disable_notification: bool,
+    ) -> None:
+        await self._send_plain_with_retry(
+            chat_id=chat_id,
+            bot=bot,
+            text=self._format_system_html(text),
+            parse_mode=ParseMode.HTML,
+            disable_notification=disable_notification,
+        )
+
+    def _build_completion_summary(self) -> str:
+        snapshot = build_context_snapshot(
+            session_id=self._session_manager.session_id,
+            data=self._hook_state.last_result_data,
+            context_window_estimate_tokens=self._config.context_window_estimate_tokens,
+            cwd=self._config.vault_path,
+        )
+        lines = [format_context_snapshot_compact(snapshot)]
+        username = (self._config.telegram_notify_username or "").strip().lstrip("@")
+        if username:
+            lines.append(f"@{username}")
+        return "\n".join(lines)
+
+    def _has_queue_idle_state(self, pending_messages: list[str]) -> bool:
+        return not pending_messages and self._hook_state.message_queue.empty()
+
     async def handle_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -313,9 +363,11 @@ class TelegramBot:
             self._pending_messages.clear()
             self._hook_state.reset()  # Drain queues, cancel background tasks
             logger.info("Session reset via /new from user %d", update.effective_user.id)
-            await update.effective_message.reply_text(
-                "Session cleared. Starting fresh.",
-                disable_web_page_preview=True,
+            await self._send_system_message(
+                chat_id=chat_id,
+                bot=context.bot,
+                text="session cleared",
+                disable_notification=True,
             )
 
     async def handle_context(
@@ -327,35 +379,20 @@ class TelegramBot:
         if not self._is_authorized(update.effective_user.id):
             return
 
-        lines: list[str] = []
-        sid = self._session_manager.session_id
-        lines.append(f"session_id: {sid or '(none)'}")
-
-        data = self._hook_state.last_result_data
-        if data:
-            lines.append(f"num_turns: {data.get('num_turns', '?')}")
-            cost = data.get("total_cost_usd")
-            lines.append(f"total_cost_usd: {cost if cost is not None else '?'}")
-            lines.append(f"duration_ms: {data.get('duration_ms', '?')}")
-
-            usage = data.get("usage")
-            if usage:
-                inp = usage.get("input_tokens") or 0
-                out = usage.get("output_tokens") or 0
-                cache_create = usage.get("cache_creation_input_tokens") or 0
-                cache_rd = usage.get("cache_read_input_tokens") or 0
-                total = inp + out + cache_create + cache_rd
-                pct = max(0.0, (1 - total / 200_000) * 100)
-                lines.append(f"input_tokens: {inp}")
-                lines.append(f"output_tokens: {out}")
-                lines.append(f"cache_creation: {cache_create}")
-                lines.append(f"cache_read: {cache_rd}")
-                lines.append(f"total_used: {total}")
-                lines.append(f"context_remaining: {pct:.1f}%")
-            else:
-                lines.append("(no usage data yet)")
-        else:
-            lines.append("(no session data yet)")
+        snapshot = build_context_snapshot(
+            session_id=self._session_manager.session_id,
+            data=self._hook_state.last_result_data,
+            context_window_estimate_tokens=self._config.context_window_estimate_tokens,
+            cwd=self._config.vault_path,
+        )
+        probe = None
+        if self._config.context_probe_claude_cli:
+            probe = await probe_context_via_claude_cli(
+                session_id=snapshot.get("session_id"),
+                cwd=self._config.vault_path,
+            )
+        snapshot = apply_context_probe(snapshot, probe)
+        lines = format_context_snapshot_lines(snapshot)
 
         await update.effective_message.reply_text(
             "\n".join(lines),
@@ -374,9 +411,11 @@ class TelegramBot:
         await self._ensure_background_poller(context.bot)
         self._hook_state.interrupt_flag = True
         logger.info("Interrupt via /stop from user %d", update.effective_user.id)
-        await update.effective_message.reply_text(
-            "Interrupt sent.",
-            disable_web_page_preview=True,
+        await self._send_system_message(
+            chat_id=update.effective_message.chat_id,
+            bot=context.bot,
+            text="interrupt sent",
+            disable_notification=True,
         )
 
     def _status_to_text(self, event: StatusEvent) -> str:
@@ -397,7 +436,7 @@ class TelegramBot:
             elif isinstance(item, StatusEvent):
                 status_text = self._status_to_text(item)
                 if status_text.strip():
-                    parts.append(f"<i>{html.escape(status_text)}</i>")
+                    parts.append(self._format_status_html(status_text))
         return "\n".join(parts).strip()
 
     async def _send_html(
@@ -494,7 +533,7 @@ class TelegramBot:
         )
 
         turn_items: list[TextEvent | StatusEvent] = []
-        done_sent = False
+        completion_sent = False
         event_count = 0
         turn_count = 0
         self._busy_chats.add(chat_id)
@@ -504,10 +543,10 @@ class TelegramBot:
         )
 
         try:
-            await self._send_plain_with_retry(
+            await self._send_system_message(
                 chat_id=chat_id,
                 bot=bot,
-                text="(working)",
+                text="working",
                 disable_notification=True,
             )
             async for event in runner.run(user_text):
@@ -536,25 +575,27 @@ class TelegramBot:
                         await self._flush_turn(chat_id=chat_id, bot=bot, turn_items=turn_items)
                         turn_items.clear()
 
-                    await self._send_plain_with_retry(
-                        chat_id=chat_id,
-                        bot=bot,
-                        text="(done)",
-                        disable_notification=False,
-                    )
-                    done_sent = True
+                    self._pending_messages = runner.remaining_pending
+                    if self._has_queue_idle_state(self._pending_messages):
+                        await self._send_system_message(
+                            chat_id=chat_id,
+                            bot=bot,
+                            text=self._build_completion_summary(),
+                            disable_notification=False,
+                        )
+                        completion_sent = True
                     break
 
             self._pending_messages = runner.remaining_pending
 
-            if not done_sent:
-                await self._send_plain_with_retry(
+            if not completion_sent:
+                await self._send_system_message(
                     chat_id=chat_id,
                     bot=bot,
-                    text="(done)",
+                    text=self._build_completion_summary(),
                     disable_notification=False,
                 )
-                done_sent = True
+                completion_sent = True
 
         except Exception as exc:
             logger.exception("Error in ConversationRunner")
@@ -564,10 +605,10 @@ class TelegramBot:
                 error_detail = error_detail[:200] + "..."
 
             try:
-                await self._send_plain_with_retry(
+                await self._send_system_message(
                     chat_id=chat_id,
                     bot=bot,
-                    text=f"(error: {error_detail} — session preserved)",
+                    text=f"error: {error_detail}",
                     disable_notification=False,
                 )
             except Exception:
@@ -581,19 +622,18 @@ class TelegramBot:
 
         finally:
             self._busy_chats.discard(chat_id)
-            # Always send the (done) sentinel so consumers (eval harness, etc.)
-            # know the turn is complete. Without this, _collect_response with
-            # require_done=True hangs until timeout on error paths.
-            if not done_sent:
+            # Always send the final completion summary so Telegram collectors
+            # have a stable end-of-turn marker even on error paths.
+            if not completion_sent:
                 try:
-                    await self._send_plain_with_retry(
+                    await self._send_system_message(
                         chat_id=chat_id,
                         bot=bot,
-                        text="(done)",
+                        text=self._build_completion_summary(),
                         disable_notification=False,
                     )
                 except Exception:
-                    logger.debug("Failed to send (done) sentinel in finally", exc_info=True)
+                    logger.debug("Failed to send completion summary in finally", exc_info=True)
 
     async def _process_message(
         self,
@@ -617,14 +657,27 @@ class TelegramBot:
             lock.locked(), bool(self._busy_chats), chat_id,
         )
         try:
-            await self._send_plain_with_retry(
+            await self._send_system_message(
                 chat_id=chat_id,
                 bot=context.bot,
-                text="(received)",
+                text="received",
                 disable_notification=True,
             )
         except Exception:
             logger.debug("Failed to send receipt marker", exc_info=True)
+        if lock.locked() or chat_id in self._busy_chats:
+            self._hook_state.message_queue.put_nowait(user_text)
+            logger.info("[process_message] queued while busy chat=%d", chat_id)
+            try:
+                await self._send_system_message(
+                    chat_id=chat_id,
+                    bot=context.bot,
+                    text="queued",
+                    disable_notification=True,
+                )
+            except Exception:
+                logger.debug("Failed to send queued marker", exc_info=True)
+            return
         async with lock:
             logger.info("[process_message] lock acquired chat=%d", chat_id)
             await self._run_and_send(

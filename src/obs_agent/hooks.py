@@ -43,8 +43,9 @@ def _deny(reason: str) -> dict:
     """Return a deny hook response with reason."""
     return {
         "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "reason": reason,
+            "permissionDecisionReason": reason,
         }
     }
 
@@ -183,6 +184,7 @@ class HookPipeline:
         """Run all checks, merging results."""
         merged: SyncHookJSONOutput = {}
         accumulated_context: list[str] = []
+        event_name = hook_input.get("hook_event_name")
 
         for check in self._checks:
             result = await check(hook_input, tool_use_id, context)
@@ -199,6 +201,7 @@ class HookPipeline:
                 # Merge accumulated context before returning
                 if accumulated_context:
                     merged.setdefault("hookSpecificOutput", {})
+                    merged["hookSpecificOutput"]["hookEventName"] = event_name
                     merged["hookSpecificOutput"]["additionalContext"] = "\n\n".join(accumulated_context)
                 merged["continue_"] = False
                 if "stopReason" in result:
@@ -209,16 +212,19 @@ class HookPipeline:
             if hso and hso.get("permissionDecision") == "deny":
                 if accumulated_context:
                     merged.setdefault("hookSpecificOutput", {})
+                    merged["hookSpecificOutput"]["hookEventName"] = event_name
                     merged["hookSpecificOutput"]["additionalContext"] = "\n\n".join(accumulated_context)
                 merged.setdefault("hookSpecificOutput", {})
+                merged["hookSpecificOutput"]["hookEventName"] = event_name
                 merged["hookSpecificOutput"]["permissionDecision"] = "deny"
-                if "reason" in hso:
-                    merged["hookSpecificOutput"]["reason"] = hso["reason"]
+                if "permissionDecisionReason" in hso:
+                    merged["hookSpecificOutput"]["permissionDecisionReason"] = hso["permissionDecisionReason"]
                 return merged
 
         # No short-circuit — return accumulated context if any
         if accumulated_context:
             merged.setdefault("hookSpecificOutput", {})
+            merged["hookSpecificOutput"]["hookEventName"] = event_name
             merged["hookSpecificOutput"]["additionalContext"] = "\n\n".join(accumulated_context)
 
         return merged
@@ -316,6 +322,7 @@ def _make_queue_check(state: HookState) -> CheckFn:
         )
         return {
             "hookSpecificOutput": {
+                "hookEventName": hook_input["hook_event_name"],
                 "additionalContext": formatted,
             }
         }

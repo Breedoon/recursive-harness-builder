@@ -133,6 +133,17 @@ class TestSessionSettings:
         cfg = OBSConfig.from_env()
         assert cfg.cache_window_seconds == 1800
 
+    def test_context_probe_cli_default_off(self):
+        """Claude CLI context probe is opt-in by default."""
+        cfg = OBSConfig()
+        assert cfg.context_probe_claude_cli is False
+
+    def test_context_probe_cli_from_env(self, monkeypatch):
+        """OBS_CONTEXT_PROBE_CLAUDE_CLI toggles context probe path."""
+        monkeypatch.setenv("OBS_CONTEXT_PROBE_CLAUDE_CLI", "1")
+        cfg = OBSConfig.from_env()
+        assert cfg.context_probe_claude_cli is True
+
 
 class TestBgForkTimeout:
     """Config provides background fork timeout settings."""
@@ -152,6 +163,17 @@ class TestBgForkTimeout:
         monkeypatch.setenv("OBS_BG_FORK_TIMEOUT", "900")
         cfg = OBSConfig.from_env()
         assert cfg.bg_fork_timeout == 900.0
+
+
+class TestTelegramNotifyUsername:
+    def test_notify_username_default_none(self):
+        cfg = OBSConfig()
+        assert cfg.telegram_notify_username is None
+
+    def test_notify_username_from_env(self, monkeypatch):
+        monkeypatch.setenv("OBS_TELEGRAM_NOTIFY_USERNAME", "@breedoon")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_notify_username == "breedoon"
 
 
 # --- Immutable Paths ---

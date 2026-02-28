@@ -20,8 +20,9 @@ The Telethon session must be pre-authenticated (run spikes/generate_session.py).
 from __future__ import annotations
 
 import asyncio
-import os
 import logging
+import os
+import re
 
 from telethon import TelegramClient
 from telethon.events import NewMessage
@@ -31,13 +32,24 @@ logger = logging.getLogger("obs_agent.eval.telegram")
 
 # Default timeout tuning:
 # - First bot response can legitimately take some time
-# - After first content, long idle without `(done)` usually means transport
-#   desync or missing sentinel, so fail fast instead of idling for minutes
+# - After first content, long idle without the final completion summary usually
+#   means transport desync or a missing end marker, so fail fast instead of
+#   idling for minutes
 _DEFAULT_FIRST_MESSAGE_TIMEOUT = 90.0
 _DEFAULT_DONE_TIMEOUT = 120.0
 _DEFAULT_IDLE_QUIESCENCE_TIMEOUT = 30.0
 _CONTROL_SETTLE_SECONDS = 3.0
-_DONE_SENTINEL = "(done)"
+_COMPLETION_RE = re.compile(
+    r"(?ims)^\s*context:\s+\S+\s*/\s*\S+(?:\s*\n\s*@[\w_]+)?\s*$"
+)
+
+
+def _is_completion_message(text: str) -> bool:
+    stripped = text.strip()
+    if stripped == "(done)":
+        return True
+    normalized = stripped.replace("_", "").replace("*", "")
+    return bool(_COMPLETION_RE.search(normalized))
 
 
 class TelegramPlatform:
@@ -125,14 +137,14 @@ class TelegramPlatform:
         done_timeout: float | None = None,
         idle_quiescence_timeout: float | None = None,
     ) -> str:
-        """Collect all response chunks until done sentinel or timeout.
+        """Collect all response chunks until the completion marker or timeout.
 
         Timeout model:
         - Wait up to first_message_timeout for first bot message
         - For control commands (require_done=False), collect until short settle idle
         - For normal turns (require_done=True):
-          - Wait for `(done)` up to done_timeout (capped by `timeout`)
-          - If idle >= idle_quiescence_timeout before `(done)`, fail fast
+          - Wait for the final completion summary up to done_timeout (capped by `timeout`)
+          - If idle >= idle_quiescence_timeout before that marker, fail fast
             with a structured timeout marker
         """
         chunks: list[str] = []
@@ -149,11 +161,11 @@ class TelegramPlatform:
         except asyncio.TimeoutError:
             return f"(timeout: no response from bot after {first_budget:.0f}s)"
 
-        if first.strip() == _DONE_SENTINEL:
+        if _is_completion_message(first):
             return "\n".join(chunks)
 
         if not require_done:
-            # Control commands (e.g. /new) do not emit (done).
+            # Control commands (e.g. /new) do not emit the completion summary.
             while True:
                 try:
                     more = await asyncio.wait_for(
@@ -164,13 +176,13 @@ class TelegramPlatform:
                     break
             return "\n".join(chunks)
 
-        # Collect additional chunks until done sentinel, with bounded done + idle budgets.
+        # Collect additional chunks until the completion marker, with bounded done + idle budgets.
         done_deadline = asyncio.get_running_loop().time() + done_budget
         while True:
             remaining = done_deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return (
-                    f"(timeout: missing (done) sentinel after {done_budget:.0f}s; "
+                    f"(timeout: missing completion marker after {done_budget:.0f}s; "
                     f"{len(chunks)} chunk(s) received)"
                 )
             try:
@@ -179,11 +191,11 @@ class TelegramPlatform:
                     timeout=min(idle_budget, remaining),
                 )
                 chunks.append(more)
-                if more.strip() == _DONE_SENTINEL:
+                if _is_completion_message(more):
                     break
             except asyncio.TimeoutError:
                 return (
-                    f"(timeout: missing (done) sentinel after {idle_budget:.0f}s idle; "
+                    f"(timeout: missing completion marker after {idle_budget:.0f}s idle; "
                     f"{len(chunks)} chunk(s) received)"
                 )
 
@@ -236,7 +248,7 @@ class TelegramPlatform:
         return response
 
     async def send_control(self, text: str, timeout: float = 20.0) -> str:
-        """Send a control command that is not expected to emit '(done)'."""
+        """Send a control command that is not expected to emit the completion summary."""
         if self._client is None:
             raise RuntimeError("TelegramPlatform not connected")
 

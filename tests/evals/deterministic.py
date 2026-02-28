@@ -44,6 +44,11 @@ def _contains_any(text: str, items: list[str]) -> bool:
     return any(item.lower() in t for item in items)
 
 
+def _has_completion_marker(text: str) -> bool:
+    lower = text.lower()
+    return "(done)" in lower or "context:" in lower
+
+
 async def _run_steps(scenario: EvalScenario, platform: Platform) -> tuple[list[str], str]:
     outputs: list[str] = []
     transcript_parts: list[str] = []
@@ -86,6 +91,14 @@ def _extract_int(label: str, text: str) -> int | None:
     match = re.search(rf"{re.escape(label)}\s*:?\s*(\d+)", text, re.IGNORECASE)
     if match:
         return int(match.group(1))
+    # Markdown-table shape, e.g. "| **input_tokens** | 3 |"
+    table_match = re.search(
+        rf"{re.escape(label)}[^0-9]{{0,20}}(\d+)",
+        text,
+        re.IGNORECASE,
+    )
+    if table_match:
+        return int(table_match.group(1))
     return None
 
 
@@ -130,6 +143,85 @@ def _extract_total_tokens_used(text: str) -> int | None:
         if match:
             return _parse_amount(match.group(1), match.group(2))
     return None
+
+
+def _extract_total_tokens_window(text: str) -> int | None:
+    """Extract configured/mentioned context window token count.
+
+    Accepts:
+    - 'estimated_context_window_tokens: 200000'
+    - '... of 200k tokens'
+    - '... out of 200000 window'
+    """
+
+    structured = _extract_int("estimated_context_window_tokens", text)
+    if structured is not None:
+        return structured
+
+    def _parse_amount(raw: str, suffix: str) -> int:
+        normalized = raw.replace(",", "")
+        value = float(normalized)
+        if suffix.lower() == "k":
+            value *= 1_000
+        elif suffix.lower() == "m":
+            value *= 1_000_000
+        return int(value)
+
+    patterns = [
+        r"\bof\s+(\d+(?:[.,]\d+)?)\s*([kKmM]?)\s+tokens\b",
+        r"\bout of\s+(\d+(?:[.,]\d+)?)\s*([kKmM]?)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return _parse_amount(match.group(1), match.group(2))
+    return None
+
+
+def _validate_context_report(text: str) -> tuple[bool, str]:
+    low = text.lower()
+    has_uuid = re.search(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        low,
+    )
+    has_named_session = re.search(r"session[\s\W_]{0,40}\bid\b", low) is not None
+    if not has_uuid and not has_named_session:
+        return False, "session_id missing"
+
+    input_tokens = _extract_token_count("input", text)
+    output_tokens = _extract_token_count("output", text)
+    total_used_tokens = _extract_total_tokens_used(text)
+    structured_used = _extract_int("estimated_context_used_tokens", text)
+    if (
+        (input_tokens or 0) <= 0
+        and (output_tokens or 0) <= 0
+        and (total_used_tokens or 0) <= 0
+        and (structured_used or 0) <= 0
+    ):
+        return False, "token usage appears zero"
+
+    used_tokens = structured_used if structured_used is not None else total_used_tokens
+    window_tokens = _extract_total_tokens_window(text)
+    if (
+        used_tokens is not None
+        and window_tokens is not None
+        and used_tokens > window_tokens
+    ):
+        return False, "context used exceeds window estimate (likely cumulative bug)"
+    if _contains_any(text, ["100.0%", "100%"]):
+        return False, "context remaining appears stuck at 100%"
+    if _contains_any(
+        text,
+        [
+            "context_info failed",
+            "session_info failed",
+            "introspection tool failure",
+            "unable to retrieve context",
+            "tool invocation failed",
+        ],
+    ):
+        return False, "response reports introspection tool failure"
+    return True, "ok"
 
 
 def _validate_scenario(scenario_id: str, outputs: list[str], transcript: str) -> tuple[bool, str]:
@@ -237,28 +329,38 @@ def _validate_scenario(scenario_id: str, outputs: list[str], transcript: str) ->
     if scenario_id == "session_context_info":
         if len(outputs) < 2:
             return False, "expected two outputs"
-        second = outputs[1]
-        low = second.lower()
-        has_uuid = re.search(
-            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
-            low,
-        )
-        has_named_session = re.search(r"session[\s\W_]{0,40}\bid\b", low) is not None
-        if not has_uuid and not has_named_session:
-            return False, "session_id missing"
-        input_tokens = _extract_token_count("input", second)
-        output_tokens = _extract_token_count("output", second)
-        total_used_tokens = _extract_total_tokens_used(second)
-        if (
-            (input_tokens or 0) <= 0
-            and (output_tokens or 0) <= 0
-            and (total_used_tokens or 0) <= 0
-        ):
-            return False, "token usage appears zero"
-        if _contains_any(second, ["100.0%", "100%"]):
-            return False, "context remaining appears stuck at 100%"
-        if _contains_any(second, ["error", "failed", "exception"]):
-            return False, "response reports introspection tool failure"
+        return _validate_context_report(outputs[1])
+
+    if scenario_id == "session_context_non_cumulative":
+        if len(outputs) < 3:
+            return False, "expected three outputs"
+        return _validate_context_report(outputs[-1])
+
+    if scenario_id == "session_context_tool_use_regression":
+        if len(outputs) < 6:
+            return False, "expected six outputs"
+        if "ready" not in outputs[0].lower():
+            return False, "missing READY warm-up response"
+
+        first = outputs[1]
+        third = outputs[3]
+        fifth = outputs[5]
+
+        for label, text in [("first", first), ("third", third), ("fifth", fifth)]:
+            ok, details = _validate_context_report(text)
+            if not ok:
+                return False, f"{label} context snapshot invalid: {details}"
+
+        used_1 = _extract_int("estimated_context_used_tokens", first) or _extract_total_tokens_used(first)
+        used_3 = _extract_int("estimated_context_used_tokens", third) or _extract_total_tokens_used(third)
+        used_5 = _extract_int("estimated_context_used_tokens", fifth) or _extract_total_tokens_used(fifth)
+        if used_1 is None or used_3 is None or used_5 is None:
+            return False, "could not parse used tokens from one or more snapshots"
+
+        # Guard against the known regression: tool-heavy turn inflates to a large value,
+        # then a plain text turn reports a sharp drop without reset/compaction.
+        if used_5 + 5_000 < used_3:
+            return False, "context used dropped sharply after plain-text follow-up (likely cumulative/aggregation bug)"
         return True, "ok"
 
     if scenario_id == "tg_auth_guard":
@@ -285,8 +387,8 @@ def _validate_scenario(scenario_id: str, outputs: list[str], transcript: str) ->
             return False, "warm-up response missing READY"
         if "fork_launched" not in full:
             return False, "missing immediate FORK_LAUNCHED confirmation"
-        if "(done)" not in full:
-            return False, "missing (done) sentinel"
+        if not _has_completion_marker(full):
+            return False, "missing completion marker"
         if not _contains_any(
             full,
             [
@@ -307,8 +409,8 @@ def _validate_scenario(scenario_id: str, outputs: list[str], transcript: str) ->
         lower = full.lower()
         if not full.strip():
             return False, "empty response"
-        if "(done)" not in lower:
-            return False, "missing (done) sentinel"
+        if not _has_completion_marker(lower):
+            return False, "missing completion marker"
         if _has_error(full):
             return False, "response contains error markers"
         skills = ["file-conventions", "update-context", "manage-summaries", "create-reference"]
@@ -321,8 +423,8 @@ def _validate_scenario(scenario_id: str, outputs: list[str], transcript: str) ->
     if scenario_id == "tg_html_format":
         full = "\n".join(outputs)
         lower = full.lower()
-        if "(done)" not in lower:
-            return False, "missing (done) sentinel"
+        if not _has_completion_marker(lower):
+            return False, "missing completion marker"
         if "bubble" not in lower:
             return False, "response missing bubble sort context"
         if "def " not in lower:
@@ -338,13 +440,17 @@ def _validate_scenario(scenario_id: str, outputs: list[str], transcript: str) ->
     if scenario_id == "tg_queue_while_busy":
         full = "\n".join(outputs)
         lower = full.lower()
-        if "(done)" not in lower:
-            return False, "missing (done) sentinel"
+        if len(outputs) != 1:
+            return False, "busy follow-up became a separate turn instead of one queued run"
+        if not _has_completion_marker(lower):
+            return False, "missing completion marker"
         if not re.search(r"\b4\b", lower):
             return False, "missing queued 2+2 response"
         skills = ["file-conventions", "update-context", "manage-summaries", "create-reference"]
         if sum(1 for s in skills if s in lower) < 2:
             return False, "missing substantive skills response"
+        if "queued message delivered" not in lower:
+            return False, "missing visible queued-message delivery evidence"
         if _has_error(full):
             return False, "response contains error markers"
         return True, "ok"
@@ -352,8 +458,8 @@ def _validate_scenario(scenario_id: str, outputs: list[str], transcript: str) ->
     if scenario_id == "tg_message_split":
         full = "\n".join(outputs)
         lower = full.lower()
-        if "(done)" not in lower:
-            return False, "missing (done) sentinel"
+        if not _has_completion_marker(lower):
+            return False, "missing completion marker"
         if len(full) < 3500:
             return False, "output too short; message-splitting stress likely not exercised"
         milestones = [
@@ -386,14 +492,14 @@ def _validate_scenario(scenario_id: str, outputs: list[str], transcript: str) ->
         second_low = second.lower()
         if "forced_stress_done" not in first_low:
             return False, "first turn missing FORCED_STRESS_DONE marker"
-        if "(done)" not in first_low:
-            return False, "first turn missing (done) sentinel"
+        if not _has_completion_marker(first_low):
+            return False, "first turn missing completion marker"
         if not _contains_any(second_low, ["pong", "ping"]):
             return False, "second turn missing direct ping/pong response"
         if _contains_any(second_low, ["read:", "mcp__obs-agent__read", "2019-12-24", "2020-02-21"]):
             return False, "second turn appears contaminated by stale turn-1 read backlog"
-        if "(done)" not in second_low:
-            return False, "second turn missing (done) sentinel"
+        if not _has_completion_marker(second_low):
+            return False, "second turn missing completion marker"
         return True, "ok"
 
     return False, f"no deterministic validator implemented for {scenario_id}"

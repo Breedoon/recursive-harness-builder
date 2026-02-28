@@ -3,7 +3,7 @@
 Covers the simplified Telegram runtime:
 - per-turn chronological message flushing
 - inline status + text rendering
-- final (done) sentinel behavior
+- final context-summary completion behavior
 - per-chat lock serialization
 - background queue auto-delivery poller
 """
@@ -18,7 +18,7 @@ from obs_agent.events import StatusEvent
 from obs_agent.runner import DoneEvent, TextEvent, TurnEndEvent
 from obs_agent.telegram import FragmentBuffer, TelegramBot, create_telegram_app
 
-# Near-zero gap for fast test execution (real default is 1.5s)
+# Near-zero gap for fast test execution (real default is 0.35s)
 _TEST_GAP = 0.05
 
 
@@ -63,7 +63,7 @@ class TestTelegramBotAuth:
             ctx = _make_context()
             await bot.handle_message(update, ctx)
 
-        # receipt + working + content + done
+        # receipt + working + content + completion summary
         assert ctx.bot.send_message.call_count == 4
 
     async def test_disallowed_user_rejected(self, config):
@@ -104,14 +104,39 @@ class TestTelegramMessageFlow:
         assert ctx.bot.send_message.call_count == 4
 
         calls = [c.kwargs for c in ctx.bot.send_message.call_args_list]
-        assert calls[0]["text"] == "(received)"
-        assert calls[1]["text"] == "(working)"
+        assert calls[0]["text"] == "<u><i>received</i></u>"
+        assert calls[1]["text"] == "<u><i>working</i></u>"
         assert calls[2]["parse_mode"] == "HTML"
         assert calls[2]["disable_notification"] is True
         assert "<i>Read: CLAUDE.md</i>" in calls[2]["text"]
         assert "Hello from tool run" in calls[2]["text"]
-        assert calls[3]["text"] == "(done)"
+        assert calls[3]["text"] == "<u><i>context: 0 / 200k</i></u>"
         assert calls[3]["disable_notification"] is False
+
+    async def test_thinking_content_is_rendered_verbatim(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        events = [
+            StatusEvent(type="thinking", summary="I should inspect CLAUDE.md first."),
+            TurnEndEvent(),
+            DoneEvent(),
+        ]
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                for event in events:
+                    yield event
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            update = _make_update("test")
+            ctx = _make_context()
+            await bot.handle_message(update, ctx)
+
+        calls = [c.kwargs for c in ctx.bot.send_message.call_args_list]
+        assert "<i>I should inspect CLAUDE.md first.</i>" in calls[2]["text"]
 
     async def test_sends_one_content_message_per_turn(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -139,26 +164,46 @@ class TestTelegramMessageFlow:
 
         assert ctx.bot.send_message.call_count == 5
         calls = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
-        assert calls[0] == "(received)"
-        assert calls[1] == "(working)"
+        assert calls[0] == "<u><i>received</i></u>"
+        assert calls[1] == "<u><i>working</i></u>"
         assert "turn one" in calls[2]
         assert "turn two" in calls[3]
-        assert calls[4] == "(done)"
+        assert calls[4] == "<u><i>context: 0 / 200k</i></u>"
+
+    async def test_completion_summary_mentions_username_when_configured(self, config):
+        config.telegram_notify_username = "breedoon"
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        events = [TextEvent(text="done"), TurnEndEvent(), DoneEvent()]
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                for event in events:
+                    yield event
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            update = _make_update("test")
+            ctx = _make_context()
+            await bot.handle_message(update, ctx)
+
+        calls = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
+        assert calls[-1] == "<u><i>context: 0 / 200k\n@breedoon</i></u>"
 
 
 class TestPerChatLock:
-    async def test_same_chat_processing_serialized(self, config):
+    async def test_busy_follow_up_is_enqueued_instead_of_starting_second_turn(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
 
         started: list[str] = []
-        finished: list[str] = []
+        release = asyncio.Event()
 
         async def fake_run_and_send(**kwargs):
             text = kwargs["user_text"]
             started.append(text)
-            if text == "first":
-                await asyncio.sleep(0.05)
-            finished.append(text)
+            await release.wait()
 
         with patch.object(bot, "_run_and_send", side_effect=fake_run_and_send):
             ctx = _make_context()
@@ -166,12 +211,18 @@ class TestPerChatLock:
             u2 = _make_update("second", message_id=2)
 
             t1 = asyncio.create_task(bot._process_message("first", u1, ctx))
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.01)
             t2 = asyncio.create_task(bot._process_message("second", u2, ctx))
+            await asyncio.sleep(0.01)
+
+            assert started == ["first"]
+            assert bot._hook_state.message_queue.get_nowait() == "second"
+
+            release.set()
             await asyncio.gather(t1, t2)
 
-        assert started == ["first", "second"]
-        assert finished == ["first", "second"]
+        texts = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
+        assert "<u><i>queued</i></u>" in texts
 
 
 class TestBackgroundPoller:
@@ -239,7 +290,8 @@ class TestCommands:
         mock_reset.assert_called_once()
         assert bot._pending_messages == []
         assert bot._hook_state.interrupt_flag is False
-        update.effective_message.reply_text.assert_called_once()
+        ctx.bot.send_message.assert_called_once()
+        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>session cleared</i></u>"
 
     async def test_stop_sets_interrupt_flag(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -249,7 +301,8 @@ class TestCommands:
         await bot.handle_stop(update, ctx)
 
         assert bot._hook_state.interrupt_flag is True
-        update.effective_message.reply_text.assert_called_once()
+        ctx.bot.send_message.assert_called_once()
+        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent</i></u>"
 
 
 class TestCreateTelegramApp:
@@ -294,9 +347,9 @@ class TestFragmentBuffer:
         buf = FragmentBuffer(on_complete=on_complete, gap_seconds=_TEST_GAP)
         ctx = _make_context()
 
-        u1 = _make_update("part1", message_id=100)
-        u2 = _make_update("part2", message_id=101)
-        u3 = _make_update("part3", message_id=102)
+        u1 = _make_update("a" * 4096, message_id=100)
+        u2 = _make_update("b" * 4096, message_id=101)
+        u3 = _make_update("c" * 200, message_id=102)
 
         t1 = asyncio.create_task(buf.add(u1, ctx))
         await asyncio.sleep(0)
@@ -304,9 +357,9 @@ class TestFragmentBuffer:
         await buf.add(u3, ctx)
         await t1
 
-        assert received == ["part1part2part3"]
+        assert received == [("a" * 4096) + ("b" * 4096) + ("c" * 200)]
 
-    async def test_different_users_never_combined(self):
+    async def test_quick_short_messages_are_not_combined(self):
         received: list[str] = []
 
         async def on_complete(text, update, context):
@@ -315,11 +368,12 @@ class TestFragmentBuffer:
         buf = FragmentBuffer(on_complete=on_complete, gap_seconds=_TEST_GAP)
         ctx = _make_context()
 
-        u1 = _make_update("from_alice", user_id=111, message_id=100)
-        u2 = _make_update("from_bob", user_id=222, message_id=101)
+        u1 = _make_update("first", user_id=111, message_id=100)
+        u2 = _make_update("second", user_id=111, message_id=101)
 
         await asyncio.gather(buf.add(u1, ctx), buf.add(u2, ctx))
         assert len(received) == 2
+        assert received == ["first", "second"]
 
 
 # --- Error handling ---
@@ -469,13 +523,13 @@ class TestTelegramErrorHandling:
                 mock_soft.assert_called_once()
                 mock_full.assert_not_called()
 
-                # Error message says "session preserved", not "session reset"
+                # Error message stays in the shared system-message format.
                 sent_calls = ctx.bot.send_message.call_args_list
                 error_texts = [
                     c.kwargs.get("text", "") for c in sent_calls
                     if "error" in c.kwargs.get("text", "").lower()
                 ]
-                assert any("session preserved" in t for t in error_texts)
+                assert any("<u><i>error: ProcessError: CLI died" in t for t in error_texts)
 
     async def test_transient_transport_error_does_not_truncate_run(self, config):
         """A mid-stream Telegram send failure should retry and finish the turn."""
@@ -521,4 +575,4 @@ class TestTelegramErrorHandling:
 
             texts = [c.kwargs.get("text", "") for c in ctx.bot.send_message.call_args_list]
             assert any("FINAL_MARKER" in t for t in texts)
-            assert texts[-1] == "(done)"
+            assert texts[-1] == "<u><i>context: 0 / 200k</i></u>"

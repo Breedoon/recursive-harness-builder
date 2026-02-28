@@ -26,10 +26,13 @@ class OBSConfig:
     max_queue_continuations: int = 3
     bg_fork_timeout: float = 600.0  # seconds to wait for background forks
     max_buffer_size: int = 10 * 1024 * 1024  # 10 MB SDK JSON buffer limit
+    context_window_estimate_tokens: int = 200_000
+    context_probe_claude_cli: bool = False
 
     # Telegram
     telegram_bot_token: str | None = None
     telegram_allowed_user_ids: list[int] = field(default_factory=list)
+    telegram_notify_username: str | None = None
 
     # --- Class Methods ---
 
@@ -52,12 +55,21 @@ class OBSConfig:
             kwargs["bg_fork_timeout"] = float(bg_timeout)
         if buf_size := os.environ.get("OBS_MAX_BUFFER_SIZE"):
             kwargs["max_buffer_size"] = int(buf_size)
+        if context_est := os.environ.get("OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"):
+            kwargs["context_window_estimate_tokens"] = int(context_est)
+        if probe_cli := os.environ.get("OBS_CONTEXT_PROBE_CLAUDE_CLI"):
+            kwargs["context_probe_claude_cli"] = probe_cli.strip().lower() in {"1", "true", "yes", "on"}
         if tg_token := os.environ.get("OBS_TELEGRAM_BOT_TOKEN") or os.environ.get("OBS_TELEGRAM_PROD_BOT_TOKEN"):
             kwargs["telegram_bot_token"] = tg_token
         if tg_users := os.environ.get("OBS_TELEGRAM_ALLOWED_USERS") or os.environ.get("OBS_TELEGRAM_AUTHORIZED_USER_ID"):
             kwargs["telegram_allowed_user_ids"] = [
                 int(uid.strip()) for uid in tg_users.split(",") if uid.strip()
             ]
+        if tg_username := (
+            os.environ.get("OBS_TELEGRAM_NOTIFY_USERNAME")
+            or os.environ.get("OBS_TELEGRAM_TEST_NOTIFY_USERNAME")
+        ):
+            kwargs["telegram_notify_username"] = tg_username.lstrip("@").strip() or None
 
         return cls(**kwargs)
 
