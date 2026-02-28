@@ -167,6 +167,52 @@ class TestRunnerStatusEvents:
 
         status_events = [e for e in events if isinstance(e, StatusEvent)]
         assert any(e.type == "thinking" for e in status_events)
+        assert any(e.summary == "hmm..." for e in status_events)
+
+
+class TestRunnerUsageSnapshot:
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_last_result_data_prefers_latest_assistant_usage(self, mock_get_client, config):
+        assistant_msg = MagicMock()
+        assistant_msg.content = [TextBlock(text="ok")]
+        assistant_msg.session_id = "sess-1"
+        assistant_msg.usage = {
+            "input_tokens": 4,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 100,
+            "cache_read_input_tokens": 2000,
+        }
+
+        result_msg = MagicMock()
+        result_msg.content = []
+        result_msg.session_id = "sess-1"
+        result_msg.num_turns = 2
+        result_msg.total_cost_usd = 0.12
+        result_msg.duration_ms = 1234
+        result_msg.usage = {
+            "input_tokens": 4,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 900,
+            "cache_read_input_tokens": 9000,
+        }
+
+        mock_get_client.return_value = _make_mock_client([assistant_msg, result_msg])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        await _collect_events(runner, "hello")
+
+        data = hook_state.last_result_data
+        assert data is not None
+        assert data["session_id"] == "sess-1"
+        assert data["num_turns"] == 2
+        assert data["total_cost_usd"] == 0.12
+        assert data["duration_ms"] == 1234
+        # Usage should come from the latest assistant step, not aggregated ResultMessage usage.
+        assert data["usage"]["cache_read_input_tokens"] == 2000
+        assert data["usage"]["cache_creation_input_tokens"] == 100
 
 
 # --- Pending messages ---

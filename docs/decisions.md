@@ -253,12 +253,12 @@ D001-D017 were made during the [[Agent/system/sessions/2026-02-11-initial-design
 - Event-driven wake/coalescing infrastructure (OpenClaw-like heartbeat system)
 **Rationale**: The lock removes common ordering races with minimal complexity. Polling is operationally simple and robust for the current single-user production shape; it provides background auto-delivery without introducing a larger scheduling subsystem.
 
-## D034: `(done)` Sentinel as Completion Contract for Telegram
-**Decision**: Every Telegram run sends content silently (`disable_notification=True`) and emits a final `(done)` message with notification enabled.
+## D034: Queue-Idle Context Summary as Completion Contract for Telegram
+**Decision**: Every Telegram run sends content silently (`disable_notification=True`) and emits a final compact context summary (`context: used / window`, optionally with `@username`) when the queue is idle, with notification enabled.
 **Alternatives considered**:
 - Track and notify only the exact final content chunk
 - No explicit completion marker
-**Rationale**: `(done)` is a low-complexity, explicit completion signal that is easy for humans and eval harnesses to detect. It avoids fragile “true last chunk” logic while preserving clear operator awareness.
+**Rationale**: The user cares about "nothing else queued" rather than per-turn completion. A compact context summary doubles as an explicit completion marker and a useful session-health snapshot, while still avoiding fragile "true last chunk" tracking. Mentioning the configured Telegram username also provides a more reliable final notification path than relying on Telegram's silent/unsilent toggles alone.
 
 ## D035: Observability-First Tool Summaries
 **Decision**: Tool summaries are standardized to 200-character truncation and unknown tools fall back to structured payload visibility instead of opaque labels.

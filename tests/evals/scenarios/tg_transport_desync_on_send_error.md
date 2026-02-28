@@ -5,12 +5,12 @@ profiles: feature, full
 # Telegram Transport Desync On Send Error
 
 ## Intent
-This tests the specific desync failure mode reported in production: a large burst of tool/status output during one turn causes Telegram send errors, the bot emits `(done)` anyway, and then stale output from the previous turn leaks into the next user turn.
+This tests the specific desync failure mode reported in production: a large burst of tool/status output during one turn causes Telegram send errors, the bot emits the final completion summary anyway, and then stale output from the previous turn leaks into the next user turn.
 
 A working system: after the stress turn completes, the next user message (`ping`) gets a clean immediate ping response. No leftover tool/status lines from the previous turn appear in the ping turn.
 
 A broken system looks like:
-- `(done)` appears for the stress turn, but the next turn starts by dumping leftover `Read:` lines from the previous turn
+- The completion summary appears for the stress turn, but the next turn starts by dumping leftover `Read:` lines from the previous turn
 - The ping turn is delayed or polluted by old backlog before the ping acknowledgement
 - The bot claims completion but still has undelivered output that only appears when the user sends another message
 
@@ -27,4 +27,4 @@ Suspicious: intermittent `(error sending message — try again)` is acceptable o
 - The second turn responds to `ping` directly (e.g., `pong`/`ping`) as its primary intent
 - The second turn does NOT contain stale `Read:` lines or other leftover stress-turn content before addressing `ping`
 - The interaction demonstrates chronological integrity: no post-completion backlog leak from turn 1 into turn 2
-- The transcript includes `(done)` sentinels and they align with actual turn completion behavior
+- The transcript includes completion summaries and they align with actual turn completion behavior

@@ -295,8 +295,9 @@ class TestHookPipeline:
         async def deny_check(inp, tid, ctx):
             return {
                 "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
-                    "reason": "blocked",
+                    "permissionDecisionReason": "blocked",
                 }
             }
 
@@ -305,20 +306,22 @@ class TestHookPipeline:
 
         pipeline = HookPipeline([deny_check, should_not_run])
         result = await pipeline(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
+        assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
         assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-        assert result["hookSpecificOutput"]["reason"] == "blocked"
+        assert result["hookSpecificOutput"]["permissionDecisionReason"] == "blocked"
 
     @pytest.mark.asyncio
     async def test_accumulates_context(self):
         """Pipeline merges additionalContext from multiple checks."""
         async def check_a(inp, tid, ctx):
-            return {"hookSpecificOutput": {"additionalContext": "context A"}}
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "context A"}}
 
         async def check_b(inp, tid, ctx):
-            return {"hookSpecificOutput": {"additionalContext": "context B"}}
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "context B"}}
 
         pipeline = HookPipeline([check_a, check_b])
         result = await pipeline(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
+        assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
         ctx = result["hookSpecificOutput"]["additionalContext"]
         assert "context A" in ctx
         assert "context B" in ctx
@@ -330,10 +333,11 @@ class TestHookPipeline:
             return None
 
         async def provides_context(inp, tid, ctx):
-            return {"hookSpecificOutput": {"additionalContext": "hello"}}
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "hello"}}
 
         pipeline = HookPipeline([noop, provides_context])
         result = await pipeline(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
+        assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
         assert result["hookSpecificOutput"]["additionalContext"] == "hello"
 
 
@@ -436,6 +440,7 @@ class TestCheckMessageQueue:
         check = _make_queue_check(state)
         result = await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
         assert result is not None
+        assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
         ctx = result["hookSpecificOutput"]["additionalContext"]
         assert "hello from user" in ctx
         assert "[Queued message from user]" in ctx
@@ -449,6 +454,7 @@ class TestCheckMessageQueue:
         check = _make_queue_check(state)
         result = await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
         assert result is not None
+        assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
         ctx = result["hookSpecificOutput"]["additionalContext"]
         assert "first message" in ctx
         assert "second message" in ctx
@@ -592,4 +598,5 @@ class TestCreateHookMatchers:
         pipeline = matchers["PostToolUse"][0].hooks[0]
 
         result = await pipeline(_make_post_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
+        assert result.get("hookSpecificOutput", {}).get("hookEventName") == "PostToolUse"
         assert "queued msg" in result.get("hookSpecificOutput", {}).get("additionalContext", "")

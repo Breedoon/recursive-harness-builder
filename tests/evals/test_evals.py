@@ -190,7 +190,7 @@ def _start_telegram_bot(vault_path: Path) -> tuple[subprocess.Popen, Path]:
     IMPORTANT: We redirect stderr to a temp file instead of using PIPE.
     With PIPE, the OS pipe buffer (~64KB on macOS) fills up during long eval
     runs. When the buffer is full, the bot subprocess blocks on every log
-    write, causing a silent deadlock — no Telegram messages sent, no (done)
+    write, causing a silent deadlock — no Telegram messages sent, no final completion summary
     sentinel, zero output from the bot's perspective. Writing to a file
     avoids this entirely.
     """

@@ -14,6 +14,13 @@ from typing import TYPE_CHECKING, Callable
 
 from claude_agent_sdk import ClaudeAgentOptions, TextBlock, query, tool, create_sdk_mcp_server
 
+from obs_agent.context_probe import probe_context_via_claude_cli
+from obs_agent.context_stats import (
+    apply_context_probe,
+    build_context_snapshot,
+    format_context_snapshot_lines,
+)
+
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
     from obs_agent.hooks import HookState
@@ -151,64 +158,40 @@ def create_obs_tools(
         text = "\n".join(result_parts) or "(fork returned no output)"
         return {"content": [{"type": "text", "text": text}]}
 
+    async def _render_context_and_session() -> str:
+        data = hook_state.last_result_data if hook_state is not None else None
+        snapshot = build_context_snapshot(
+            session_id=get_session_id(),
+            data=data,
+            context_window_estimate_tokens=config.context_window_estimate_tokens,
+            cwd=config.vault_path,
+        )
+        probe = None
+        if config.context_probe_claude_cli:
+            probe = await probe_context_via_claude_cli(
+                session_id=snapshot.get("session_id"),
+                cwd=config.vault_path,
+            )
+        snapshot = apply_context_probe(snapshot, probe)
+        return "\n".join(format_context_snapshot_lines(snapshot))
+
     @tool(
         "session_info",
-        "Return current session metadata: session ID, turn count, total cost, "
-        "and duration. Use when the user asks about the current session.",
+        "Return current session + usage snapshot: session ID, turn count, latest usage, "
+        "billing token totals, and estimated context remaining.",
         {},
     )
     async def session_info(args: dict) -> dict:
-        data = hook_state.last_result_data if hook_state is not None else None
-        if data is None:
-            return {
-                "content": [
-                    {"type": "text", "text": "No session data available yet (need at least one completed turn)."}
-                ]
-            }
-        lines = [
-            f"session_id: {data.get('session_id')}",
-            f"num_turns: {data.get('num_turns')}",
-            f"total_cost_usd: {data.get('total_cost_usd')}",
-            f"duration_ms: {data.get('duration_ms')}",
-        ]
-        return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+        return {"content": [{"type": "text", "text": await _render_context_and_session()}]}
 
     @tool(
         "context_info",
-        "Return context window usage: input/output token counts, cache stats, "
-        "and estimated percentage of context remaining (200k window). "
-        "Use when the user asks about context usage or tokens.",
+        "Return current session + context usage snapshot including latest input/output/cache "
+        "token stats, billing token total, and estimated context remaining.",
         {},
     )
     async def context_info(args: dict) -> dict:
-        data = hook_state.last_result_data if hook_state is not None else None
-        usage = data.get("usage") if data else None
-        if usage is None:
-            return {
-                "content": [
-                    {"type": "text", "text": "No usage data available yet (need at least one completed turn)."}
-                ]
-            }
-
-        input_tokens = usage.get("input_tokens") or 0
-        output_tokens = usage.get("output_tokens") or 0
-        cache_creation = usage.get("cache_creation_input_tokens") or 0
-        cache_read = usage.get("cache_read_input_tokens") or 0
-        # Total context usage includes cached tokens (they still occupy the window)
-        total_used = input_tokens + output_tokens + cache_creation + cache_read
-        context_window = 200_000
-        pct_remaining = max(0.0, (1 - total_used / context_window) * 100)
-
-        lines = [
-            f"input_tokens: {input_tokens}",
-            f"output_tokens: {output_tokens}",
-            f"cache_creation_input_tokens: {cache_creation}",
-            f"cache_read_input_tokens: {cache_read}",
-            f"total_tokens_used: {total_used}",
-            f"context_window: {context_window}",
-            f"pct_remaining: {pct_remaining:.1f}%",
-        ]
-        return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+        return {"content": [{"type": "text", "text": await _render_context_and_session()}]}
 
     server = create_sdk_mcp_server("obs-agent", tools=[self_fork, session_info, context_info])
     return server

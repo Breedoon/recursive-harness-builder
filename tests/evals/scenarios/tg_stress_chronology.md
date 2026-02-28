@@ -21,5 +21,5 @@ profiles: feature, full
 - The output includes a substantive response to the CLAUDE.md section-list task
 - The output also acknowledges the "how is it going" and ping follow-up messages
 - No message appears dropped; all three user intents are addressed in output
-- The output includes the `(done)` sentinel
+- The output includes the final completion summary (`context: ... / ...`)
 - The output does not contain timeout or internal error text

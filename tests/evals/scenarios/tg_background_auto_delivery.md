@@ -20,4 +20,4 @@ continuation_timeouts: 60,20
 - The transcript contains FORK_LAUNCHED (proving immediate foreground response)
 - The transcript later contains background-fork result content without any additional user message
 - The transcript includes at least one concrete detail from CLAUDE.md in the delivered fork result
-- The transcript includes the `(done)` sentinel
+- The transcript includes the final completion summary (`context: ... / ...`)

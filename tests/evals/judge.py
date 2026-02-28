@@ -91,6 +91,18 @@ def _build_judge_prompt_sequential(scenario: EvalScenario) -> str:
         if scenario.intent
         else "- No extra intent notes provided."
     )
+    explore_raw = scenario.metadata.get("exploration_messages", "0")
+    try:
+        exploration_budget = max(0, int(explore_raw))
+    except ValueError:
+        exploration_budget = 0
+    exploration_text = ""
+    if exploration_budget > 0:
+        exploration_text = (
+            f"\nAfter completing the required steps, you MAY send up to {exploration_budget} additional "
+            "probing messages to try to falsify the behavior. Use this budget to stress suspicious "
+            "patterns (e.g., impossible token math, inconsistent context trends, or contradictory tool outputs)."
+        )
 
     return f"""You are evaluating the OBS Agent by running a test scenario.
 
@@ -100,6 +112,7 @@ def _build_judge_prompt_sequential(scenario: EvalScenario) -> str:
 Use the send_message tool to interact with the agent. Follow these steps IN ORDER:
 
 {steps_text}
+{exploration_text}
 
 ## Intent Context
 {intent_text}
@@ -124,7 +137,8 @@ VERDICT:
 If ALL criteria are met: VERDICT must be PASS.
 If ANY criterion is not met: VERDICT must be FAIL.
 
-Be strict: if output is technically passing but behavior seems off for the intent, call it out in NOTES.
+Be strict and adversarial: try to find failure modes, not just check boxes.
+If output is technically passing but behavior seems off for the intent, call it out in NOTES.
 """
 
 

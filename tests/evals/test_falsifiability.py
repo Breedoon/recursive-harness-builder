@@ -10,6 +10,7 @@ from tests.evals.scenario import parse_scenario
 SCENARIO_DIR = Path(__file__).parent / "scenarios"
 EXPECTED_JUDGE_SCENARIOS = {
     "background_fork",
+    "context_usage_stress",
     "context_awareness",
     "tg_chronological_output",
     "tg_large_output_resilience",
@@ -29,7 +30,7 @@ def test_judge_suite_is_small_and_intentional() -> None:
         if (parse_scenario(SCENARIO_DIR / f"{sid}.md").lane or "").lower() == "judge"
     }
     assert judge == EXPECTED_JUDGE_SCENARIOS
-    assert len(judge) <= 6
+    assert len(judge) <= 7
 
 
 def test_scenario_quality_floor() -> None:
@@ -76,13 +77,13 @@ def test_deterministic_mutation_spot_checks() -> None:
         ),
         (
             "tg_transport_desync_forced_concurrency",
-            ["FORCED_STRESS_DONE (done)", "Read: stale backlog then pong (done)"],
+            ["FORCED_STRESS_DONE\ncontext: 30k / 200k", "Read: stale backlog then pong\ncontext: 31k / 200k"],
             "",
             "contaminated",
         ),
         (
             "tg_message_split",
-            ["tiny answer (done)"],
+            ["tiny answer\ncontext: 10k / 200k"],
             "",
             "too short",
         ),

@@ -79,10 +79,109 @@ def test_validate_session_context_info_accepts_parenthetical_tokens_of() -> None
     assert details == "ok"
 
 
+def test_validate_session_context_info_rejects_used_exceeding_window() -> None:
+    output = (
+        "session_id: 5a98046b-60f1-4983-bac8-8249a6437e56\n"
+        "estimated_context_window_tokens: 200000\n"
+        "estimated_context_used_tokens: 312000\n"
+        "estimated_context_remaining_pct: 0.0%\n"
+    )
+    passed, details = _validate_scenario("session_context_info", ["ok", output], "")
+    assert not passed
+    assert "exceeds window" in details
+
+
+def test_validate_session_context_info_accepts_markdown_table_token_fields() -> None:
+    output = (
+        "| **Session ID** | `5a98046b-60f1-4983-bac8-8249a6437e56` |\n"
+        "| **input_tokens** | 3 |\n"
+        "| **output_tokens** | 6 |\n"
+        "| **estimated_context_window_tokens** | 200000 |\n"
+        "| **estimated_context_used_tokens** | 23314 |\n"
+    )
+    passed, details = _validate_scenario("session_context_info", ["ok", output], "")
+    assert passed
+    assert details == "ok"
+
+
+def test_validate_session_context_non_cumulative_accepts_valid_report() -> None:
+    output = (
+        "session_id: 5a98046b-60f1-4983-bac8-8249a6437e56\n"
+        "estimated_context_window_tokens: 200000\n"
+        "estimated_context_used_tokens: 37000\n"
+        "estimated_context_remaining_pct: 81.5%\n"
+    )
+    passed, details = _validate_scenario("session_context_non_cumulative", ["a", "b", output], "")
+    assert passed
+    assert details == "ok"
+
+
+def test_validate_session_context_info_rejects_explicit_tool_failure() -> None:
+    output = (
+        "session_id: 5a98046b-60f1-4983-bac8-8249a6437e56\n"
+        "estimated_context_window_tokens: 200000\n"
+        "estimated_context_used_tokens: 37000\n"
+        "context_info failed: timeout\n"
+    )
+    passed, details = _validate_scenario("session_context_info", ["ok", output], "")
+    assert not passed
+    assert "introspection tool failure" in details
+
+
+def test_validate_session_context_tool_use_regression_rejects_sharp_drop() -> None:
+    one = (
+        "session_id: 5a98046b-60f1-4983-bac8-8249a6437e56\n"
+        "estimated_context_window_tokens: 200000\n"
+        "estimated_context_used_tokens: 21000\n"
+    )
+    three = (
+        "session_id: 5a98046b-60f1-4983-bac8-8249a6437e56\n"
+        "estimated_context_window_tokens: 200000\n"
+        "estimated_context_used_tokens: 76000\n"
+    )
+    five = (
+        "session_id: 5a98046b-60f1-4983-bac8-8249a6437e56\n"
+        "estimated_context_window_tokens: 200000\n"
+        "estimated_context_used_tokens: 32000\n"
+    )
+    passed, details = _validate_scenario(
+        "session_context_tool_use_regression",
+        ["READY", one, "DONE_READS", three, "4", five],
+        "",
+    )
+    assert not passed
+    assert "dropped sharply" in details
+
+
+def test_validate_session_context_tool_use_regression_accepts_stable_values() -> None:
+    one = (
+        "session_id: 5a98046b-60f1-4983-bac8-8249a6437e56\n"
+        "estimated_context_window_tokens: 200000\n"
+        "estimated_context_used_tokens: 21000\n"
+    )
+    three = (
+        "session_id: 5a98046b-60f1-4983-bac8-8249a6437e56\n"
+        "estimated_context_window_tokens: 200000\n"
+        "estimated_context_used_tokens: 36000\n"
+    )
+    five = (
+        "session_id: 5a98046b-60f1-4983-bac8-8249a6437e56\n"
+        "estimated_context_window_tokens: 200000\n"
+        "estimated_context_used_tokens: 35000\n"
+    )
+    passed, details = _validate_scenario(
+        "session_context_tool_use_regression",
+        ["READY", one, "DONE_READS", three, "4", five],
+        "",
+    )
+    assert passed
+    assert details == "ok"
+
+
 def test_validate_tg_auth_guard_requires_paris() -> None:
     passed, details = _validate_scenario(
         "tg_auth_guard",
-        ["Hello there (done)", "London (done)"],
+        ["Hello there\ncontext: 12k / 200k", "London\ncontext: 13k / 200k"],
         "",
     )
     assert not passed
@@ -90,7 +189,12 @@ def test_validate_tg_auth_guard_requires_paris() -> None:
 
 
 def test_validate_tg_message_split_checks_length_and_coverage() -> None:
-    long_text = " ".join(["Babbage Lovelace Turing ENIAC transistor ARPANET World Wide Web smartphone machine learning"] * 60) + " (done)"
+    long_text = (
+        " ".join(
+            ["Babbage Lovelace Turing ENIAC transistor ARPANET World Wide Web smartphone machine learning"] * 60
+        )
+        + "\ncontext: 24k / 200k"
+    )
     passed, details = _validate_scenario("tg_message_split", [long_text], "")
     assert passed
     assert details == "ok"
@@ -99,11 +203,24 @@ def test_validate_tg_message_split_checks_length_and_coverage() -> None:
 def test_validate_tg_transport_desync_detects_backlog_leak() -> None:
     passed, details = _validate_scenario(
         "tg_transport_desync_forced_concurrency",
-        ["FORCED_STRESS_DONE (done)", "Read: 2019-12-24.md ... pong (done)"],
+        ["FORCED_STRESS_DONE\ncontext: 28k / 200k", "Read: 2019-12-24.md ... pong\ncontext: 29k / 200k"],
         "",
     )
     assert not passed
     assert "contaminated" in details
+
+
+def test_validate_tg_queue_while_busy_requires_single_queued_run() -> None:
+    passed, details = _validate_scenario(
+        "tg_queue_while_busy",
+        [
+            "skills response only\ncontext: 20k / 200k",
+            "4\ncontext: 21k / 200k",
+        ],
+        "",
+    )
+    assert not passed
+    assert "separate turn" in details
 
 
 def test_validate_immutable_guard_ignores_immutable_word_in_skill_dump() -> None:

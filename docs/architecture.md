@@ -67,13 +67,13 @@ The Telegram adapter intentionally uses a simple, robust model:
 1. Fragment reassembly for Telegram auto-split user messages
 2. Per-chat lock serialization (prevents in-chat out-of-order processing)
 3. Per-turn flush: inline tool/status + text in chronological order
-4. `(done)` sentinel at run completion (notification enabled)
+4. Final `context: used / window` summary at queue-idle completion (notification enabled)
 5. Background queue poller every 3s for idle auto-delivery
 
 Important implementation notes:
 
 - Content chunks are sent with `disable_notification=True`
-- `(done)` is sent with `disable_notification=False`
+- The final completion summary is sent with `disable_notification=False`
 - Single-user assumption remains in auto-delivery routing (`_last_chat_id` + `_last_bot`)
 
 ## Testing Architecture
