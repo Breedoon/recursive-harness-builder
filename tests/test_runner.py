@@ -20,6 +20,7 @@ from claude_agent_sdk import (
 
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
+from obs_agent.queueing import QueuedMessage
 from obs_agent.runner import (
     ConversationRunner,
     DoneEvent,
@@ -64,7 +65,10 @@ class TestDrainQueue:
         q = asyncio.Queue()
         q.put_nowait("a")
         q.put_nowait("b")
-        assert _drain_queue(q) == ["a", "b"]
+        assert _drain_queue(q) == [
+            QueuedMessage(text="a"),
+            QueuedMessage(text="b"),
+        ]
         assert q.empty()
 
 
@@ -309,6 +313,50 @@ class TestRunnerContinuation:
         texts = [e.text for e in text_events]
         assert "Main response" in texts
         assert "Continuation" in texts
+
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_reply_target_queue_is_deferred_for_next_run(self, mock_get_client, config):
+        call_count = 0
+
+        async def mock_receive():
+            nonlocal call_count
+            call_count += 1
+            mock_msg = MagicMock()
+            mock_msg.content = [TextBlock(text=f"Response {call_count}")]
+            mock_msg.session_id = None
+            yield mock_msg
+            if call_count == 1:
+                hook_state.message_queue.put_nowait(
+                    QueuedMessage(
+                        text="reply while busy",
+                        telegram_message_id=42,
+                        reply_to_message_id=7,
+                    )
+                )
+
+        mock_client = AsyncMock()
+        mock_client.receive_response = mock_receive
+        mock_client.query = AsyncMock()
+        mock_get_client.return_value = mock_client
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        events = await _collect_events(runner, "hello")
+
+        text_events = [e for e in events if isinstance(e, TextEvent)]
+        texts = [e.text for e in text_events]
+        assert texts == ["Response 1"]
+        assert mock_client.query.call_count == 1
+        assert runner.remaining_pending == [
+            QueuedMessage(
+                text="reply while busy",
+                telegram_message_id=42,
+                reply_to_message_id=7,
+            )
+        ]
 
 
 # --- Remaining pending ---

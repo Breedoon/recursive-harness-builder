@@ -455,6 +455,24 @@ def _validate_scenario(scenario_id: str, outputs: list[str], transcript: str) ->
             return False, "response contains error markers"
         return True, "ok"
 
+    if scenario_id == "tg_inbound_batching":
+        full = "\n".join(outputs)
+        lower = full.lower()
+        if len(outputs) != 1:
+            return False, "batched inbound messages became multiple completed turns"
+        if not _has_completion_marker(lower):
+            return False, "missing completion marker"
+        if "batch_ok:" not in lower:
+            return False, "missing final batch confirmation"
+        for token in ["alpha", "bravo", "charlie"]:
+            if token not in lower:
+                return False, f"missing {token} from combined batch response"
+        if "queued message delivered" in lower:
+            return False, "messages were queued into an active run instead of held as one inbound batch"
+        if _has_error(full):
+            return False, "response contains error markers"
+        return True, "ok"
+
     if scenario_id == "tg_message_split":
         full = "\n".join(outputs)
         lower = full.lower()

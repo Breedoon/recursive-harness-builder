@@ -20,9 +20,11 @@ The Telethon session must be pre-authenticated (run spikes/generate_session.py).
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import os
 import re
+from pathlib import Path
 
 from telethon import TelegramClient
 from telethon.events import NewMessage
@@ -50,6 +52,30 @@ def _is_completion_message(text: str) -> bool:
         return True
     normalized = stripped.replace("_", "").replace("*", "")
     return bool(_COMPLETION_RE.search(normalized))
+
+
+@dataclass(frozen=True)
+class TelegramObservedMessage:
+    """Structured Telegram message observed from the bot."""
+
+    message_id: int
+    text: str
+    reply_to_message_id: int | None = None
+
+
+@dataclass(frozen=True)
+class TelegramResponseTrace:
+    """Structured record of one user send plus the resulting bot messages."""
+
+    sent_message_id: int | None
+    output: str
+    messages: list[TelegramObservedMessage]
+
+
+def _coerce_observed_message(message: TelegramObservedMessage | str) -> TelegramObservedMessage:
+    if isinstance(message, TelegramObservedMessage):
+        return message
+    return TelegramObservedMessage(message_id=-1, text=message)
 
 
 class TelegramPlatform:
@@ -81,7 +107,8 @@ class TelegramPlatform:
         self._idle_quiescence_timeout = idle_quiescence_timeout
         self._client: TelegramClient | None = None
         self._last_output = ""
-        self._response_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._response_queue: asyncio.Queue[TelegramObservedMessage | str] = asyncio.Queue()
+        self._recent_bot_messages: list[TelegramObservedMessage] = []
 
     async def connect(self) -> None:
         """Connect the Telethon client and set up the message handler.
@@ -123,12 +150,22 @@ class TelegramPlatform:
                     event.message.id, self._baseline_msg_id,
                 )
                 return
-            text = event.message.text or ""
-            self._response_queue.put_nowait(text)
+            observed = TelegramObservedMessage(
+                message_id=event.message.id,
+                text=event.message.text or "",
+                reply_to_message_id=getattr(
+                    getattr(event.message, "reply_to", None),
+                    "reply_to_msg_id",
+                    None,
+                ),
+            )
+            self._recent_bot_messages.append(observed)
+            self._recent_bot_messages = self._recent_bot_messages[-200:]
+            self._response_queue.put_nowait(observed)
 
         logger.info("TelegramPlatform connected to %s", self._bot_username)
 
-    async def _collect_response(
+    async def _collect_response_trace(
         self,
         timeout: float,
         *,
@@ -136,7 +173,8 @@ class TelegramPlatform:
         first_message_timeout: float | None = None,
         done_timeout: float | None = None,
         idle_quiescence_timeout: float | None = None,
-    ) -> str:
+        sent_message_id: int | None = None,
+    ) -> TelegramResponseTrace:
         """Collect all response chunks until the completion marker or timeout.
 
         Timeout model:
@@ -147,59 +185,103 @@ class TelegramPlatform:
           - If idle >= idle_quiescence_timeout before that marker, fail fast
             with a structured timeout marker
         """
-        chunks: list[str] = []
+        observed_messages: list[TelegramObservedMessage] = []
         first_budget = min(timeout, first_message_timeout or self._first_message_timeout)
         done_budget = min(timeout, done_timeout or self._done_timeout)
         idle_budget = idle_quiescence_timeout or self._idle_quiescence_timeout
 
         # Wait for the first message
         try:
-            first = await asyncio.wait_for(
+            first_raw = await asyncio.wait_for(
                 self._response_queue.get(), timeout=first_budget
             )
-            chunks.append(first)
+            first = _coerce_observed_message(first_raw)
+            observed_messages.append(first)
         except asyncio.TimeoutError:
-            return f"(timeout: no response from bot after {first_budget:.0f}s)"
+            return TelegramResponseTrace(
+                sent_message_id=sent_message_id,
+                output=f"(timeout: no response from bot after {first_budget:.0f}s)",
+                messages=[],
+            )
 
-        if _is_completion_message(first):
-            return "\n".join(chunks)
+        if _is_completion_message(first.text):
+            return TelegramResponseTrace(
+                sent_message_id=sent_message_id,
+                output="\n".join(message.text for message in observed_messages),
+                messages=observed_messages,
+            )
 
         if not require_done:
             # Control commands (e.g. /new) do not emit the completion summary.
             while True:
                 try:
-                    more = await asyncio.wait_for(
+                    more_raw = await asyncio.wait_for(
                         self._response_queue.get(), timeout=_CONTROL_SETTLE_SECONDS
                     )
-                    chunks.append(more)
+                    observed_messages.append(_coerce_observed_message(more_raw))
                 except asyncio.TimeoutError:
                     break
-            return "\n".join(chunks)
+            return TelegramResponseTrace(
+                sent_message_id=sent_message_id,
+                output="\n".join(message.text for message in observed_messages),
+                messages=observed_messages,
+            )
 
         # Collect additional chunks until the completion marker, with bounded done + idle budgets.
         done_deadline = asyncio.get_running_loop().time() + done_budget
         while True:
             remaining = done_deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                return (
-                    f"(timeout: missing completion marker after {done_budget:.0f}s; "
-                    f"{len(chunks)} chunk(s) received)"
+                return TelegramResponseTrace(
+                    sent_message_id=sent_message_id,
+                    output=(
+                        f"(timeout: missing completion marker after {done_budget:.0f}s; "
+                        f"{len(observed_messages)} chunk(s) received)"
+                    ),
+                    messages=observed_messages,
                 )
             try:
-                more = await asyncio.wait_for(
+                more_raw = await asyncio.wait_for(
                     self._response_queue.get(),
                     timeout=min(idle_budget, remaining),
                 )
-                chunks.append(more)
-                if _is_completion_message(more):
+                more = _coerce_observed_message(more_raw)
+                observed_messages.append(more)
+                if _is_completion_message(more.text):
                     break
             except asyncio.TimeoutError:
-                return (
-                    f"(timeout: missing completion marker after {idle_budget:.0f}s idle; "
-                    f"{len(chunks)} chunk(s) received)"
+                return TelegramResponseTrace(
+                    sent_message_id=sent_message_id,
+                    output=(
+                        f"(timeout: missing completion marker after {idle_budget:.0f}s idle; "
+                        f"{len(observed_messages)} chunk(s) received)"
+                    ),
+                    messages=observed_messages,
                 )
 
-        return "\n".join(chunks)
+        return TelegramResponseTrace(
+            sent_message_id=sent_message_id,
+            output="\n".join(message.text for message in observed_messages),
+            messages=observed_messages,
+        )
+
+    async def _collect_response(
+        self,
+        timeout: float,
+        *,
+        require_done: bool = True,
+        first_message_timeout: float | None = None,
+        done_timeout: float | None = None,
+        idle_quiescence_timeout: float | None = None,
+    ) -> str:
+        trace = await self._collect_response_trace(
+            timeout=timeout,
+            require_done=require_done,
+            first_message_timeout=first_message_timeout,
+            done_timeout=done_timeout,
+            idle_quiescence_timeout=idle_quiescence_timeout,
+        )
+        return trace.output
 
     async def rebaseline(self) -> None:
         """Update baseline to the latest message in the chat.
@@ -234,34 +316,134 @@ class TelegramPlatform:
         if self._client is None:
             raise RuntimeError("TelegramPlatform not connected")
 
-        # Drain any stale messages
-        while not self._response_queue.empty():
-            try:
-                self._response_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        self._drain_queue()
 
-        await self._client.send_message(self._bot_entity, text)
+        sent = await self._client.send_message(self._bot_entity, text)
+        trace = await self._collect_response_trace(
+            timeout=self._timeout,
+            require_done=True,
+            sent_message_id=getattr(sent, "id", None),
+        )
+        self._last_output = trace.output
+        return trace.output
 
-        response = await self._collect_response(timeout=self._timeout, require_done=True)
-        self._last_output = response
-        return response
+    async def send_with_trace(self, text: str) -> TelegramResponseTrace:
+        """Send a message and return structured Telegram metadata for the reply."""
+        if self._client is None:
+            raise RuntimeError("TelegramPlatform not connected")
+
+        self._drain_queue()
+        sent = await self._client.send_message(self._bot_entity, text)
+        trace = await self._collect_response_trace(
+            timeout=self._timeout,
+            require_done=True,
+            sent_message_id=getattr(sent, "id", None),
+        )
+        self._last_output = trace.output
+        return trace
 
     async def send_control(self, text: str, timeout: float = 20.0) -> str:
         """Send a control command that is not expected to emit the completion summary."""
         if self._client is None:
             raise RuntimeError("TelegramPlatform not connected")
 
-        while not self._response_queue.empty():
-            try:
-                self._response_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        self._drain_queue()
 
-        await self._client.send_message(self._bot_entity, text)
-        response = await self._collect_response(timeout=timeout, require_done=False)
-        self._last_output = response
-        return response
+        sent = await self._client.send_message(self._bot_entity, text)
+        trace = await self._collect_response_trace(
+            timeout=timeout,
+            require_done=False,
+            sent_message_id=getattr(sent, "id", None),
+        )
+        self._last_output = trace.output
+        return trace.output
+
+    async def send_control_with_trace(
+        self, text: str, timeout: float = 20.0
+    ) -> TelegramResponseTrace:
+        """Send a control command and return structured Telegram metadata."""
+        if self._client is None:
+            raise RuntimeError("TelegramPlatform not connected")
+
+        self._drain_queue()
+        sent = await self._client.send_message(self._bot_entity, text)
+        trace = await self._collect_response_trace(
+            timeout=timeout,
+            require_done=False,
+            sent_message_id=getattr(sent, "id", None),
+        )
+        self._last_output = trace.output
+        return trace
+
+    async def send_file(
+        self,
+        path: str | Path,
+        *,
+        caption: str | None = None,
+        force_document: bool = False,
+        voice_note: bool = False,
+        video_note: bool = False,
+        timeout: float | None = None,
+        first_message_timeout: float | None = None,
+        done_timeout: float | None = None,
+        idle_quiescence_timeout: float | None = None,
+    ) -> str:
+        """Send a local file to the bot and wait for the complete reply."""
+        if self._client is None:
+            raise RuntimeError("TelegramPlatform not connected")
+
+        self._drain_queue()
+        sent = await self._client.send_file(
+            self._bot_entity,
+            str(path),
+            caption=caption,
+            force_document=force_document,
+            voice_note=voice_note,
+            video_note=video_note,
+        )
+        trace = await self._collect_response_trace(
+            timeout=timeout or self._timeout,
+            require_done=True,
+            first_message_timeout=first_message_timeout,
+            done_timeout=done_timeout,
+            idle_quiescence_timeout=idle_quiescence_timeout,
+            sent_message_id=getattr(sent, "id", None),
+        )
+        self._last_output = trace.output
+        return trace.output
+
+    async def send_files(
+        self,
+        paths: list[str | Path],
+        *,
+        captions: list[str] | None = None,
+        force_document: bool = False,
+        timeout: float | None = None,
+        first_message_timeout: float | None = None,
+        done_timeout: float | None = None,
+        idle_quiescence_timeout: float | None = None,
+    ) -> str:
+        """Send multiple local files, usually as a Telegram album."""
+        if self._client is None:
+            raise RuntimeError("TelegramPlatform not connected")
+
+        self._drain_queue()
+        sent = await self._client.send_file(
+            self._bot_entity,
+            [str(path) for path in paths],
+            caption=captions,
+            force_document=force_document,
+        )
+        trace = await self._collect_response_trace(
+            timeout=timeout or self._timeout,
+            require_done=True,
+            first_message_timeout=first_message_timeout,
+            done_timeout=done_timeout,
+            idle_quiescence_timeout=idle_quiescence_timeout,
+            sent_message_id=getattr(sent, "id", None),
+        )
+        self._last_output = trace.output
+        return trace.output
 
     async def send_nowait(self, text: str) -> None:
         """Send a message without waiting for response."""
@@ -269,18 +451,108 @@ class TelegramPlatform:
             raise RuntimeError("TelegramPlatform not connected")
         await self._client.send_message(self._bot_entity, text)
 
+    async def reply(self, text: str, *, reply_to_message_id: int) -> str:
+        """Reply to a specific Telegram message and wait for the bot reply."""
+        trace = await self.reply_with_trace(text, reply_to_message_id=reply_to_message_id)
+        return trace.output
+
+    async def reply_with_trace(
+        self,
+        text: str,
+        *,
+        reply_to_message_id: int,
+        timeout: float | None = None,
+        require_done: bool = True,
+    ) -> TelegramResponseTrace:
+        """Reply to a specific Telegram message and return structured reply data."""
+        if self._client is None:
+            raise RuntimeError("TelegramPlatform not connected")
+
+        self._drain_queue()
+        sent = await self._client.send_message(
+            self._bot_entity,
+            text,
+            reply_to=reply_to_message_id,
+        )
+        trace = await self._collect_response_trace(
+            timeout=timeout or self._timeout,
+            require_done=require_done,
+            sent_message_id=getattr(sent, "id", None),
+        )
+        self._last_output = trace.output
+        return trace
+
+    async def reply_control_with_trace(
+        self,
+        text: str,
+        *,
+        reply_to_message_id: int,
+        timeout: float = 20.0,
+    ) -> TelegramResponseTrace:
+        """Reply with a control command that does not emit completion summary."""
+        return await self.reply_with_trace(
+            text,
+            reply_to_message_id=reply_to_message_id,
+            timeout=timeout,
+            require_done=False,
+        )
+
     async def read(self) -> str:
         """Return the most recent bot output."""
         return self._last_output
 
     async def wait_for_prompt(self, timeout: int = 120) -> str:
         """Wait for the next bot message(s), collecting multi-message responses."""
-        response = await self._collect_response(timeout=timeout, require_done=True)
-        self._last_output = response
-        return response
+        trace = await self._collect_response_trace(timeout=timeout, require_done=True)
+        self._last_output = trace.output
+        return trace.output
+
+    async def wait_for_prompt_with_trace(self, timeout: int = 120) -> TelegramResponseTrace:
+        """Wait for the next bot message(s), preserving Telegram metadata."""
+        trace = await self._collect_response_trace(timeout=timeout, require_done=True)
+        self._last_output = trace.output
+        return trace
+
+    async def get_recent_messages(self, limit: int = 20) -> list[TelegramObservedMessage]:
+        """Fetch recent bot-chat messages directly from Telegram."""
+        if self._client is None:
+            raise RuntimeError("TelegramPlatform not connected")
+
+        messages: list[TelegramObservedMessage] = []
+        async for message in self._client.iter_messages(self._bot_entity, limit=limit):
+            messages.append(
+                TelegramObservedMessage(
+                    message_id=message.id,
+                    text=message.text or "",
+                    reply_to_message_id=getattr(
+                        getattr(message, "reply_to", None),
+                        "reply_to_msg_id",
+                        None,
+                    ),
+                )
+            )
+        messages.reverse()
+        return messages
+
+    def format_recent_messages(self, limit: int = 20) -> str:
+        """Render recent observed bot messages for assertion failures."""
+        recent = self._recent_bot_messages[-limit:]
+        if not recent:
+            return "(no observed bot messages)"
+        return "\n".join(
+            f"id={message.message_id} reply_to={message.reply_to_message_id} text={message.text!r}"
+            for message in recent
+        )
 
     async def close(self) -> None:
         """Disconnect the Telethon client."""
         if self._client is not None:
             await self._client.disconnect()
             self._client = None
+
+    def _drain_queue(self) -> None:
+        while not self._response_queue.empty():
+            try:
+                self._response_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break

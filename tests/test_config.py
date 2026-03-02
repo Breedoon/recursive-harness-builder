@@ -123,9 +123,9 @@ class TestSessionSettings:
     """Config provides session management settings."""
 
     def test_default_cache_window(self):
-        """Default cache window is 58 minutes (3480 seconds)."""
+        """Default cache window is effectively non-expiring for now."""
         cfg = OBSConfig()
-        assert cfg.cache_window_seconds == 3480
+        assert cfg.cache_window_seconds == 1000 * 60 * 60
 
     def test_cache_window_from_env(self, monkeypatch):
         """OBS_CACHE_WINDOW env var overrides cache window."""
@@ -287,3 +287,18 @@ class TestTelegramSettings:
         """Allowed users can be set via constructor."""
         cfg = OBSConfig(telegram_allowed_user_ids=[1, 2, 3])
         assert cfg.telegram_allowed_user_ids == [1, 2, 3]
+
+    def test_temp_root_default(self):
+        cfg = OBSConfig()
+        assert cfg.telegram_temp_root == Path("/tmp/obs-agent")
+
+    def test_temp_root_from_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OBS_TELEGRAM_TEMP_ROOT", str(tmp_path / "tg-temp"))
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_temp_root == tmp_path / "tg-temp"
+
+    def test_transcription_script_from_env(self, monkeypatch, tmp_path):
+        script = tmp_path / "transcribe.sh"
+        monkeypatch.setenv("OBS_TELEGRAM_TRANSCRIPTION_SCRIPT", str(script))
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_transcription_script == script

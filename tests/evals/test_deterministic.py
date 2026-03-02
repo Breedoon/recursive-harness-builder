@@ -223,6 +223,30 @@ def test_validate_tg_queue_while_busy_requires_single_queued_run() -> None:
     assert "separate turn" in details
 
 
+def test_validate_tg_inbound_batching_rejects_queued_delivery() -> None:
+    passed, details = _validate_scenario(
+        "tg_inbound_batching",
+        [
+            "BATCH_OK: ALPHA BRAVO CHARLIE\nqueued message delivered\ncontext: 22k / 200k",
+        ],
+        "",
+    )
+    assert not passed
+    assert "queued into an active run" in details
+
+
+def test_validate_tg_inbound_batching_accepts_single_batched_turn() -> None:
+    passed, details = _validate_scenario(
+        "tg_inbound_batching",
+        [
+            "BATCH_OK: ALPHA BRAVO CHARLIE\nOne sentence covering Babbage, Turing, ARPANET, the Web, and modern ML.\ncontext: 22k / 200k",
+        ],
+        "",
+    )
+    assert passed
+    assert details == "ok"
+
+
 def test_validate_immutable_guard_ignores_immutable_word_in_skill_dump() -> None:
     first = (
         "Skill docs mention immutable paths. "

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+from obs_agent._sdk_patch import ensure_raw_uuid_patch
 from obs_agent.hooks import HookState, create_hook_matchers
 from obs_agent.tools import create_obs_tools
 
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
 
 logger = logging.getLogger("obs_agent.session")
+
+ensure_raw_uuid_patch()
 
 
 class SessionManager:

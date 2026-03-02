@@ -8,6 +8,11 @@ from pathlib import Path
 
 
 _DEFAULT_VAULT = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "T"
+_DEFAULT_TELEGRAM_TEMP_ROOT = Path("/tmp") / "obs-agent"
+_DEFAULT_TELEGRAM_TRANSCRIPTION_SCRIPT = (
+    Path("/Users/breedoon/Documents/PATH/transcription/transcribe.sh")
+)
+_DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no expiry for now
 
 IMMUTABLE_PATTERNS: list[str] = [
     "Misc/Meeting Notes",
@@ -22,7 +27,7 @@ class OBSConfig:
     claude_dir: str = ".claude"
     daemon_host: str = "127.0.0.1"
     daemon_port: int = 7832
-    cache_window_seconds: int = 3480  # 58 minutes
+    cache_window_seconds: int = _DEFAULT_CACHE_WINDOW_SECONDS
     max_queue_continuations: int = 3
     bg_fork_timeout: float = 600.0  # seconds to wait for background forks
     max_buffer_size: int = 10 * 1024 * 1024  # 10 MB SDK JSON buffer limit
@@ -33,6 +38,10 @@ class OBSConfig:
     telegram_bot_token: str | None = None
     telegram_allowed_user_ids: list[int] = field(default_factory=list)
     telegram_notify_username: str | None = None
+    telegram_temp_root: Path = field(default_factory=lambda: _DEFAULT_TELEGRAM_TEMP_ROOT)
+    telegram_transcription_script: Path = field(
+        default_factory=lambda: _DEFAULT_TELEGRAM_TRANSCRIPTION_SCRIPT
+    )
 
     # --- Class Methods ---
 
@@ -70,6 +79,10 @@ class OBSConfig:
             or os.environ.get("OBS_TELEGRAM_TEST_NOTIFY_USERNAME")
         ):
             kwargs["telegram_notify_username"] = tg_username.lstrip("@").strip() or None
+        if tg_temp_root := os.environ.get("OBS_TELEGRAM_TEMP_ROOT"):
+            kwargs["telegram_temp_root"] = Path(tg_temp_root)
+        if tg_transcribe := os.environ.get("OBS_TELEGRAM_TRANSCRIPTION_SCRIPT"):
+            kwargs["telegram_transcription_script"] = Path(tg_transcribe)
 
         return cls(**kwargs)
 

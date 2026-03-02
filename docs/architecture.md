@@ -64,7 +64,7 @@ Event stream emitted to adapters:
 
 The Telegram adapter intentionally uses a simple, robust model:
 
-1. Fragment reassembly for Telegram auto-split user messages
+1. Inbound batching for rapid same-user Telegram messages, including auto-split fragment reassembly
 2. Per-chat lock serialization (prevents in-chat out-of-order processing)
 3. Per-turn flush: inline tool/status + text in chronological order
 4. Final `context: used / window` summary at queue-idle completion (notification enabled)

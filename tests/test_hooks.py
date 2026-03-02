@@ -27,6 +27,7 @@ from obs_agent.hooks import (
     _make_queue_check,
     create_hook_matchers,
 )
+from obs_agent.queueing import QueuedMessage
 
 
 # --- PreToolUse Guard: Immutable Files ---
@@ -508,6 +509,47 @@ class TestCheckMessageQueue:
         check = _make_queue_check(state)
         await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
         assert state.status_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_reply_target_messages_remain_queued(self):
+        """Reply-target queued messages must not be injected as additionalContext."""
+        state = HookState()
+        deferred = QueuedMessage(
+            text="fork me later",
+            telegram_message_id=42,
+            reply_to_message_id=7,
+        )
+        state.message_queue.put_nowait(deferred)
+        check = _make_queue_check(state)
+
+        result = await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
+
+        assert result is None
+        remaining = state.message_queue.get_nowait()
+        assert remaining == deferred
+        assert state.status_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_plain_messages_drain_while_reply_targets_stay_queued(self):
+        """Plain queued messages inject immediately, reply-targets stay for later routing."""
+        state = HookState()
+        deferred = QueuedMessage(
+            text="fork me later",
+            telegram_message_id=42,
+            reply_to_message_id=7,
+        )
+        state.message_queue.put_nowait("plain message")
+        state.message_queue.put_nowait(deferred)
+        check = _make_queue_check(state)
+
+        result = await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
+
+        assert result is not None
+        ctx = result["hookSpecificOutput"]["additionalContext"]
+        assert "plain message" in ctx
+        assert "fork me later" not in ctx
+        remaining = state.message_queue.get_nowait()
+        assert remaining == deferred
 
 
 class TestHookStateStatusQueue:

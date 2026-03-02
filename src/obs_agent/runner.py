@@ -27,6 +27,7 @@ from claude_agent_sdk import (
 from obs_agent.events import StatusEvent, summarize_tool_use
 from obs_agent.hooks import HookState
 from obs_agent.metrics import log_result
+from obs_agent.queueing import QueuedMessage, coerce_queued_message, queued_texts
 from obs_agent.session import SessionManager
 
 if TYPE_CHECKING:
@@ -48,7 +49,10 @@ class TextEvent:
 @dataclass
 class TurnEndEvent:
     """Signals that one SDK assistant message has fully streamed."""
-    pass
+
+    jsonl_uuid: str | None = None
+    message_role: str | None = None
+    has_text: bool = False
 
 
 @dataclass
@@ -83,15 +87,30 @@ def _is_recoverable(exc: BaseException) -> bool:
 # Queue helpers
 # ---------------------------------------------------------------------------
 
-def _drain_queue(queue: asyncio.Queue) -> list[str]:
+def _drain_queue(queue: asyncio.Queue) -> list[QueuedMessage]:
     """Drain all messages from an asyncio.Queue, returning them as a list."""
-    messages: list[str] = []
+    messages: list[QueuedMessage] = []
     while not queue.empty():
         try:
-            messages.append(queue.get_nowait())
+            messages.append(coerce_queued_message(queue.get_nowait()))
         except asyncio.QueueEmpty:
             break
     return messages
+
+
+def _message_role(message) -> str | None:
+    role = getattr(message, "role", None)
+    if isinstance(role, str) and role:
+        return role
+
+    type_name = type(message).__name__
+    if type_name == "AssistantMessage":
+        return "assistant"
+    if type_name == "UserMessage":
+        return "user"
+    if type_name == "SystemMessage":
+        return "system"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -119,12 +138,15 @@ class ConversationRunner:
         hook_state: HookState,
         config: OBSConfig,
         *,
-        pending_messages: list[str] | None = None,
+        pending_messages: list[QueuedMessage | str] | None = None,
     ) -> None:
         self._session_mgr = session_manager
         self._hook_state = hook_state
         self._config = config
-        self._pending_messages = list(pending_messages) if pending_messages else []
+        self._pending_messages = [
+            coerce_queued_message(message)
+            for message in pending_messages or []
+        ]
         self._client = None  # set during run()
         self._last_message = None  # tracks last SDK message for metrics
         self._last_result_message = None  # latest ResultMessage-like payload
@@ -154,7 +176,7 @@ class ConversationRunner:
             }
 
     @property
-    def remaining_pending(self) -> list[str]:
+    def remaining_pending(self) -> list[QueuedMessage]:
         """Messages left in the queue after run() completes (for next turn)."""
         return self._pending_messages
 
@@ -169,6 +191,9 @@ class ConversationRunner:
         """
         async for message in self._client.receive_response():
             self._last_message = message
+            raw_uuid = getattr(message, "_raw_uuid", None)
+            message_role = _message_role(message)
+            has_text = False
             if (
                 getattr(message, "num_turns", None) is not None
                 and getattr(message, "total_cost_usd", None) is not None
@@ -196,6 +221,7 @@ class ConversationRunner:
                             summary=thinking_text or "thinking...",
                         )
                     elif isinstance(block, TextBlock):
+                        has_text = True
                         yield TextEvent(text=block.text)
 
             # Drain status_queue after each message
@@ -205,7 +231,11 @@ class ConversationRunner:
                 except asyncio.QueueEmpty:
                     break
 
-            yield TurnEndEvent()
+            yield TurnEndEvent(
+                jsonl_uuid=raw_uuid if isinstance(raw_uuid, str) and raw_uuid else None,
+                message_role=message_role,
+                has_text=has_text,
+            )
 
     async def _stream_or_reconnect(
         self, retry_prompt: str,
@@ -288,7 +318,7 @@ class ConversationRunner:
 
         if pending:
             prefix = "\n".join(
-                f"[Queued message from user]: {m}" for m in pending
+                f"[Queued message from user]: {m.text}" for m in pending
             )
             actual_message = f"{prefix}\n\n{user_message}"
             self._pending_messages = []
@@ -298,7 +328,7 @@ class ConversationRunner:
                 type="queue_delivered",
                 summary="queued message delivered",
                 count=pending_count,
-                messages=pending,
+                messages=queued_texts(pending),
             )
 
         # 2. Get client and send query (with reconnect on connection loss)
@@ -336,14 +366,19 @@ class ConversationRunner:
 
         # 4. Continuation loop: process queued messages inline
         continuation_count = 0
+        deferred_pending: list[QueuedMessage] = []
         while continuation_count < self._config.max_queue_continuations:
             remaining = _drain_queue(self._hook_state.message_queue)
             if not remaining:
                 break
+            latest = remaining[-1]
+            if latest.reply_to_message_id is not None:
+                deferred_pending.extend(remaining)
+                break
             continuation_count += 1
 
             continuation_prompt = (
-                "\n".join(f"[Queued message from user]: {m}" for m in remaining)
+                "\n".join(f"[Queued message from user]: {m.text}" for m in remaining)
                 + "\n\n(User sent these while you were responding. Address them briefly.)"
             )
 
@@ -351,7 +386,7 @@ class ConversationRunner:
                 type="queue_delivered",
                 summary="queued message delivered",
                 count=len(remaining),
-                messages=remaining,
+                messages=queued_texts(remaining),
             )
 
             await self._query_or_reconnect(continuation_prompt)
@@ -384,7 +419,7 @@ class ConversationRunner:
                 continue
 
             bg_prompt = (
-                "\n".join(f"[Queued message from user]: {m}" for m in bg_remaining)
+                "\n".join(f"[Queued message from user]: {m.text}" for m in bg_remaining)
                 + "\n\n(Background fork results arrived. Process and summarize them.)"
             )
 
@@ -392,7 +427,7 @@ class ConversationRunner:
                 type="queue_delivered",
                 summary="background fork result delivered",
                 count=len(bg_remaining),
-                messages=bg_remaining,
+                messages=queued_texts(bg_remaining),
             )
 
             await self._query_or_reconnect(bg_prompt)
@@ -403,7 +438,7 @@ class ConversationRunner:
             self._refresh_last_result_data()
 
         # 6. Drain remaining queue for next turn
-        self._pending_messages = _drain_queue(self._hook_state.message_queue)
+        self._pending_messages = deferred_pending + _drain_queue(self._hook_state.message_queue)
 
         self._session_mgr.touch()
         yield DoneEvent()

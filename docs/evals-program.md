@@ -75,6 +75,12 @@ Priority P1:
   `feature` is materially different from `full`.
 - Reduce runtime of long Telegram stress cases without losing failure detection
   quality (especially scenarios with 120-300s waits).
+- Decide the long-term Telegram judge control model:
+  - constrained harness tools backed by Telethon
+  - vs broader/raw Telethon access plus stronger judge onboarding
+  - Current gap: the existing Telegram eval platform cannot express reply-to
+    actions or expose message IDs cleanly enough for Phase 0-C fork-via-reply
+    validation.
 
 Priority P2:
 - Finalize CLI deprecation path:
@@ -86,6 +92,9 @@ Priority P2:
 1. Draft the Tier 2 master eval scenario contract (intent, steps, criteria).
 2. Implement subsystem tags/filtering for Tier 1 (`feature`) runs.
 3. Rebalance long-running stress budgets after master eval lands.
+4. Redesign Telegram judge capabilities so the judge can drive richer flows
+   (reply-to, future topics/threads, structured message inspection) without
+   flattening everything into transcript-only assertions.
 
 ## 2026-02-28 Telegram Eval Retrospective
 

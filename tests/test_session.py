@@ -96,9 +96,10 @@ class TestCreateOptions:
         assert options.resume == "sess-1"
 
     def test_resume_option_unset_after_timeout(self, config):
+        config.cache_window_seconds = 60
         mgr = SessionManager(config=config)
         mgr.set_session_id("sess-old")
-        mgr.last_activity = time.time() - 7200
+        mgr.last_activity = time.time() - 3600
         options = mgr.create_options()
         assert options.resume is None
 
@@ -167,6 +168,7 @@ class TestClientLifecycle:
 
     @pytest.mark.asyncio
     async def test_get_client_recreates_after_cache_expiry(self, config):
+        config.cache_window_seconds = 60
         mgr = SessionManager(config=config)
         mock_client1 = AsyncMock()
         mock_client2 = AsyncMock()
@@ -180,7 +182,7 @@ class TestClientLifecycle:
         with patch("obs_agent.session.ClaudeSDKClient", side_effect=_make_client):
             first = await mgr.get_client()
             mgr.set_session_id("sess-old")
-            mgr.last_activity = time.time() - 7200
+            mgr.last_activity = time.time() - 3600
             second = await mgr.get_client()
 
         assert first is not second
@@ -225,4 +227,3 @@ class TestClientLifecycle:
         assert mgr.session_id == "sess-42"
         assert mgr._connected is True
         mock_client.connect.assert_called_once()
-

@@ -25,6 +25,8 @@ from claude_agent_sdk.types import (
     SyncHookJSONOutput,
 )
 
+from obs_agent.queueing import coerce_queued_message
+
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
 
@@ -295,12 +297,19 @@ def _make_queue_check(state: HookState) -> CheckFn:
         context: HookContext,
     ) -> SyncHookJSONOutput | None:
         messages: list[str] = []
+        deferred_messages: list[QueuedMessage] = []
         while not state.message_queue.empty():
             try:
-                msg = state.message_queue.get_nowait()
-                messages.append(msg)
+                msg = coerce_queued_message(state.message_queue.get_nowait())
+                if msg.reply_to_message_id is not None:
+                    deferred_messages.append(msg)
+                else:
+                    messages.append(msg.text)
             except asyncio.QueueEmpty:
                 break
+
+        for msg in deferred_messages:
+            state.message_queue.put_nowait(msg)
 
         if not messages:
             return None
