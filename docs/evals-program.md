@@ -96,6 +96,62 @@ Priority P2:
    (reply-to, future topics/threads, structured message inspection) without
    flattening everything into transcript-only assertions.
 
+## 2026-03-02 Deterministic Telegram Testing Note
+
+Context:
+- The Telegram topics/forking work was validated primarily with a mix of:
+  - deterministic unit tests
+  - live Telethon-backed tests against a real forum supergroup
+  - tightly constrained prompts that ask the agent to answer in a predictable way
+- This ended up being more useful than trying to force the same work through the
+  current judge-eval architecture.
+
+### What worked well
+
+- A "semi-deterministic" live harness worked well:
+  - real Telegram transport
+  - real bot
+  - real SDK/Claude session behavior
+  - but with deterministic prompts and explicit assertions
+- Examples:
+  - "Use session_info and reply with only the session_id UUID."
+  - "Reply with only YES if you saw token X earlier in our conversation."
+  - "Reply with only TOKEN-123."
+- This gave strong end-to-end coverage while still producing debuggable failures.
+
+### Why this was better than judge-first evals for this feature
+
+- Topic routing and fork behavior mostly have explicit protocol-level outcomes:
+  - which thread replied
+  - which session ID is active
+  - whether a topic was created/deleted
+  - whether the daemon stayed alive
+- Those are better asserted directly than graded by a judge.
+- The live Telethon harness also made it easy to preserve exact Telegram metadata
+  and bot logs on failure, which is much harder to recover from transcript-only
+  or judge-only paths.
+
+### Recommendation
+
+- Use deterministic or semi-deterministic live tests as the default validation
+  path for transport/routing/stateful Telegram features.
+- Keep judge evals for:
+  - broad end-to-end product behavior
+  - long realistic scenarios
+  - qualitative UX checks
+  - final "master eval" style coverage
+- Do not force narrow transport/state invariants through a judge lane when the
+  system already exposes an exact, assertable signal.
+
+### Process note
+
+- The workflow that worked best here was:
+  1. enumerate the intended test matrix first
+  2. encode those cases as deterministic or semi-deterministic tests
+  3. run them repeatedly on the real transport
+  4. only trust the implementation after the full matrix passes
+- This should become the default approach for similar Telegram/platform changes.
+
 ## 2026-02-28 Telegram Eval Retrospective
 
 Context:

@@ -35,6 +35,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("obs_agent.runner")
 
+_RECOVERY_PROMPT = (
+    "Resume the interrupted response only. "
+    "Do not treat this as a new user message or as part of the conversation history."
+)
+
 
 # ---------------------------------------------------------------------------
 # Runner event types
@@ -339,7 +344,17 @@ class ConversationRunner:
                 raise
             logger.warning("Connection failed on get_client, reconnecting: %s", exc)
             await self._session_mgr.disconnect()
-            self._client = await self._session_mgr.get_client()
+            try:
+                self._client = await self._session_mgr.get_client()
+            except Exception as retry_exc:
+                if not _is_recoverable(retry_exc):
+                    raise
+                logger.warning(
+                    "Reconnect on get_client also failed, dropping session and starting fresh: %s",
+                    retry_exc,
+                )
+                await self._session_mgr.async_reset()
+                self._client = await self._session_mgr.get_client()
 
         try:
             await self._client.query(actual_message)
@@ -356,7 +371,7 @@ class ConversationRunner:
         self._last_result_message = None
         self._last_assistant_usage = None
         async for event in self._stream_or_reconnect(
-            "Connection interrupted. Continue where you left off."
+            _RECOVERY_PROMPT
         ):
             yield event
 
@@ -367,7 +382,10 @@ class ConversationRunner:
         # 4. Continuation loop: process queued messages inline
         continuation_count = 0
         deferred_pending: list[QueuedMessage] = []
-        while continuation_count < self._config.max_queue_continuations:
+        while (
+            continuation_count < self._config.max_queue_continuations
+            and not self._hook_state.pause_queue_delivery
+        ):
             remaining = _drain_queue(self._hook_state.message_queue)
             if not remaining:
                 break
@@ -391,13 +409,13 @@ class ConversationRunner:
 
             await self._query_or_reconnect(continuation_prompt)
             async for event in self._stream_or_reconnect(
-                "Connection interrupted. Continue where you left off."
+                _RECOVERY_PROMPT
             ):
                 yield event
             self._refresh_last_result_data()
 
         # 5. Background fork wait loop
-        while self._hook_state.background_tasks:
+        while self._hook_state.background_tasks and not self._hook_state.pause_queue_delivery:
             tasks = set(self._hook_state.background_tasks)
             if not tasks:
                 break
@@ -432,7 +450,7 @@ class ConversationRunner:
 
             await self._query_or_reconnect(bg_prompt)
             async for event in self._stream_or_reconnect(
-                "Connection interrupted. Continue where you left off."
+                _RECOVERY_PROMPT
             ):
                 yield event
             self._refresh_last_result_data()

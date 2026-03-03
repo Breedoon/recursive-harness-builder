@@ -132,6 +132,7 @@ class HookState:
     message_queue: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
     status_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     interrupt_flag: bool = False
+    pause_queue_delivery: bool = False
     session_id: str | None = None
     background_tasks: set[asyncio.Task] = field(default_factory=set)
     last_result_data: dict | None = None  # last ResultMessage metrics
@@ -160,6 +161,7 @@ class HookState:
                 task.cancel()
         self.background_tasks.clear()
         self.interrupt_flag = False
+        self.pause_queue_delivery = False
         self.session_id = None
         self.last_result_data = None
 

@@ -79,16 +79,17 @@ async def live_server(e2e_config):
 async def small_buffer_server(e2e_config):
     """Start a real uvicorn server with a 4KB buffer to force overflow.
 
-    The SDK init handshake needs ~2-3KB, so 4KB allows connect() to succeed.
+    The SDK init handshake has grown over time, so this fixture uses a slightly
+    larger buffer that still passes init but overflows on a large tool result.
     A large file (large_test_data.md) is placed in the vault; asking the agent
-    to read it produces a tool result JSON > 4KB, triggering the overflow.
+    to read it produces a tool result JSON well above the configured limit.
     The runner catches it, reconnects, and the session survives.
     """
     # Place a large file in the vault that will cause tool result overflow
     large_file = e2e_config.vault_path / "large_test_data.md"
-    large_file.write_text("# Large Test Data\n\n" + ("This is test content line. " * 300) + "\n")
+    large_file.write_text("# Large Test Data\n\n" + ("This is test content line. " * 600) + "\n")
 
-    e2e_config.max_buffer_size = 4096  # 4KB — init passes, tool results overflow
+    e2e_config.max_buffer_size = 8192  # init passes; large tool results still overflow
     port = _free_port()
     app = create_app(e2e_config)
     server_config = uvicorn.Config(

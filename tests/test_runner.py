@@ -26,6 +26,7 @@ from obs_agent.runner import (
     DoneEvent,
     TextEvent,
     TurnEndEvent,
+    _RECOVERY_PROMPT,
     _drain_queue,
     _is_recoverable,
 )
@@ -506,6 +507,36 @@ class TestRunnerReconnectOnStreamError:
         text_events = [e for e in events if isinstance(e, TextEvent)]
         assert any("Recovered" in e.text for e in text_events)
         mock_reconnect.assert_called_once()
+        recovery_client.query.assert_awaited_once_with(f"(System: {_RECOVERY_PROMPT})")
+
+
+class TestRunnerGetClientRecovery:
+    @patch("obs_agent.session.SessionManager.async_reset")
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_second_recoverable_get_client_failure_drops_session_and_starts_fresh(
+        self, mock_get_client, mock_async_reset, config
+    ):
+        failing = CLIJSONDecodeError("big json", ValueError("too big"))
+
+        recovery_msg = MagicMock()
+        recovery_msg.content = [TextBlock(text="Fresh session")]
+        recovery_msg.session_id = "sess-fresh"
+        fresh_client = _make_mock_client([recovery_msg])
+
+        mock_get_client.side_effect = [failing, failing, fresh_client]
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        with patch.object(session_mgr, "disconnect", new_callable=AsyncMock) as mock_disconnect:
+            runner = ConversationRunner(session_mgr, hook_state, config)
+            events = await _collect_events(runner, "hello")
+
+        text_events = [e for e in events if isinstance(e, TextEvent)]
+        assert any("Fresh session" in e.text for e in text_events)
+        mock_disconnect.assert_awaited_once()
+        mock_async_reset.assert_awaited_once()
 
     @patch("obs_agent.session.SessionManager.reconnect")
     @patch("obs_agent.session.SessionManager.get_client")

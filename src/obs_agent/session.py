@@ -139,7 +139,7 @@ class SessionManager:
 
     async def _disconnect_unlocked(self) -> None:
         """Disconnect without acquiring lock (called from within locked context)."""
-        if self._client is not None and self._connected:
+        if self._client is not None:
             try:
                 await self._client.disconnect()
             except Exception:
