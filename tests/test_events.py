@@ -201,28 +201,58 @@ class TestSummarizeToolUse:
         assert payload["tool"] == "Edit"
         assert payload["input"]["file_path"] == "/tmp/x"
 
-    def test_self_fork_foreground(self):
-        """self_fork shows task description."""
-        result = summarize_tool_use("self_fork", {"task": "Summarize meeting notes", "background": False})
-        assert result == "Fork: Summarize meeting notes"
+    def test_fork_task_uses_description(self):
+        """ForkTask prefers the short user-facing description."""
+        result = summarize_tool_use(
+            "ForkTask",
+            {"prompt": "Summarize the codebase", "description": "Code summary"},
+        )
+        assert result == "ForkTask: Code summary"
 
-    def test_self_fork_background(self):
-        """self_fork with background=true shows '(bg)' prefix."""
-        result = summarize_tool_use("self_fork", {"task": "Research topic", "background": True})
-        assert result == "Fork (bg): Research topic"
+    def test_fork_task_falls_back_to_prompt(self):
+        """ForkTask falls back to prompt text when no description is present."""
+        result = summarize_tool_use("ForkTask", {"prompt": "Research topic"})
+        assert result == "ForkTask: Research topic"
 
-    def test_self_fork_truncates_long_task(self):
-        """self_fork truncates task descriptions longer than 200 chars."""
-        long_task = "a" * 300
-        result = summarize_tool_use("self_fork", {"task": long_task})
-        assert result.startswith("Fork: ")
+    def test_fork_task_includes_timeout(self):
+        """ForkTask shows timeout when the caller provided one."""
+        result = summarize_tool_use(
+            "ForkTask",
+            {"description": "Research topic", "timeout_ms": 5000},
+        )
+        assert result == "ForkTask: Research topic timeout=5000ms"
+
+    def test_fork_task_includes_max_turns(self):
+        result = summarize_tool_use(
+            "ForkTask",
+            {"description": "Research topic", "max_turns": 25},
+        )
+        assert result == "ForkTask: Research topic max_turns=25"
+
+    def test_fork_task_truncates_long_prompt(self):
+        """ForkTask truncates long fallback prompt summaries."""
+        long_prompt = "a" * 300
+        result = summarize_tool_use("ForkTask", {"prompt": long_prompt})
+        assert result.startswith("ForkTask: ")
         assert result.endswith("...")
         assert len(result) == 200
 
-    def test_self_fork_empty_task(self):
-        """self_fork with empty task returns just prefix."""
-        result = summarize_tool_use("self_fork", {"task": ""})
-        assert result == "Fork"
+    def test_fork_task_empty(self):
+        """ForkTask with no prompt or description returns just the tool name."""
+        result = summarize_tool_use("ForkTask", {})
+        assert result == "ForkTask"
+
+    def test_fork_task_resume_summary(self):
+        result = summarize_tool_use("ForkTask", {"description": "Research topic", "resume": "agent-123"})
+        assert result == "ForkTask: Research topic resume=agent-123"
+
+    def test_fork_task_output_summary(self):
+        result = summarize_tool_use("ForkTaskOutput", {"task_id": "agent-123", "block": True})
+        assert result == "ForkTaskOutput: agent-123 block=True"
+
+    def test_fork_task_stop_summary(self):
+        result = summarize_tool_use("ForkTaskStop", {"task_id": "agent-123"})
+        assert result == "ForkTaskStop: agent-123"
 
     def test_task_tool_with_prompt(self):
         """Task tool shows the prompt."""

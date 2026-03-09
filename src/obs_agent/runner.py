@@ -118,6 +118,79 @@ def _message_role(message) -> str | None:
     return None
 
 
+def _system_message_to_status_event(message) -> StatusEvent | None:
+    """Convert selected SystemMessage subtypes into visible status events."""
+    subtype = getattr(message, "subtype", None)
+    if not isinstance(subtype, str) or not subtype:
+        return None
+    recognized_exact = {"task_started", "task_progress", "task_notification"}
+    if subtype not in recognized_exact and not subtype.startswith("task_"):
+        return None
+    data = getattr(message, "data", None)
+    payload = data if isinstance(data, dict) else {}
+    lines: list[str] = []
+    task_id = str(payload.get("task_id") or "").strip()
+    if task_id:
+        lines.append(f"task_id: {task_id}")
+    description = str(payload.get("description") or "").strip()
+    if description:
+        lines.append(f"description: {description}")
+
+    if subtype == "task_progress":
+        last_tool_name = str(payload.get("last_tool_name") or "").strip()
+        usage = payload.get("usage")
+        if last_tool_name:
+            lines.append(f"last_tool: {last_tool_name}")
+        if isinstance(usage, dict):
+            tool_uses = usage.get("tool_uses")
+            total_tokens = usage.get("total_tokens")
+            duration_ms = usage.get("duration_ms")
+            usage_bits: list[str] = []
+            if tool_uses is not None:
+                usage_bits.append(f"tool_uses={tool_uses}")
+            if total_tokens is not None:
+                usage_bits.append(f"total_tokens={total_tokens}")
+            if duration_ms is not None:
+                usage_bits.append(f"duration_ms={duration_ms}")
+            if usage_bits:
+                lines.append("usage: " + " ".join(usage_bits))
+
+    if subtype == "task_notification":
+        status = str(payload.get("status") or "").strip()
+        summary = str(payload.get("summary") or "").strip()
+        if status:
+            lines.append(f"status: {status}")
+        if summary:
+            lines.append(summary)
+    elif subtype not in {"task_started", "task_progress"}:
+        status = str(payload.get("status") or "").strip()
+        summary = str(payload.get("summary") or "").strip()
+        if status:
+            lines.append(f"status: {status}")
+        if summary:
+            lines.append(summary)
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            usage_bits: list[str] = []
+            tool_uses = usage.get("tool_uses")
+            total_tokens = usage.get("total_tokens")
+            duration_ms = usage.get("duration_ms")
+            if tool_uses is not None:
+                usage_bits.append(f"tool_uses={tool_uses}")
+            if total_tokens is not None:
+                usage_bits.append(f"total_tokens={total_tokens}")
+            if duration_ms is not None:
+                usage_bits.append(f"duration_ms={duration_ms}")
+            if usage_bits:
+                lines.append("usage: " + " ".join(usage_bits))
+
+    return StatusEvent(
+        type="notification",
+        summary=f"notification: {subtype}",
+        messages=lines or None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # ConversationRunner
 # ---------------------------------------------------------------------------
@@ -180,6 +253,13 @@ class ConversationRunner:
                 "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
             }
 
+    def _sync_session_id_from_client(self) -> None:
+        if self._client is None:
+            return
+        session_id = getattr(self._client, "session_id", None)
+        if isinstance(session_id, str) and session_id:
+            self._session_mgr.set_session_id(session_id)
+
     @property
     def remaining_pending(self) -> list[QueuedMessage]:
         """Messages left in the queue after run() completes (for next turn)."""
@@ -229,6 +309,10 @@ class ConversationRunner:
                         has_text = True
                         yield TextEvent(text=block.text)
 
+            system_status = _system_message_to_status_event(message)
+            if system_status is not None:
+                yield system_status
+
             # Drain status_queue after each message
             while not self._hook_state.status_queue.empty():
                 try:
@@ -275,6 +359,7 @@ class ConversationRunner:
                     logger.error("Fresh session also failed", exc_info=True)
                     raise exc from None
             await self._client.query(f"(System: {retry_prompt})")
+            self._sync_session_id_from_client()
             async for event in self._stream_response():
                 yield event
 
@@ -282,6 +367,7 @@ class ConversationRunner:
         """Send query; on recoverable error reconnect and retry."""
         try:
             await self._client.query(prompt)
+            self._sync_session_id_from_client()
         except Exception as exc:
             if not _is_recoverable(exc):
                 raise
@@ -300,6 +386,7 @@ class ConversationRunner:
                     logger.error("Fresh session also failed", exc_info=True)
                     raise exc from None
             await self._client.query(prompt)
+            self._sync_session_id_from_client()
 
     # ------------------------------------------------------------------
     # Main orchestration
@@ -339,6 +426,7 @@ class ConversationRunner:
         # 2. Get client and send query (with reconnect on connection loss)
         try:
             self._client = await self._session_mgr.get_client()
+            self._sync_session_id_from_client()
         except Exception as exc:
             if not _is_recoverable(exc):
                 raise
@@ -346,6 +434,7 @@ class ConversationRunner:
             await self._session_mgr.disconnect()
             try:
                 self._client = await self._session_mgr.get_client()
+                self._sync_session_id_from_client()
             except Exception as retry_exc:
                 if not _is_recoverable(retry_exc):
                     raise
@@ -355,16 +444,20 @@ class ConversationRunner:
                 )
                 await self._session_mgr.async_reset()
                 self._client = await self._session_mgr.get_client()
+                self._sync_session_id_from_client()
 
         try:
             await self._client.query(actual_message)
+            self._sync_session_id_from_client()
         except Exception as exc:
             if not _is_recoverable(exc):
                 raise
             logger.warning("Connection lost on initial query, reconnecting: %s", exc)
             await self._session_mgr.disconnect()
             self._client = await self._session_mgr.get_client()
+            self._sync_session_id_from_client()
             await self._client.query(actual_message)
+            self._sync_session_id_from_client()
 
         # 3. Stream response (with reconnect on recoverable errors)
         self._last_message = None

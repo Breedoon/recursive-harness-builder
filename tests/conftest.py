@@ -82,7 +82,11 @@ def fixture_vault(tmp_path: Path) -> Path:
 @pytest.fixture
 def config(fixture_vault: Path) -> OBSConfig:
     """OBSConfig pointing at the fixture vault."""
-    return OBSConfig(vault_path=fixture_vault, telegram_allowed_user_ids=[12345])
+    return OBSConfig(
+        vault_path=fixture_vault,
+        telegram_allowed_user_ids=[12345],
+        telegram_state_db_path=fixture_vault / ".claude" / "telegram-state.sqlite3",
+    )
 
 
 @pytest.fixture
@@ -196,7 +200,10 @@ def e2e_vault(tmp_path: Path) -> Path:
 @pytest.fixture
 def e2e_config(e2e_vault: Path) -> OBSConfig:
     """Config pointing at the E2E fixture vault."""
-    return OBSConfig(vault_path=e2e_vault)
+    return OBSConfig(
+        vault_path=e2e_vault,
+        telegram_state_db_path=e2e_vault / ".claude" / "telegram-state.sqlite3",
+    )
 
 
 def _ensure_fixture_vault() -> Path:

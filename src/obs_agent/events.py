@@ -113,13 +113,39 @@ def summarize_tool_use(tool_name: str, tool_input: dict) -> str:
         query = tool_input.get("query", "")
         return _truncate(f"WebSearch: '{query}'") if query else "WebSearch"
 
-    if tool_name == "self_fork":
-        task = tool_input.get("task", "")
-        background = tool_input.get("background", False)
-        prefix = "Fork (bg)" if background else "Fork"
-        if task:
-            return _truncate(f"{prefix}: {task}")
-        return prefix
+    if tool_name in {"ForkTask", "AgentTask"}:
+        description = tool_input.get("description", "")
+        prompt = tool_input.get("prompt", "")
+        resume = tool_input.get("resume")
+        timeout_ms = tool_input.get("timeout_ms")
+        max_turns = tool_input.get("max_turns")
+        prefix = tool_name
+        if description:
+            summary = f"{prefix}: {description}"
+        elif prompt:
+            summary = f"{prefix}: {prompt}"
+        else:
+            summary = prefix
+        if resume:
+            summary = f"{summary} resume={resume}"
+        if timeout_ms is not None:
+            summary = f"{summary} timeout={timeout_ms}ms"
+        if max_turns is not None:
+            summary = f"{summary} max_turns={max_turns}"
+        return _truncate(summary)
+
+    if tool_name in {"ForkTaskOutput", "AgentTaskOutput"}:
+        task_id = tool_input.get("task_id", "")
+        block = tool_input.get("block")
+        if task_id:
+            return _truncate(f"{tool_name}: {task_id} block={block}")
+        return tool_name
+
+    if tool_name in {"ForkTaskStop", "AgentTaskStop"}:
+        task_id = tool_input.get("task_id", "")
+        if task_id:
+            return _truncate(f"{tool_name}: {task_id}")
+        return tool_name
 
     if tool_name == "Task":
         prompt = tool_input.get("prompt", "")

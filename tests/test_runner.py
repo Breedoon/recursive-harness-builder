@@ -174,6 +174,87 @@ class TestRunnerStatusEvents:
         assert any(e.type == "thinking" for e in status_events)
         assert any(e.summary == "hmm..." for e in status_events)
 
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_system_task_started_yields_notification_status(self, mock_get_client, config):
+        system_msg = MagicMock()
+        system_msg.content = []
+        system_msg.session_id = None
+        system_msg.subtype = "task_started"
+        system_msg.data = {
+            "task_id": "task-123",
+            "description": "worker-a background run",
+            "task_type": "in_process_teammate",
+        }
+        mock_get_client.return_value = _make_mock_client([system_msg])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        events = await _collect_events(runner, "launch")
+        status_events = [e for e in events if isinstance(e, StatusEvent)]
+        notif = next((e for e in status_events if e.type == "notification"), None)
+        assert notif is not None
+        assert notif.summary == "notification: task_started"
+        assert notif.messages is not None
+        assert "task_id: task-123" in notif.messages
+
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_system_task_notification_yields_notification_status(self, mock_get_client, config):
+        system_msg = MagicMock()
+        system_msg.content = []
+        system_msg.session_id = None
+        system_msg.subtype = "task_notification"
+        system_msg.data = {
+            "task_id": "task-321",
+            "status": "completed",
+            "summary": "worker-a finished",
+        }
+        mock_get_client.return_value = _make_mock_client([system_msg])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        events = await _collect_events(runner, "wait")
+        status_events = [e for e in events if isinstance(e, StatusEvent)]
+        notif = next((e for e in status_events if e.type == "notification"), None)
+        assert notif is not None
+        assert notif.summary == "notification: task_notification"
+        assert notif.messages is not None
+        assert "status: completed" in notif.messages
+        assert "worker-a finished" in notif.messages
+
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_system_future_task_subtype_yields_notification_status(self, mock_get_client, config):
+        system_msg = MagicMock()
+        system_msg.content = []
+        system_msg.session_id = None
+        system_msg.subtype = "task_idle"
+        system_msg.data = {
+            "task_id": "task-777",
+            "status": "idle",
+            "summary": "worker-a is idle",
+        }
+        mock_get_client.return_value = _make_mock_client([system_msg])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        events = await _collect_events(runner, "wait")
+        status_events = [e for e in events if isinstance(e, StatusEvent)]
+        notif = next((e for e in status_events if e.type == "notification"), None)
+        assert notif is not None
+        assert notif.summary == "notification: task_idle"
+        assert notif.messages is not None
+        assert "task_id: task-777" in notif.messages
+        assert "status: idle" in notif.messages
+        assert "worker-a is idle" in notif.messages
+
 
 class TestRunnerUsageSnapshot:
     @patch("obs_agent.session.SessionManager.get_client")

@@ -36,5 +36,6 @@ markers = [
     "eval: eval scenarios run by SDK judge agent against real CLI + vault",
     "integration: live HTTP + SDK integration tests",
     "telegram: Telegram-specific eval scenarios (require OBS_TELEGRAM_BOT_USERNAME)",
+    "telegram_smoke: dense live Telegram smoke scenarios for fast dev-loop validation",
 ]
 testpaths = ["tests"]

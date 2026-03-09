@@ -7,11 +7,16 @@ from dataclasses import dataclass
 import logging
 import os
 import re
+import time
+import uuid
 from typing import Any
 
 import httpx
 from telethon import TelegramClient
+from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest, InviteToChannelRequest
+from telethon.tl.types import Channel, ChatAdminRights
 from telethon.sessions import StringSession
+from telethon.utils import get_peer_id
 
 
 logger = logging.getLogger("obs_agent.eval.telegram_forum")
@@ -30,6 +35,27 @@ def _is_completion_message(text: str) -> bool:
     stripped = text.strip()
     normalized = stripped.replace("_", "").replace("*", "")
     return bool(_COMPLETION_RE.search(normalized))
+
+
+def _is_progress_message(text: str) -> bool:
+    normalized = text.strip().replace("_", "").replace("*", "").strip().lower()
+    if not normalized:
+        return True
+    if normalized in {"received", "working"}:
+        return True
+    if normalized.startswith("context:"):
+        return True
+    return False
+
+
+def _has_substantive_output(messages: list["TelegramForumObservedMessage"]) -> bool:
+    for message in messages:
+        if _is_completion_message(message.text):
+            continue
+        if _is_progress_message(message.text):
+            continue
+        return True
+    return False
 
 
 def _forum_thread_id(message: Any) -> int | None:
@@ -51,6 +77,7 @@ class TelegramForumObservedMessage:
     text: str
     reply_to_message_id: int | None
     thread_id: int | None
+    sender_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -77,9 +104,17 @@ class TelegramForumPlatform:
         done_timeout: float = _DEFAULT_DONE_TIMEOUT,
         idle_quiescence_timeout: float = _DEFAULT_IDLE_QUIESCENCE_TIMEOUT,
     ) -> None:
-        self._chat_id = chat_id or int(os.environ["OBS_TELEGRAM_LIVE_FORUM_CHAT_ID"])
+        self._chat_id = chat_id
         self._bot_username = bot_username or os.environ["TELEGRAM_TEST_BOT_USERNAME"]
         self._bot_token = bot_token or os.environ["OBS_TELEGRAM_TEST_BOT_TOKEN"]
+        extra_tokens = os.environ.get("OBS_TELEGRAM_BOT_TOKENS", "").strip()
+        self._sender_bot_tokens = [
+            token.strip()
+            for token in extra_tokens.split(",")
+            if token.strip()
+        ]
+        if self._bot_token not in self._sender_bot_tokens:
+            self._sender_bot_tokens.insert(0, self._bot_token)
         self._api_id = api_id or int(os.environ["TELEGRAM_API_ID"])
         self._api_hash = api_hash or os.environ["TELEGRAM_API_HASH"]
         self._session_string = session_string or os.environ["TELEGRAM_SESSION"]
@@ -89,6 +124,7 @@ class TelegramForumPlatform:
         self._idle_quiescence_timeout = idle_quiescence_timeout
         self._client: TelegramClient | None = None
         self._bot_id: int | None = None
+        self._bot_sender_ids: set[int] = set()
         self._last_output = ""
         self._recent_messages: list[TelegramForumObservedMessage] = []
 
@@ -103,6 +139,209 @@ class TelegramForumPlatform:
             raise RuntimeError("Telethon session not authorized")
         bot_entity = await self._client.get_entity(self._bot_username)
         self._bot_id = bot_entity.id
+        self._bot_sender_ids = {bot_entity.id}
+        await self._discover_additional_bot_sender_ids()
+        if self._chat_id is None:
+            self._chat_id = await self._resolve_or_create_forum_chat(
+                primary_bot_entity=bot_entity
+            )
+        else:
+            channel = await self._client.get_entity(self._chat_id)
+            if not isinstance(channel, Channel):
+                raise RuntimeError(f"Configured chat_id is not a channel: {self._chat_id}")
+            await self._invite_sender_bots_to_chat(channel, bot_entity)
+            if not await self._probe_forum_chat(self._chat_id):
+                raise RuntimeError(
+                    "Configured forum chat is not writable by primary test bot "
+                    f"(chat_id={self._chat_id})"
+                )
+        logger.info("TelegramForumPlatform using chat_id=%s", self._chat_id)
+
+    async def _discover_additional_bot_sender_ids(self) -> None:
+        for token in self._sender_bot_tokens:
+            try:
+                payload = await self._bot_api_post("getMe", {}, token=token)
+                user_id = payload.get("result", {}).get("id")
+                if isinstance(user_id, int):
+                    self._bot_sender_ids.add(user_id)
+            except Exception:
+                logger.debug("Failed resolving sender bot id for token", exc_info=True)
+
+    async def _bot_api_post(
+        self,
+        method: str,
+        data: dict[str, Any],
+        *,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        use_token = token or self._bot_token
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{use_token}/{method}",
+                data=data,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError(f"{method} failed: {payload}")
+        return payload
+
+    async def _probe_forum_chat(self, chat_id: int) -> bool:
+        probe_name = f"obs-harness-probe-{uuid.uuid4().hex[:8]}"
+        try:
+            created = await self._bot_api_post(
+                "createForumTopic",
+                {"chat_id": chat_id, "name": probe_name},
+            )
+            thread_id = created["result"].get("message_thread_id")
+            if isinstance(thread_id, int):
+                try:
+                    await self._bot_api_post(
+                        "deleteForumTopic",
+                        {"chat_id": chat_id, "message_thread_id": thread_id},
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed cleanup after forum probe chat_id=%s thread=%s",
+                        chat_id,
+                        thread_id,
+                        exc_info=True,
+                    )
+            return True
+        except Exception:
+            return False
+
+    async def _invite_sender_bots_to_chat(self, channel: Channel, primary_bot_entity: Any) -> None:
+        assert self._client is not None
+        invitees: list[Any] = [primary_bot_entity]
+        for token in self._sender_bot_tokens:
+            if token == self._bot_token:
+                continue
+            try:
+                payload = await self._bot_api_post("getMe", {}, token=token)
+                username = payload.get("result", {}).get("username")
+                if isinstance(username, str) and username.strip():
+                    invitees.append(await self._client.get_entity(username.strip()))
+            except Exception:
+                logger.debug("Failed discovering extra sender bot for invite", exc_info=True)
+
+        seen_ids: set[int] = set()
+        unique_invitees: list[Any] = []
+        for user in invitees:
+            user_id = getattr(user, "id", None)
+            if isinstance(user_id, int) and user_id not in seen_ids:
+                unique_invitees.append(user)
+                seen_ids.add(user_id)
+        for user in unique_invitees:
+            try:
+                await self._client(InviteToChannelRequest(channel=channel, users=[user]))
+            except Exception:
+                logger.debug(
+                    "Failed inviting bot user_id=%s to forum chat",
+                    getattr(user, "id", None),
+                    exc_info=True,
+                )
+
+        rights = ChatAdminRights(
+            change_info=True,
+            delete_messages=True,
+            ban_users=True,
+            invite_users=True,
+            pin_messages=True,
+            manage_topics=True,
+            other=True,
+        )
+        for user in unique_invitees:
+            try:
+                await self._client(
+                    EditAdminRequest(
+                        channel=channel,
+                        user_id=user,
+                        admin_rights=rights,
+                        rank="obs-forum-bot",
+                    )
+                )
+            except Exception:
+                logger.debug(
+                    "Failed promoting bot user_id=%s in forum chat",
+                    getattr(user, "id", None),
+                    exc_info=True,
+                )
+
+    async def _create_forum_chat_with_bots(self, primary_bot_entity: Any) -> int:
+        assert self._client is not None
+        title = f"OBS Live Forum {time.strftime('%Y%m%d-%H%M%S')}"
+        created = await self._client(
+            CreateChannelRequest(
+                title=title,
+                about="OBS live forum harness",
+                megagroup=True,
+                forum=True,
+            )
+        )
+        channel = next((chat for chat in created.chats if isinstance(chat, Channel)), None)
+        if channel is None:
+            raise RuntimeError("CreateChannelRequest did not return a channel")
+        await self._invite_sender_bots_to_chat(channel, primary_bot_entity)
+        chat_id = int(get_peer_id(channel))
+        if not await self._probe_forum_chat(chat_id):
+            raise RuntimeError(
+                "Created forum chat but bot could not create topics; check bot admin permissions"
+            )
+        return chat_id
+
+    async def provision_forum_chat(self) -> int:
+        """Create a fresh forum chat with sender bots invited/admined."""
+        if self._client is None:
+            raise RuntimeError("TelegramForumPlatform not connected")
+        bot_entity = await self._client.get_entity(self._bot_username)
+        async for dialog in self._client.iter_dialogs(limit=200):
+            entity = dialog.entity
+            if not isinstance(entity, Channel):
+                continue
+            if not getattr(entity, "megagroup", False):
+                continue
+            if not getattr(entity, "forum", False):
+                continue
+            chat_id = int(get_peer_id(entity))
+            if self._chat_id is not None and chat_id == self._chat_id:
+                continue
+            try:
+                await self._invite_sender_bots_to_chat(entity, bot_entity)
+            except Exception:
+                logger.debug("Failed reconciling bots for provisioned forum chat", exc_info=True)
+            if await self._probe_forum_chat(chat_id):
+                return chat_id
+        return await self._create_forum_chat_with_bots(bot_entity)
+
+    async def create_isolated_forum_chat(self) -> int:
+        """Always create a brand-new forum supergroup for deterministic live tests."""
+        if self._client is None:
+            raise RuntimeError("TelegramForumPlatform not connected")
+        bot_entity = await self._client.get_entity(self._bot_username)
+        return await self._create_forum_chat_with_bots(bot_entity)
+
+    async def _resolve_or_create_forum_chat(self, primary_bot_entity: Any) -> int:
+        assert self._client is not None
+        # Try existing forum supergroups first.
+        async for dialog in self._client.iter_dialogs(limit=200):
+            entity = dialog.entity
+            if not isinstance(entity, Channel):
+                continue
+            if not getattr(entity, "megagroup", False):
+                continue
+            if not getattr(entity, "forum", False):
+                continue
+            try:
+                await self._invite_sender_bots_to_chat(entity, primary_bot_entity)
+            except Exception:
+                logger.debug("Failed reconciling bots for existing forum chat", exc_info=True)
+            chat_id = int(get_peer_id(entity))
+            if await self._probe_forum_chat(chat_id):
+                return chat_id
+
+        # Create a fresh forum supergroup and add/promote configured bots.
+        return await self._create_forum_chat_with_bots(primary_bot_entity)
 
     async def close(self) -> None:
         if self._client is not None:
@@ -110,36 +349,40 @@ class TelegramForumPlatform:
             self._client = None
 
     async def create_topic(self, name: str) -> int:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"https://api.telegram.org/bot{self._bot_token}/createForumTopic",
-                data={"chat_id": self._chat_id, "name": name},
-            )
-        response.raise_for_status()
-        payload = response.json()
-        if not payload.get("ok"):
-            raise RuntimeError(f"createForumTopic failed: {payload}")
+        payload = await self._bot_api_post(
+            "createForumTopic",
+            {"chat_id": self._chat_id, "name": name},
+        )
         thread_id = payload["result"].get("message_thread_id")
         if not isinstance(thread_id, int):
             raise RuntimeError(f"createForumTopic returned no thread id: {payload}")
         return thread_id
 
     async def delete_topic(self, thread_id: int) -> None:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"https://api.telegram.org/bot{self._bot_token}/deleteForumTopic",
-                data={"chat_id": self._chat_id, "message_thread_id": thread_id},
-            )
-        response.raise_for_status()
-        payload = response.json()
-        if not payload.get("ok"):
-            raise RuntimeError(f"deleteForumTopic failed: {payload}")
+        await self._bot_api_post(
+            "deleteForumTopic",
+            {"chat_id": self._chat_id, "message_thread_id": thread_id},
+        )
+
+    async def rename_topic(self, thread_id: int, name: str) -> None:
+        await self._bot_api_post(
+            "editForumTopic",
+            {"chat_id": self._chat_id, "message_thread_id": thread_id, "name": name},
+        )
 
     async def latest_bot_message_id(self, *, thread_id: int | None = None) -> int:
         messages = await self.get_recent_messages(thread_id=thread_id, limit=1)
         if not messages:
             return 0
         return messages[-1].message_id
+
+    async def latest_bot_message_id_any_thread(self) -> int:
+        if self._client is None:
+            raise RuntimeError("TelegramForumPlatform not connected")
+        async for message in self._client.iter_messages(self._chat_id, limit=200):
+            if message.sender_id in self._bot_sender_ids:
+                return int(getattr(message, "id", 0) or 0)
+        return 0
 
     async def get_recent_messages(
         self,
@@ -151,8 +394,11 @@ class TelegramForumPlatform:
             raise RuntimeError("TelegramForumPlatform not connected")
 
         observed: list[TelegramForumObservedMessage] = []
-        async for message in self._client.iter_messages(self._chat_id, limit=max(limit * 5, 50)):
-            if message.sender_id != self._bot_id:
+        # Under heavy fork fanout, thread-local messages may be sparse within global
+        # chat history, so scan a deeper window before giving up.
+        scan_limit = min(max(limit * 40, 200), 10_000)
+        async for message in self._client.iter_messages(self._chat_id, limit=scan_limit):
+            if message.sender_id not in self._bot_sender_ids:
                 continue
             message_thread_id = _forum_thread_id(message)
             if message_thread_id != thread_id:
@@ -167,6 +413,7 @@ class TelegramForumPlatform:
                         None,
                     ),
                     thread_id=message_thread_id,
+                    sender_id=getattr(message, "sender_id", None),
                 )
             )
             if len(observed) >= limit:
@@ -288,6 +535,20 @@ class TelegramForumPlatform:
                 )
             )
 
+    async def wait_for_global_silence(self, *, seconds: float) -> None:
+        before = await self.latest_bot_message_id_any_thread()
+        await asyncio.sleep(seconds)
+        after = await self.latest_bot_message_id_any_thread()
+        if after != before:
+            recent = await self.get_recent_messages(thread_id=None, limit=12)
+            raise AssertionError(
+                "Expected global forum silence, but new bot messages arrived:\n"
+                + "\n".join(
+                    f"id={message.message_id} thread={message.thread_id} reply_to={message.reply_to_message_id} text={message.text!r}"
+                    for message in recent
+                )
+            )
+
     def format_recent_messages(self, *, limit: int = 20) -> str:
         recent = self._recent_messages[-limit:]
         if not recent:
@@ -313,6 +574,7 @@ class TelegramForumPlatform:
         first_deadline = asyncio.get_running_loop().time() + first_budget
         done_deadline = asyncio.get_running_loop().time() + done_budget
         seen_ids: set[int] = set()
+        seen_completion = False
 
         while True:
             new_messages = await self._fetch_new_messages(
@@ -332,6 +594,7 @@ class TelegramForumPlatform:
             await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
         if _is_completion_message(observed_messages[-1].text):
+            seen_completion = True
             return TelegramForumResponseTrace(
                 sent_message_id=sent_message_id,
                 output="\n".join(message.text for message in observed_messages),
@@ -362,8 +625,16 @@ class TelegramForumPlatform:
         idle_deadline = asyncio.get_running_loop().time() + idle_budget
         while True:
             if _is_completion_message(observed_messages[-1].text):
+                seen_completion = True
+            if seen_completion and asyncio.get_running_loop().time() >= idle_deadline:
                 break
             if asyncio.get_running_loop().time() >= done_deadline:
+                if _has_substantive_output(observed_messages):
+                    return TelegramForumResponseTrace(
+                        sent_message_id=sent_message_id,
+                        output="\n".join(message.text for message in observed_messages),
+                        messages=observed_messages,
+                    )
                 return TelegramForumResponseTrace(
                     sent_message_id=sent_message_id,
                     output=(
@@ -379,8 +650,16 @@ class TelegramForumPlatform:
             )
             if new_messages:
                 observed_messages.extend(new_messages)
+                if any(_is_completion_message(message.text) for message in new_messages):
+                    seen_completion = True
                 idle_deadline = asyncio.get_running_loop().time() + idle_budget
-            elif asyncio.get_running_loop().time() >= idle_deadline:
+            elif not seen_completion and asyncio.get_running_loop().time() >= idle_deadline:
+                if _has_substantive_output(observed_messages):
+                    return TelegramForumResponseTrace(
+                        sent_message_id=sent_message_id,
+                        output="\n".join(message.text for message in observed_messages),
+                        messages=observed_messages,
+                    )
                 return TelegramForumResponseTrace(
                     sent_message_id=sent_message_id,
                     output=(

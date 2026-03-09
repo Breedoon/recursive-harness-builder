@@ -123,6 +123,23 @@ class TestCreateOptions:
         assert mock_create.call_count == 1
         assert mock_create.call_args.kwargs.get("hook_state") is state
 
+    def test_includes_session_sdk_env_overrides(self, config):
+        mgr = SessionManager(config=config)
+        mgr.set_sdk_env_overrides(
+            {
+                "CLAUDE_CODE_ENABLE_TASKS": "1",
+                "CLAUDE_CODE_TASK_LIST_ID": "team-alpha",
+            }
+        )
+        options = mgr.create_options()
+        assert options.env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
+        assert options.env["CLAUDE_CODE_TASK_LIST_ID"] == "team-alpha"
+
+    def test_set_sdk_env_overrides_filters_empty_values(self, config):
+        mgr = SessionManager(config=config)
+        mgr.set_sdk_env_overrides({"A": "1", "B": "", "": "x"})
+        assert mgr.sdk_env_overrides == {"A": "1"}
+
 
 class TestResetBehavior:
     def test_reset_clears_session_and_client_refs(self, config):

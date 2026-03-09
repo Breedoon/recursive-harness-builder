@@ -136,6 +136,11 @@ class HookState:
     session_id: str | None = None
     background_tasks: set[asyncio.Task] = field(default_factory=set)
     last_result_data: dict | None = None  # last ResultMessage metrics
+    fork_task_launcher: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    fork_task_outputter: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    fork_task_stopper: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    inbox_message_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    current_tool_use_id: str | None = None
 
     def reset(self) -> None:
         """Clear all queued state for a fresh session.
@@ -164,6 +169,7 @@ class HookState:
         self.pause_queue_delivery = False
         self.session_id = None
         self.last_result_data = None
+        self.current_tool_use_id = None
 
 
 class HookPipeline:
@@ -298,6 +304,15 @@ def _make_queue_check(state: HookState) -> CheckFn:
         tool_use_id: str | None,
         context: HookContext,
     ) -> SyncHookJSONOutput | None:
+        event_name = hook_input.get("hook_event_name")
+        if event_name == "PreToolUse":
+            state.current_tool_use_id = tool_use_id
+            session_id = hook_input.get("session_id")
+            if isinstance(session_id, str) and session_id.strip():
+                state.session_id = session_id.strip()
+        elif event_name == "PostToolUse" and state.current_tool_use_id == tool_use_id:
+            state.current_tool_use_id = None
+
         messages: list[str] = []
         deferred_messages: list[QueuedMessage] = []
         while not state.message_queue.empty():
@@ -341,6 +356,66 @@ def _make_queue_check(state: HookState) -> CheckFn:
     return _check
 
 
+def _make_notification_check(state: HookState) -> CheckFn:
+    """Create a check that surfaces notification/lifecycle hook events.
+
+    We mirror native hook events into status_queue so transport adapters (e.g.
+    Telegram) can show user-visible activity for teammate/task lifecycle.
+    """
+
+    async def _check(
+        hook_input: HookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput | None:
+        _ = tool_use_id, context
+        event_name = hook_input.get("hook_event_name")
+        if event_name not in {"Notification", "SubagentStart", "SubagentStop"}:
+            return None
+
+        from obs_agent.events import StatusEvent
+
+        if event_name == "Notification":
+            notification_type = str(hook_input.get("notification_type") or "notification").strip()
+            title = str(hook_input.get("title") or "").strip()
+            message = str(hook_input.get("message") or "").strip()
+            lines: list[str] = []
+            if title:
+                lines.append(f"title: {title}")
+            if message:
+                lines.append(message)
+            state.status_queue.put_nowait(
+                StatusEvent(
+                    type="notification",
+                    summary=f"notification: {notification_type}",
+                    messages=lines or None,
+                )
+            )
+            return None
+
+        agent_id = str(hook_input.get("agent_id") or "").strip()
+        agent_type = str(hook_input.get("agent_type") or "").strip()
+        lines = []
+        if agent_id:
+            lines.append(f"agent_id: {agent_id}")
+        if agent_type:
+            lines.append(f"agent_type: {agent_type}")
+        if event_name == "SubagentStop":
+            transcript = str(hook_input.get("agent_transcript_path") or "").strip()
+            if transcript:
+                lines.append(f"transcript: {transcript}")
+        state.status_queue.put_nowait(
+            StatusEvent(
+                type="notification",
+                summary=f"notification: {event_name}",
+                messages=lines or None,
+            )
+        )
+        return None
+
+    return _check
+
+
 # ---------------------------------------------------------------------------
 # Factory: build hook matchers for ClaudeAgentOptions
 # ---------------------------------------------------------------------------
@@ -358,9 +433,11 @@ def create_hook_matchers(
     interrupt_check = _make_interrupt_check(state)
     immutable_check = _make_immutable_check(config)
     queue_check = _make_queue_check(state)
+    notification_check = _make_notification_check(state)
 
     pre_tool_pipeline = HookPipeline([interrupt_check, immutable_check, queue_check])
     post_tool_pipeline = HookPipeline([queue_check])
+    notification_pipeline = HookPipeline([notification_check])
 
     return {
         "PreToolUse": [
@@ -368,5 +445,14 @@ def create_hook_matchers(
         ],
         "PostToolUse": [
             HookMatcher(matcher=None, hooks=[post_tool_pipeline]),
+        ],
+        "Notification": [
+            HookMatcher(matcher=None, hooks=[notification_pipeline]),
+        ],
+        "SubagentStart": [
+            HookMatcher(matcher=None, hooks=[notification_pipeline]),
+        ],
+        "SubagentStop": [
+            HookMatcher(matcher=None, hooks=[notification_pipeline]),
         ],
     }

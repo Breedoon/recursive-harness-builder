@@ -44,6 +44,7 @@ class SessionManager:
         self._client: ClaudeSDKClient | None = None
         self._connected: bool = False
         self._lock = asyncio.Lock()
+        self._sdk_env_overrides: dict[str, str] = {}
 
     @property
     def session_id(self) -> str | None:
@@ -57,6 +58,23 @@ class SessionManager:
     def touch(self) -> None:
         """Update last_activity to current time."""
         self.last_activity = time.time()
+
+    def set_sdk_env_overrides(self, env: dict[str, str] | None) -> None:
+        """Set per-session SDK env overrides for newly created clients.
+
+        Existing connected clients are not reconfigured in-place; callers that
+        need immediate effect should reconnect/reset the session.
+        """
+        self._sdk_env_overrides = {
+            str(key): str(value)
+            for key, value in (env or {}).items()
+            if str(key).strip() and str(value).strip()
+        }
+
+    @property
+    def sdk_env_overrides(self) -> dict[str, str]:
+        """Expose the current per-session SDK env override map."""
+        return dict(self._sdk_env_overrides)
 
     def should_resume(self) -> bool:
         """Decide whether to resume the existing session.
@@ -86,6 +104,7 @@ class SessionManager:
             cwd=str(self.config.vault_path),
             permission_mode="bypassPermissions",
             setting_sources=["project"],
+            env=self._sdk_env_overrides.copy(),
             max_buffer_size=self.config.max_buffer_size,
         )
 

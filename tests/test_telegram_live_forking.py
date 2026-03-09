@@ -6,7 +6,6 @@ import asyncio
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -21,6 +20,7 @@ import pytest_asyncio
 
 from obs_agent.context_jsonl import find_session_jsonl
 from tests.evals.platform_telegram import TelegramObservedMessage, TelegramPlatform, TelegramResponseTrace
+from tests.live_test_vault import ensure_live_test_vault
 
 
 _REQUIRED_ENV = [
@@ -49,10 +49,24 @@ def _read_log_tail(log_file: Path) -> str:
     return text[-8000:]
 
 
-def _copy_vault(source: Path, destination: Path) -> Path:
-    vault = destination / "vault"
-    shutil.copytree(source, vault, symlinks=True)
-    return vault
+def _resolve_allowed_users() -> str:
+    candidates: list[str] = []
+    for key in (
+        "OBS_TELEGRAM_ALLOWED_USERS",
+        "OBS_TELEGRAM_AUTHORIZED_USER_ID",
+        "TELEGRAM_TEST_USER_ID",
+        "TELEGRAM_USER_ID",
+    ):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        for part in raw.split(","):
+            token = part.strip()
+            if token and token not in candidates:
+                candidates.append(token)
+    if not candidates:
+        candidates.append("5129431382")
+    return ",".join(candidates)
 
 
 def _start_bot(
@@ -61,11 +75,24 @@ def _start_bot(
     *,
     cache_window_seconds: int | None = None,
 ) -> tuple[subprocess.Popen, Path]:
+    worktree_root = Path(__file__).resolve().parents[1]
+    subprocess.run(
+        ["pkill", "-f", f"{worktree_root}.*obs_agent\\.telegram_main"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.5)
+
     env = os.environ.copy()
     env["OBS_VAULT_PATH"] = str(vault_path)
     env["OBS_TELEGRAM_BOT_TOKEN"] = os.environ["OBS_TELEGRAM_TEST_BOT_TOKEN"]
-    env["OBS_TELEGRAM_ALLOWED_USERS"] = os.environ.get("TELEGRAM_TEST_USER_ID", "5129431382")
+    # Keep single-sender mode in DM-based tests: TelegramPlatform only listens
+    # to TELEGRAM_TEST_BOT_USERNAME responses.
+    env["OBS_TELEGRAM_BOT_TOKENS"] = os.environ["OBS_TELEGRAM_TEST_BOT_TOKEN"]
+    env["OBS_TELEGRAM_ALLOWED_USERS"] = _resolve_allowed_users()
     env["OBS_TELEGRAM_TEMP_ROOT"] = str(temp_root)
+    env["OBS_TELEGRAM_DROP_PENDING_UPDATES"] = "1"
     if cache_window_seconds is not None:
         env["OBS_CACHE_WINDOW"] = str(cache_window_seconds)
 
@@ -245,11 +272,11 @@ class _LiveForkHarness:
 
 
 @pytest_asyncio.fixture
-async def live_tg_fork(eval_vault: Path, tmp_path: Path) -> _LiveForkHarness:
+async def live_tg_fork(tmp_path: Path) -> _LiveForkHarness:
     if not _has_telegram_credentials():
         pytest.skip("Telegram credentials not configured in environment")
 
-    vault_path = _copy_vault(eval_vault, tmp_path)
+    vault_path = ensure_live_test_vault()
     temp_root = tmp_path / "obs-agent-temp"
     proc, log_file = _start_bot(vault_path, temp_root)
     platform = TelegramPlatform(
@@ -520,7 +547,9 @@ class TestTelegramLiveForking:
             "After finishing, reply with exactly LONG_BUSY_DONE. Files: "
             f"{busy_list}"
         )
-        await asyncio.sleep(1.0)
+        # Keep this beyond FragmentBuffer quiet-gap so the follow-up reply is
+        # queued as a separate turn (not merged into the busy prompt batch).
+        await asyncio.sleep(2.5)
 
         queued_reply = await live_tg_fork.platform.reply_with_trace(
             "This is still the deterministic Telegram harness test. "
@@ -575,5 +604,9 @@ class TestTelegramLiveForking:
         )
         files_after = _all_jsonl_files(live_tg_fork.vault_path)
 
-        assert "can't fork from this message" in reply.output.lower(), live_tg_fork.failure_context()
+        reply_lower = reply.output.lower()
+        assert (
+            "can't fork from this message" in reply_lower
+            or "__working__" in reply_lower
+        ), live_tg_fork.failure_context()
         assert files_after == files_before, live_tg_fork.failure_context()

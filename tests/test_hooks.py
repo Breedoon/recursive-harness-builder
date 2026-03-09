@@ -24,6 +24,7 @@ from obs_agent.hooks import (
     HookPipeline,
     _make_interrupt_check,
     _make_immutable_check,
+    _make_notification_check,
     _make_queue_check,
     create_hook_matchers,
 )
@@ -258,6 +259,48 @@ def _make_post_tool_use_input(**overrides) -> dict:
         "tool_input": {"file_path": "/some/file.md"},
         "tool_response": "file contents",
         "tool_use_id": "tu-123",
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_notification_input(**overrides) -> dict:
+    base = {
+        "hook_event_name": "Notification",
+        "session_id": "test-session",
+        "transcript_path": "/tmp/transcript",
+        "cwd": "/tmp",
+        "notification_type": "TaskCompleted",
+        "title": "Task done",
+        "message": "worker-a completed task 1",
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_subagent_start_input(**overrides) -> dict:
+    base = {
+        "hook_event_name": "SubagentStart",
+        "session_id": "test-session",
+        "transcript_path": "/tmp/transcript",
+        "cwd": "/tmp",
+        "agent_id": "agent-123",
+        "agent_type": "general-purpose",
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_subagent_stop_input(**overrides) -> dict:
+    base = {
+        "hook_event_name": "SubagentStop",
+        "session_id": "test-session",
+        "transcript_path": "/tmp/transcript",
+        "cwd": "/tmp",
+        "stop_hook_active": False,
+        "agent_id": "agent-123",
+        "agent_type": "general-purpose",
+        "agent_transcript_path": "/tmp/agent-123.jsonl",
     }
     base.update(overrides)
     return base
@@ -573,15 +616,62 @@ class TestHookStateStatusQueue:
         assert got is event
 
 
+class TestCheckNotification:
+    """_make_notification_check mirrors hook notifications into status queue."""
+
+    @pytest.mark.asyncio
+    async def test_notification_event_pushes_status_event(self):
+        state = HookState()
+        check = _make_notification_check(state)
+
+        result = await check(_make_notification_input(), None, _EMPTY_CONTEXT)
+
+        assert result is None
+        event = state.status_queue.get_nowait()
+        assert event.type == "notification"
+        assert event.summary == "notification: TaskCompleted"
+        assert event.messages == ["title: Task done", "worker-a completed task 1"]
+
+    @pytest.mark.asyncio
+    async def test_subagent_start_pushes_status_event(self):
+        state = HookState()
+        check = _make_notification_check(state)
+
+        result = await check(_make_subagent_start_input(), None, _EMPTY_CONTEXT)
+
+        assert result is None
+        event = state.status_queue.get_nowait()
+        assert event.type == "notification"
+        assert event.summary == "notification: SubagentStart"
+        assert "agent_id: agent-123" in (event.messages or [])
+        assert "agent_type: general-purpose" in (event.messages or [])
+
+    @pytest.mark.asyncio
+    async def test_subagent_stop_pushes_status_event(self):
+        state = HookState()
+        check = _make_notification_check(state)
+
+        result = await check(_make_subagent_stop_input(), None, _EMPTY_CONTEXT)
+
+        assert result is None
+        event = state.status_queue.get_nowait()
+        assert event.type == "notification"
+        assert event.summary == "notification: SubagentStop"
+        assert "transcript: /tmp/agent-123.jsonl" in (event.messages or [])
+
+
 class TestCreateHookMatchers:
     """create_hook_matchers builds the correct pipeline structure."""
 
-    def test_returns_pre_and_post_tool_use(self, config):
-        """Returns dict with PreToolUse and PostToolUse keys."""
+    def test_returns_pre_post_and_notification_hooks(self, config):
+        """Returns dict with task/tool and notification lifecycle hook keys."""
         state = HookState()
         matchers = create_hook_matchers(config, state)
         assert "PreToolUse" in matchers
         assert "PostToolUse" in matchers
+        assert "Notification" in matchers
+        assert "SubagentStart" in matchers
+        assert "SubagentStop" in matchers
 
     def test_pre_tool_use_has_one_matcher(self, config):
         """PreToolUse has exactly one HookMatcher with one pipeline."""
@@ -642,3 +732,16 @@ class TestCreateHookMatchers:
         result = await pipeline(_make_post_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
         assert result.get("hookSpecificOutput", {}).get("hookEventName") == "PostToolUse"
         assert "queued msg" in result.get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    @pytest.mark.asyncio
+    async def test_notification_pipeline_pushes_status_event(self, config):
+        state = HookState()
+        matchers = create_hook_matchers(config, state)
+        pipeline = matchers["Notification"][0].hooks[0]
+
+        result = await pipeline(_make_notification_input(), None, _EMPTY_CONTEXT)
+
+        assert result == {}
+        event = state.status_queue.get_nowait()
+        assert event.type == "notification"
+        assert event.summary == "notification: TaskCompleted"

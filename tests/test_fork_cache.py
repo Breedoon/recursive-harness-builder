@@ -1,10 +1,7 @@
-"""Fork cache verification integration test.
+"""Legacy self_fork integration test.
 
-Verifies that forking a session via query(fork_session=True) actually hits
-the prompt cache (cache_read_input_tokens > 0) rather than re-processing
-the entire conversation.
-
-Run with: .venv/bin/pytest tests/test_fork_cache.py -v -m integration --timeout=300
+ForkTask now owns delegated forking in Telegram topics, so the old HTTP
+self_fork/cache behavior is no longer part of the supported surface.
 """
 
 from __future__ import annotations
@@ -22,6 +19,8 @@ import uvicorn
 from obs_agent.daemon import create_app
 
 logger = logging.getLogger(__name__)
+
+pytestmark = pytest.mark.skip(reason="Legacy self_fork integration test removed; ForkTask is Telegram-only")
 
 
 def _free_port() -> int:
@@ -66,7 +65,7 @@ async def live_server(e2e_config):
 
 @pytest.mark.integration
 class TestForkCacheHits:
-    """Verify that forking produces cache hits via the self_fork MCP tool."""
+    """Retained only as skipped historical reference."""
 
     async def test_fork_produces_response(self, live_server):
         """Send a message, then ask the agent to fork — fork should respond."""

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import obs_agent.config as config_module
 from obs_agent.config import OBSConfig
 
 
@@ -237,6 +238,19 @@ class TestVaultValidation:
         with pytest.raises(FileNotFoundError):
             cfg.validate()
 
+    def test_validate_fails_when_state_db_inside_temp_root(self, tmp_path):
+        vault = tmp_path / "vault"
+        (vault / ".claude").mkdir(parents=True)
+        (vault / "CLAUDE.md").write_text("# context")
+        temp_root = tmp_path / "tg-temp"
+        cfg = OBSConfig(
+            vault_path=vault,
+            telegram_temp_root=temp_root,
+            telegram_state_db_path=temp_root / "telegram-state.sqlite3",
+        )
+        with pytest.raises(ValueError, match="outside OBS_TELEGRAM_TEMP_ROOT"):
+            cfg.validate()
+
 
 # --- Telegram Settings ---
 
@@ -296,6 +310,31 @@ class TestTelegramSettings:
         monkeypatch.setenv("OBS_TELEGRAM_TEMP_ROOT", str(tmp_path / "tg-temp"))
         cfg = OBSConfig.from_env()
         assert cfg.telegram_temp_root == tmp_path / "tg-temp"
+
+    def test_state_db_path_default(self):
+        cfg = OBSConfig()
+        expected = (
+            Path(config_module.__file__).resolve().parents[2]
+            / ".obs-agent"
+            / "state"
+            / "telegram-state.sqlite3"
+        )
+        assert cfg.telegram_state_db_path == expected
+
+    def test_state_db_path_from_env(self, monkeypatch, tmp_path):
+        db_path = tmp_path / "state.sqlite3"
+        monkeypatch.setenv("OBS_TELEGRAM_STATE_DB_PATH", str(db_path))
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_state_db_path == db_path
+
+    def test_state_retention_days_default(self):
+        cfg = OBSConfig()
+        assert cfg.telegram_state_retention_days == 30
+
+    def test_state_retention_days_from_env(self, monkeypatch):
+        monkeypatch.setenv("OBS_TELEGRAM_STATE_RETENTION_DAYS", "14")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_state_retention_days == 14
 
     def test_transcription_script_from_env(self, monkeypatch, tmp_path):
         script = tmp_path / "transcribe.sh"

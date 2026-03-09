@@ -8,7 +8,11 @@ from pathlib import Path
 
 
 _DEFAULT_VAULT = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "T"
+_DEFAULT_CODEBASE_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_TELEGRAM_TEMP_ROOT = Path("/tmp") / "obs-agent"
+_DEFAULT_TELEGRAM_STATE_DB_PATH = (
+    _DEFAULT_CODEBASE_ROOT / ".obs-agent" / "state" / "telegram-state.sqlite3"
+)
 _DEFAULT_TELEGRAM_TRANSCRIPTION_SCRIPT = (
     Path("/Users/breedoon/Documents/PATH/transcription/transcribe.sh")
 )
@@ -17,6 +21,16 @@ _DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no exp
 IMMUTABLE_PATTERNS: list[str] = [
     "Misc/Meeting Notes",
 ]
+
+
+def _resolved(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    normalized_path = _resolved(path)
+    normalized_parent = _resolved(parent)
+    return normalized_path == normalized_parent or normalized_parent in normalized_path.parents
 
 
 @dataclass
@@ -36,9 +50,12 @@ class OBSConfig:
 
     # Telegram
     telegram_bot_token: str | None = None
+    telegram_bot_tokens: list[str] = field(default_factory=list)
     telegram_allowed_user_ids: list[int] = field(default_factory=list)
     telegram_notify_username: str | None = None
     telegram_temp_root: Path = field(default_factory=lambda: _DEFAULT_TELEGRAM_TEMP_ROOT)
+    telegram_state_db_path: Path = field(default_factory=lambda: _DEFAULT_TELEGRAM_STATE_DB_PATH)
+    telegram_state_retention_days: int = 30
     telegram_transcription_script: Path = field(
         default_factory=lambda: _DEFAULT_TELEGRAM_TRANSCRIPTION_SCRIPT
     )
@@ -68,8 +85,17 @@ class OBSConfig:
             kwargs["context_window_estimate_tokens"] = int(context_est)
         if probe_cli := os.environ.get("OBS_CONTEXT_PROBE_CLAUDE_CLI"):
             kwargs["context_probe_claude_cli"] = probe_cli.strip().lower() in {"1", "true", "yes", "on"}
+        raw_tokens = (
+            os.environ.get("OBS_TELEGRAM_BOT_TOKENS")
+            or os.environ.get("OBS_TELEGRAM_TEST_BOT_TOKENS")
+            or ""
+        ).strip()
+        if raw_tokens:
+            kwargs["telegram_bot_tokens"] = [
+                token.strip() for token in raw_tokens.split(",") if token.strip()
+            ]
         if tg_token := os.environ.get("OBS_TELEGRAM_BOT_TOKEN") or os.environ.get("OBS_TELEGRAM_PROD_BOT_TOKEN"):
-            kwargs["telegram_bot_token"] = tg_token
+            kwargs["telegram_bot_token"] = tg_token.strip()
         if tg_users := os.environ.get("OBS_TELEGRAM_ALLOWED_USERS") or os.environ.get("OBS_TELEGRAM_AUTHORIZED_USER_ID"):
             kwargs["telegram_allowed_user_ids"] = [
                 int(uid.strip()) for uid in tg_users.split(",") if uid.strip()
@@ -81,6 +107,10 @@ class OBSConfig:
             kwargs["telegram_notify_username"] = tg_username.lstrip("@").strip() or None
         if tg_temp_root := os.environ.get("OBS_TELEGRAM_TEMP_ROOT"):
             kwargs["telegram_temp_root"] = Path(tg_temp_root)
+        if tg_state_db := os.environ.get("OBS_TELEGRAM_STATE_DB_PATH"):
+            kwargs["telegram_state_db_path"] = Path(tg_state_db)
+        if tg_state_retention := os.environ.get("OBS_TELEGRAM_STATE_RETENTION_DAYS"):
+            kwargs["telegram_state_retention_days"] = int(tg_state_retention)
         if tg_transcribe := os.environ.get("OBS_TELEGRAM_TRANSCRIPTION_SCRIPT"):
             kwargs["telegram_transcription_script"] = Path(tg_transcribe)
 
@@ -139,6 +169,27 @@ class OBSConfig:
 
     # --- Validation ---
 
+    @property
+    def telegram_primary_bot_token(self) -> str | None:
+        """Primary Telegram bot token used for polling updates."""
+        if self.telegram_bot_token:
+            return self.telegram_bot_token
+        if self.telegram_bot_tokens:
+            return self.telegram_bot_tokens[0]
+        return None
+
+    @property
+    def telegram_sender_bot_tokens(self) -> list[str]:
+        """Ordered deduplicated sender token list (primary first)."""
+        ordered: list[str] = []
+        primary = self.telegram_primary_bot_token
+        if primary:
+            ordered.append(primary)
+        for token in self.telegram_bot_tokens:
+            if token and token not in ordered:
+                ordered.append(token)
+        return ordered
+
     def validate(self) -> None:
         """Validate that expected vault structure exists. Raises FileNotFoundError."""
         if not self.vault_path.exists():
@@ -147,3 +198,8 @@ class OBSConfig:
             raise FileNotFoundError(f".claude directory not found: {self.claude_path}")
         if not self.context_path.is_file():
             raise FileNotFoundError(f"CLAUDE.md not found: {self.context_path}")
+        if _is_within(self.telegram_state_db_path, self.telegram_temp_root):
+            raise ValueError(
+                "Invalid Telegram state DB path: OBS_TELEGRAM_STATE_DB_PATH must be outside "
+                "OBS_TELEGRAM_TEMP_ROOT to avoid startup cleanup deleting persistence data."
+            )
