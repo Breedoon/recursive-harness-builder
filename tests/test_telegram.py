@@ -888,6 +888,79 @@ class TestCommands:
         assert topic.hook_state.pause_queue_delivery is True
         assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
 
+    async def test_report_writes_case_file_with_metadata(self, config):
+        chat_id = -100555666777
+        thread_id = 321
+        trigger_message_id = 42
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot, chat_id=chat_id, thread_id=thread_id)
+        state.session_manager.set_session_id("sid-root")
+        bot._session_heads["sid-root"] = "head-uuid"
+        bot._record_message_binding(
+            route=state.route,
+            message_id=trigger_message_id,
+            jsonl_uuid="bound-uuid",
+            session_id="sid-root",
+            role="assistant",
+        )
+
+        update = _make_update(
+            "/report investigate fork callback mismatch",
+            chat_id=chat_id,
+            message_id=trigger_message_id,
+            thread_id=thread_id,
+        )
+        ctx = _make_context()
+        ctx.args = ["investigate", "fork", "callback", "mismatch"]
+
+        with patch.dict("os.environ", {"OBS_RUNTIME_LOG_FILE": "/tmp/runtime.log"}, clear=False):
+            await bot.handle_report(update, ctx)
+
+        ctx.bot.send_message.assert_called_once()
+        assert "report saved:" in ctx.bot.send_message.call_args.kwargs["text"]
+
+        report_dir = config.claude_path / "reports" / "cases"
+        reports = sorted(report_dir.glob("case-*.md"))
+        assert len(reports) == 1
+        text = reports[0].read_text()
+        assert "- Trigger comment: investigate fork callback mismatch" in text
+        assert f"- Chat ID: {chat_id}" in text
+        assert f"- Topic thread ID: {thread_id}" in text
+        assert f"- Trigger message ID: {trigger_message_id}" in text
+        assert "https://t.me/c/555666777/321/42" in text
+        assert "- Runtime log file: /tmp/runtime.log" in text
+        assert "- Active route session ID: sid-root" in text
+        assert "- Active route head UUID: head-uuid" in text
+        assert "- Trigger binding UUID: bound-uuid" in text
+
+    async def test_report_without_comment_uses_placeholder(self, config):
+        chat_id = -100777888999
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/report", chat_id=chat_id, message_id=50)
+        ctx = _make_context()
+        ctx.args = []
+
+        await bot.handle_report(update, ctx)
+
+        report_dir = config.claude_path / "reports" / "cases"
+        reports = sorted(report_dir.glob("case-*.md"))
+        assert len(reports) == 1
+        text = reports[0].read_text()
+        assert "- Trigger comment: (no comment provided)" in text
+
+    async def test_report_unauthorized_user_does_not_write_case_file(self, config):
+        config.telegram_allowed_user_ids = [99999]
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/report unauthorized", user_id=12345)
+        ctx = _make_context()
+        ctx.args = ["unauthorized"]
+
+        await bot.handle_report(update, ctx)
+
+        ctx.bot.send_message.assert_not_called()
+        report_dir = config.claude_path / "reports" / "cases"
+        assert not report_dir.exists()
+
 
 class TestTopicCommands:
     async def test_forum_topic_created_populates_title_and_icon_metadata(self, config):

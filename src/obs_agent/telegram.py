@@ -20,6 +20,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -2446,6 +2447,43 @@ class TelegramBot:
             disable_web_page_preview=True,
         )
 
+    async def handle_report(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /report [comment] - persist a debug case file for later analysis."""
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+
+        route = self._route_for_message(update.effective_message)
+        comment = " ".join(context.args).strip()
+        try:
+            report_path = self._write_case_report(
+                route=route,
+                trigger_message_id=update.effective_message.message_id,
+                trigger_user_id=update.effective_user.id,
+                comment=comment,
+            )
+        except Exception as exc:
+            logger.exception("Failed writing /report case file")
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=f"report failed: {exc}",
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
+
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=f"report saved: {report_path}",
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
+
     async def handle_stop(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -3290,6 +3328,79 @@ class TelegramBot:
         if route.thread_id is None:
             return f"https://t.me/c/{chat_token}/{message_id}"
         return f"https://t.me/c/{chat_token}/{route.thread_id}/{message_id}"
+
+    def _resolve_runtime_log_file(self) -> str | None:
+        for key in ("OBS_RUNTIME_LOG_FILE", "OBS_TELEGRAM_LOG_FILE"):
+            value = (os.environ.get(key) or "").strip()
+            if value:
+                return value
+        return None
+
+    def _write_case_report(
+        self,
+        *,
+        route: TelegramRoute,
+        trigger_message_id: int,
+        trigger_user_id: int,
+        comment: str,
+    ) -> Path:
+        now_utc = datetime.now(timezone.utc)
+        timestamp_slug = now_utc.strftime("%Y%m%d-%H%M%S")
+        thread_part = (
+            f"topic{route.thread_id}"
+            if route.thread_id is not None
+            else "general"
+        )
+        filename = (
+            f"case-{timestamp_slug}-chat{route.chat_id}-{thread_part}-{uuid.uuid4().hex[:8]}.md"
+        )
+        report_dir = self._config.claude_path / "reports" / "cases"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / filename
+
+        state = self._get_state(route, create=False)
+        session_id = state.session_id if state is not None else None
+        session_head = self._session_heads.get(session_id or "")
+        session_jsonl = (
+            find_session_jsonl(session_id=session_id, cwd=self._config.vault_path)
+            if session_id
+            else None
+        )
+
+        bound = self._message_map.get((route.chat_id, trigger_message_id))
+        bound_uuid = bound.jsonl_uuid if bound is not None else None
+        bound_session = bound.session_id if bound is not None else None
+        trigger_link = self._build_message_link(route, trigger_message_id)
+        log_file = self._resolve_runtime_log_file()
+        normalized_comment = comment.strip() or "(no comment provided)"
+
+        lines = [
+            "# Telegram Case Report",
+            "",
+            f"- Created (UTC): {now_utc.isoformat(timespec='seconds')}",
+            f"- Trigger comment: {normalized_comment}",
+            f"- Chat ID: {route.chat_id}",
+            f"- Topic thread ID: {route.thread_id if route.thread_id is not None else '(General)'}",
+            f"- Topic title: {self._current_topic_title(route)}",
+            f"- Trigger message ID: {trigger_message_id}",
+            f"- Trigger message link: {trigger_link or '(unavailable for this chat id)'}",
+            f"- Trigger user ID: {trigger_user_id}",
+            f"- Active route session ID: {session_id or '(none)'}",
+            f"- Active route head UUID: {session_head or '(none)'}",
+            f"- Trigger binding UUID: {bound_uuid or '(none)'}",
+            f"- Trigger binding session ID: {bound_session or '(none)'}",
+            f"- Session JSONL: {session_jsonl or '(none)'}",
+            f"- State DB: {self._config.telegram_state_db_path}",
+            f"- Runtime PID: {os.getpid()}",
+            f"- Runtime log file: {log_file or '(OBS_RUNTIME_LOG_FILE not set)'}",
+            "",
+            "## Notes",
+            "- This file was created by `/report` for later debugging.",
+            "- Correlate with logs using timestamp + chat/topic/message identifiers above.",
+            "",
+        ]
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        return report_path
 
     def _find_bound_message_id(
         self,
@@ -4742,6 +4853,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("new", bot.handle_new))
     app.add_handler(CommandHandler("stop", bot.handle_stop))
     app.add_handler(CommandHandler("context", bot.handle_context))
+    app.add_handler(CommandHandler("report", bot.handle_report))
     app.add_handler(CommandHandler("fork", bot.handle_fork))
     app.add_handler(CommandHandler("delete", bot.handle_delete))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, bot.handle_forum_topic_created))
@@ -4770,6 +4882,7 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("clear", "Clear this topic; use '/clear all' for the whole group"),
         BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
         BotCommand("context", "Show session and context window info"),
+        BotCommand("report", "Save a debug case file for this message/topic"),
         BotCommand("fork", "Create a new topic from this head or replied message"),
         BotCommand("delete", "Delete this topic; use '/delete all' to remove all non-General topics"),
     ])
