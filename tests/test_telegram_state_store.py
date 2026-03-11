@@ -48,6 +48,32 @@ def test_state_store_roundtrip_snapshot(tmp_path):
         status="completed",
         idle_ready=True,
     )
+    store.upsert_topic_schedule(
+        schedule_id="sched-1",
+        chat_id=-1001,
+        thread_id=42,
+        description="Nightly",
+        schedule_mode="interval",
+        cron_expr="0 0 */1 * *",
+        trigger_kind="interval",
+        interval_seconds=86400,
+        prompt="Run maintenance",
+        run_mode="continue",
+        recurring=True,
+        enabled=True,
+        run_count=2,
+        max_runs=10,
+        from_ts=None,
+        until_ts=None,
+        inherit_mode="none",
+        next_run_at=123456.0,
+        last_run_at=120000.0,
+        last_success_at=120001.0,
+        last_error=None,
+        max_retry_attempts=2,
+        retry_delay_seconds=45,
+        retry_attempt_count=1,
+    )
 
     snapshot = store.load_snapshot()
     assert len(snapshot.route_states) == 1
@@ -90,6 +116,24 @@ def test_state_store_roundtrip_snapshot(tmp_path):
     assert worker.description == "Team worker"
     assert worker.status == "completed"
     assert worker.idle_ready is True
+    assert len(snapshot.topic_schedules) == 1
+    schedule = snapshot.topic_schedules[0]
+    assert schedule.schedule_id == "sched-1"
+    assert schedule.chat_id == -1001
+    assert schedule.thread_id == 42
+    assert schedule.description == "Nightly"
+    assert schedule.schedule_mode == "interval"
+    assert schedule.trigger_kind == "interval"
+    assert schedule.interval_seconds == 86400
+    assert schedule.prompt == "Run maintenance"
+    assert schedule.run_mode == "continue"
+    assert schedule.recurring is True
+    assert schedule.enabled is True
+    assert schedule.run_count == 2
+    assert schedule.max_runs == 10
+    assert schedule.max_retry_attempts == 2
+    assert schedule.retry_delay_seconds == 45
+    assert schedule.retry_attempt_count == 1
     store.close()
 
 
@@ -137,6 +181,32 @@ def test_state_store_prune_removes_expired_rows(tmp_path):
             status="completed",
             idle_ready=True,
         )
+        store.upsert_topic_schedule(
+            schedule_id="sched-old",
+            chat_id=-1002,
+            thread_id=None,
+            description=None,
+            schedule_mode="interval",
+            cron_expr="*/5 * * * *",
+            trigger_kind="interval",
+            interval_seconds=300,
+            prompt="old",
+            run_mode="continue",
+            recurring=True,
+            enabled=True,
+            run_count=0,
+            max_runs=None,
+            from_ts=None,
+            until_ts=None,
+            inherit_mode="none",
+            next_run_at=20.0,
+            last_run_at=None,
+            last_success_at=None,
+            last_error=None,
+            max_retry_attempts=0,
+            retry_delay_seconds=30,
+            retry_attempt_count=0,
+        )
 
     with patch("obs_agent.telegram_state_store.time.time", return_value=(35 * 24 * 60 * 60)):
         store.prune(retention_days=30)
@@ -147,6 +217,7 @@ def test_state_store_prune_removes_expired_rows(tmp_path):
     assert snapshot.system_messages == []
     assert snapshot.session_heads == {}
     assert snapshot.team_worker_states == []
+    assert snapshot.topic_schedules == []
     store.close()
 
 
@@ -195,13 +266,41 @@ def test_state_store_delete_route_and_bindings(tmp_path):
         status="completed",
         idle_ready=True,
     )
+    store.upsert_topic_schedule(
+        schedule_id="sched-3",
+        chat_id=-1003,
+        thread_id=123,
+        description=None,
+        schedule_mode="interval",
+        cron_expr="@hourly",
+        trigger_kind="interval",
+        interval_seconds=3600,
+        prompt="check",
+        run_mode="continue",
+        recurring=True,
+        enabled=True,
+        run_count=0,
+        max_runs=None,
+        from_ts=None,
+        until_ts=None,
+        inherit_mode="none",
+        next_run_at=10.0,
+        last_run_at=None,
+        last_success_at=None,
+        last_error=None,
+        max_retry_attempts=0,
+        retry_delay_seconds=30,
+        retry_attempt_count=0,
+    )
     store.delete_team_worker_states_for_route(chat_id=-1003, thread_id=123)
+    store.delete_topic_schedules_for_route(chat_id=-1003, thread_id=123)
 
     snapshot = store.load_snapshot()
     assert snapshot.route_states == []
     assert snapshot.message_bindings == []
     assert snapshot.system_messages == []
     assert snapshot.team_worker_states == []
+    assert snapshot.topic_schedules == []
     store.close()
 
 

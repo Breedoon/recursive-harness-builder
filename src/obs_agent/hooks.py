@@ -139,8 +139,14 @@ class HookState:
     fork_task_launcher: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     fork_task_outputter: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     fork_task_stopper: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    cron_creator: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    cron_lister: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    cron_deleter: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     inbox_message_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    stop_event_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     current_tool_use_id: str | None = None
+    schedule_run_active: bool = False
+    execution_active: bool = False
 
     def reset(self) -> None:
         """Clear all queued state for a fresh session.
@@ -170,6 +176,8 @@ class HookState:
         self.session_id = None
         self.last_result_data = None
         self.current_tool_use_id = None
+        self.schedule_run_active = False
+        self.execution_active = False
 
 
 class HookPipeline:
@@ -416,6 +424,38 @@ def _make_notification_check(state: HookState) -> CheckFn:
     return _check
 
 
+def _make_stop_check(state: HookState) -> CheckFn:
+    """Create a check that emits route-local stop notifications."""
+
+    async def _check(
+        hook_input: HookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput | None:
+        _ = tool_use_id, context
+        if hook_input.get("hook_event_name") != "Stop":
+            return None
+        session_id = hook_input.get("session_id")
+        normalized_session_id = (
+            session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+        )
+        if normalized_session_id is not None:
+            state.session_id = normalized_session_id
+        notifier = state.stop_event_notifier
+        if notifier is None:
+            return None
+        payload = {
+            "session_id": normalized_session_id,
+            "hook_input": dict(hook_input),
+            "schedule_run_active": bool(state.schedule_run_active),
+            "execution_active": bool(state.execution_active),
+        }
+        await notifier(payload)
+        return None
+
+    return _check
+
+
 # ---------------------------------------------------------------------------
 # Factory: build hook matchers for ClaudeAgentOptions
 # ---------------------------------------------------------------------------
@@ -434,10 +474,12 @@ def create_hook_matchers(
     immutable_check = _make_immutable_check(config)
     queue_check = _make_queue_check(state)
     notification_check = _make_notification_check(state)
+    stop_check = _make_stop_check(state)
 
     pre_tool_pipeline = HookPipeline([interrupt_check, immutable_check, queue_check])
     post_tool_pipeline = HookPipeline([queue_check])
     notification_pipeline = HookPipeline([notification_check])
+    stop_pipeline = HookPipeline([stop_check])
 
     return {
         "PreToolUse": [
@@ -454,5 +496,8 @@ def create_hook_matchers(
         ],
         "SubagentStop": [
             HookMatcher(matcher=None, hooks=[notification_pipeline]),
+        ],
+        "Stop": [
+            HookMatcher(matcher=None, hooks=[stop_pipeline]),
         ],
     }

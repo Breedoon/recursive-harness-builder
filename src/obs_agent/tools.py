@@ -376,6 +376,226 @@ def create_obs_tools(
     async def agent_task_stop(args: dict) -> dict:
         return await _task_stop(args, tool_name="AgentTaskStop")
 
+    async def _cron_create(args: dict, *, tool_name: str) -> dict:
+        prompt = str(args.get("prompt", "")).strip()
+        if not prompt:
+            return _error_result(f"Cannot use {tool_name}: prompt is required")
+        cron = str(args.get("cron", "")).strip()
+        schedule_mode_raw = args.get("schedule_mode")
+        schedule_mode = (
+            str(schedule_mode_raw).strip().lower()
+            if schedule_mode_raw is not None
+            else ""
+        )
+        if not schedule_mode:
+            if args.get("interval_seconds") is not None:
+                schedule_mode = "interval"
+            elif cron:
+                schedule_mode = "cron"
+        if schedule_mode not in {"interval", "cron"}:
+            return _error_result(
+                f"Cannot use {tool_name}: schedule_mode must be interval or cron"
+            )
+        if schedule_mode == "cron" and not cron:
+            return _error_result(f"Cannot use {tool_name}: cron is required for schedule_mode=cron")
+
+        interval_seconds_raw = args.get("interval_seconds")
+        interval_seconds: int | None = None
+        if interval_seconds_raw is not None:
+            try:
+                interval_seconds = int(interval_seconds_raw)
+            except (TypeError, ValueError):
+                return _error_result(
+                    f"Cannot use {tool_name}: interval_seconds must be an integer"
+                )
+            if interval_seconds < 0:
+                return _error_result(
+                    f"Cannot use {tool_name}: interval_seconds must be non-negative"
+                )
+        max_runs_raw = args.get("max_runs")
+        max_runs: int = 1
+        if max_runs_raw is not None:
+            try:
+                max_runs = int(max_runs_raw)
+            except (TypeError, ValueError):
+                return _error_result(f"Cannot use {tool_name}: max_runs must be an integer")
+            if max_runs <= 0:
+                return _error_result(f"Cannot use {tool_name}: max_runs must be positive")
+
+        reset_session_raw = args.get("reset_session")
+        reset_session: bool | None = None
+        if reset_session_raw is not None:
+            if isinstance(reset_session_raw, bool):
+                reset_session = reset_session_raw
+            elif isinstance(reset_session_raw, (int, float)):
+                reset_session = bool(int(reset_session_raw))
+            elif isinstance(reset_session_raw, str):
+                normalized = reset_session_raw.strip().lower()
+                if normalized in {"true", "1", "yes", "on"}:
+                    reset_session = True
+                elif normalized in {"false", "0", "no", "off"}:
+                    reset_session = False
+                else:
+                    return _error_result(
+                        f"Cannot use {tool_name}: reset_session must be a boolean"
+                    )
+            else:
+                return _error_result(
+                    f"Cannot use {tool_name}: reset_session must be a boolean"
+                )
+
+        legacy_run_mode = str(args.get("run_mode") or "").strip().lower()
+        if reset_session is None and legacy_run_mode:
+            if legacy_run_mode not in {"continue", "reset_session"}:
+                return _error_result(
+                    f"Cannot use {tool_name}: run_mode must be continue or reset_session"
+                )
+            reset_session = legacy_run_mode == "reset_session"
+        if reset_session is None:
+            reset_session = False
+
+        inherit = str(args.get("inherit") or "").strip().lower() or "none"
+        if inherit not in {"none", "fork", "all"}:
+            return _error_result(
+                f"Cannot use {tool_name}: inherit must be none, fork, or all"
+            )
+
+        if hook_state is None or hook_state.cron_creator is None:
+            return _transport_unavailable(tool_name)
+        try:
+            return await hook_state.cron_creator(
+                {
+                    "schedule_mode": schedule_mode,
+                    "cron": cron,
+                    "prompt": prompt,
+                    "interval_seconds": interval_seconds,
+                    "reset_session": reset_session,
+                    "description": str(args.get("description") or "").strip() or None,
+                    "max_runs": max_runs,
+                    "from": str(args.get("from") or "").strip() or None,
+                    "until": str(args.get("until") or "").strip() or None,
+                    "inherit": inherit,
+                    "tool_use_id": hook_state.current_tool_use_id,
+                }
+            )
+        except Exception as exc:
+            logger.exception("%s failed", tool_name)
+            return _error_result(f"{tool_name} failed: {type(exc).__name__}: {exc}")
+
+    async def _cron_list(args: dict, *, tool_name: str) -> dict:
+        _ = args
+        if hook_state is None or hook_state.cron_lister is None:
+            return _transport_unavailable(tool_name)
+        try:
+            return await hook_state.cron_lister({"tool_use_id": hook_state.current_tool_use_id})
+        except Exception as exc:
+            logger.exception("%s failed", tool_name)
+            return _error_result(f"{tool_name} failed: {type(exc).__name__}: {exc}")
+
+    async def _cron_delete(args: dict, *, tool_name: str) -> dict:
+        schedule_id = str(args.get("id") or "").strip()
+        if not schedule_id:
+            return _error_result(f"Cannot use {tool_name}: id is required")
+        if hook_state is None or hook_state.cron_deleter is None:
+            return _transport_unavailable(tool_name)
+        try:
+            return await hook_state.cron_deleter(
+                {"id": schedule_id, "tool_use_id": hook_state.current_tool_use_id}
+            )
+        except Exception as exc:
+            logger.exception("%s failed", tool_name)
+            return _error_result(f"{tool_name} failed: {type(exc).__name__}: {exc}")
+
+    @tool(
+        "CronCreate",
+        "Create a per-topic schedule in interval or cron mode. "
+        "Interval mode is inactivity-based: after each topic turn finishes, "
+        "next_run_at is reset to now + interval_seconds (not fixed wall-clock slots). "
+        "Cron mode is wall-clock based (standard 5-field cron). "
+        "Schedules run only when the topic is idle and the bot is available. "
+        "Default behavior is one-shot (max_runs=1). "
+        "Repeat by setting max_runs > 1.",
+        {
+            "schedule_mode": {
+                "type": "string",
+                "description": (
+                    "interval or cron. interval = inactivity-based (re-anchored on topic completion/stop); "
+                    "cron = wall-clock. If omitted, inferred from provided fields."
+                ),
+            },
+            "cron": {
+                "type": "string",
+                "description": (
+                    "Cron expression for schedule_mode=cron (wall-clock). "
+                    "Standard 5-field cron syntax."
+                ),
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Prompt injected when this schedule fires.",
+            },
+            "interval_seconds": {
+                "type": "integer",
+                "description": (
+                    "Interval seconds for schedule_mode=interval. "
+                    "After each topic completion/stop, next run is scheduled after this many seconds. "
+                    "0 means trigger on topic stop."
+                ),
+            },
+            "reset_session": {
+                "type": "boolean",
+                "description": "If true, clear the session before each scheduled run.",
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional short schedule name shown in completion messages.",
+            },
+            "max_runs": {
+                "type": "integer",
+                "description": "Run cap. Defaults to 1 when omitted.",
+            },
+            "from": {
+                "type": "string",
+                "description": "Optional RFC3339 start timestamp for active window start (inclusive).",
+            },
+            "until": {
+                "type": "string",
+                "description": "Optional RFC3339 cutoff timestamp; schedule stops at/after this time.",
+            },
+            "inherit": {
+                "type": "string",
+                "description": "Optional inheritance mode: none, fork, or all.",
+            },
+            "run_mode": {
+                "type": "string",
+                "description": "Deprecated alias: continue or reset_session.",
+            },
+        },
+    )
+    async def cron_create(args: dict) -> dict:
+        return await _cron_create(args, tool_name="CronCreate")
+
+    @tool(
+        "CronList",
+        "List schedules for the current topic route only, including next_run_at and run counters.",
+        {},
+    )
+    async def cron_list(args: dict) -> dict:
+        return await _cron_list(args, tool_name="CronList")
+
+    @tool(
+        "CronDelete",
+        "Delete one schedule by ID in the current topic route.",
+        {
+            "id": {
+                "type": "string",
+                "description": "Schedule ID returned by CronCreate.",
+            },
+        },
+    )
+    async def cron_delete(args: dict) -> dict:
+        return await _cron_delete(args, tool_name="CronDelete")
+
     async def _send_inbox_message(args: dict) -> dict:
         team_name = str(args.get("team_name", "")).strip()
         recipient = str(args.get("recipient", "")).strip()
@@ -573,6 +793,9 @@ def create_obs_tools(
             agent_task,
             agent_task_output,
             agent_task_stop,
+            cron_create,
+            cron_list,
+            cron_delete,
             send_inbox_message,
             read_inbox,
             fork_task,

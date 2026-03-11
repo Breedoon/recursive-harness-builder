@@ -12,11 +12,12 @@ import asyncio
 import json
 import uuid
 from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 
 from obs_agent.events import StatusEvent
 from obs_agent.queueing import QueuedMessage
@@ -26,6 +27,7 @@ from obs_agent.telegram import (
     TelegramRoute,
     TelegramBot,
     _ForkTaskRecord,
+    _TopicScheduleRecord,
     _RunOutcome,
     _TelegramMessageBinding,
     create_telegram_app,
@@ -71,6 +73,24 @@ def _make_context() -> MagicMock:
     ctx.bot.send_message = AsyncMock()
     ctx.args = []
     return ctx
+
+
+def _expected_local_schedule_time(
+    ts: float,
+    *,
+    now_ts: float,
+    include_seconds: bool,
+) -> str:
+    now_dt = datetime.fromtimestamp(now_ts, timezone.utc).astimezone()
+    value_dt = datetime.fromtimestamp(ts, timezone.utc).astimezone()
+    tz_label = value_dt.tzname() or value_dt.strftime("%z") or "local"
+    time_fmt = "%H:%M:%S" if include_seconds else "%H:%M"
+    if value_dt.date() == now_dt.date():
+        return f"today at {value_dt.strftime(time_fmt)} {tz_label}"
+    if value_dt.date() == (now_dt + timedelta(days=1)).date():
+        return f"tomorrow at {value_dt.strftime(time_fmt)} {tz_label}"
+    full_fmt = "%Y-%m-%d %H:%M:%S" if include_seconds else "%Y-%m-%d %H:%M"
+    return f"{value_dt.strftime(full_fmt)} {tz_label}"
 
 
 def _state(bot: TelegramBot, chat_id: int = 67890, thread_id: int | None = None):
@@ -455,7 +475,7 @@ class TestTelegramMessageFlow:
         assert "turn two" in calls[3]
         assert calls[4] == "<u><i>context: 0 / 200k</i></u>"
 
-    async def test_completion_summary_mentions_username_when_configured(self, config):
+    async def test_completion_summary_omits_username_when_configured(self, config):
         config.telegram_notify_username = "breedoon"
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         events = [TextEvent(text="done"), TurnEndEvent(), DoneEvent()]
@@ -475,7 +495,7 @@ class TestTelegramMessageFlow:
             await bot.handle_message(update, ctx)
 
         calls = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
-        assert calls[-1] == "<u><i>context: 0 / 200k\n@breedoon</i></u>"
+        assert calls[-1] == "<u><i>context: 0 / 200k</i></u>"
 
     async def test_attachment_receipt_is_sent_before_normalization(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -650,7 +670,7 @@ class TestBackgroundPoller:
             )
         ]
 
-    async def test_route_warning_mentions_username_once(self, config):
+    async def test_route_warning_is_deprecated(self, config):
         config.telegram_notify_username = "breedoon"
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         state = _state(bot)
@@ -664,9 +684,7 @@ class TestBackgroundPoller:
             await bot._maybe_send_route_warning(state)
             await bot._maybe_send_route_warning(state)
 
-        mock_send.assert_awaited_once()
-        assert mock_send.call_args.kwargs["text"] == "session has been idle for 50 minutes\n@breedoon"
-        assert state.warning_sent is True
+        mock_send.assert_not_called()
 
     async def test_route_warning_waits_until_idle_threshold(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -681,6 +699,1067 @@ class TestBackgroundPoller:
             await bot._maybe_send_route_warning(state)
 
         mock_send.assert_not_called()
+
+
+class TestTopicScheduling:
+    async def test_default_schedule_is_seeded_from_settings_on_new_route(self, config):
+        settings_path = config.vault_path / ".claude" / "settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "obs_agent": {
+                        "schedule_defaults": {
+                            "default_interval": {
+                                "enabled": True,
+                                "interval_seconds": 120,
+                                "prompt": "default run",
+                                "description": "DefaultSchedule",
+                                "max_runs": 3,
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=70)
+        state = bot._get_state(route)
+        assert state is not None
+
+        schedule_ids = bot._schedule_ids_by_route.get(route, set())
+        assert len(schedule_ids) == 1
+        record = bot._topic_schedules_by_id[next(iter(schedule_ids))]
+        assert record.description == "DefaultSchedule"
+        assert record.prompt == "default run"
+        assert record.interval_seconds == 120
+        assert record.max_retry_attempts == 0
+        assert record.max_runs == 3
+        assert record.enabled is True
+
+    async def test_default_schedule_respects_disabled_flag(self, config):
+        settings_path = config.vault_path / ".claude" / "settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "obs_agent": {
+                        "schedule_defaults": {
+                            "default_interval": {
+                                "enabled": False,
+                                "interval_seconds": 120,
+                                "prompt": "default run",
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=71)
+        state = bot._get_state(route)
+        assert state is not None
+        assert bot._schedule_ids_by_route.get(route, set()) == set()
+
+    async def test_default_schedule_can_load_from_obs_namespace(self, config):
+        settings_path = config.vault_path / ".claude" / "settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "obs": {
+                        "scheduling": {
+                            "retry": {
+                                "max_attempts": 2,
+                                "delay_seconds": 45,
+                            },
+                            "defaults": {
+                                "schedule": {
+                                    "enabled": True,
+                                    "schedule_mode": "interval",
+                                    "interval_seconds": 180,
+                                    "prompt": "obs default run",
+                                    "description": "ObsDefault",
+                                    "reset_session": True,
+                                    "max_runs": 4,
+                                    "inherit": "fork",
+                                }
+                            },
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=72)
+        state = bot._get_state(route)
+        assert state is not None
+
+        schedule_ids = bot._schedule_ids_by_route.get(route, set())
+        assert len(schedule_ids) == 1
+        record = bot._topic_schedules_by_id[next(iter(schedule_ids))]
+        assert record.description == "ObsDefault"
+        assert record.prompt == "obs default run"
+        assert record.interval_seconds == 180
+        assert record.reset_session is True
+        assert record.max_runs == 4
+        assert record.inherit_mode == "fork"
+        assert record.max_retry_attempts == 2
+        assert record.retry_delay_seconds == 45
+
+    async def test_cron_create_fails_on_unsupported_expression(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=77)
+        state = bot._get_state(route)
+        assert state is not None
+
+        result = await bot._cron_create(
+            route=route,
+            args={
+                "cron": "not-a-cron",
+                "prompt": "run",
+            },
+        )
+
+        assert result["is_error"] is True
+        assert "invalid cron expression" in result["content"][0]["text"]
+
+    async def test_cron_create_supports_on_stop_via_interval_zero(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=78)
+        state = bot._get_state(route)
+        assert state is not None
+
+        result = await bot._cron_create(
+            route=route,
+            args={
+                "cron": "*/5 * * * *",
+                "prompt": "run stop",
+                "interval_seconds": 0,
+                "description": "StopRunner",
+            },
+        )
+
+        assert "schedule" in result["tool_use_result"]
+        schedules = bot._schedule_ids_by_route[route]
+        assert len(schedules) == 1
+        schedule_id = next(iter(schedules))
+        record = bot._topic_schedules_by_id[schedule_id]
+        assert record.trigger_kind == "on_topic_stop"
+        assert record.next_run_at is None
+
+    async def test_cron_create_defaults_to_one_run_without_retries(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=88)
+        state = bot._get_state(route)
+        assert state is not None
+
+        result = await bot._cron_create(
+            route=route,
+            args={
+                "cron": "*/5 * * * *",
+                "prompt": "run once",
+                "interval_seconds": 30,
+            },
+        )
+
+        assert "is_error" not in result
+        schedules = bot._schedule_ids_by_route[route]
+        assert len(schedules) == 1
+        record = bot._topic_schedules_by_id[next(iter(schedules))]
+        assert record.max_runs == 1
+        assert record.max_retry_attempts == 0
+        assert record.retry_delay_seconds == 30
+        assert record.retry_attempt_count == 0
+
+    async def test_cron_create_supports_wall_clock_cron_mode(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=889)
+        state = bot._get_state(route)
+        assert state is not None
+
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
+            result = await bot._cron_create(
+                route=route,
+                args={
+                    "schedule_mode": "cron",
+                    "cron": "*/5 * * * *",
+                    "prompt": "run cron",
+                },
+            )
+
+        assert "is_error" not in result
+        schedule_id = next(iter(bot._schedule_ids_by_route[route]))
+        record = bot._topic_schedules_by_id[schedule_id]
+        assert record.schedule_mode == "cron"
+        assert record.trigger_kind == "cron"
+        assert record.next_run_at == 1200.0
+
+    async def test_cron_create_rejects_overlapping_windows(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=891)
+        state = bot._get_state(route)
+        assert state is not None
+
+        first = await bot._cron_create(
+            route=route,
+            args={
+                "schedule_mode": "interval",
+                "interval_seconds": 60,
+                "cron": "*/1 * * * *",
+                "prompt": "first",
+                "from": "2030-03-10T10:00:00Z",
+                "until": "2030-03-10T11:00:00Z",
+            },
+        )
+        assert "is_error" not in first
+
+        overlap = await bot._cron_create(
+            route=route,
+            args={
+                "schedule_mode": "interval",
+                "interval_seconds": 120,
+                "cron": "*/2 * * * *",
+                "prompt": "second",
+                "from": "2030-03-10T10:30:00Z",
+                "until": "2030-03-10T11:30:00Z",
+            },
+        )
+        assert overlap["is_error"] is True
+        assert "overlapping schedule window" in overlap["content"][0]["text"]
+
+        adjacent = await bot._cron_create(
+            route=route,
+            args={
+                "schedule_mode": "interval",
+                "interval_seconds": 120,
+                "cron": "*/2 * * * *",
+                "prompt": "third",
+                "from": "2030-03-10T11:00:00Z",
+                "until": "2030-03-10T12:00:00Z",
+            },
+        )
+        assert "is_error" not in adjacent
+
+    async def test_due_interval_schedule_executes_once_and_advances(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=79)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-int",
+            route=route,
+            description="Interval",
+            cron_expr="*/2 * * * *",
+            trigger_kind="interval",
+            interval_seconds=120,
+            prompt="run interval",
+            schedule_mode="interval",
+            reset_session=False,
+            next_run_at=0.0,
+        )
+        bot._register_topic_schedule(record)
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            new=AsyncMock(return_value=_RunOutcome(assistant_text="ok")),
+        ) as run_mock, patch("obs_agent.telegram.time.time", return_value=1000.0):
+            await bot._run_due_interval_schedules()
+
+        run_mock.assert_awaited_once()
+        updated = bot._topic_schedules_by_id["sched-int"]
+        assert updated.run_count == 1
+        assert updated.last_success_at == 1000.0
+        assert updated.next_run_at == 1120.0
+
+    async def test_schedule_run_summary_uses_updated_interval_eta_and_remaining(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=791)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-summary",
+            route=route,
+            description="SummaryJob",
+            cron_expr="*/1 * * * *",
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="run summary",
+            schedule_mode="interval",
+            reset_session=False,
+            max_runs=3,
+            next_run_at=0.0,
+        )
+        bot._register_topic_schedule(record)
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            new=AsyncMock(return_value=_RunOutcome(assistant_text="ok")),
+        ) as run_mock, patch.object(bot, "_send_system_message", new=AsyncMock()) as send_mock, patch(
+            "obs_agent.telegram.time.time", return_value=1000.0
+        ):
+            ran = await bot._execute_topic_schedule(record=record, trigger_kind="interval")
+
+        assert ran is True
+        run_mock.assert_awaited_once()
+        updated = bot._topic_schedules_by_id["sched-summary"]
+        assert updated.run_count == 1
+        assert updated.next_run_at == 1060.0
+        summary_texts = [str(call.kwargs.get("text", "")) for call in send_mock.await_args_list]
+        assert any("schedule_triggered: SummaryJob (every 1m ; remaining=2)" in text for text in summary_texts)
+        next_local = _expected_local_schedule_time(1060.0, now_ts=1000.0, include_seconds=False)
+        assert any(f"next_schedule: SummaryJob at {next_local}" in text for text in summary_texts)
+        assert any("remaining=2" in text for text in summary_texts)
+
+    async def test_schedule_run_emits_trigger_marker_before_completion_summary(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=7911)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-trigger-order",
+            route=route,
+            description="OrderJob",
+            cron_expr="*/1 * * * *",
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="run order",
+            schedule_mode="interval",
+            reset_session=False,
+            max_runs=2,
+            next_run_at=0.0,
+        )
+        bot._register_topic_schedule(record)
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            new=AsyncMock(return_value=_RunOutcome(assistant_text="ok")),
+        ) as run_mock, patch.object(bot, "_send_system_message", new=AsyncMock()) as send_mock, patch(
+            "obs_agent.telegram.time.time", return_value=1000.0
+        ):
+            ran = await bot._execute_topic_schedule(record=record, trigger_kind="interval")
+
+        assert ran is True
+        run_mock.assert_awaited_once()
+        sent_texts = [str(call.kwargs.get("text", "")) for call in send_mock.await_args_list]
+        assert sent_texts[0].startswith("schedule_triggered: OrderJob")
+        assert "remaining=1" in sent_texts[0]
+        next_local = _expected_local_schedule_time(1060.0, now_ts=1000.0, include_seconds=False)
+        assert any(f"next_schedule: OrderJob at {next_local}" in text for text in sent_texts[1:])
+
+    async def test_completion_summary_omits_schedule_triggered_line(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=7912)
+        state = bot._get_state(route)
+        assert state is not None
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-trigger-hidden",
+                route=route,
+                description="HiddenTrigger",
+                cron_expr="*/1 * * * *",
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="run",
+                schedule_mode="interval",
+                next_run_at=1060.0,
+            )
+        )
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
+            summary = bot._build_completion_summary(
+                state,
+                triggered_schedule_id="sched-trigger-hidden",
+            )
+        assert "schedule_triggered:" not in summary
+
+    async def test_next_schedule_line_uses_second_precision_for_second_intervals(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=7913)
+        state = bot._get_state(route)
+        assert state is not None
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-seconds",
+                route=route,
+                description="SecondsJob",
+                cron_expr="*/1 * * * *",
+                trigger_kind="interval",
+                interval_seconds=15,
+                prompt="run",
+                schedule_mode="interval",
+                max_runs=3,
+                run_count=1,
+                from_ts=1005.0,
+                until_ts=2000.0,
+                next_run_at=1013.0,
+            )
+        )
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
+            summary = bot._build_completion_summary(state)
+        next_local = _expected_local_schedule_time(1013.0, now_ts=1000.0, include_seconds=True)
+        from_local = _expected_local_schedule_time(1005.0, now_ts=1000.0, include_seconds=True)
+        until_local = _expected_local_schedule_time(2000.0, now_ts=1000.0, include_seconds=True)
+        assert f"next_schedule: SecondsJob at {next_local}" in summary
+        assert f"from={from_local}" in summary
+        assert f"until={until_local}" in summary
+
+    async def test_overlap_validation_ignores_exhausted_and_inflight_final_schedule(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=7914)
+        state = bot._get_state(route)
+        assert state is not None
+
+        exhausted = _TopicScheduleRecord(
+            schedule_id="sched-exhausted-overlap",
+            route=route,
+            description="Exhausted",
+            cron_expr="*/1 * * * *",
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="run",
+            schedule_mode="interval",
+            max_runs=1,
+            run_count=1,
+            from_ts=900.0,
+            until_ts=None,
+            next_run_at=1000.0,
+        )
+        inflight_final = _TopicScheduleRecord(
+            schedule_id="sched-inflight-final",
+            route=route,
+            description="InflightFinal",
+            cron_expr="*/1 * * * *",
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="run",
+            schedule_mode="interval",
+            max_runs=2,
+            run_count=1,
+            from_ts=900.0,
+            until_ts=None,
+            next_run_at=1000.0,
+        )
+        bot._register_topic_schedule(exhausted)
+        bot._register_topic_schedule(inflight_final)
+        bot._active_schedule_execution_by_route[route] = "sched-inflight-final"
+
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
+            overlap_error = bot._validate_schedule_overlap(
+                route=route,
+                start_ts=950.0,
+                end_ts=1200.0,
+            )
+
+        assert overlap_error is None
+        assert bot._topic_schedules_by_id["sched-exhausted-overlap"].enabled is False
+
+    async def test_interval_schedule_failure_consumes_run_count_and_notifies_user(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=89)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-fail",
+            route=route,
+            description="FailingJob",
+            cron_expr="*/1 * * * *",
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="run fail",
+            schedule_mode="interval",
+            reset_session=False,
+            next_run_at=0.0,
+        )
+        bot._register_topic_schedule(record)
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            new=AsyncMock(return_value=_RunOutcome(assistant_text="x", failed=True, error="boom")),
+        ), patch.object(bot, "_send_system_message", new=AsyncMock()) as notify_mock, patch(
+            "obs_agent.telegram.time.time", return_value=1000.0
+        ):
+            await bot._execute_topic_schedule(record=record, trigger_kind="interval")
+            updated = bot._topic_schedules_by_id["sched-fail"]
+            assert updated.run_count == 1
+            assert updated.retry_attempt_count == 0
+            assert updated.next_run_at == 1060.0
+            assert updated.last_error == "boom"
+
+        assert notify_mock.await_count >= 1
+        sent_texts = [str(call.kwargs.get("text", "")) for call in notify_mock.await_args_list]
+        assert any("schedule failed: FailingJob: boom" in text for text in sent_texts)
+
+    async def test_schedule_exhausts_when_either_max_runs_or_until_is_reached(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=890)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        max_runs_record = _TopicScheduleRecord(
+            schedule_id="sched-max-runs",
+            route=route,
+            description="MaxRuns",
+            cron_expr="*/1 * * * *",
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="run",
+            schedule_mode="interval",
+            reset_session=False,
+            next_run_at=0.0,
+            run_count=5,
+            max_runs=5,
+            until_ts=2000.0,
+        )
+        until_record = _TopicScheduleRecord(
+            schedule_id="sched-until",
+            route=route,
+            description="Until",
+            cron_expr="*/1 * * * *",
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="run",
+            schedule_mode="interval",
+            reset_session=False,
+            next_run_at=0.0,
+            run_count=0,
+            max_runs=5,
+            until_ts=900.0,
+        )
+        bot._register_topic_schedule(max_runs_record)
+        bot._register_topic_schedule(until_record)
+
+        with patch.object(bot, "_run_and_send", new=AsyncMock()) as run_mock, patch(
+            "obs_agent.telegram.time.time", return_value=1000.0
+        ):
+            ran_max = await bot._execute_topic_schedule(record=max_runs_record, trigger_kind="interval")
+            ran_until = await bot._execute_topic_schedule(record=until_record, trigger_kind="interval")
+
+        assert ran_max is False
+        assert ran_until is False
+        run_mock.assert_not_awaited()
+        assert bot._topic_schedules_by_id["sched-max-runs"].enabled is False
+        assert bot._topic_schedules_by_id["sched-until"].enabled is False
+
+    async def test_stop_event_triggers_on_stop_schedule_once(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=80)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-stop",
+            route=route,
+            description="OnStop",
+            cron_expr="*/1 * * * *",
+            trigger_kind="on_topic_stop",
+            interval_seconds=None,
+            prompt="run on stop",
+            schedule_mode="interval",
+            reset_session=False,
+            next_run_at=None,
+        )
+        bot._register_topic_schedule(record)
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            new=AsyncMock(return_value=_RunOutcome(assistant_text="ok")),
+        ) as run_mock:
+            bot._schedule_stop_events.put_nowait(
+                (
+                    route,
+                    {
+                        "session_id": None,
+                        "schedule_run_active": False,
+                    },
+                )
+            )
+            await bot._process_stop_schedule_events()
+
+        run_mock.assert_awaited_once()
+        assert bot._topic_schedules_by_id["sched-stop"].run_count == 1
+
+    async def test_stop_event_skips_schedule_origin_to_prevent_loop(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=81)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-stop-2",
+            route=route,
+            description="OnStop",
+            cron_expr="*/1 * * * *",
+            trigger_kind="on_topic_stop",
+            interval_seconds=None,
+            prompt="run on stop",
+            schedule_mode="interval",
+            reset_session=False,
+            next_run_at=None,
+        )
+        bot._register_topic_schedule(record)
+
+        with patch.object(bot, "_run_and_send", new=AsyncMock()) as run_mock:
+            bot._schedule_stop_events.put_nowait(
+                (
+                    route,
+                    {
+                        "session_id": None,
+                        "schedule_run_active": True,
+                    },
+                )
+            )
+            await bot._process_stop_schedule_events()
+
+        run_mock.assert_not_awaited()
+
+    async def test_stop_event_defers_while_execution_active_then_runs(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=8100)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-stop-defer",
+            route=route,
+            description="OnStop",
+            cron_expr="*/1 * * * *",
+            trigger_kind="on_topic_stop",
+            interval_seconds=None,
+            prompt="run on stop",
+            schedule_mode="interval",
+            reset_session=False,
+            next_run_at=None,
+        )
+        bot._register_topic_schedule(record)
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            new=AsyncMock(return_value=_RunOutcome(assistant_text="ok")),
+        ) as run_mock:
+            bot._schedule_stop_events.put_nowait(
+                (
+                    route,
+                    {
+                        "session_id": None,
+                        "schedule_run_active": False,
+                        "execution_active": True,
+                    },
+                )
+            )
+            await bot._process_stop_schedule_events()
+            run_mock.assert_not_awaited()
+            assert not bot._schedule_stop_events.empty()
+
+            await bot._process_stop_schedule_events()
+
+        run_mock.assert_awaited_once()
+        assert bot._topic_schedules_by_id["sched-stop-defer"].run_count == 1
+        assert bot._schedule_stop_events.empty()
+
+    async def test_stop_event_suppressed_by_recent_schedule_window(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=810)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-stop-window",
+            route=route,
+            description="OnStop",
+            cron_expr="*/1 * * * *",
+            trigger_kind="on_topic_stop",
+            interval_seconds=None,
+            prompt="run on stop",
+            schedule_mode="interval",
+            reset_session=False,
+            next_run_at=None,
+        )
+        bot._register_topic_schedule(record)
+        bot._schedule_stop_suppress_until[route] = 2000.0
+
+        with patch.object(bot, "_run_and_send", new=AsyncMock()) as run_mock, patch(
+            "obs_agent.telegram.time.time", return_value=1999.0
+        ):
+            bot._schedule_stop_events.put_nowait(
+                (
+                    route,
+                    {
+                        "session_id": None,
+                        "schedule_run_active": False,
+                    },
+                )
+            )
+            await bot._process_stop_schedule_events()
+
+        run_mock.assert_not_awaited()
+
+    async def test_stop_event_reanchors_interval_schedule_next_run(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=811)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-reanchor",
+            route=route,
+            description="Reanchor",
+            schedule_mode="interval",
+            cron_expr="*/1 * * * *",
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="run interval",
+            reset_session=False,
+            next_run_at=9999.0,
+        )
+        bot._register_topic_schedule(record)
+
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
+            bot._schedule_stop_events.put_nowait(
+                (
+                    route,
+                    {
+                        "session_id": None,
+                        "schedule_run_active": False,
+                        "execution_active": False,
+                    },
+                )
+            )
+            await bot._process_stop_schedule_events()
+
+        assert bot._topic_schedules_by_id["sched-reanchor"].next_run_at == 1060.0
+
+    async def test_reanchor_interval_schedule_updates_completion_eta(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=8111)
+        state = bot._get_state(route)
+        assert state is not None
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-summary-reanchor",
+            route=route,
+            description="Summary",
+            schedule_mode="interval",
+            cron_expr="*/1 * * * *",
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="run interval",
+            reset_session=False,
+            next_run_at=1010.0,
+        )
+        bot._register_topic_schedule(record)
+
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
+            bot._reanchor_interval_schedules_for_route(route=route, base_ts=1000.0)
+            summary = bot._build_completion_summary(state)
+
+        assert bot._topic_schedules_by_id["sched-summary-reanchor"].next_run_at == 1060.0
+        next_local = _expected_local_schedule_time(1060.0, now_ts=1000.0, include_seconds=False)
+        assert f"next_schedule: Summary at {next_local}" in summary
+
+    async def test_inherit_mode_fork_only_copies_to_fork_children(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        parent_route = TelegramRoute(chat_id=67890, thread_id=812)
+        non_fork_child = TelegramRoute(chat_id=67890, thread_id=813)
+        fork_child = TelegramRoute(chat_id=67890, thread_id=814)
+        assert bot._get_state(parent_route) is not None
+        assert bot._get_state(non_fork_child) is not None
+        assert bot._get_state(fork_child) is not None
+
+        parent_record = _TopicScheduleRecord(
+            schedule_id="sched-parent",
+            route=parent_route,
+            description="Parent",
+            schedule_mode="interval",
+            cron_expr="*/2 * * * *",
+            trigger_kind="interval",
+            interval_seconds=120,
+            prompt="run parent",
+            reset_session=False,
+            inherit_mode="fork",
+            next_run_at=1000.0,
+        )
+        bot._register_topic_schedule(parent_record)
+
+        bot._inherit_topic_schedules(
+            parent_route=parent_route,
+            child_route=non_fork_child,
+            is_fork=False,
+        )
+        assert bot._schedule_ids_by_route.get(non_fork_child, set()) == set()
+
+        bot._inherit_topic_schedules(
+            parent_route=parent_route,
+            child_route=fork_child,
+            is_fork=True,
+        )
+        inherited_ids = bot._schedule_ids_by_route.get(fork_child, set())
+        assert len(inherited_ids) == 1
+        inherited = bot._topic_schedules_by_id[next(iter(inherited_ids))]
+        assert inherited.inherit_mode == "fork"
+        assert inherited.interval_seconds == 120
+        assert inherited.run_count == 0
+
+    async def test_completion_summary_reports_only_one_next_schedule(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=815)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.set_session_id("sid-summary")
+
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-first",
+                route=route,
+                description="First",
+                schedule_mode="interval",
+                cron_expr="*/1 * * * *",
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="first",
+                reset_session=False,
+                next_run_at=1060.0,
+            )
+        )
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-second",
+                route=route,
+                description="Second",
+                schedule_mode="interval",
+                cron_expr="*/2 * * * *",
+                trigger_kind="interval",
+                interval_seconds=120,
+                prompt="second",
+                reset_session=False,
+                next_run_at=1120.0,
+                from_ts=1200.0,
+                until_ts=1300.0,
+            )
+        )
+
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
+            summary = bot._build_completion_summary(state)
+        assert summary.count("next_schedule:") == 1
+        next_local = _expected_local_schedule_time(1060.0, now_ts=1000.0, include_seconds=False)
+        assert f"next_schedule: First at {next_local}" in summary
+
+    async def test_completion_summary_includes_next_schedule_line(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=82)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.set_session_id("sid-1")
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-next",
+            route=route,
+            description="Maintenance",
+            cron_expr="*/5 * * * *",
+            trigger_kind="interval",
+            interval_seconds=300,
+            prompt="run",
+            schedule_mode="interval",
+            reset_session=False,
+            run_count=2,
+            max_runs=5,
+            next_run_at=1300.0,
+        )
+        bot._register_topic_schedule(record)
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
+            summary = bot._build_completion_summary(state)
+
+        assert summary.startswith("context: ")
+        next_local = _expected_local_schedule_time(1300.0, now_ts=1000.0, include_seconds=False)
+        assert f"next_schedule: Maintenance at {next_local}" in summary
+        assert "remaining=3" in summary
+
+    async def test_due_schedule_defers_while_busy_and_runs_once_after_unlock(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=83)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = _TopicScheduleRecord(
+            schedule_id="sched-busy",
+            route=route,
+            description="Busy",
+            cron_expr="*/1 * * * *",
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="run",
+            schedule_mode="interval",
+            reset_session=False,
+            next_run_at=0.0,
+        )
+        bot._register_topic_schedule(record)
+        state.busy = True
+        with patch.object(
+            bot,
+            "_run_and_send",
+            new=AsyncMock(return_value=_RunOutcome(assistant_text="ok")),
+        ) as run_mock, patch("obs_agent.telegram.time.time", return_value=1000.0):
+            await bot._run_due_interval_schedules()
+            run_mock.assert_not_awaited()
+            state.busy = False
+            await bot._run_due_interval_schedules()
+            run_mock.assert_awaited_once()
+
+    async def test_multi_topic_due_schedules_remain_isolated(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route_a = TelegramRoute(chat_id=67890, thread_id=84)
+        route_b = TelegramRoute(chat_id=67890, thread_id=85)
+        state_a = bot._get_state(route_a)
+        state_b = bot._get_state(route_b)
+        assert state_a is not None
+        assert state_b is not None
+        fake_bot_a = MagicMock()
+        fake_bot_b = MagicMock()
+        fake_bot_a.send_message = AsyncMock()
+        fake_bot_b.send_message = AsyncMock()
+        state_a.last_bot = fake_bot_a
+        state_b.last_bot = fake_bot_b
+
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-a",
+                route=route_a,
+                description="A",
+                cron_expr="*/1 * * * *",
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="run A",
+                schedule_mode="interval",
+                reset_session=False,
+                next_run_at=0.0,
+            )
+        )
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-b",
+                route=route_b,
+                description="B",
+                cron_expr="*/1 * * * *",
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="run B",
+                schedule_mode="interval",
+                reset_session=False,
+                next_run_at=0.0,
+            )
+        )
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            new=AsyncMock(return_value=_RunOutcome(assistant_text="ok")),
+        ) as run_mock, patch("obs_agent.telegram.time.time", return_value=2000.0):
+            await bot._run_due_interval_schedules()
+
+        assert run_mock.await_count == 2
+        called_routes = {call.kwargs["state"].route for call in run_mock.await_args_list}
+        assert called_routes == {route_a, route_b}
+
+    async def test_on_stop_and_interval_in_same_route_do_not_duplicate(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=86)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-i",
+                route=route,
+                description="Interval",
+                cron_expr="*/1 * * * *",
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="interval",
+                schedule_mode="interval",
+                reset_session=False,
+                next_run_at=0.0,
+            )
+        )
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-s",
+                route=route,
+                description="Stop",
+                cron_expr="*/1 * * * *",
+                trigger_kind="on_topic_stop",
+                interval_seconds=None,
+                prompt="stop",
+                schedule_mode="interval",
+                reset_session=False,
+                next_run_at=None,
+            )
+        )
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            new=AsyncMock(return_value=_RunOutcome(assistant_text="ok")),
+        ) as run_mock:
+            with patch("obs_agent.telegram.time.time", return_value=3000.0):
+                await bot._run_due_interval_schedules()
+            with patch("obs_agent.telegram.time.time", return_value=3005.0):
+                bot._schedule_stop_events.put_nowait(
+                    (route, {"session_id": None, "schedule_run_active": False})
+                )
+                await bot._process_stop_schedule_events()
+
+        assert run_mock.await_count == 2
+        prompts = [call.kwargs["user_text"] for call in run_mock.await_args_list]
+        assert any("interval" in prompt for prompt in prompts)
+        assert any("stop" in prompt for prompt in prompts)
 
 
 class TestForkViaReply:
@@ -858,6 +1937,101 @@ class TestCommands:
         assert state.hook_state.interrupt_flag is False
         ctx.bot.send_message.assert_called_once()
         assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>session cleared</i></u>"
+
+    async def test_clear_mentions_unschedule_when_topic_has_schedule(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=1)
+        state = bot._get_state(route)
+        assert state is not None
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-clear-note",
+                route=route,
+                description="Kept",
+                schedule_mode="interval",
+                cron_expr="*/5 * * * *",
+                trigger_kind="interval",
+                interval_seconds=300,
+                prompt="run",
+                reset_session=False,
+                next_run_at=5000.0,
+            )
+        )
+
+        update = _make_update("/clear", thread_id=1)
+        ctx = _make_context()
+        await bot.handle_clear(update, ctx)
+        assert (
+            ctx.bot.send_message.call_args.kwargs["text"]
+            == "<u><i>session cleared; schedule was kept. Use /unschedule to remove this topic schedule.</i></u>"
+        )
+
+    async def test_unschedule_removes_topic_schedules(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=1)
+        assert bot._get_state(route) is not None
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-remove",
+                route=route,
+                description="Removable",
+                schedule_mode="interval",
+                cron_expr="*/5 * * * *",
+                trigger_kind="interval",
+                interval_seconds=300,
+                prompt="run",
+                reset_session=False,
+                next_run_at=5000.0,
+            )
+        )
+        update = _make_update("/unschedule", thread_id=1)
+        ctx = _make_context()
+        await bot.handle_unschedule(update, ctx)
+        assert bot._schedule_ids_by_route.get(route, set()) == set()
+        assert "unscheduled 1 schedule(s)" in ctx.bot.send_message.call_args.kwargs["text"]
+
+    async def test_unschedule_all_removes_chat_schedules(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route_a = TelegramRoute(chat_id=67890, thread_id=1)
+        route_b = TelegramRoute(chat_id=67890, thread_id=2)
+        assert bot._get_state(route_a) is not None
+        assert bot._get_state(route_b) is not None
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-a",
+                route=route_a,
+                description="A",
+                schedule_mode="interval",
+                cron_expr="*/5 * * * *",
+                trigger_kind="interval",
+                interval_seconds=300,
+                prompt="run",
+                reset_session=False,
+                next_run_at=5000.0,
+            )
+        )
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-b",
+                route=route_b,
+                description="B",
+                schedule_mode="interval",
+                cron_expr="*/5 * * * *",
+                trigger_kind="interval",
+                interval_seconds=300,
+                prompt="run",
+                reset_session=False,
+                next_run_at=5000.0,
+            )
+        )
+
+        update = _make_update("/unschedule all", thread_id=1)
+        ctx = _make_context()
+        ctx.args = ["all"]
+        await bot.handle_unschedule(update, ctx)
+        assert bot._schedule_ids_by_route.get(route_a, set()) == set()
+        assert bot._schedule_ids_by_route.get(route_b, set()) == set()
+        assert "unscheduled 2 schedule(s) across this chat" in ctx.bot.send_message.call_args.kwargs["text"]
 
     async def test_stop_sets_interrupt_flag_and_pauses_auto_delivery(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -1231,6 +2405,66 @@ class TestTopicCommands:
 
 
 class TestForkTaskRuntime:
+    async def test_launch_agent_task_fails_fast_when_topic_creation_badrequest(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.last_bot = MagicMock()
+        state.last_bot.create_forum_topic = AsyncMock(
+            side_effect=BadRequest("not enough rights to manage topics")
+        )
+        state.last_bot.send_message = AsyncMock()
+        state.session_manager.set_session_id("sid-root")
+
+        with pytest.raises(RuntimeError, match="Failed to create forum topic"):
+            await bot._launch_fork_task(
+                route=route,
+                args={
+                    "prompt": "Launch worker",
+                    "description": "Topic launch",
+                    "fork": False,
+                    "task_tool_name": "AgentTask",
+                },
+            )
+
+        state.last_bot.create_forum_topic.assert_awaited_once()
+        state.last_bot.send_message.assert_not_awaited()
+        assert bot._fork_tasks_by_id == {}
+        assert state.active_fork_task_ids == set()
+        await bot.shutdown()
+
+    async def test_launch_agent_task_bounds_topic_creation_retries(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.last_bot = MagicMock()
+        state.last_bot.create_forum_topic = AsyncMock(side_effect=TelegramError("network failure"))
+        state.last_bot.send_message = AsyncMock()
+        state.session_manager.set_session_id("sid-root")
+
+        async def _no_sleep(_delay: float) -> None:
+            return None
+
+        with patch("obs_agent.telegram.asyncio.sleep", new=AsyncMock(side_effect=_no_sleep)):
+            with pytest.raises(RuntimeError, match="Failed to create forum topic"):
+                await bot._launch_fork_task(
+                    route=route,
+                    args={
+                        "prompt": "Launch worker",
+                        "description": "Topic launch",
+                        "fork": False,
+                        "task_tool_name": "AgentTask",
+                    },
+                )
+
+        assert state.last_bot.create_forum_topic.await_count == 3
+        state.last_bot.send_message.assert_not_awaited()
+        assert bot._fork_tasks_by_id == {}
+        assert state.active_fork_task_ids == set()
+        await bot.shutdown()
+
     async def test_launch_fork_task_creates_record_and_child_topic(self, config, tmp_path):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=-10067890, thread_id=None)
@@ -1573,7 +2807,7 @@ class TestForkTaskRuntime:
         assert "SECRET-42" in queued
         assert "https://t.me/c/67890/321/910" in queued
         send_calls = fake_bot.send_message.await_args_list
-        assert send_calls[0].kwargs["text"].startswith("<u><i>fork task completed")
+        assert "subtask: fork completed" in send_calls[0].kwargs["text"]
         assert "open child completion" in send_calls[1].kwargs["text"]
         assert "https://t.me/c/67890/321/910" in send_calls[1].kwargs["text"]
         run_text = run_mock.await_args.kwargs["user_text"]
@@ -1583,8 +2817,8 @@ class TestForkTaskRuntime:
         assert "SendInboxMessage" in run_text
         assert "ReadInbox" in run_text
         fake_bot.edit_message_text.assert_awaited_once()
-        assert fake_bot.edit_message_text.await_args.kwargs["text"].startswith("<u><i>fork task completed")
-        assert "https://t.me/c/67890/911" in fake_bot.edit_message_text.await_args.kwargs["text"]
+        assert "subtask: fork completed" in fake_bot.edit_message_text.await_args.kwargs["text"]
+        assert "return_to_parent: https://t.me/c/67890/911" in fake_bot.edit_message_text.await_args.kwargs["text"]
         assert child_route not in bot._fork_task_by_child_route
 
     async def test_execute_super_task_team_worker_stays_idle_ready(self, config):
@@ -2548,7 +3782,7 @@ class TestForkTaskRuntime:
         await bot.handle_delete(delete_update, delete_ctx)
         assert record.terminal_request == "failed"
 
-    async def test_active_fork_tasks_suppress_parent_completion_summary(self, config):
+    async def test_active_fork_tasks_still_emit_completion_summary(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=None)
         state = bot._get_state(route)
@@ -2572,8 +3806,8 @@ class TestForkTaskRuntime:
             ctx = _make_context()
             await bot.handle_message(update, ctx)
 
-        assert ctx.bot.send_message.call_count == 3
-        assert bot._should_emit_completion_summary(state) is False
+        assert ctx.bot.send_message.call_count == 4
+        assert bot._should_emit_completion_summary(state) is True
 
 
 class TestTelegramTransport:

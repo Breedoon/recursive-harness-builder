@@ -16,6 +16,7 @@ dependencies = [
     "prompt-toolkit>=3.0.0",
     "python-telegram-bot>=21.0",
     "markdown-it-py>=3.0",
+    "croniter>=3.0.3",
 ]
 
 [project.optional-dependencies]
@@ -37,5 +38,6 @@ markers = [
     "integration: live HTTP + SDK integration tests",
     "telegram: Telegram-specific eval scenarios (require OBS_TELEGRAM_BOT_USERNAME)",
     "telegram_smoke: dense live Telegram smoke scenarios for fast dev-loop validation",
+    "telegram_soak: long-running Telegram soak scenarios (around one hour)",
 ]
 testpaths = ["tests"]

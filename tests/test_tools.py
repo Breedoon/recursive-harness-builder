@@ -62,6 +62,9 @@ class TestForkTaskTool:
             "AgentTask",
             "AgentTaskOutput",
             "AgentTaskStop",
+            "CronCreate",
+            "CronList",
+            "CronDelete",
             "SendInboxMessage",
             "ReadInbox",
             "ForkTask",
@@ -503,3 +506,125 @@ class TestForkTaskTool:
         )
         payload = json.loads(read_result["content"][0]["text"])
         assert payload["count"] == 40
+
+
+class TestCronTools:
+    @pytest.mark.asyncio
+    async def test_cron_create_requires_cron_and_prompt(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
+        handler = _tool_handler(captured["tools"], "CronCreate")
+
+        missing_cron = await handler({"schedule_mode": "cron", "prompt": "hello"})
+        assert missing_cron["is_error"] is True
+        assert "cron is required" in missing_cron["content"][0]["text"]
+
+        missing_prompt = await handler({"schedule_mode": "cron", "cron": "*/2 * * * *"})
+        assert missing_prompt["is_error"] is True
+        assert "prompt is required" in missing_prompt["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_cron_create_validates_fields(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.cron_creator = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "CronCreate")
+
+        bad_interval = await handler(
+            {"cron": "*/2 * * * *", "prompt": "hi", "interval_seconds": -1}
+        )
+        assert bad_interval["is_error"] is True
+        assert "interval_seconds must be non-negative" in bad_interval["content"][0]["text"]
+
+        bad_runs = await handler(
+            {"cron": "*/2 * * * *", "prompt": "hi", "max_runs": 0}
+        )
+        assert bad_runs["is_error"] is True
+        assert "max_runs must be positive" in bad_runs["content"][0]["text"]
+
+        bad_mode = await handler(
+            {"cron": "*/2 * * * *", "prompt": "hi", "run_mode": "boom"}
+        )
+        assert bad_mode["is_error"] is True
+        assert "run_mode must be continue or reset_session" in bad_mode["content"][0]["text"]
+
+        bad_inherit = await handler(
+            {"cron": "*/2 * * * *", "prompt": "hi", "inherit": "children"}
+        )
+        assert bad_inherit["is_error"] is True
+        assert "inherit must be none, fork, or all" in bad_inherit["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_cron_create_delegates_to_transport(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.cron_creator = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "CronCreate")
+
+        result = await handler(
+            {
+                "cron": "*/2 * * * *",
+                "prompt": "run job",
+                "interval_seconds": 0,
+                "run_mode": "reset_session",
+                "description": "maint",
+                "until": "2026-03-11T12:00:00Z",
+                "inherit": "none",
+            }
+        )
+
+        assert result["content"][0]["text"] == "ok"
+        state.cron_creator.assert_awaited_once_with(
+            {
+                "schedule_mode": "interval",
+                "cron": "*/2 * * * *",
+                "prompt": "run job",
+                "interval_seconds": 0,
+                "reset_session": True,
+                "description": "maint",
+                "max_runs": 1,
+                "from": None,
+                "until": "2026-03-11T12:00:00Z",
+                "inherit": "none",
+                "tool_use_id": None,
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_cron_list_and_delete_require_transport(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
+        list_handler = _tool_handler(captured["tools"], "CronList")
+        delete_handler = _tool_handler(captured["tools"], "CronDelete")
+
+        list_result = await list_handler({})
+        assert list_result["is_error"] is True
+        assert "does not provide task orchestration" in list_result["content"][0]["text"]
+
+        delete_result = await delete_handler({"id": "abc"})
+        assert delete_result["is_error"] is True
+        assert "does not provide task orchestration" in delete_result["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_cron_delete_requires_id(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.cron_deleter = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "CronDelete")
+
+        result = await handler({})
+        assert result["is_error"] is True
+        assert "id is required" in result["content"][0]["text"]

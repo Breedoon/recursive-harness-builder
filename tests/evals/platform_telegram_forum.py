@@ -603,6 +603,7 @@ class TelegramForumPlatform:
 
         if not require_done:
             quiet_deadline = asyncio.get_running_loop().time() + _CONTROL_SETTLE_SECONDS
+            hard_deadline = asyncio.get_running_loop().time() + timeout
             while True:
                 new_messages = await self._fetch_new_messages(
                     after_message_id=after_message_id,
@@ -613,6 +614,8 @@ class TelegramForumPlatform:
                     observed_messages.extend(new_messages)
                     quiet_deadline = asyncio.get_running_loop().time() + _CONTROL_SETTLE_SECONDS
                 elif asyncio.get_running_loop().time() >= quiet_deadline:
+                    break
+                elif asyncio.get_running_loop().time() >= hard_deadline:
                     break
                 else:
                     await asyncio.sleep(_POLL_INTERVAL_SECONDS)

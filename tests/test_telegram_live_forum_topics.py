@@ -85,6 +85,11 @@ def _resolve_sender_tokens() -> list[str]:
     return tokens
 
 
+def _kill_existing_daemons_enabled() -> bool:
+    raw = (os.environ.get("OBS_TELEGRAM_TEST_KILL_EXISTING_DAEMONS") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _kill_worktree_telegram_daemons(worktree_root: Path) -> None:
     pgrep = subprocess.run(
         ["pgrep", "-f", "obs_agent\\.telegram_main"],
@@ -122,10 +127,16 @@ def _kill_worktree_telegram_daemons(worktree_root: Path) -> None:
             subprocess.run(["kill", str(pid)], check=False)
 
 
-def _start_bot(vault_path: Path, temp_root: Path) -> tuple[subprocess.Popen, Path]:
-    worktree_root = Path(__file__).resolve().parents[1]
-    _kill_worktree_telegram_daemons(worktree_root)
-    time.sleep(0.5)
+def _start_bot(
+    vault_path: Path,
+    temp_root: Path,
+    *,
+    state_db_path: Path | None = None,
+) -> tuple[subprocess.Popen, Path]:
+    if _kill_existing_daemons_enabled():
+        worktree_root = Path(__file__).resolve().parents[1]
+        _kill_worktree_telegram_daemons(worktree_root)
+        time.sleep(0.5)
 
     env = os.environ.copy()
     env["OBS_VAULT_PATH"] = str(vault_path)
@@ -134,6 +145,8 @@ def _start_bot(vault_path: Path, temp_root: Path) -> tuple[subprocess.Popen, Pat
     env["OBS_TELEGRAM_BOT_TOKENS"] = ",".join(sender_tokens)
     env["OBS_TELEGRAM_ALLOWED_USERS"] = _resolve_allowed_users()
     env["OBS_TELEGRAM_TEMP_ROOT"] = str(temp_root)
+    resolved_state_db = state_db_path or (temp_root.parent / "telegram-state.sqlite3")
+    env["OBS_TELEGRAM_STATE_DB_PATH"] = str(resolved_state_db)
     env["OBS_TELEGRAM_DROP_PENDING_UPDATES"] = "1"
     # Native Task* parity harness requires the built-in task tools enabled.
     env.setdefault("CLAUDE_CODE_ENABLE_TASKS", "1")
@@ -325,6 +338,8 @@ class _LiveForumHarness:
     log_file: Path
     vault_path: Path
     bot_username: str
+    temp_root: Path | None = None
+    state_db_path: Path | None = None
 
     def failure_context(self) -> str:
         return (
@@ -353,16 +368,33 @@ async def _warm_platform(harness: _LiveForumHarness) -> None:
 
 
 async def _reset_general(harness: _LiveForumHarness) -> None:
-    trace = await harness.platform.send_control(
-        f"/clear@{harness.bot_username} all",
-        timeout=25.0,
-    )
-    assert "cleared" in trace.output.lower(), trace.output + harness.failure_context()
-    await asyncio.sleep(2.0)
-    try:
-        await harness.platform.wait_for_global_silence(seconds=2.0)
-    except AssertionError:
-        await asyncio.sleep(2.0)
+    clear_cmd = f"/clear@{harness.bot_username} all"
+    for _ in range(6):
+        baseline = await harness.platform.latest_bot_message_id(thread_id=None)
+        trace = await harness.platform.send_control(
+            clear_cmd,
+            timeout=25.0,
+        )
+        if "cleared" in trace.output.lower():
+            await asyncio.sleep(2.0)
+            try:
+                await harness.platform.wait_for_global_silence(seconds=2.0)
+            except AssertionError:
+                await asyncio.sleep(2.0)
+            return
+        recent = await harness.platform.get_recent_messages(thread_id=None, limit=40)
+        if any(
+            message.message_id > baseline and "cleared" in message.text.lower()
+            for message in recent
+        ):
+            await asyncio.sleep(2.0)
+            try:
+                await harness.platform.wait_for_global_silence(seconds=2.0)
+            except AssertionError:
+                await asyncio.sleep(2.0)
+            return
+        await asyncio.sleep(1.0)
+    raise AssertionError("Forum bot did not confirm /clear all")
 
 
 async def _session_id_for_route(
@@ -430,7 +462,8 @@ async def live_tg_forum(tmp_path: Path) -> _LiveForumHarness:
 
     vault_path = ensure_live_test_vault()
     temp_root = tmp_path / "obs-agent-temp"
-    proc, log_file = _start_bot(vault_path, temp_root)
+    state_db_path = tmp_path / "telegram-state.sqlite3"
+    proc, log_file = _start_bot(vault_path, temp_root, state_db_path=state_db_path)
     shared_chat_id = await _ensure_cached_forum_chat_id()
     platform = TelegramForumPlatform(chat_id=shared_chat_id, idle_quiescence_timeout=90.0)
     harness = _LiveForumHarness(
@@ -439,6 +472,8 @@ async def live_tg_forum(tmp_path: Path) -> _LiveForumHarness:
         log_file=log_file,
         vault_path=vault_path,
         bot_username=os.environ["TELEGRAM_TEST_BOT_USERNAME"],
+        temp_root=temp_root,
+        state_db_path=state_db_path,
     )
     await platform.connect()
     try:
@@ -446,7 +481,7 @@ async def live_tg_forum(tmp_path: Path) -> _LiveForumHarness:
         yield harness
     finally:
         await platform.close()
-        _stop_bot(proc)
+        _stop_bot(harness.proc)
 
 
 @pytest.mark.integration

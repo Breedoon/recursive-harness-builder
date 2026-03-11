@@ -20,9 +20,14 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+try:
+    from croniter import croniter
+except Exception:  # pragma: no cover - optional import error surfaced on cron create
+    croniter = None
 
 from telegram import Bot, Update
 from telegram.constants import ChatAction, ParseMode
@@ -80,6 +85,8 @@ _MAIN_SESSION_WARNING_SECONDS = 50 * 60.0
 _SUPER_TASK_HEARTBEAT_SECONDS = 15.0
 _SUPER_TASK_IDLE_SECONDS = 30.0
 _SUPER_TASK_MONITOR_TICK_SECONDS = 1.0
+_SCHEDULE_STOP_SUPPRESS_SECONDS = 3.0
+_SCHEDULE_STOP_MAX_DEFERS = 5
 
 # Prompt used when auto-delivering queued background results while user is idle.
 _AUTO_DELIVERY_PROMPT = (
@@ -89,6 +96,8 @@ _AUTO_DELIVERY_PROMPT = (
 _PRIORITY_SYSTEM = 0
 _PRIORITY_ASSISTANT = 10
 _PRIORITY_OBSERVABILITY = 30
+_TOPIC_CREATE_MAX_ATTEMPTS = 3
+_TASK_LAUNCH_SEND_MAX_ATTEMPTS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +241,50 @@ class _ForkTaskRecord:
     wake_source_summary: str | None = None
     wake_source_content: str | None = None
     emit_parent_callback: bool = True
+
+
+@dataclass
+class _TopicScheduleRecord:
+    schedule_id: str
+    route: TelegramRoute
+    description: str | None
+    schedule_mode: str  # interval | cron
+    cron_expr: str | None
+    trigger_kind: str  # interval | cron | on_topic_stop
+    interval_seconds: int | None
+    prompt: str
+    reset_session: bool = False
+    recurring: bool = True
+    enabled: bool = True
+    run_count: int = 0
+    max_runs: int | None = None
+    from_ts: float | None = None
+    until_ts: float | None = None
+    inherit_mode: str = "none"
+    next_run_at: float | None = None
+    last_run_at: float | None = None
+    last_success_at: float | None = None
+    last_error: str | None = None
+    max_retry_attempts: int = 0
+    retry_delay_seconds: int = 30
+    retry_attempt_count: int = 0
+
+
+@dataclass(frozen=True)
+class _DefaultScheduleTemplate:
+    schedule_mode: str
+    cron_expr: str | None
+    interval_seconds: int | None
+    prompt: str
+    reset_session: bool
+    recurring: bool
+    description: str | None
+    max_runs: int | None
+    from_ts: float | None
+    until_ts: float | None
+    inherit_mode: str
+    max_retry_attempts: int
+    retry_delay_seconds: int
 
 
 @dataclass(frozen=True)
@@ -490,8 +543,19 @@ class TelegramBot:
         self._fork_task_by_child_route: dict[TelegramRoute, str] = {}
         self._fork_task_tasks: dict[str, asyncio.Task] = {}
         self._team_worker_records: dict[tuple[str, str], str] = {}
-        self._warning_seconds = _MAIN_SESSION_WARNING_SECONDS
+        self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
+        self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
+        self._schedule_running_by_route: set[TelegramRoute] = set()
+        self._active_schedule_execution_by_route: dict[TelegramRoute, str] = {}
+        self._schedule_stop_events: asyncio.Queue[tuple[TelegramRoute, dict[str, Any]]] = asyncio.Queue()
+        self._schedule_stop_suppress_until: dict[TelegramRoute, float] = {}
+        self._primary_bot: Any | None = None
         self._media_group_receipt_ids: dict[tuple[int, int, int | None, str], list[int]] = {}
+        self._settings_payload = self._load_settings_payload()
+        self._schedule_retry_max_attempts, self._schedule_retry_delay_seconds = (
+            self._load_schedule_retry_policy(self._settings_payload)
+        )
+        self._default_schedule_template = self._load_default_schedule_template(self._settings_payload)
 
         self._enable_background_poller = enable_background_poller
         self._background_poll_seconds = background_poll_seconds
@@ -533,6 +597,7 @@ class TelegramBot:
         )
         self._restore_state_from_store()
         await self._ensure_transport_worker()
+        await self._ensure_background_poller(None)
 
     def _next_transport_sequence(self) -> int:
         self._transport_sequence += 1
@@ -784,17 +849,45 @@ class TelegramBot:
                 except RetryAfter as exc:
                     delay = max(float(exc.retry_after), 1.0)
                     attempt += 1
+                    if attempt >= _TOPIC_CREATE_MAX_ATTEMPTS:
+                        raise RuntimeError(
+                            f"Failed to create forum topic '{op.name}' in chat {op.route.chat_id} "
+                            f"after {attempt} attempts: {exc}"
+                        ) from exc
                     self._chat_next_send_at[op.route.chat_id] = max(
                         self._chat_next_send_at.get(op.route.chat_id, 0.0),
                         time.monotonic() + delay,
                     )
                     self._note_chat_retry_after(op.route.chat_id, delay)
+                    logger.warning(
+                        "Telegram create_forum_topic rate limit route=%s attempt=%d retry_in=%.1fs",
+                        op.route,
+                        attempt,
+                        delay,
+                    )
                     await asyncio.sleep(delay)
                     last_error = exc
                     break
                 except TelegramError as exc:
                     attempt += 1
+                    if isinstance(exc, BadRequest):
+                        raise RuntimeError(
+                            f"Failed to create forum topic '{op.name}' in chat {op.route.chat_id}: {exc}. "
+                            "AgentTask/ForkTask cannot continue without creating the child topic."
+                        ) from exc
+                    if attempt >= _TOPIC_CREATE_MAX_ATTEMPTS:
+                        raise RuntimeError(
+                            f"Failed to create forum topic '{op.name}' in chat {op.route.chat_id} "
+                            f"after {attempt} attempts: {exc}"
+                        ) from exc
                     delay = min(30.0, 2 ** min(attempt, 5))
+                    logger.warning(
+                        "Telegram create_forum_topic failed route=%s attempt=%d retry_in=%.1fs: %s",
+                        op.route,
+                        attempt,
+                        delay,
+                        exc,
+                    )
                     await asyncio.sleep(delay)
                     last_error = exc
                     break
@@ -973,6 +1066,248 @@ class TelegramBot:
             return "General"
         return f"Topic {route.thread_id}"
 
+    @staticmethod
+    def _safe_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _load_settings_payload(self) -> dict[str, Any] | None:
+        settings_path = self._config.claude_path / "settings.json"
+        if not settings_path.exists():
+            return None
+        try:
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("Failed parsing settings file at %s", settings_path, exc_info=True)
+            return None
+        return loaded if isinstance(loaded, dict) else None
+
+    def _load_schedule_retry_policy(self, settings: dict[str, Any] | None) -> tuple[int, int]:
+        max_attempts = 0
+        delay_seconds = 30
+        if not isinstance(settings, dict):
+            return max_attempts, delay_seconds
+        obs = settings.get("obs")
+        if not isinstance(obs, dict):
+            return max_attempts, delay_seconds
+        scheduling = obs.get("scheduling")
+        if not isinstance(scheduling, dict):
+            return max_attempts, delay_seconds
+        retry = scheduling.get("retry")
+        if not isinstance(retry, dict):
+            return max_attempts, delay_seconds
+        max_attempts = max(self._safe_int(retry.get("max_attempts"), 0), 0)
+        delay_seconds = max(self._safe_int(retry.get("delay_seconds"), 30), 1)
+        return max_attempts, delay_seconds
+
+    def _parse_default_schedule_template(
+        self,
+        default_schedule: dict[str, Any],
+        *,
+        source_label: str,
+    ) -> _DefaultScheduleTemplate | None:
+        if default_schedule.get("enabled") is False:
+            return None
+        prompt = str(default_schedule.get("prompt") or "").strip()
+        if not prompt:
+            logger.warning("Ignoring %s: prompt is required", source_label)
+            return None
+
+        schedule_mode = str(default_schedule.get("schedule_mode") or "").strip().lower()
+        cron_expr = str(default_schedule.get("cron") or "").strip() or None
+        interval_seconds_raw = default_schedule.get("interval_seconds")
+        interval_seconds: int | None = None
+        if interval_seconds_raw is not None:
+            try:
+                interval_seconds = int(interval_seconds_raw)
+            except (TypeError, ValueError):
+                logger.warning("Ignoring %s: interval_seconds must be an integer", source_label)
+                return None
+            if interval_seconds < 0:
+                logger.warning("Ignoring %s: interval_seconds must be non-negative", source_label)
+                return None
+        if not schedule_mode:
+            if interval_seconds is not None:
+                schedule_mode = "interval"
+            elif cron_expr:
+                schedule_mode = "cron"
+        if schedule_mode not in {"interval", "cron"}:
+            logger.warning("Ignoring %s: schedule_mode must be interval or cron", source_label)
+            return None
+        if schedule_mode == "interval" and interval_seconds is None:
+            logger.warning("Ignoring %s: interval_seconds is required for interval mode", source_label)
+            return None
+        if schedule_mode == "cron":
+            if not cron_expr:
+                logger.warning("Ignoring %s: cron is required for cron mode", source_label)
+                return None
+            if croniter is None:
+                logger.warning("Ignoring %s: croniter is required for cron mode", source_label)
+                return None
+            try:
+                self._next_cron_fire_ts(cron_expr=cron_expr, base_ts=time.time())
+            except ValueError:
+                logger.warning("Ignoring %s: invalid cron expression %s", source_label, cron_expr)
+                return None
+
+        reset_session_raw = default_schedule.get("reset_session")
+        reset_session = bool(reset_session_raw) if isinstance(reset_session_raw, bool) else False
+        if reset_session_raw is None:
+            run_mode = str(default_schedule.get("run_mode") or "").strip().lower()
+            if run_mode in {"continue", "reset_session"}:
+                reset_session = run_mode == "reset_session"
+            elif run_mode:
+                logger.warning("Ignoring %s: unsupported run_mode %s", source_label, run_mode)
+                return None
+
+        max_runs_raw = default_schedule.get("max_runs")
+        max_runs: int = 1
+        if max_runs_raw is not None:
+            try:
+                max_runs = int(max_runs_raw)
+            except (TypeError, ValueError):
+                logger.warning("Ignoring %s: max_runs must be an integer", source_label)
+                return None
+            if max_runs <= 0:
+                logger.warning("Ignoring %s: max_runs must be positive", source_label)
+                return None
+
+        from_raw = str(default_schedule.get("from") or "").strip() or None
+        until_raw = str(default_schedule.get("until") or "").strip() or None
+        try:
+            from_ts = self._parse_rfc3339_timestamp(from_raw)
+            until_ts = self._parse_rfc3339_timestamp(until_raw)
+        except ValueError:
+            logger.warning("Ignoring %s: from/until must be RFC3339 timestamp", source_label)
+            return None
+        if from_ts is not None and until_ts is not None and from_ts > until_ts:
+            logger.warning("Ignoring %s: from must be <= until", source_label)
+            return None
+
+        inherit_mode = str(default_schedule.get("inherit") or "none").strip().lower() or "none"
+        if inherit_mode not in {"none", "fork", "all"}:
+            logger.warning("Ignoring %s: inherit must be none, fork, or all", source_label)
+            return None
+
+        return _DefaultScheduleTemplate(
+            schedule_mode=schedule_mode,
+            cron_expr=cron_expr,
+            interval_seconds=interval_seconds,
+            prompt=prompt,
+            reset_session=reset_session,
+            recurring=max_runs != 1,
+            description=str(default_schedule.get("description") or "").strip() or None,
+            max_runs=max_runs,
+            from_ts=from_ts,
+            until_ts=until_ts,
+            inherit_mode=inherit_mode,
+            max_retry_attempts=self._schedule_retry_max_attempts,
+            retry_delay_seconds=self._schedule_retry_delay_seconds,
+        )
+
+    def _load_default_schedule_template(self, settings: dict[str, Any] | None) -> _DefaultScheduleTemplate | None:
+        if not isinstance(settings, dict):
+            return None
+
+        obs = settings.get("obs")
+        if isinstance(obs, dict):
+            scheduling = obs.get("scheduling")
+            if isinstance(scheduling, dict):
+                defaults = scheduling.get("defaults")
+                if isinstance(defaults, dict):
+                    if defaults.get("auto_create_on_session_start") is False:
+                        return None
+                    schedule = defaults.get("schedule")
+                    if isinstance(schedule, dict):
+                        return self._parse_default_schedule_template(
+                            schedule,
+                            source_label="obs.scheduling.defaults.schedule",
+                        )
+
+        obs_agent = settings.get("obs_agent")
+        if not isinstance(obs_agent, dict):
+            return None
+        schedule_defaults = obs_agent.get("schedule_defaults")
+        if not isinstance(schedule_defaults, dict):
+            return None
+        if schedule_defaults.get("auto_create_on_session_start") is False:
+            return None
+        legacy = schedule_defaults.get("default_interval")
+        if not isinstance(legacy, dict):
+            return None
+        logger.warning(
+            "settings.json uses deprecated obs_agent.schedule_defaults; migrate to obs.scheduling.defaults"
+        )
+        normalized = dict(legacy)
+        if "schedule_mode" not in normalized:
+            normalized["schedule_mode"] = "interval"
+        return self._parse_default_schedule_template(
+            normalized,
+            source_label="obs_agent.schedule_defaults.default_interval",
+        )
+
+    def _maybe_seed_default_schedule(self, *, route: TelegramRoute) -> None:
+        template = self._default_schedule_template
+        if template is None:
+            return
+        if self._schedule_ids_by_route.get(route):
+            return
+        now = time.time()
+        trigger_kind = "on_topic_stop"
+        if template.schedule_mode == "cron":
+            trigger_kind = "cron"
+        elif template.interval_seconds and template.interval_seconds > 0:
+            trigger_kind = "interval"
+        record = _TopicScheduleRecord(
+            schedule_id=uuid.uuid4().hex[:8],
+            route=route,
+            description=template.description,
+            schedule_mode=template.schedule_mode,
+            cron_expr=template.cron_expr,
+            trigger_kind=trigger_kind,
+            interval_seconds=template.interval_seconds,
+            prompt=template.prompt,
+            reset_session=template.reset_session,
+            recurring=template.recurring,
+            enabled=True,
+            run_count=0,
+            max_runs=template.max_runs,
+            from_ts=template.from_ts,
+            until_ts=template.until_ts,
+            inherit_mode=template.inherit_mode,
+            next_run_at=None,
+            max_retry_attempts=template.max_retry_attempts,
+            retry_delay_seconds=template.retry_delay_seconds,
+            retry_attempt_count=0,
+        )
+        if record.trigger_kind in {"interval", "cron"}:
+            try:
+                record.next_run_at = self._next_timed_run_at(record, base_ts=now)
+            except ValueError:
+                logger.warning(
+                    "Skipping default schedule due to invalid timing config route=%s mode=%s",
+                    route,
+                    record.schedule_mode,
+                )
+                return
+        overlap_error = self._validate_schedule_overlap(
+            route=route,
+            start_ts=record.from_ts,
+            end_ts=record.until_ts,
+        )
+        if overlap_error:
+            logger.warning("Skipping default schedule for %s: %s", route, overlap_error)
+            return
+        self._register_topic_schedule(record)
+        logger.info(
+            "Applied default schedule from settings route=%s mode=%s max_runs=%s",
+            route,
+            template.schedule_mode,
+            template.max_runs,
+        )
+
     def _topic_metadata_for_route(self, route: TelegramRoute) -> _TopicMetadata:
         return self._topic_metadata_by_route.get(route, _TopicMetadata())
 
@@ -1053,6 +1388,36 @@ class TelegramBot:
             self._system_message_routes[key] = route
 
         self._session_heads.update(snapshot.session_heads)
+
+        for entry in snapshot.topic_schedules:
+            route = TelegramRoute(chat_id=entry.chat_id, thread_id=entry.thread_id)
+            record = _TopicScheduleRecord(
+                schedule_id=entry.schedule_id,
+                route=route,
+                description=entry.description,
+                schedule_mode=entry.schedule_mode,
+                cron_expr=entry.cron_expr,
+                trigger_kind=entry.trigger_kind,
+                interval_seconds=entry.interval_seconds,
+                prompt=entry.prompt,
+                reset_session=(entry.run_mode == "reset_session"),
+                recurring=entry.recurring,
+                enabled=entry.enabled,
+                run_count=entry.run_count,
+                max_runs=entry.max_runs,
+                from_ts=entry.from_ts,
+                until_ts=entry.until_ts,
+                inherit_mode=entry.inherit_mode,
+                next_run_at=entry.next_run_at,
+                last_run_at=entry.last_run_at,
+                last_success_at=entry.last_success_at,
+                last_error=entry.last_error,
+                max_retry_attempts=entry.max_retry_attempts,
+                retry_delay_seconds=entry.retry_delay_seconds,
+                retry_attempt_count=entry.retry_attempt_count,
+            )
+            self._topic_schedules_by_id[record.schedule_id] = record
+            self._schedule_ids_by_route.setdefault(route, set()).add(record.schedule_id)
 
         for entry in snapshot.team_worker_states:
             key = self._team_worker_key(entry.team_name, entry.agent_name)
@@ -1172,7 +1537,11 @@ class TelegramBot:
         hook_state.fork_task_launcher = self._make_fork_task_launcher(route)
         hook_state.fork_task_outputter = self._make_fork_task_outputter(route)
         hook_state.fork_task_stopper = self._make_fork_task_stopper(route)
+        hook_state.cron_creator = self._make_cron_creator(route)
+        hook_state.cron_lister = self._make_cron_lister(route)
+        hook_state.cron_deleter = self._make_cron_deleter(route)
         hook_state.inbox_message_notifier = self._make_inbox_message_notifier(route)
+        hook_state.stop_event_notifier = self._make_stop_event_notifier(route)
         return state
 
     def _get_state(
@@ -1187,6 +1556,7 @@ class TelegramBot:
             state = self._build_session_state(route, topic_title=topic_title)
             self._states_by_route[route] = state
             self._persist_state_for_route(route)
+            self._maybe_seed_default_schedule(route=route)
         if state is not None and topic_title:
             if not state.topic_title:
                 state.topic_title = topic_title
@@ -1229,12 +1599,37 @@ class TelegramBot:
 
         return _stop
 
+    def _make_cron_creator(self, route: TelegramRoute):
+        async def _create(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._cron_create(route=route, args=args)
+
+        return _create
+
+    def _make_cron_lister(self, route: TelegramRoute):
+        async def _list(args: dict[str, Any]) -> dict[str, Any]:
+            _ = args
+            return await self._cron_list(route=route)
+
+        return _list
+
+    def _make_cron_deleter(self, route: TelegramRoute):
+        async def _delete(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._cron_delete(route=route, args=args)
+
+        return _delete
+
     def _make_inbox_message_notifier(self, route: TelegramRoute):
         async def _notify(payload: dict[str, Any]) -> None:
             await self._handle_inbox_message_notification(
                 sender_route=route,
                 payload=payload,
             )
+
+        return _notify
+
+    def _make_stop_event_notifier(self, route: TelegramRoute):
+        async def _notify(payload: dict[str, Any]) -> None:
+            self._schedule_stop_events.put_nowait((route, payload))
 
         return _notify
 
@@ -1247,10 +1642,7 @@ class TelegramBot:
         return bool(state.active_fork_task_ids)
 
     def _should_emit_completion_summary(self, state: TelegramSessionState) -> bool:
-        return (
-            state.notify_on_completion
-            and not self._route_has_active_fork_tasks(state)
-        )
+        return state.notify_on_completion
 
     def _current_topic_base(self, state: TelegramSessionState) -> str:
         return (state.topic_title or self._default_topic_title(state.route)).strip()
@@ -1269,6 +1661,866 @@ class TelegramBot:
         state.child_fork_count += 1
         self._persist_state_for_route(state.route)
         return f"{base} - F{state.child_fork_count}".strip()[:128]
+
+    @staticmethod
+    def _cron_error_result(text: str) -> dict[str, Any]:
+        return {
+            "content": [{"type": "text", "text": text}],
+            "tool_use_result": {"error": text},
+            "is_error": True,
+        }
+
+    @staticmethod
+    def _cron_ok_result(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=True)}],
+            "tool_use_result": payload,
+        }
+
+    @staticmethod
+    def _parse_supported_cron_interval_seconds(expr: str) -> int | None:
+        normalized = expr.strip().lower()
+        if normalized == "@hourly":
+            return 60 * 60
+        if normalized == "@daily":
+            return 24 * 60 * 60
+        parts = normalized.split()
+        if len(parts) != 5:
+            return None
+        minute, hour, day_of_month, month, day_of_week = parts
+
+        def _step_value(token: str) -> int | None:
+            if not token.startswith("*/"):
+                return None
+            raw = token[2:]
+            if not raw.isdigit():
+                return None
+            value = int(raw)
+            if value <= 0:
+                return None
+            return value
+
+        if (
+            (minutes := _step_value(minute)) is not None
+            and hour == "*"
+            and day_of_month == "*"
+            and month == "*"
+            and day_of_week == "*"
+        ):
+            return minutes * 60
+        if (
+            minute == "0"
+            and (hours := _step_value(hour)) is not None
+            and day_of_month == "*"
+            and month == "*"
+            and day_of_week == "*"
+        ):
+            return hours * 60 * 60
+        if (
+            minute == "0"
+            and hour == "0"
+            and (days := _step_value(day_of_month)) is not None
+            and month == "*"
+            and day_of_week == "*"
+        ):
+            return days * 24 * 60 * 60
+        return None
+
+    @staticmethod
+    def _parse_rfc3339_timestamp(raw_value: str | None) -> float | None:
+        if raw_value is None:
+            return None
+        normalized = raw_value.strip()
+        if not normalized:
+            return None
+        if normalized.endswith("Z"):
+            normalized = f"{normalized[:-1]}+00:00"
+        parsed = datetime.fromisoformat(normalized)
+        return parsed.timestamp()
+
+    @staticmethod
+    def _window_overlap(
+        *,
+        start_a: float | None,
+        end_a: float | None,
+        start_b: float | None,
+        end_b: float | None,
+    ) -> bool:
+        left_a = float("-inf") if start_a is None else float(start_a)
+        right_a = float("inf") if end_a is None else float(end_a)
+        left_b = float("-inf") if start_b is None else float(start_b)
+        right_b = float("inf") if end_b is None else float(end_b)
+        return max(left_a, left_b) < min(right_a, right_b)
+
+    def _validate_schedule_overlap(
+        self,
+        *,
+        route: TelegramRoute,
+        start_ts: float | None,
+        end_ts: float | None,
+    ) -> str | None:
+        now = time.time()
+        active_schedule_id = self._active_schedule_execution_by_route.get(route)
+        for existing in self._active_schedules_for_route(route):
+            if self._schedule_is_exhausted(existing, now):
+                existing.enabled = False
+                existing.next_run_at = None
+                self._register_topic_schedule(existing)
+                continue
+            if (
+                active_schedule_id == existing.schedule_id
+                and existing.max_runs is not None
+                and (existing.run_count + 1) >= existing.max_runs
+            ):
+                continue
+            if self._window_overlap(
+                start_a=start_ts,
+                end_a=end_ts,
+                start_b=existing.from_ts,
+                end_b=existing.until_ts,
+            ):
+                return (
+                    "CronCreate failed: overlapping schedule window for this topic. "
+                    "Only non-overlapping [from, until) windows are allowed."
+                )
+        return None
+
+    def _next_cron_fire_ts(
+        self,
+        *,
+        cron_expr: str,
+        base_ts: float,
+        not_before_ts: float | None = None,
+    ) -> float:
+        if croniter is None:
+            raise ValueError("croniter is not installed")
+        anchor = datetime.fromtimestamp(base_ts, timezone.utc)
+        try:
+            itr = croniter(cron_expr, anchor)
+            candidate = float(itr.get_next(float))
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
+        if not_before_ts is not None and candidate < not_before_ts:
+            anchor_nb = datetime.fromtimestamp(not_before_ts - 1.0, timezone.utc)
+            try:
+                itr = croniter(cron_expr, anchor_nb)
+                candidate = float(itr.get_next(float))
+            except Exception as exc:
+                raise ValueError(str(exc)) from exc
+        return candidate
+
+    def _persist_topic_schedule(self, record: _TopicScheduleRecord) -> None:
+        self._state_store.upsert_topic_schedule(
+            schedule_id=record.schedule_id,
+            chat_id=record.route.chat_id,
+            thread_id=record.route.thread_id,
+            description=record.description,
+            schedule_mode=record.schedule_mode,
+            cron_expr=record.cron_expr,
+            trigger_kind=record.trigger_kind,
+            interval_seconds=record.interval_seconds,
+            prompt=record.prompt,
+            run_mode="reset_session" if record.reset_session else "continue",
+            recurring=record.recurring,
+            enabled=record.enabled,
+            run_count=record.run_count,
+            max_runs=record.max_runs,
+            from_ts=record.from_ts,
+            until_ts=record.until_ts,
+            inherit_mode=record.inherit_mode,
+            next_run_at=record.next_run_at,
+            last_run_at=record.last_run_at,
+            last_success_at=record.last_success_at,
+            last_error=record.last_error,
+            max_retry_attempts=record.max_retry_attempts,
+            retry_delay_seconds=record.retry_delay_seconds,
+            retry_attempt_count=record.retry_attempt_count,
+        )
+
+    def _register_topic_schedule(self, record: _TopicScheduleRecord) -> None:
+        previous = self._topic_schedules_by_id.get(record.schedule_id)
+        if previous is not None and previous.route != record.route:
+            schedule_ids = self._schedule_ids_by_route.get(previous.route)
+            if schedule_ids is not None:
+                schedule_ids.discard(record.schedule_id)
+                if not schedule_ids:
+                    self._schedule_ids_by_route.pop(previous.route, None)
+        self._topic_schedules_by_id[record.schedule_id] = record
+        self._schedule_ids_by_route.setdefault(record.route, set()).add(record.schedule_id)
+        self._persist_topic_schedule(record)
+
+    def _delete_topic_schedule(self, schedule_id: str) -> None:
+        record = self._topic_schedules_by_id.pop(schedule_id, None)
+        if record is not None:
+            schedule_ids = self._schedule_ids_by_route.get(record.route)
+            if schedule_ids is not None:
+                schedule_ids.discard(schedule_id)
+                if not schedule_ids:
+                    self._schedule_ids_by_route.pop(record.route, None)
+        self._state_store.delete_topic_schedule(schedule_id=schedule_id)
+
+    def _delete_topic_schedules_for_route(self, route: TelegramRoute) -> None:
+        for schedule_id in list(self._schedule_ids_by_route.get(route, set())):
+            self._topic_schedules_by_id.pop(schedule_id, None)
+            self._state_store.delete_topic_schedule(schedule_id=schedule_id)
+        self._schedule_ids_by_route.pop(route, None)
+        self._state_store.delete_topic_schedules_for_route(
+            chat_id=route.chat_id,
+            thread_id=route.thread_id,
+        )
+
+    def _schedule_should_inherit(self, *, record: _TopicScheduleRecord, is_fork: bool) -> bool:
+        mode = (record.inherit_mode or "none").strip().lower()
+        if mode == "all":
+            return True
+        if mode == "fork":
+            return is_fork
+        return False
+
+    def _inherit_topic_schedules(
+        self,
+        *,
+        parent_route: TelegramRoute,
+        child_route: TelegramRoute,
+        is_fork: bool,
+    ) -> None:
+        now = time.time()
+        parent_records = [
+            self._topic_schedules_by_id[schedule_id]
+            for schedule_id in sorted(self._schedule_ids_by_route.get(parent_route, set()))
+            if schedule_id in self._topic_schedules_by_id
+        ]
+        for parent_record in parent_records:
+            if not parent_record.enabled:
+                continue
+            if self._schedule_is_exhausted(parent_record, now):
+                continue
+            if not self._schedule_should_inherit(record=parent_record, is_fork=is_fork):
+                continue
+            overlap_error = self._validate_schedule_overlap(
+                route=child_route,
+                start_ts=parent_record.from_ts,
+                end_ts=parent_record.until_ts,
+            )
+            if overlap_error:
+                logger.info(
+                    "Skipping inherited schedule due to overlap parent_route=%s child_route=%s schedule_id=%s",
+                    parent_route,
+                    child_route,
+                    parent_record.schedule_id,
+                )
+                continue
+            child_record = _TopicScheduleRecord(
+                schedule_id=uuid.uuid4().hex[:8],
+                route=child_route,
+                description=parent_record.description,
+                schedule_mode=parent_record.schedule_mode,
+                cron_expr=parent_record.cron_expr,
+                trigger_kind=parent_record.trigger_kind,
+                interval_seconds=parent_record.interval_seconds,
+                prompt=parent_record.prompt,
+                reset_session=parent_record.reset_session,
+                recurring=parent_record.recurring,
+                enabled=True,
+                run_count=0,
+                max_runs=parent_record.max_runs,
+                from_ts=parent_record.from_ts,
+                until_ts=parent_record.until_ts,
+                inherit_mode=parent_record.inherit_mode,
+                next_run_at=None,
+                last_run_at=None,
+                last_success_at=None,
+                last_error=None,
+                max_retry_attempts=parent_record.max_retry_attempts,
+                retry_delay_seconds=parent_record.retry_delay_seconds,
+                retry_attempt_count=0,
+            )
+            if child_record.trigger_kind in {"interval", "cron"}:
+                try:
+                    child_record.next_run_at = self._next_timed_run_at(child_record, base_ts=now)
+                except ValueError:
+                    logger.debug(
+                        "Skipping inherited schedule with invalid timed config parent=%s child=%s",
+                        parent_record.schedule_id,
+                        child_route,
+                        exc_info=True,
+                    )
+                    continue
+            self._register_topic_schedule(child_record)
+
+    def _schedule_summary_payload(self, record: _TopicScheduleRecord) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "id": record.schedule_id,
+            "description": record.description,
+            "schedule_mode": record.schedule_mode,
+            "trigger_kind": record.trigger_kind,
+            "interval_seconds": record.interval_seconds,
+            "cron": record.cron_expr,
+            "trigger": self._schedule_trigger_label(record),
+            "reset_session": record.reset_session,
+            "enabled": record.enabled,
+            "run_count": record.run_count,
+            "max_runs": record.max_runs,
+            "from": (
+                datetime.fromtimestamp(record.from_ts, timezone.utc).isoformat().replace("+00:00", "Z")
+                if record.from_ts is not None
+                else None
+            ),
+            "until": (
+                datetime.fromtimestamp(record.until_ts, timezone.utc).isoformat().replace("+00:00", "Z")
+                if record.until_ts is not None
+                else None
+            ),
+            "next_run_at": (
+                datetime.fromtimestamp(record.next_run_at, timezone.utc).isoformat().replace("+00:00", "Z")
+                if record.next_run_at is not None
+                else None
+            ),
+            "inherit": record.inherit_mode,
+        }
+        if record.last_error:
+            payload["last_error"] = record.last_error
+        return payload
+
+    async def _cron_create(
+        self,
+        *,
+        route: TelegramRoute,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = self._get_state(route, create=False)
+        if state is None:
+            return self._cron_error_result("CronCreate is only available inside an active Telegram topic")
+
+        prompt = str(args.get("prompt") or "").strip()
+        if not prompt:
+            return self._cron_error_result("CronCreate failed: prompt is required")
+        schedule_mode = str(args.get("schedule_mode") or "").strip().lower()
+        cron_expr = str(args.get("cron") or "").strip()
+        if not schedule_mode:
+            if args.get("interval_seconds") is not None:
+                schedule_mode = "interval"
+            elif cron_expr:
+                schedule_mode = "cron"
+        if schedule_mode not in {"interval", "cron"}:
+            return self._cron_error_result(
+                "CronCreate failed: schedule_mode must be interval or cron"
+            )
+        if schedule_mode == "cron" and not cron_expr:
+            return self._cron_error_result(
+                "CronCreate failed: cron is required for schedule_mode=cron"
+            )
+
+        interval_override = args.get("interval_seconds")
+        interval_seconds: int | None
+        trigger_kind: str
+        if schedule_mode == "interval":
+            if interval_override is None:
+                return self._cron_error_result(
+                    "CronCreate failed: interval_seconds is required for schedule_mode=interval"
+                )
+            try:
+                parsed_override = int(interval_override)
+            except (TypeError, ValueError):
+                return self._cron_error_result("CronCreate failed: interval_seconds must be an integer")
+            if parsed_override < 0:
+                return self._cron_error_result("CronCreate failed: interval_seconds must be non-negative")
+            if parsed_override == 0:
+                trigger_kind = "on_topic_stop"
+                interval_seconds = None
+            else:
+                trigger_kind = "interval"
+                interval_seconds = parsed_override
+        else:
+            if croniter is None:
+                return self._cron_error_result(
+                    "CronCreate failed: cron mode unavailable because croniter is not installed"
+                )
+            trigger_kind = "cron"
+            interval_seconds = None
+
+        max_runs = args.get("max_runs")
+        if max_runs is not None:
+            try:
+                max_runs = int(max_runs)
+            except (TypeError, ValueError):
+                return self._cron_error_result("CronCreate failed: max_runs must be an integer")
+            if max_runs <= 0:
+                return self._cron_error_result("CronCreate failed: max_runs must be positive")
+        else:
+            max_runs = 1
+
+        reset_session = args.get("reset_session")
+        if reset_session is None:
+            run_mode = str(args.get("run_mode") or "").strip().lower()
+            if run_mode and run_mode not in {"continue", "reset_session"}:
+                return self._cron_error_result(
+                    "CronCreate failed: run_mode must be continue or reset_session"
+                )
+            reset_session = run_mode == "reset_session"
+        elif not isinstance(reset_session, bool):
+            return self._cron_error_result("CronCreate failed: reset_session must be boolean")
+
+        from_raw = str(args.get("from") or "").strip() or None
+        until_raw = str(args.get("until") or "").strip() or None
+        try:
+            from_ts = self._parse_rfc3339_timestamp(from_raw)
+            until_ts = self._parse_rfc3339_timestamp(until_raw)
+        except ValueError:
+            return self._cron_error_result(
+                "CronCreate failed: from/until must be RFC3339 timestamp"
+            )
+        if from_ts is not None and until_ts is not None and from_ts > until_ts:
+            return self._cron_error_result(
+                "CronCreate failed: from must be <= until"
+            )
+
+        inherit_mode = str(args.get("inherit") or "none").strip().lower() or "none"
+        if inherit_mode not in {"none", "fork", "all"}:
+            return self._cron_error_result(
+                "CronCreate failed: inherit must be none, fork, or all"
+            )
+
+        overlap_error = self._validate_schedule_overlap(
+            route=route,
+            start_ts=from_ts,
+            end_ts=until_ts,
+        )
+        if overlap_error:
+            return self._cron_error_result(overlap_error)
+
+        now = time.time()
+        schedule_id = uuid.uuid4().hex[:8]
+        record = _TopicScheduleRecord(
+            schedule_id=schedule_id,
+            route=route,
+            description=str(args.get("description") or "").strip() or None,
+            schedule_mode=schedule_mode,
+            cron_expr=cron_expr,
+            trigger_kind=trigger_kind,
+            interval_seconds=interval_seconds,
+            prompt=prompt,
+            reset_session=bool(reset_session),
+            recurring=max_runs != 1,
+            enabled=True,
+            run_count=0,
+            max_runs=max_runs,
+            from_ts=from_ts,
+            until_ts=until_ts,
+            inherit_mode=inherit_mode,
+            next_run_at=None,
+            max_retry_attempts=self._schedule_retry_max_attempts,
+            retry_delay_seconds=self._schedule_retry_delay_seconds,
+            retry_attempt_count=0,
+        )
+        if record.trigger_kind in {"interval", "cron"}:
+            try:
+                record.next_run_at = self._next_timed_run_at(record, base_ts=now)
+            except ValueError as exc:
+                return self._cron_error_result(f"CronCreate failed: invalid cron expression: {exc}")
+        self._register_topic_schedule(record)
+
+        bot = self._bot_for_state(state)
+        if bot is not None:
+            try:
+                await self._send_system_message(
+                    route=route,
+                    bot=bot,
+                    text=(
+                        "schedule created: "
+                        f"{self._schedule_display_name(record)} "
+                        f"({self._schedule_trigger_label(record)})"
+                    ),
+                    disable_notification=True,
+                )
+            except Exception:
+                logger.debug("Failed sending schedule create marker route=%s", route, exc_info=True)
+
+        payload = {
+            "schedule": self._schedule_summary_payload(record),
+        }
+        return self._cron_ok_result(payload)
+
+    async def _cron_list(self, *, route: TelegramRoute) -> dict[str, Any]:
+        schedules = [
+            self._topic_schedules_by_id[schedule_id]
+            for schedule_id in sorted(self._schedule_ids_by_route.get(route, set()))
+            if schedule_id in self._topic_schedules_by_id
+        ]
+        payload = {"schedules": [self._schedule_summary_payload(record) for record in schedules]}
+        return self._cron_ok_result(payload)
+
+    async def _cron_delete(
+        self,
+        *,
+        route: TelegramRoute,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        schedule_id = str(args.get("id") or "").strip()
+        if not schedule_id:
+            return self._cron_error_result("CronDelete failed: id is required")
+        record = self._topic_schedules_by_id.get(schedule_id)
+        if record is None or record.route != route:
+            return self._cron_ok_result({"deleted": False, "id": schedule_id})
+        self._delete_topic_schedule(schedule_id)
+        state = self._get_state(route, create=False)
+        bot = self._bot_for_state(state) if state is not None else self._primary_bot
+        if bot is not None:
+            try:
+                await self._send_system_message(
+                    route=route,
+                    bot=bot,
+                    text=f"schedule deleted: {schedule_id}",
+                    disable_notification=True,
+                )
+            except Exception:
+                logger.debug("Failed sending schedule delete marker route=%s", route, exc_info=True)
+        return self._cron_ok_result({"deleted": True, "id": schedule_id})
+
+    def _schedule_is_exhausted(self, record: _TopicScheduleRecord, now: float) -> bool:
+        if record.max_runs is not None and record.run_count >= record.max_runs:
+            return True
+        if record.until_ts is not None and now >= record.until_ts:
+            return True
+        return False
+
+    def _schedule_window_not_started(self, record: _TopicScheduleRecord, now: float) -> bool:
+        return record.from_ts is not None and now < record.from_ts
+
+    def _next_timed_run_at(self, record: _TopicScheduleRecord, *, base_ts: float) -> float | None:
+        if record.trigger_kind == "interval":
+            if record.interval_seconds is None:
+                return None
+            anchor = max(base_ts, record.from_ts or base_ts)
+            return anchor + record.interval_seconds
+        if record.trigger_kind == "cron":
+            cron_expr = (record.cron_expr or "").strip()
+            if not cron_expr:
+                raise ValueError("missing cron expression")
+            return self._next_cron_fire_ts(
+                cron_expr=cron_expr,
+                base_ts=base_ts,
+                not_before_ts=record.from_ts,
+            )
+        return None
+
+    def _reanchor_interval_schedules_for_route(
+        self,
+        *,
+        route: TelegramRoute,
+        base_ts: float | None = None,
+    ) -> None:
+        now = base_ts if base_ts is not None else time.time()
+        schedule_ids = sorted(self._schedule_ids_by_route.get(route, set()))
+        for schedule_id in schedule_ids:
+            record = self._topic_schedules_by_id.get(schedule_id)
+            if record is None or not record.enabled:
+                continue
+            if record.trigger_kind != "interval" or record.interval_seconds is None:
+                continue
+            if self._schedule_is_exhausted(record, now):
+                record.enabled = False
+                record.next_run_at = None
+                self._register_topic_schedule(record)
+                continue
+            if self._schedule_window_not_started(record, now):
+                continue
+            try:
+                record.next_run_at = self._next_timed_run_at(record, base_ts=now)
+            except ValueError as exc:
+                record.enabled = False
+                record.last_error = f"schedule config error: {exc}"
+                record.next_run_at = None
+            self._register_topic_schedule(record)
+
+    async def _execute_topic_schedule(
+        self,
+        *,
+        record: _TopicScheduleRecord,
+        trigger_kind: str,
+    ) -> bool:
+        if not record.enabled:
+            return False
+        now = time.time()
+        if self._schedule_is_exhausted(record, now):
+            record.enabled = False
+            record.next_run_at = None
+            self._register_topic_schedule(record)
+            return False
+        if self._schedule_window_not_started(record, now):
+            if record.trigger_kind in {"interval", "cron"}:
+                try:
+                    record.next_run_at = self._next_timed_run_at(record, base_ts=now)
+                except ValueError as exc:
+                    record.enabled = False
+                    record.last_error = f"schedule config error: {exc}"
+                    record.next_run_at = None
+                self._register_topic_schedule(record)
+            return False
+
+        state = self._get_state(record.route, create=False)
+        if state is None:
+            return False
+        bot = self._bot_for_state(state)
+        if bot is None:
+            return False
+        lock = self._get_route_lock(record.route)
+        if lock.locked() or state.busy or record.route in self._schedule_running_by_route:
+            return False
+
+        now_after = now
+        run_succeeded = False
+        run_failed = False
+        failure_text: str | None = None
+
+        async def _emit_post_schedule_summary() -> None:
+            try:
+                await self._send_system_message(
+                    route=record.route,
+                    bot=bot,
+                    text=self._build_completion_summary(
+                        state,
+                        triggered_schedule_id=record.schedule_id,
+                    ),
+                    disable_notification=False,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed sending post-schedule summary route=%s schedule_id=%s",
+                    record.route,
+                    record.schedule_id,
+                    exc_info=True,
+                )
+
+        self._schedule_running_by_route.add(record.route)
+        self._active_schedule_execution_by_route[record.route] = record.schedule_id
+        try:
+            async with lock:
+                if state.busy:
+                    return False
+                if record.reset_session:
+                    await self._reset_route_state(state)
+                    state.last_bot = bot
+                try:
+                    await self._send_system_message(
+                        route=record.route,
+                        bot=bot,
+                        text=self._schedule_trigger_line(record, now_ts=time.time()),
+                        disable_notification=True,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed sending schedule trigger marker route=%s schedule_id=%s",
+                        record.route,
+                        record.schedule_id,
+                        exc_info=True,
+                    )
+                scheduled_prompt = (
+                    "(System: scheduled execution.)\n\n"
+                    f"{record.prompt}"
+                )
+                record.last_run_at = time.time()
+                self._schedule_stop_suppress_until[record.route] = (
+                    time.time() + _SCHEDULE_STOP_SUPPRESS_SECONDS
+                )
+                state.hook_state.schedule_run_active = True
+                try:
+                    outcome = await self._run_and_send(
+                        state=state,
+                        user_text=scheduled_prompt,
+                        bot=bot,
+                        trigger_message=None,
+                        triggered_schedule_id=record.schedule_id,
+                        suppress_completion_summary=True,
+                    )
+                    now_after = time.time()
+                    if outcome.failed:
+                        run_failed = True
+                        failure_text = outcome.error or "scheduled run failed"
+                    else:
+                        run_succeeded = True
+                finally:
+                    state.hook_state.schedule_run_active = False
+        except Exception as exc:
+            now_after = time.time()
+            run_failed = True
+            failure_text = f"{type(exc).__name__}: {exc}"
+            logger.debug(
+                "Scheduled run failed schedule_id=%s route=%s",
+                record.schedule_id,
+                record.route,
+                exc_info=True,
+            )
+        finally:
+            self._schedule_running_by_route.discard(record.route)
+            self._active_schedule_execution_by_route.pop(record.route, None)
+
+        if run_succeeded:
+            record.run_count += 1
+            record.retry_attempt_count = 0
+            record.last_error = None
+            record.last_success_at = now_after
+        elif run_failed:
+            record.last_error = failure_text or "scheduled run failed"
+            if (
+                record.max_retry_attempts > 0
+                and record.retry_attempt_count < record.max_retry_attempts
+            ):
+                record.retry_attempt_count += 1
+                if record.trigger_kind in {"interval", "cron"}:
+                    retry_delay = max(int(record.retry_delay_seconds), 1)
+                    record.next_run_at = now_after + retry_delay
+                self._register_topic_schedule(record)
+                await _emit_post_schedule_summary()
+                return False
+            record.retry_attempt_count = 0
+            record.run_count += 1
+            try:
+                await self._send_system_message(
+                    route=record.route,
+                    bot=bot,
+                    text=(
+                        "schedule failed: "
+                        f"{self._schedule_display_name(record)}: "
+                        f"{record.last_error}"
+                    ),
+                    disable_notification=False,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed sending schedule failure marker route=%s schedule_id=%s",
+                    record.route,
+                    record.schedule_id,
+                    exc_info=True,
+                )
+
+        if self._schedule_is_exhausted(record, now_after):
+            record.enabled = False
+        if record.enabled and record.trigger_kind in {"interval", "cron"}:
+            try:
+                record.next_run_at = self._next_timed_run_at(record, base_ts=now_after)
+            except ValueError as exc:
+                record.enabled = False
+                record.last_error = f"schedule config error: {exc}"
+                record.next_run_at = None
+        elif record.trigger_kind in {"interval", "cron"}:
+            record.next_run_at = None
+        self._register_topic_schedule(record)
+        await _emit_post_schedule_summary()
+        return run_succeeded
+
+    async def _run_due_interval_schedules(self) -> None:
+        now = time.time()
+        due_records = [
+            record
+            for record in self._topic_schedules_by_id.values()
+            if record.enabled
+            and record.trigger_kind in {"interval", "cron"}
+            and record.next_run_at is not None
+            and record.next_run_at <= now
+        ]
+        due_records.sort(key=lambda record: float(record.next_run_at or now))
+        for record in due_records:
+            await self._execute_topic_schedule(record=record, trigger_kind=record.trigger_kind)
+
+    async def _process_stop_schedule_events(self) -> None:
+        events: list[tuple[TelegramRoute, dict[str, Any]]] = []
+        while not self._schedule_stop_events.empty():
+            try:
+                events.append(self._schedule_stop_events.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        now = time.time()
+        expired_routes = [
+            route
+            for route, until in self._schedule_stop_suppress_until.items()
+            if now >= until
+        ]
+        for route in expired_routes:
+            self._schedule_stop_suppress_until.pop(route, None)
+
+        deferred_by_route: dict[TelegramRoute, dict[str, Any]] = {}
+
+        def _defer_stop_event(route: TelegramRoute, payload: dict[str, Any]) -> None:
+            raw_count = payload.get("_defer_count")
+            if isinstance(raw_count, (int, float)):
+                defer_count = int(raw_count)
+            else:
+                defer_count = 0
+            if defer_count >= _SCHEDULE_STOP_MAX_DEFERS:
+                logger.debug(
+                    "Dropping deferred stop event after max defers route=%s payload=%s",
+                    route,
+                    payload,
+                )
+                return
+            deferred_payload = dict(payload)
+            # Replayed events should run after the active turn drains.
+            deferred_payload["execution_active"] = False
+            deferred_payload["schedule_run_active"] = False
+            deferred_payload["_defer_count"] = defer_count + 1
+            deferred_by_route[route] = deferred_payload
+
+        for route, payload in events:
+            if bool(payload.get("schedule_run_active")):
+                continue
+            if bool(payload.get("execution_active")):
+                _defer_stop_event(route, payload)
+                continue
+            suppress_until = self._schedule_stop_suppress_until.get(route, 0.0)
+            if now < suppress_until:
+                continue
+            state = self._get_state(route, create=False)
+            if state is None:
+                continue
+            lock = self._get_route_lock(route)
+            if state.busy or lock.locked() or route in self._schedule_running_by_route:
+                _defer_stop_event(route, payload)
+                continue
+            session_id = payload.get("session_id")
+            if (
+                isinstance(session_id, str)
+                and session_id
+                and session_id in self._route_by_session_id
+                and self._route_by_session_id.get(session_id) != route
+            ):
+                continue
+            records = [
+                self._topic_schedules_by_id[schedule_id]
+                for schedule_id in sorted(self._schedule_ids_by_route.get(route, set()))
+                if schedule_id in self._topic_schedules_by_id
+            ]
+            for record in records:
+                if not record.enabled:
+                    continue
+                if self._schedule_is_exhausted(record, now):
+                    record.enabled = False
+                    record.next_run_at = None
+                    self._register_topic_schedule(record)
+                    continue
+                if record.trigger_kind == "interval" and record.interval_seconds is not None:
+                    if self._schedule_window_not_started(record, now):
+                        continue
+                    try:
+                        record.next_run_at = self._next_timed_run_at(record, base_ts=now)
+                    except ValueError as exc:
+                        record.enabled = False
+                        record.last_error = f"schedule config error: {exc}"
+                        record.next_run_at = None
+                    self._register_topic_schedule(record)
+                    continue
+                if record.trigger_kind != "on_topic_stop":
+                    continue
+                if self._schedule_window_not_started(record, now):
+                    continue
+                ran = await self._execute_topic_schedule(record=record, trigger_kind="on_topic_stop")
+                if not ran and (state.busy or lock.locked() or route in self._schedule_running_by_route):
+                    _defer_stop_event(route, payload)
+                    break
+
+        for route, payload in deferred_by_route.items():
+            self._schedule_stop_events.put_nowait((route, payload))
 
     def _build_fork_task_topic_name(
         self,
@@ -1792,7 +3044,9 @@ class TelegramBot:
                 source_message_id = resolved_message_id
         return source_session_id, source_uuid, source_route, source_message_id
 
-    async def _ensure_background_poller(self, bot) -> None:
+    async def _ensure_background_poller(self, bot: Any | None) -> None:
+        if bot is not None:
+            self._primary_bot = bot
         if not self._enable_background_poller:
             return
         if self._background_task is not None and not self._background_task.done():
@@ -1945,6 +3199,7 @@ class TelegramBot:
         reply_to_message_id: int | None = None,
         priority: int = _PRIORITY_SYSTEM,
         underline: bool = True,
+        max_attempts: int | None = None,
     ) -> list:
         sent_messages = await self._send_html(
             route=route,
@@ -1953,28 +3208,206 @@ class TelegramBot:
             disable_notification=disable_notification,
             reply_to_message_id=reply_to_message_id,
             priority=priority,
+            max_attempts=max_attempts,
         )
         self._remember_system_message_ids(route=route, sent_messages=sent_messages)
         return sent_messages
 
-    def _build_completion_summary(self, state: TelegramSessionState) -> str:
+    def _active_schedules_for_route(self, route: TelegramRoute) -> list[_TopicScheduleRecord]:
+        schedule_ids = self._schedule_ids_by_route.get(route, set())
+        records = [
+            self._topic_schedules_by_id[schedule_id]
+            for schedule_id in schedule_ids
+            if schedule_id in self._topic_schedules_by_id
+        ]
+        now = time.time()
+        active: list[_TopicScheduleRecord] = []
+        for record in records:
+            if not record.enabled:
+                continue
+            if self._schedule_is_exhausted(record, now):
+                record.enabled = False
+                record.next_run_at = None
+                self._register_topic_schedule(record)
+                continue
+            active.append(record)
+        return active
+
+    def _format_duration_human(self, seconds: float | int) -> str:
+        total = max(int(seconds), 0)
+        if total == 0:
+            return "0s"
+        days, rem = divmod(total, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, secs = divmod(rem, 60)
+        parts: list[str] = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        if secs and not parts:
+            parts.append(f"{secs}s")
+        return " ".join(parts[:2])
+
+    def _schedule_display_name(self, record: _TopicScheduleRecord) -> str:
+        if record.description:
+            return record.description
+        return record.schedule_id
+
+    def _schedule_trigger_label(self, record: _TopicScheduleRecord) -> str:
+        if record.trigger_kind == "on_topic_stop":
+            return "on stop"
+        if record.schedule_mode == "cron" and record.cron_expr:
+            return f"cron {record.cron_expr}"
+        if record.interval_seconds is not None:
+            return f"every {self._format_duration_human(record.interval_seconds)}"
+        return "interval"
+
+    def _schedule_uses_second_precision(self, record: _TopicScheduleRecord) -> bool:
+        if record.trigger_kind == "interval" and record.interval_seconds is not None:
+            return record.interval_seconds < 60
+        return False
+
+    def _format_schedule_timestamp(
+        self,
+        *,
+        ts: float,
+        record: _TopicScheduleRecord,
+        now_ts: float | None = None,
+    ) -> str:
+        include_seconds = self._schedule_uses_second_precision(record)
+        now_utc = datetime.fromtimestamp(now_ts if now_ts is not None else time.time(), timezone.utc)
+        value_utc = datetime.fromtimestamp(ts, timezone.utc)
+        now_dt = now_utc.astimezone()
+        value_dt = value_utc.astimezone()
+        tz_label = value_dt.tzname() or value_dt.strftime("%z") or "local"
+        time_fmt = "%H:%M:%S" if include_seconds else "%H:%M"
+        if value_dt.date() == now_dt.date():
+            return f"today at {value_dt.strftime(time_fmt)} {tz_label}"
+        if value_dt.date() == (now_dt + timedelta(days=1)).date():
+            return f"tomorrow at {value_dt.strftime(time_fmt)} {tz_label}"
+        full_fmt = "%Y-%m-%d %H:%M:%S" if include_seconds else "%Y-%m-%d %H:%M"
+        return f"{value_dt.strftime(full_fmt)} {tz_label}"
+
+    def _schedule_details(
+        self,
+        record: _TopicScheduleRecord,
+        *,
+        now_ts: float,
+        remaining_offset: int = 0,
+    ) -> list[str]:
+        details: list[str] = [self._schedule_trigger_label(record)]
+        if record.max_retry_attempts > 0:
+            details.append(
+                f"retries={record.retry_attempt_count}/{record.max_retry_attempts}"
+            )
+        if record.max_runs is not None:
+            remaining = max(record.max_runs - record.run_count - remaining_offset, 0)
+            details.append(f"remaining={remaining}")
+        if record.from_ts is not None:
+            details.append(
+                "from="
+                + self._format_schedule_timestamp(
+                    ts=record.from_ts,
+                    record=record,
+                    now_ts=now_ts,
+                )
+            )
+        if record.until_ts is not None:
+            details.append(
+                "until="
+                + self._format_schedule_timestamp(
+                    ts=record.until_ts,
+                    record=record,
+                    now_ts=now_ts,
+                )
+            )
+        return details
+
+    def _schedule_trigger_line(
+        self,
+        record: _TopicScheduleRecord,
+        *,
+        now_ts: float,
+    ) -> str:
+        details = self._schedule_details(
+            record,
+            now_ts=now_ts,
+            remaining_offset=1,
+        )
+        if details:
+            return (
+                f"schedule_triggered: {self._schedule_display_name(record)} "
+                f"({' ; '.join(details)})"
+            )
+        return f"schedule_triggered: {self._schedule_display_name(record)}"
+
+    def _next_schedule_line(self, route: TelegramRoute) -> str | None:
+        now = time.time()
+        timed_records = [
+            record
+            for record in self._active_schedules_for_route(route)
+            if record.next_run_at is not None
+        ]
+        record: _TopicScheduleRecord | None = None
+        if timed_records:
+            record = min(timed_records, key=lambda item: float(item.next_run_at or now))
+        else:
+            stop_records = [
+                candidate
+                for candidate in self._active_schedules_for_route(route)
+                if candidate.trigger_kind == "on_topic_stop"
+            ]
+            if stop_records:
+                record = stop_records[0]
+        if record is None:
+            return None
+
+        if record.next_run_at is not None:
+            run_at_text = self._format_schedule_timestamp(
+                ts=record.next_run_at,
+                record=record,
+                now_ts=now,
+            )
+            pieces = [f"next_schedule: {self._schedule_display_name(record)} at {run_at_text}"]
+        else:
+            pieces = [f"next_schedule: {self._schedule_display_name(record)} on next stop"]
+        details = self._schedule_details(record, now_ts=now)
+        if details:
+            pieces.append(f"({' ; '.join(details)})")
+        return " ".join(pieces)
+
+    def _build_completion_summary(
+        self,
+        state: TelegramSessionState,
+        *,
+        subtask_status: str | None = None,
+        return_to_parent_link: str | None = None,
+        triggered_schedule_id: str | None = None,
+    ) -> str:
         snapshot = build_context_snapshot(
             session_id=state.session_id,
             data=state.hook_state.last_result_data,
             context_window_estimate_tokens=self._config.context_window_estimate_tokens,
             cwd=self._config.vault_path,
         )
-        return self._append_notify_username(format_context_snapshot_compact(snapshot))
-
-    def _append_notify_username(self, text: str) -> str:
-        lines = [text]
-        username = (self._config.telegram_notify_username or "").strip().lstrip("@")
-        if username:
-            lines.append(f"@{username}")
+        lines = [format_context_snapshot_compact(snapshot)]
+        if subtask_status:
+            lines.append(f"subtask: {subtask_status}")
+        if return_to_parent_link:
+            lines.append(f"return_to_parent: {return_to_parent_link}")
+        next_schedule = self._next_schedule_line(state.route)
+        if next_schedule:
+            lines.append(next_schedule)
         return "\n".join(lines)
 
     def _has_queue_idle_state(self, state: TelegramSessionState) -> bool:
         return not state.pending_messages and state.hook_state.message_queue.empty()
+
+    def _bot_for_state(self, state: TelegramSessionState) -> Any | None:
+        return state.last_bot or self._primary_bot
 
     async def _activate_route_session(
         self,
@@ -2007,26 +3440,7 @@ class TelegramBot:
         self._persist_state_for_route(state.route)
 
     async def _maybe_send_route_warning(self, state: TelegramSessionState) -> None:
-        if not state.notify_on_completion:
-            return
-        if state.warning_sent or state.last_bot is None:
-            return
-        last_activity = state.session_manager.last_activity
-        if last_activity is None:
-            return
-        if (time.time() - last_activity) < self._warning_seconds:
-            return
-        try:
-            await self._send_system_message(
-                route=state.route,
-                bot=state.last_bot,
-                text=self._append_notify_username("session has been idle for 50 minutes"),
-                disable_notification=False,
-            )
-        except Exception:
-            logger.debug("Failed to send session reminder", exc_info=True)
-            return
-        state.warning_sent = True
+        _ = state
 
     async def _send_received_marker(
         self,
@@ -2403,6 +3817,11 @@ class TelegramBot:
         await self._ensure_background_poller(context.bot)
         route = self._route_for_message(update.effective_message)
         states, apply_all = self._command_targets(route=route, args=context.args)
+        has_schedules = (
+            any(bool(self._schedule_ids_by_route.get(state.route, set())) for state in states)
+            if apply_all
+            else bool(self._schedule_ids_by_route.get(route, set()))
+        )
         for state in states:
             state.last_bot = context.bot
             state.hook_state.interrupt_flag = True
@@ -2418,7 +3837,18 @@ class TelegramBot:
         await self._send_system_message(
             route=route,
             bot=context.bot,
-            text="all topic sessions cleared" if apply_all else "session cleared",
+            text=(
+                (
+                    "all topic sessions cleared; schedules were kept. "
+                    "Use /unschedule all to remove schedules across this chat."
+                )
+                if apply_all and has_schedules
+                else (
+                    "session cleared; schedule was kept. Use /unschedule to remove this topic schedule."
+                    if has_schedules
+                    else ("all topic sessions cleared" if apply_all else "session cleared")
+                )
+            ),
             disable_notification=True,
         )
 
@@ -2427,6 +3857,72 @@ class TelegramBot:
     ) -> None:
         """Backward-compatible alias for /clear."""
         await self.handle_clear(update, context)
+
+    async def handle_unschedule(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /unschedule - remove schedule(s) from this topic or chat (/unschedule all)."""
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+
+        route = self._route_for_message(update.effective_message)
+        states, apply_all = self._command_targets(route=route, args=context.args)
+        if apply_all:
+            deleted = 0
+            for state in states:
+                schedule_ids = sorted(self._schedule_ids_by_route.get(state.route, set()))
+                for schedule_id in schedule_ids:
+                    self._delete_topic_schedule(schedule_id)
+                    deleted += 1
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=(
+                    f"unscheduled {deleted} schedule(s) across this chat"
+                    if deleted > 0
+                    else "no schedules attached to this chat"
+                ),
+                disable_notification=True,
+            )
+            return
+
+        schedule_ids = sorted(self._schedule_ids_by_route.get(route, set()))
+        if not schedule_ids:
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text="no schedules attached to this topic",
+                disable_notification=True,
+            )
+            return
+
+        deleted = 0
+        if context.args:
+            target_id = context.args[0].strip()
+            record = self._topic_schedules_by_id.get(target_id)
+            if record is None or record.route != route:
+                await self._send_system_message(
+                    route=route,
+                    bot=context.bot,
+                    text=f"no schedule found in this topic: {target_id}",
+                    disable_notification=True,
+                )
+                return
+            self._delete_topic_schedule(target_id)
+            deleted = 1
+        else:
+            for schedule_id in schedule_ids:
+                self._delete_topic_schedule(schedule_id)
+                deleted += 1
+
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=f"unscheduled {deleted} schedule(s) for this topic",
+            disable_notification=True,
+        )
 
     async def handle_context(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -2634,6 +4130,7 @@ class TelegramBot:
         disable_notification: bool,
         reply_to_message_id: int | None = None,
         priority: int = _PRIORITY_ASSISTANT,
+        max_attempts: int | None = None,
     ) -> list:
         text = html_text.strip() if html_text.strip() else "(no response)"
         chunks = split_message(text)
@@ -2651,6 +4148,7 @@ class TelegramBot:
                     disable_notification=disable_notification,
                     reply_to_message_id=reply_to_message_id if index == 0 else None,
                     priority=priority,
+                    max_attempts=max_attempts,
                 )
                 sent_messages.append(sent)
             except BadRequest as exc:
@@ -2665,6 +4163,7 @@ class TelegramBot:
                         disable_notification=disable_notification,
                         reply_to_message_id=reply_to_message_id if index == 0 else None,
                         priority=priority,
+                        max_attempts=max_attempts,
                     )
                     sent_messages.append(sent)
                     continue
@@ -2687,6 +4186,7 @@ class TelegramBot:
                                 else None
                             ),
                             priority=priority,
+                            max_attempts=max_attempts,
                         )
                         sent_messages.append(sent)
                     continue
@@ -2762,6 +4262,8 @@ class TelegramBot:
         trigger_message: QueuedMessage | None = None,
         extra_pending: list[QueuedMessage] | None = None,
         trigger_status_message_ids: list[int] | None = None,
+        triggered_schedule_id: str | None = None,
+        suppress_completion_summary: bool = False,
     ) -> _RunOutcome:
         pending_messages = list(state.pending_messages)
         if extra_pending:
@@ -2793,6 +4295,7 @@ class TelegramBot:
         failed = False
         error_text: str | None = None
         state.busy = True
+        state.hook_state.execution_active = True
         state.last_bot = bot
         state.hook_state.pause_queue_delivery = False
         trigger_status_ids = list(trigger_status_message_ids or [])
@@ -2811,7 +4314,7 @@ class TelegramBot:
                     text="working",
                     disable_notification=True,
                     reply_to_message_id=reply_to_message_id,
-                    max_attempts=1,
+                    max_attempts=3,
                 )
             except Exception:
                 logger.debug("Failed to send working marker", exc_info=True)
@@ -2938,11 +4441,19 @@ class TelegramBot:
                     )
                     state.pending_messages = runner.remaining_pending
                     await self._flush_observability_buffer(route=state.route, bot=bot)
-                    if self._should_emit_completion_summary(state):
+                    if not suppress_completion_summary and self._should_emit_completion_summary(state):
+                        if triggered_schedule_id is None:
+                            self._reanchor_interval_schedules_for_route(
+                                route=state.route,
+                                base_ts=time.time(),
+                            )
                         summary_message = await self._send_system_message(
                             route=state.route,
                             bot=bot,
-                            text=self._build_completion_summary(state),
+                            text=self._build_completion_summary(
+                                state,
+                                triggered_schedule_id=triggered_schedule_id,
+                            ),
                             disable_notification=False,
                             reply_to_message_id=reply_to_message_id,
                         )
@@ -2985,11 +4496,23 @@ class TelegramBot:
             )
             await self._flush_observability_buffer(route=state.route, bot=bot)
 
-            if not completion_sent and self._should_emit_completion_summary(state):
+            if (
+                not completion_sent
+                and not suppress_completion_summary
+                and self._should_emit_completion_summary(state)
+            ):
+                if triggered_schedule_id is None:
+                    self._reanchor_interval_schedules_for_route(
+                        route=state.route,
+                        base_ts=time.time(),
+                    )
                 summary_message = await self._send_system_message(
                     route=state.route,
                     bot=bot,
-                    text=self._build_completion_summary(state),
+                    text=self._build_completion_summary(
+                        state,
+                        triggered_schedule_id=triggered_schedule_id,
+                    ),
                     disable_notification=False,
                     reply_to_message_id=reply_to_message_id,
                 )
@@ -3045,18 +4568,31 @@ class TelegramBot:
 
         finally:
             state.busy = False
+            state.hook_state.execution_active = False
             try:
                 await self._flush_observability_buffer(route=state.route, bot=bot)
             except Exception:
                 logger.debug("Failed flushing observability buffer in finally", exc_info=True)
             # Always send the final completion summary so Telegram collectors
             # have a stable end-of-turn marker even on error paths.
-            if not completion_sent and self._should_emit_completion_summary(state):
+            if (
+                not completion_sent
+                and not suppress_completion_summary
+                and self._should_emit_completion_summary(state)
+            ):
                 try:
+                    if triggered_schedule_id is None:
+                        self._reanchor_interval_schedules_for_route(
+                            route=state.route,
+                            base_ts=time.time(),
+                        )
                     summary_message = await self._send_system_message(
                         route=state.route,
                         bot=bot,
-                        text=self._build_completion_summary(state),
+                        text=self._build_completion_summary(
+                            state,
+                            triggered_schedule_id=triggered_schedule_id,
+                        ),
                         disable_notification=False,
                         reply_to_message_id=reply_to_message_id,
                     )
@@ -3272,10 +4808,12 @@ class TelegramBot:
         while True:
             try:
                 await asyncio.sleep(self._background_poll_seconds)
+                await self._process_stop_schedule_events()
+                await self._run_due_interval_schedules()
                 for state in list(self._states_by_route.values()):
-                    if state.last_bot is None:
+                    bot = self._bot_for_state(state)
+                    if bot is None:
                         continue
-                    await self._maybe_send_route_warning(state)
                     if state.busy or state.hook_state.pause_queue_delivery:
                         continue
 
@@ -3303,7 +4841,7 @@ class TelegramBot:
                         await self._run_and_send(
                             state=state,
                             user_text=_AUTO_DELIVERY_PROMPT,
-                            bot=state.last_bot,
+                            bot=bot,
                             trigger_message=(
                                 (queued or state.pending_messages)[-1]
                                 if (queued or state.pending_messages)
@@ -3481,6 +5019,7 @@ class TelegramBot:
         self._route_locks.pop(route, None)
         self._prune_bindings_for_route(route)
         self._topic_metadata_by_route.pop(route, None)
+        self._delete_topic_schedules_for_route(route)
         self._state_store.delete_route_state(
             chat_id=route.chat_id,
             thread_id=route.thread_id,
@@ -3564,6 +5103,11 @@ class TelegramBot:
             title=topic_name,
             icon_custom_emoji_id=child_icon,
         )
+        self._inherit_topic_schedules(
+            parent_route=parent_state.route,
+            child_route=child_route,
+            is_fork=is_fork,
+        )
         await self._activate_route_session(child_state, child_session_id)
         child_state.session_manager.set_sdk_env_overrides(
             self._build_team_worker_env(
@@ -3584,6 +5128,7 @@ class TelegramBot:
             html_text=styled_service_html,
             disable_notification=True,
             underline=False,
+            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
         )
         service_message_id = self._sent_message_id(service_messages[0]) if service_messages else None
         if service_message_id is not None:
@@ -4060,6 +5605,7 @@ class TelegramBot:
             html_text=self._underline_first_nonempty_line_html(resume_service_html),
             disable_notification=True,
             underline=False,
+            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
         )
         record.launch_child_message_id = (
             self._sent_message_id(resume_service_messages[0]) if resume_service_messages else None
@@ -4093,6 +5639,7 @@ class TelegramBot:
             bot=state.last_bot,
             html_text=parent_html,
             disable_notification=True,
+            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
         )
         record.launch_parent_message_id = (
             self._sent_message_id(parent_messages[0]) if parent_messages else None
@@ -4224,6 +5771,7 @@ class TelegramBot:
             bot=state.last_bot,
             html_text=confirmation,
             disable_notification=True,
+            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
         )
         confirmation_id = (
             self._sent_message_id(confirmation_messages[0]) if confirmation_messages else None
@@ -4445,18 +5993,18 @@ class TelegramBot:
         child_terminal_link: str | None = None
         child_state = self._get_state(record.child_route, create=False)
         if child_state is not None and child_state.last_bot is not None:
-            terminal_html = self._build_fork_task_terminal_html(
-                record=record,
-                parent_callback_link=None,
+            terminal_text = self._build_completion_summary(
+                child_state,
+                subtask_status=f"{'fork' if record.is_fork else 'agent task'} {self._record_status_label(record)}",
             )
-            terminal_messages = await self._send_system_html_message(
+            terminal_message = await self._send_system_message(
                 route=record.child_route,
                 bot=child_state.last_bot,
-                html_text=terminal_html,
+                text=terminal_text,
                 disable_notification=True,
             )
             record.child_completion_message_id = (
-                self._sent_message_id(terminal_messages[0]) if terminal_messages else None
+                self._sent_message_id(terminal_message) if terminal_message is not None else None
             )
             if record.child_completion_message_id is not None:
                 child_terminal_link = self._build_message_link(
@@ -4528,15 +6076,16 @@ class TelegramBot:
             and parent_callback_link
             and child_terminal_link is not None
         ):
-            backlink_html = self._build_fork_task_terminal_html(
-                record=record,
-                parent_callback_link=parent_callback_link,
+            backlink_text = self._build_completion_summary(
+                child_state,
+                subtask_status=f"{'fork' if record.is_fork else 'agent task'} {self._record_status_label(record)}",
+                return_to_parent_link=parent_callback_link,
             )
             try:
                 await child_state.last_bot.edit_message_text(
                     chat_id=record.child_route.chat_id,
                     message_id=record.child_completion_message_id,
-                    text=self._wrap_system_html(backlink_html),
+                    text=self._format_system_html(backlink_text),
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
@@ -4851,6 +6400,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.bot_data["obs_telegram_bot"] = bot
     app.add_handler(CommandHandler("clear", bot.handle_clear))
     app.add_handler(CommandHandler("new", bot.handle_new))
+    app.add_handler(CommandHandler("unschedule", bot.handle_unschedule))
     app.add_handler(CommandHandler("stop", bot.handle_stop))
     app.add_handler(CommandHandler("context", bot.handle_context))
     app.add_handler(CommandHandler("report", bot.handle_report))
@@ -4880,6 +6430,7 @@ async def _set_bot_commands(app: Application) -> None:
 
     await app.bot.set_my_commands([
         BotCommand("clear", "Clear this topic; use '/clear all' for the whole group"),
+        BotCommand("unschedule", "Remove schedule(s) from this topic; use /unschedule all"),
         BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
         BotCommand("context", "Show session and context window info"),
         BotCommand("report", "Save a debug case file for this message/topic"),
@@ -4896,6 +6447,7 @@ async def run_telegram_bot(config: OBSConfig) -> None:
     logger.info("Starting Telegram bot...")
     await tg_bot.initialize_runtime()
     await app.initialize()
+    await tg_bot._ensure_background_poller(app.bot)
     await _set_bot_commands(app)
     await app.start()
     drop_pending_updates = (

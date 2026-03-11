@@ -25,6 +25,7 @@ from obs_agent.hooks import (
     _make_interrupt_check,
     _make_immutable_check,
     _make_notification_check,
+    _make_stop_check,
     _make_queue_check,
     create_hook_matchers,
 )
@@ -301,6 +302,18 @@ def _make_subagent_stop_input(**overrides) -> dict:
         "agent_id": "agent-123",
         "agent_type": "general-purpose",
         "agent_transcript_path": "/tmp/agent-123.jsonl",
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_stop_input(**overrides) -> dict:
+    base = {
+        "hook_event_name": "Stop",
+        "session_id": "test-session",
+        "transcript_path": "/tmp/transcript",
+        "cwd": "/tmp",
+        "stop_hook_active": False,
     }
     base.update(overrides)
     return base
@@ -660,6 +673,23 @@ class TestCheckNotification:
         assert "transcript: /tmp/agent-123.jsonl" in (event.messages or [])
 
 
+class TestCheckStop:
+    @pytest.mark.asyncio
+    async def test_stop_event_notifies_transport(self):
+        state = HookState()
+        state.stop_event_notifier = AsyncMock()
+        check = _make_stop_check(state)
+
+        result = await check(_make_stop_input(), None, _EMPTY_CONTEXT)
+
+        assert result is None
+        state.stop_event_notifier.assert_awaited_once()
+        payload = state.stop_event_notifier.await_args.args[0]
+        assert payload["session_id"] == "test-session"
+        assert payload["schedule_run_active"] is False
+        assert payload["execution_active"] is False
+
+
 class TestCreateHookMatchers:
     """create_hook_matchers builds the correct pipeline structure."""
 
@@ -672,6 +702,7 @@ class TestCreateHookMatchers:
         assert "Notification" in matchers
         assert "SubagentStart" in matchers
         assert "SubagentStop" in matchers
+        assert "Stop" in matchers
 
     def test_pre_tool_use_has_one_matcher(self, config):
         """PreToolUse has exactly one HookMatcher with one pipeline."""

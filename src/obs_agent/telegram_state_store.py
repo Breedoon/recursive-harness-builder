@@ -59,12 +59,41 @@ class PersistedTeamWorkerState:
 
 
 @dataclass(frozen=True)
+class PersistedTopicSchedule:
+    schedule_id: str
+    chat_id: int
+    thread_id: int | None
+    description: str | None
+    schedule_mode: str
+    cron_expr: str | None
+    trigger_kind: str
+    interval_seconds: int | None
+    prompt: str
+    run_mode: str
+    recurring: bool
+    enabled: bool
+    run_count: int
+    max_runs: int | None
+    from_ts: float | None
+    until_ts: float | None
+    inherit_mode: str
+    next_run_at: float | None
+    last_run_at: float | None
+    last_success_at: float | None
+    last_error: str | None
+    max_retry_attempts: int
+    retry_delay_seconds: int
+    retry_attempt_count: int
+
+
+@dataclass(frozen=True)
 class TelegramStateSnapshot:
     route_states: list[PersistedRouteState] = field(default_factory=list)
     message_bindings: list[PersistedMessageBinding] = field(default_factory=list)
     system_messages: list[PersistedSystemMessage] = field(default_factory=list)
     session_heads: dict[str, str] = field(default_factory=dict)
     team_worker_states: list[PersistedTeamWorkerState] = field(default_factory=list)
+    topic_schedules: list[PersistedTopicSchedule] = field(default_factory=list)
 
 
 class TelegramStateStore:
@@ -166,8 +195,73 @@ class TelegramStateStore:
                 ON team_worker_state(task_id);
             CREATE INDEX IF NOT EXISTS idx_team_worker_state_route
                 ON team_worker_state(child_chat_id, child_thread_id);
+
+            CREATE TABLE IF NOT EXISTS topic_schedule (
+                schedule_id TEXT PRIMARY KEY,
+                route_key TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER,
+                description TEXT,
+                schedule_mode TEXT NOT NULL DEFAULT 'interval',
+                cron_expr TEXT,
+                trigger_kind TEXT NOT NULL,
+                interval_seconds INTEGER,
+                prompt TEXT NOT NULL,
+                run_mode TEXT NOT NULL,
+                recurring INTEGER NOT NULL DEFAULT 1,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                max_runs INTEGER,
+                from_ts REAL,
+                until_ts REAL,
+                inherit_mode TEXT NOT NULL DEFAULT 'none',
+                next_run_at REAL,
+                last_run_at REAL,
+                last_success_at REAL,
+                last_error TEXT,
+                max_retry_attempts INTEGER NOT NULL DEFAULT 0,
+                retry_delay_seconds INTEGER NOT NULL DEFAULT 30,
+                retry_attempt_count INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_topic_schedule_route_key
+                ON topic_schedule(route_key);
+            CREATE INDEX IF NOT EXISTS idx_topic_schedule_due
+                ON topic_schedule(enabled, next_run_at);
             """
         )
+        self._ensure_column_exists(
+            table="topic_schedule",
+            column="schedule_mode",
+            declaration="TEXT NOT NULL DEFAULT 'interval'",
+        )
+        self._ensure_column_exists(
+            table="topic_schedule",
+            column="from_ts",
+            declaration="REAL",
+        )
+        self._ensure_column_exists(
+            table="topic_schedule",
+            column="max_retry_attempts",
+            declaration="INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column_exists(
+            table="topic_schedule",
+            column="retry_delay_seconds",
+            declaration="INTEGER NOT NULL DEFAULT 30",
+        )
+        self._ensure_column_exists(
+            table="topic_schedule",
+            column="retry_attempt_count",
+            declaration="INTEGER NOT NULL DEFAULT 0",
+        )
+
+    def _ensure_column_exists(self, *, table: str, column: str, declaration: str) -> None:
+        conn = self._require_conn()
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if any(str(row["name"]) == column for row in rows):
+            return
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def prune(self, *, retention_days: int) -> None:
         conn = self._require_conn()
@@ -175,7 +269,14 @@ class TelegramStateStore:
         if days <= 0:
             return
         cutoff = time.time() - (days * 24 * 60 * 60)
-        for table in ("route_state", "message_binding", "session_head", "system_message", "team_worker_state"):
+        for table in (
+            "route_state",
+            "message_binding",
+            "session_head",
+            "system_message",
+            "team_worker_state",
+            "topic_schedule",
+        ):
             conn.execute(f"DELETE FROM {table} WHERE updated_at < ?", (cutoff,))
 
     def load_snapshot(self) -> TelegramStateSnapshot:
@@ -237,6 +338,37 @@ class TelegramStateStore:
                 status,
                 idle_ready
             FROM team_worker_state
+            ORDER BY updated_at ASC
+            """
+        ).fetchall()
+        schedule_rows = conn.execute(
+            """
+            SELECT
+                schedule_id,
+                chat_id,
+                thread_id,
+                description,
+                schedule_mode,
+                cron_expr,
+                trigger_kind,
+                interval_seconds,
+                prompt,
+                run_mode,
+                recurring,
+                enabled,
+                run_count,
+                max_runs,
+                from_ts,
+                until_ts,
+                inherit_mode,
+                next_run_at,
+                last_run_at,
+                last_success_at,
+                last_error,
+                max_retry_attempts,
+                retry_delay_seconds,
+                retry_attempt_count
+            FROM topic_schedule
             ORDER BY updated_at ASC
             """
         ).fetchall()
@@ -312,12 +444,73 @@ class TelegramStateStore:
             for row in team_worker_rows
             if row["team_name"] and row["agent_name"] and row["task_id"] and row["child_session_id"]
         ]
+        topic_schedules = [
+            PersistedTopicSchedule(
+                schedule_id=str(row["schedule_id"]),
+                chat_id=int(row["chat_id"]),
+                thread_id=(
+                    int(row["thread_id"]) if row["thread_id"] is not None else None
+                ),
+                description=str(row["description"]) if row["description"] else None,
+                schedule_mode=str(row["schedule_mode"] or "interval"),
+                cron_expr=str(row["cron_expr"]) if row["cron_expr"] else None,
+                trigger_kind=str(row["trigger_kind"] or "interval"),
+                interval_seconds=(
+                    int(row["interval_seconds"])
+                    if row["interval_seconds"] is not None
+                    else None
+                ),
+                prompt=str(row["prompt"]),
+                run_mode=str(row["run_mode"] or "continue"),
+                recurring=bool(int(row["recurring"] or 0)),
+                enabled=bool(int(row["enabled"] or 0)),
+                run_count=max(int(row["run_count"] or 0), 0),
+                max_runs=(
+                    int(row["max_runs"])
+                    if row["max_runs"] is not None
+                    else None
+                ),
+                from_ts=(
+                    float(row["from_ts"])
+                    if row["from_ts"] is not None
+                    else None
+                ),
+                until_ts=(
+                    float(row["until_ts"])
+                    if row["until_ts"] is not None
+                    else None
+                ),
+                inherit_mode=str(row["inherit_mode"] or "none"),
+                next_run_at=(
+                    float(row["next_run_at"])
+                    if row["next_run_at"] is not None
+                    else None
+                ),
+                last_run_at=(
+                    float(row["last_run_at"])
+                    if row["last_run_at"] is not None
+                    else None
+                ),
+                last_success_at=(
+                    float(row["last_success_at"])
+                    if row["last_success_at"] is not None
+                    else None
+                ),
+                last_error=str(row["last_error"]) if row["last_error"] else None,
+                max_retry_attempts=max(int(row["max_retry_attempts"] or 0), 0),
+                retry_delay_seconds=max(int(row["retry_delay_seconds"] or 30), 1),
+                retry_attempt_count=max(int(row["retry_attempt_count"] or 0), 0),
+            )
+            for row in schedule_rows
+            if row["schedule_id"] and row["prompt"]
+        ]
         return TelegramStateSnapshot(
             route_states=route_states,
             message_bindings=message_bindings,
             system_messages=system_messages,
             session_heads=session_heads,
             team_worker_states=team_worker_states,
+            topic_schedules=topic_schedules,
         )
 
     def upsert_route_state(
@@ -578,4 +771,132 @@ class TelegramStateStore:
               )
             """,
             (chat_id, thread_id, thread_id),
+        )
+
+    def upsert_topic_schedule(
+        self,
+        *,
+        schedule_id: str,
+        chat_id: int,
+        thread_id: int | None,
+        description: str | None,
+        schedule_mode: str,
+        cron_expr: str | None,
+        trigger_kind: str,
+        interval_seconds: int | None,
+        prompt: str,
+        run_mode: str,
+        recurring: bool,
+        enabled: bool,
+        run_count: int,
+        max_runs: int | None,
+        from_ts: float | None,
+        until_ts: float | None,
+        inherit_mode: str,
+        next_run_at: float | None,
+        last_run_at: float | None,
+        last_success_at: float | None,
+        last_error: str | None,
+        max_retry_attempts: int,
+        retry_delay_seconds: int,
+        retry_attempt_count: int,
+    ) -> None:
+        conn = self._require_conn()
+        now = time.time()
+        conn.execute(
+            """
+            INSERT INTO topic_schedule (
+                schedule_id,
+                route_key,
+                chat_id,
+                thread_id,
+                description,
+                schedule_mode,
+                cron_expr,
+                trigger_kind,
+                interval_seconds,
+                prompt,
+                run_mode,
+                recurring,
+                enabled,
+                run_count,
+                max_runs,
+                from_ts,
+                until_ts,
+                inherit_mode,
+                next_run_at,
+                last_run_at,
+                last_success_at,
+                last_error,
+                max_retry_attempts,
+                retry_delay_seconds,
+                retry_attempt_count,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(schedule_id) DO UPDATE SET
+                route_key=excluded.route_key,
+                chat_id=excluded.chat_id,
+                thread_id=excluded.thread_id,
+                description=excluded.description,
+                schedule_mode=excluded.schedule_mode,
+                cron_expr=excluded.cron_expr,
+                trigger_kind=excluded.trigger_kind,
+                interval_seconds=excluded.interval_seconds,
+                prompt=excluded.prompt,
+                run_mode=excluded.run_mode,
+                recurring=excluded.recurring,
+                enabled=excluded.enabled,
+                run_count=excluded.run_count,
+                max_runs=excluded.max_runs,
+                from_ts=excluded.from_ts,
+                until_ts=excluded.until_ts,
+                inherit_mode=excluded.inherit_mode,
+                next_run_at=excluded.next_run_at,
+                last_run_at=excluded.last_run_at,
+                last_success_at=excluded.last_success_at,
+                last_error=excluded.last_error,
+                max_retry_attempts=excluded.max_retry_attempts,
+                retry_delay_seconds=excluded.retry_delay_seconds,
+                retry_attempt_count=excluded.retry_attempt_count,
+                updated_at=excluded.updated_at
+            """,
+            (
+                schedule_id,
+                _route_key(chat_id, thread_id),
+                chat_id,
+                thread_id,
+                description,
+                schedule_mode,
+                cron_expr,
+                trigger_kind,
+                interval_seconds,
+                prompt,
+                run_mode,
+                1 if recurring else 0,
+                1 if enabled else 0,
+                max(int(run_count), 0),
+                max_runs,
+                from_ts,
+                until_ts,
+                inherit_mode,
+                next_run_at,
+                last_run_at,
+                last_success_at,
+                last_error,
+                max(int(max_retry_attempts), 0),
+                max(int(retry_delay_seconds), 1),
+                max(int(retry_attempt_count), 0),
+                now,
+            ),
+        )
+
+    def delete_topic_schedule(self, *, schedule_id: str) -> None:
+        conn = self._require_conn()
+        conn.execute("DELETE FROM topic_schedule WHERE schedule_id = ?", (schedule_id,))
+
+    def delete_topic_schedules_for_route(self, *, chat_id: int, thread_id: int | None) -> None:
+        conn = self._require_conn()
+        conn.execute(
+            "DELETE FROM topic_schedule WHERE route_key = ?",
+            (_route_key(chat_id, thread_id),),
         )
