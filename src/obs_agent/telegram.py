@@ -1642,7 +1642,11 @@ class TelegramBot:
         return bool(state.active_fork_task_ids)
 
     def _should_emit_completion_summary(self, state: TelegramSessionState) -> bool:
-        return state.notify_on_completion
+        # Keep completion markers consistent across user topics, forks, and
+        # delegated workers. Per-route suppression caused missing terminal
+        # markers in child topics while scheduled runs still emitted summaries.
+        _ = state
+        return True
 
     def _current_topic_base(self, state: TelegramSessionState) -> str:
         return (state.topic_title or self._default_topic_title(state.route)).strip()
