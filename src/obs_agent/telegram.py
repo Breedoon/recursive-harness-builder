@@ -5754,7 +5754,7 @@ class TelegramBot:
             source_message_id=source_message_id,
             topic_name=topic_name,
             child_service_html=child_service_html,
-            notify_on_completion=False,
+            notify_on_completion=True,
             is_fork=is_fork,
             team_name=team_name,
             agent_name=agent_name,

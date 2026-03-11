@@ -255,6 +255,14 @@ class TelegramStateStore:
             column="retry_attempt_count",
             declaration="INTEGER NOT NULL DEFAULT 0",
         )
+        # Completion summaries are now always-on across all topic types.
+        conn.execute(
+            """
+            UPDATE route_state
+            SET notify_on_completion = 1
+            WHERE notify_on_completion != 1
+            """
+        )
 
     def _ensure_column_exists(self, *, table: str, column: str, declaration: str) -> None:
         conn = self._require_conn()

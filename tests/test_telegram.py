@@ -2532,7 +2532,7 @@ class TestForkTaskRuntime:
         assert "session forked, your new session id is sid-child" in send_calls[1].kwargs["text"]
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=321))
         assert child_state is not None
-        assert child_state.notify_on_completion is False
+        assert child_state.notify_on_completion is True
         await bot.shutdown()
 
     async def test_launch_super_task_without_fork_creates_fresh_child_session(self, config):
@@ -4282,7 +4282,7 @@ class TestTelegramStatePersistence:
         assert restored_topic.topic_title == "General - Worker"
         assert restored_topic.topic_icon_custom_emoji_id == "emoji-1"
         assert restored_topic.child_fork_count == 2
-        assert restored_topic.notify_on_completion is False
+        assert restored_topic.notify_on_completion is True
         assert restored._route_by_session_id["sid-general"] == route_general
         assert restored._route_by_session_id["sid-topic"] == route_topic
         assert restored._route_by_session_id["sid-other"] == route_other_chat
