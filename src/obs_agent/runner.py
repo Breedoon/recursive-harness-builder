@@ -478,6 +478,7 @@ class ConversationRunner:
         while (
             continuation_count < self._config.max_queue_continuations
             and not self._hook_state.pause_queue_delivery
+            and not self._hook_state.interrupt_requested
         ):
             remaining = _drain_queue(self._hook_state.message_queue)
             if not remaining:
@@ -508,7 +509,11 @@ class ConversationRunner:
             self._refresh_last_result_data()
 
         # 5. Background fork wait loop
-        while self._hook_state.background_tasks and not self._hook_state.pause_queue_delivery:
+        while (
+            self._hook_state.background_tasks
+            and not self._hook_state.pause_queue_delivery
+            and not self._hook_state.interrupt_requested
+        ):
             tasks = set(self._hook_state.background_tasks)
             if not tasks:
                 break

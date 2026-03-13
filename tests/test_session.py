@@ -135,6 +135,11 @@ class TestCreateOptions:
         assert options.env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert options.env["CLAUDE_CODE_TASK_LIST_ID"] == "team-alpha"
 
+    def test_includes_default_sdk_hardening_env(self, config):
+        mgr = SessionManager(config=config)
+        options = mgr.create_options()
+        assert options.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+
     def test_set_sdk_env_overrides_filters_empty_values(self, config):
         mgr = SessionManager(config=config)
         mgr.set_sdk_env_overrides({"A": "1", "B": "", "": "x"})

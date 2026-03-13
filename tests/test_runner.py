@@ -440,6 +440,66 @@ class TestRunnerContinuation:
             )
         ]
 
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_interrupt_requested_skips_continuation_queries(self, mock_get_client, config):
+        call_count = 0
+
+        async def mock_receive():
+            nonlocal call_count
+            call_count += 1
+            mock_msg = MagicMock()
+            mock_msg.content = [TextBlock(text=f"Response {call_count}")]
+            mock_msg.session_id = None
+            yield mock_msg
+
+        mock_client = AsyncMock()
+        mock_client.receive_response = mock_receive
+        mock_client.query = AsyncMock()
+        mock_get_client.return_value = mock_client
+
+        hook_state = HookState(interrupt_requested=True)
+        hook_state.message_queue.put_nowait("queued during response")
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        events = await _collect_events(runner, "hello")
+
+        text_events = [e for e in events if isinstance(e, TextEvent)]
+        assert [e.text for e in text_events] == ["Response 1"]
+        assert mock_client.query.call_count == 1
+        assert runner.remaining_pending == [QueuedMessage(text="queued during response")]
+
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_interrupt_requested_skips_background_wakeup_queries(self, mock_get_client, config):
+        call_count = 0
+
+        async def mock_receive():
+            nonlocal call_count
+            call_count += 1
+            mock_msg = MagicMock()
+            mock_msg.content = [TextBlock(text=f"Response {call_count}")]
+            mock_msg.session_id = None
+            yield mock_msg
+
+        mock_client = AsyncMock()
+        mock_client.receive_response = mock_receive
+        mock_client.query = AsyncMock()
+        mock_get_client.return_value = mock_client
+
+        hook_state = HookState(interrupt_requested=True)
+        done_task = asyncio.create_task(asyncio.sleep(0))
+        hook_state.background_tasks.add(done_task)
+        hook_state.message_queue.put_nowait("bg callback")
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        await _collect_events(runner, "hello")
+
+        assert mock_client.query.call_count == 1
+        assert runner.remaining_pending == [QueuedMessage(text="bg callback")]
+
 
 # --- Remaining pending ---
 

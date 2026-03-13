@@ -2784,6 +2784,31 @@ class TelegramBot:
             if record.terminal_request is None:
                 record.terminal_request = status
 
+    def _mark_child_task_terminal_request(self, route: TelegramRoute, status: str) -> None:
+        """Mark delegated tasks running in this child route as terminal."""
+        for record in self._fork_tasks_by_id.values():
+            if record.child_route != route:
+                continue
+            if record.terminal_request is None:
+                record.terminal_request = status
+
+    async def _request_route_interrupt(self, state: TelegramSessionState) -> bool:
+        """Set interrupt intent and attempt SDK interrupt for one route."""
+        state.hook_state.interrupt_flag = True
+        state.hook_state.interrupt_requested = bool(
+            state.busy or state.hook_state.execution_active
+        )
+        state.hook_state.interrupt_notice_pending = True
+        session_mgr = state.session_manager
+        if session_mgr._client is None or not session_mgr._connected:
+            return False
+        try:
+            await session_mgr._client.interrupt()
+            return True
+        except Exception:
+            logger.debug("Route interrupt failed route=%s", state.route, exc_info=True)
+            return False
+
     async def _cancel_route_fork_tasks(self, route: TelegramRoute, status: str) -> None:
         for task_id, record in list(self._fork_tasks_by_id.items()):
             if record.child_route != route and record.parent_route != route:
@@ -3390,6 +3415,7 @@ class TelegramBot:
         subtask_status: str | None = None,
         return_to_parent_link: str | None = None,
         triggered_schedule_id: str | None = None,
+        interrupt_discarded_count: int | None = None,
     ) -> str:
         snapshot = build_context_snapshot(
             session_id=state.session_id,
@@ -3397,7 +3423,15 @@ class TelegramBot:
             context_window_estimate_tokens=self._config.context_window_estimate_tokens,
             cwd=self._config.vault_path,
         )
-        lines = [format_context_snapshot_compact(snapshot)]
+        lines: list[str] = []
+        if interrupt_discarded_count is not None:
+            if interrupt_discarded_count > 0:
+                lines.append(
+                    f"interrupted; {interrupt_discarded_count} queued messages discarded"
+                )
+            else:
+                lines.append("interrupted")
+        lines.append(format_context_snapshot_compact(snapshot))
         if subtask_status:
             lines.append(f"subtask: {subtask_status}")
         if return_to_parent_link:
@@ -3783,7 +3817,14 @@ class TelegramBot:
         route: TelegramRoute,
         args: list[str],
     ) -> tuple[list[TelegramSessionState], bool]:
-        apply_all = len(args) == 1 and args[0].strip().lower() == "all"
+        normalized_arg = ""
+        if len(args) == 1:
+            normalized_arg = args[0].strip().lower()
+            # Telegram control clients sometimes send "/cmd all@botname";
+            # treat that as the same scope selector as "/cmd all".
+            if "@" in normalized_arg:
+                normalized_arg = normalized_arg.split("@", 1)[0].strip()
+        apply_all = len(args) == 1 and normalized_arg == "all"
         if apply_all:
             routes = self._routes_in_chat(route.chat_id)
             if route not in routes:
@@ -3987,7 +4028,7 @@ class TelegramBot:
     async def handle_stop(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /stop - interrupt current response and pause queued auto-resume."""
+        """Handle /stop - interrupt current response in this topic."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
@@ -3996,12 +4037,22 @@ class TelegramBot:
         await self._ensure_background_poller(context.bot)
         route = self._route_for_message(update.effective_message)
         states, apply_all = self._command_targets(route=route, args=context.args)
+        interrupt_sent = 0
         for state in states:
             state.last_bot = context.bot
-            state.hook_state.interrupt_flag = True
-            state.hook_state.pause_queue_delivery = True
-            self._mark_task_terminal_request(state.route, "stopped")
-        logger.info("Interrupt via /stop from user %d all=%s", update.effective_user.id, apply_all)
+            if await self._request_route_interrupt(state):
+                interrupt_sent += 1
+            if apply_all:
+                await self._cancel_route_fork_tasks(state.route, status="stopped")
+            else:
+                self._mark_child_task_terminal_request(state.route, "stopped")
+        logger.info(
+            "Interrupt via /stop from user %d all=%s sdk_interrupts=%d/%d",
+            update.effective_user.id,
+            apply_all,
+            interrupt_sent,
+            len(states),
+        )
         await self._send_system_message(
             route=route,
             bot=context.bot,
@@ -4289,21 +4340,54 @@ class TelegramBot:
             pending_messages=pending_messages,
         )
 
+        def _store_remaining_pending() -> None:
+            nonlocal interrupt_discarded_count
+            remaining = runner.remaining_pending
+            if state.hook_state.interrupt_requested:
+                interrupt_discarded_count = len(remaining)
+                if remaining:
+                    logger.info(
+                        "[run_and_send] Dropping %d pending queued message(s) after /stop route=%s",
+                        len(remaining),
+                        state.route,
+                    )
+                state.pending_messages = []
+                return
+            state.pending_messages = remaining
+
         turn_items: list[TextEvent | StatusEvent] = []
         deferred_bindings: list[tuple[int, str, str]] = []
         completion_sent = False
         event_count = 0
         turn_count = 0
         latest_turn_uuid: str | None = None
+        interrupt_discarded_count: int | None = None
         captured_text_parts: list[str] = []
         failed = False
         error_text: str | None = None
         state.busy = True
         state.hook_state.execution_active = True
         state.last_bot = bot
+        state.hook_state.interrupt_requested = False
         state.hook_state.pause_queue_delivery = False
+        run_user_text = user_text
+        if state.hook_state.interrupt_notice_pending:
+            run_user_text = (
+                "(System: The user interrupted your previous response via /stop. "
+                "Any canceled work should remain canceled unless the user explicitly asks to resume it.)\n\n"
+                f"{user_text}"
+            )
+            state.hook_state.interrupt_notice_pending = False
         trigger_status_ids = list(trigger_status_message_ids or [])
         trigger_user_mapped = False
+
+        def _completion_interrupt_count() -> int | None:
+            if interrupt_discarded_count is not None:
+                return interrupt_discarded_count
+            if state.hook_state.interrupt_requested:
+                return 0
+            return None
+
         logger.info(
             "[run_and_send] START route=%s msg=%s",
             state.route, user_text[:80],
@@ -4325,7 +4409,7 @@ class TelegramBot:
             working_message_id = self._sent_message_id(working_message) if working_message is not None else None
             if isinstance(working_message_id, int):
                 trigger_status_ids.append(working_message_id)
-            async for event in runner.run(user_text):
+            async for event in runner.run(run_user_text):
                 event_count += 1
                 self._flush_deferred_bindings(
                     route=state.route,
@@ -4339,6 +4423,24 @@ class TelegramBot:
                     source="event_loop",
                 )
                 if isinstance(event, TextEvent | StatusEvent):
+                    if (
+                        isinstance(event, StatusEvent)
+                        and event.type == "queue_delivered"
+                        and event.summary.strip().lower() == "queued message delivered"
+                    ):
+                        try:
+                            queued_working_message = await self._send_system_message(
+                                route=state.route,
+                                bot=bot,
+                                text="working",
+                                disable_notification=True,
+                                max_attempts=1,
+                            )
+                            queued_working_message_id = self._sent_message_id(queued_working_message)
+                            if isinstance(queued_working_message_id, int):
+                                trigger_status_ids.append(queued_working_message_id)
+                        except Exception:
+                            logger.debug("Failed to send queued-delivery working marker", exc_info=True)
                     if isinstance(event, TextEvent) and event.text:
                         captured_text_parts.append(event.text)
                     turn_items.append(event)
@@ -4443,7 +4545,7 @@ class TelegramBot:
                         latest_turn_uuid=latest_turn_uuid,
                         source="done_event",
                     )
-                    state.pending_messages = runner.remaining_pending
+                    _store_remaining_pending()
                     await self._flush_observability_buffer(route=state.route, bot=bot)
                     if not suppress_completion_summary and self._should_emit_completion_summary(state):
                         if triggered_schedule_id is None:
@@ -4457,9 +4559,11 @@ class TelegramBot:
                             text=self._build_completion_summary(
                                 state,
                                 triggered_schedule_id=triggered_schedule_id,
+                                interrupt_discarded_count=_completion_interrupt_count(),
                             ),
                             disable_notification=False,
                             reply_to_message_id=reply_to_message_id,
+                            priority=_PRIORITY_ASSISTANT,
                         )
                         summary_message_id = self._sent_message_id(summary_message)
                         latest_uuid = latest_turn_uuid or self._session_heads.get(
@@ -4486,7 +4590,7 @@ class TelegramBot:
                         completion_sent = True
                     break
 
-            state.pending_messages = runner.remaining_pending
+            _store_remaining_pending()
             self._flush_deferred_bindings(
                 route=state.route,
                 deferred_bindings=deferred_bindings,
@@ -4516,9 +4620,11 @@ class TelegramBot:
                     text=self._build_completion_summary(
                         state,
                         triggered_schedule_id=triggered_schedule_id,
+                        interrupt_discarded_count=_completion_interrupt_count(),
                     ),
                     disable_notification=False,
                     reply_to_message_id=reply_to_message_id,
+                    priority=_PRIORITY_ASSISTANT,
                 )
                 summary_message_id = self._sent_message_id(summary_message)
                 latest_uuid = latest_turn_uuid or self._session_heads.get(
@@ -4573,6 +4679,7 @@ class TelegramBot:
         finally:
             state.busy = False
             state.hook_state.execution_active = False
+            state.hook_state.interrupt_requested = False
             try:
                 await self._flush_observability_buffer(route=state.route, bot=bot)
             except Exception:
@@ -4596,9 +4703,11 @@ class TelegramBot:
                         text=self._build_completion_summary(
                             state,
                             triggered_schedule_id=triggered_schedule_id,
+                            interrupt_discarded_count=_completion_interrupt_count(),
                         ),
                         disable_notification=False,
                         reply_to_message_id=reply_to_message_id,
+                        priority=_PRIORITY_ASSISTANT,
                     )
                     summary_message_id = self._sent_message_id(summary_message)
                     latest_uuid = latest_turn_uuid or self._session_heads.get(
@@ -4820,6 +4929,11 @@ class TelegramBot:
                         continue
                     if state.busy or state.hook_state.pause_queue_delivery:
                         continue
+                    if self._chat_pending_ops.get(state.route.chat_id, 0) > 0:
+                        # Keep model-visible queue delivery behind Telegram transport drain.
+                        # Otherwise the model can process queued updates before users have
+                        # seen prior assistant messages still pending delivery.
+                        continue
 
                     queued = _drain_queue(state.hook_state.message_queue)
                     has_pending = bool(state.pending_messages)
@@ -4837,7 +4951,11 @@ class TelegramBot:
                         state.route, len(queued), len(state.pending_messages),
                     )
                     async with lock:
-                        if state.busy or state.hook_state.pause_queue_delivery:
+                        if (
+                            state.busy
+                            or state.hook_state.pause_queue_delivery
+                            or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
+                        ):
                             for message in queued:
                                 state.hook_state.message_queue.put_nowait(message)
                             continue
@@ -5266,6 +5384,8 @@ class TelegramBot:
         elapsed_seconds: float | None = None,
         idle_seconds: float | None = None,
     ) -> None:
+        if phase in {"running", "idle"}:
+            return
         if record.is_fork:
             return
         if parent_state is None or parent_state.last_bot is None:
@@ -6443,30 +6563,98 @@ async def _set_bot_commands(app: Application) -> None:
     ])
 
 
-async def run_telegram_bot(config: OBSConfig) -> None:
-    """Start the Telegram bot (blocking)."""
+_TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS = 0.5
+_TELEGRAM_RUNTIME_RESTART_BASE_SECONDS = 1.0
+_TELEGRAM_RUNTIME_RESTART_MAX_SECONDS = 30.0
+
+
+async def _shutdown_telegram_runtime(*, app: Application, tg_bot: TelegramBot) -> None:
+    """Best-effort shutdown for Telegram runtime resources."""
+    try:
+        await tg_bot.shutdown()
+    except Exception:
+        logger.warning("Telegram bot runtime shutdown failed", exc_info=True)
+
+    try:
+        updater = app.updater
+        if updater is not None and updater.running:
+            await updater.stop()
+    except Exception:
+        logger.warning("Telegram updater stop failed", exc_info=True)
+
+    try:
+        if app.running:
+            await app.stop()
+    except Exception:
+        logger.warning("Telegram application stop failed", exc_info=True)
+
+    try:
+        await app.shutdown()
+    except Exception:
+        logger.warning("Telegram application shutdown failed", exc_info=True)
+
+
+async def _run_telegram_bot_once(config: OBSConfig) -> None:
+    """Run one Telegram runtime instance until cancellation or runtime failure."""
     app = create_telegram_app(config)
     tg_bot: TelegramBot = app.bot_data["obs_telegram_bot"]
 
     logger.info("Starting Telegram bot...")
-    await tg_bot.initialize_runtime()
-    await app.initialize()
-    await tg_bot._ensure_background_poller(app.bot)
-    await _set_bot_commands(app)
-    await app.start()
-    drop_pending_updates = (
-        (os.environ.get("OBS_TELEGRAM_DROP_PENDING_UPDATES") or "").strip().lower()
-        in {"1", "true", "yes", "on"}
-    )
-    await app.updater.start_polling(drop_pending_updates=drop_pending_updates)
-
-    stop_event = asyncio.Event()
     try:
-        await stop_event.wait()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
+        await tg_bot.initialize_runtime()
+        await app.initialize()
+        await tg_bot._ensure_background_poller(app.bot)
+        await _set_bot_commands(app)
+        await app.start()
+        drop_pending_updates = (
+            (os.environ.get("OBS_TELEGRAM_DROP_PENDING_UPDATES") or "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        await app.updater.start_polling(drop_pending_updates=drop_pending_updates)
+
+        while True:
+            await asyncio.sleep(_TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS)
+            updater_running = app.updater.running if app.updater is not None else False
+            if not app.running or not updater_running:
+                raise RuntimeError(
+                    "Telegram runtime stopped unexpectedly: "
+                    f"app.running={app.running} updater.running={updater_running}"
+                )
     finally:
-        await tg_bot.shutdown()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        await _shutdown_telegram_runtime(app=app, tg_bot=tg_bot)
+
+
+def _is_fatal_telegram_runtime_error(exc: Exception) -> bool:
+    """Errors that should fail fast rather than trigger restart loops."""
+    return isinstance(exc, ValueError)
+
+
+async def run_telegram_bot(config: OBSConfig) -> None:
+    """Start Telegram bot with runtime supervision and bounded backoff restart."""
+    restart_count = 0
+    while True:
+        try:
+            await _run_telegram_bot_once(config)
+            logger.warning("Telegram runtime exited unexpectedly; scheduling restart")
+        except KeyboardInterrupt:
+            logger.info("Telegram runtime interrupted; exiting")
+            return
+        except asyncio.CancelledError:
+            logger.info("Telegram runtime cancelled; exiting")
+            raise
+        except Exception as exc:
+            if _is_fatal_telegram_runtime_error(exc):
+                raise
+            logger.exception("Telegram runtime crashed; scheduling restart")
+
+        restart_count += 1
+        delay_seconds = min(
+            _TELEGRAM_RUNTIME_RESTART_MAX_SECONDS,
+            _TELEGRAM_RUNTIME_RESTART_BASE_SECONDS * (2 ** min(restart_count - 1, 5)),
+        )
+        logger.warning(
+            "Restarting Telegram runtime in %.1fs (attempt=%d)",
+            delay_seconds,
+            restart_count,
+        )
+        await asyncio.sleep(delay_seconds)

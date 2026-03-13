@@ -94,6 +94,89 @@ class TestPreToolUseImmutableGuard:
         assert "deny" in str(result).lower() or result.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
 
 
+# --- PreToolUse Guard: Native Tool Denylist ---
+
+
+class TestPreToolUseNativeToolGuard:
+    """PreToolUse hook blocks native tools superseded by OBS tools."""
+
+    def test_blocks_native_task_tool(self, config):
+        result = on_pre_tool_use(
+            tool_name="Task",
+            tool_input={"prompt": "run in background"},
+            config=config,
+        )
+        assert result is not None
+        assert result["decision"] == "block"
+        assert "systemMessage" in result
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "AgentTask" in reason
+
+    def test_blocks_native_task_tool_with_mcp_prefix(self, config):
+        result = on_pre_tool_use(
+            tool_name="mcp__native__TaskOutput",
+            tool_input={"task_id": "abc"},
+            config=config,
+        )
+        assert result is not None
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "AgentTaskOutput" in reason
+
+    def test_blocks_native_inbox_send_tool(self, config):
+        result = on_pre_tool_use(
+            tool_name="SendMessage",
+            tool_input={"recipient": "worker-a", "content": "hello"},
+            config=config,
+        )
+        assert result is not None
+        assert result["decision"] == "block"
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "SendInboxMessage" in reason
+        assert "ReadInbox" in reason
+
+    def test_blocks_native_inbox_read_tool(self, config):
+        result = on_pre_tool_use(
+            tool_name="ReadMessages",
+            tool_input={"limit": 10},
+            config=config,
+        )
+        assert result is not None
+        assert result["decision"] == "block"
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "SendInboxMessage" in reason
+        assert "ReadInbox" in reason
+
+    def test_blocks_enter_plan_mode(self, config):
+        result = on_pre_tool_use(
+            tool_name="EnterPlanMode",
+            tool_input={},
+            config=config,
+        )
+        assert result is not None
+        assert result["decision"] == "block"
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "EnterPlanMode" in reason
+
+    def test_allows_obs_inbox_tools(self, config):
+        send_result = on_pre_tool_use(
+            tool_name="SendInboxMessage",
+            tool_input={"team_name": "t", "recipient": "r", "content": "x"},
+            config=config,
+        )
+        read_result = on_pre_tool_use(
+            tool_name="ReadInbox",
+            tool_input={"team_name": "t", "agent": "a"},
+            config=config,
+        )
+        assert send_result is None or send_result == {}
+        assert read_result is None or read_result == {}
+
+
 # --- PreToolUse Guard: Allowed Operations ---
 
 
@@ -468,6 +551,20 @@ class TestCheckImmutableGuard:
         result = await check(inp, "tu-123", _EMPTY_CONTEXT)
         assert result is not None
         assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    @pytest.mark.asyncio
+    async def test_deny_native_task_tools(self, config):
+        """Denies native Task tools so AgentTask tooling is always used."""
+        check = _make_immutable_check(config)
+        inp = _make_pre_tool_use_input(
+            tool_name="TaskStop",
+            tool_input={"task_id": "native-task-1"},
+        )
+        result = await check(inp, "tu-123", _EMPTY_CONTEXT)
+        assert result is not None
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "AgentTaskStop" in reason
 
     @pytest.mark.asyncio
     async def test_ignores_non_pretooluse_events(self, config):

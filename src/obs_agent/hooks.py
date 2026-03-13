@@ -1,6 +1,6 @@
 """SDK hooks for OBS Agent.
 
-- PreToolUse: guards immutable files and .env from writes
+- PreToolUse: guards immutable files/.env writes and blocks native tools
 - Stop: triggers memory extraction via fork
 - PreCompact: triggers extraction then denies compaction (D022)
 - HookPipeline: extensible middleware that chains check functions
@@ -40,16 +40,63 @@ _READ_TOOLS = {"Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch"}
 # File patterns that are always blocked from writes (beyond config immutable_patterns)
 _BLOCKED_FILE_PATTERNS = [".env"]
 
+# Native delegation tools are blocked so orchestration is forced through
+# OBS-managed AgentTask/ForkTask tooling.
+_BLOCKED_NATIVE_TASK_TOOLS = {"Task", "TaskOutput", "TaskStop"}
 
-def _deny(reason: str) -> dict:
+# Native team inbox tools are blocked so worker messaging is forced through
+# OBS-managed SendInboxMessage/ReadInbox implementations.
+_BLOCKED_NATIVE_INBOX_TOOLS = {
+    "SendMessage",
+    "ReadMessage",
+    "ReadMessages",
+    "ListMessages",
+    "GetMessages",
+    "ReceiveMessages",
+}
+
+# Native runtime mode toggles are blocked in Telegram runtime.
+_BLOCKED_NATIVE_MODE_TOOLS = {
+    "EnterPlanMode",
+}
+
+
+def _normalize_tool_name(tool_name: str) -> str:
+    """Normalize tool names from hook payloads.
+
+    SDK hook payloads may report MCP tools as ``mcp__server__ToolName``.
+    We normalize those to ``ToolName`` so deny/allow checks remain stable.
+    """
+    normalized = tool_name.strip()
+    if normalized.startswith("mcp__"):
+        parts = normalized.split("__", 2)
+        if len(parts) == 3 and parts[2]:
+            return parts[2]
+    return normalized
+
+
+def _deny(
+    reason: str,
+    *,
+    additional_context: str | None = None,
+    show_system_message: bool = False,
+) -> dict:
     """Return a deny hook response with reason."""
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
+    hook_output: dict[str, Any] = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
     }
+    if additional_context:
+        hook_output["additionalContext"] = additional_context
+    payload: dict[str, Any] = {
+        "decision": "block",
+        "reason": reason,
+        "hookSpecificOutput": hook_output,
+    }
+    if show_system_message:
+        payload["systemMessage"] = reason
+    return payload
 
 
 def on_pre_tool_use(
@@ -58,12 +105,46 @@ def on_pre_tool_use(
     *,
     config: OBSConfig,
 ) -> dict | None:
-    """Guard hook: block writes to immutable files and .env.
+    """Guard hook: block disallowed native tools and protected writes.
 
     Returns None to allow, or a deny dict to block.
     """
+    normalized_tool_name = _normalize_tool_name(tool_name)
+
+    if normalized_tool_name in _BLOCKED_NATIVE_TASK_TOOLS:
+        return _deny(
+            "Blocked by platform policy: native Task tools are disabled in Telegram runtime. "
+            "Use AgentTask, AgentTaskOutput, and AgentTaskStop instead.",
+            additional_context=(
+                "System: Native Task tools are disabled by platform policy in Telegram runtime. "
+                "Do not retry Task/TaskOutput/TaskStop; switch to AgentTask tools."
+            ),
+            show_system_message=True,
+        )
+
+    if normalized_tool_name in _BLOCKED_NATIVE_INBOX_TOOLS:
+        return _deny(
+            "Blocked by platform policy: native team messaging tools are disabled in Telegram runtime. "
+            "Use SendInboxMessage and ReadInbox instead.",
+            additional_context=(
+                "System: Native team messaging tools are disabled by platform policy in Telegram runtime. "
+                "Use SendInboxMessage and ReadInbox."
+            ),
+            show_system_message=True,
+        )
+
+    if normalized_tool_name in _BLOCKED_NATIVE_MODE_TOOLS:
+        return _deny(
+            "Blocked by platform policy: EnterPlanMode is disabled in Telegram runtime.",
+            additional_context=(
+                "System: EnterPlanMode is not available in Telegram runtime. "
+                "Continue in normal execution mode."
+            ),
+            show_system_message=True,
+        )
+
     # Only guard write-mutating tools
-    if tool_name not in _WRITE_TOOLS:
+    if normalized_tool_name not in _WRITE_TOOLS:
         return None
 
     file_path_str = tool_input.get("file_path", "")
@@ -132,6 +213,8 @@ class HookState:
     message_queue: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
     status_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     interrupt_flag: bool = False
+    interrupt_requested: bool = False
+    interrupt_notice_pending: bool = False
     pause_queue_delivery: bool = False
     session_id: str | None = None
     background_tasks: set[asyncio.Task] = field(default_factory=set)
@@ -172,6 +255,8 @@ class HookState:
                 task.cancel()
         self.background_tasks.clear()
         self.interrupt_flag = False
+        self.interrupt_requested = False
+        self.interrupt_notice_pending = False
         self.pause_queue_delivery = False
         self.session_id = None
         self.last_result_data = None
@@ -228,15 +313,27 @@ class HookPipeline:
 
             # Check for short-circuit: permissionDecision is "deny"
             if hso and hso.get("permissionDecision") == "deny":
-                if accumulated_context:
-                    merged.setdefault("hookSpecificOutput", {})
-                    merged["hookSpecificOutput"]["hookEventName"] = event_name
-                    merged["hookSpecificOutput"]["additionalContext"] = "\n\n".join(accumulated_context)
-                merged.setdefault("hookSpecificOutput", {})
-                merged["hookSpecificOutput"]["hookEventName"] = event_name
-                merged["hookSpecificOutput"]["permissionDecision"] = "deny"
+                for key in (
+                    "continue_",
+                    "suppressOutput",
+                    "stopReason",
+                    "decision",
+                    "systemMessage",
+                    "reason",
+                ):
+                    if key in result:
+                        merged[key] = result[key]
+                merged_hso: dict[str, Any] = {
+                    "hookEventName": event_name,
+                    "permissionDecision": "deny",
+                }
                 if "permissionDecisionReason" in hso:
-                    merged["hookSpecificOutput"]["permissionDecisionReason"] = hso["permissionDecisionReason"]
+                    merged_hso["permissionDecisionReason"] = hso["permissionDecisionReason"]
+                if "updatedInput" in hso:
+                    merged_hso["updatedInput"] = hso["updatedInput"]
+                if accumulated_context:
+                    merged_hso["additionalContext"] = "\n\n".join(accumulated_context)
+                merged["hookSpecificOutput"] = merged_hso
                 return merged
 
         # No short-circuit — return accumulated context if any
@@ -263,9 +360,17 @@ def _make_interrupt_check(state: HookState) -> CheckFn:
     ) -> SyncHookJSONOutput | None:
         if state.interrupt_flag:
             state.interrupt_flag = False
+            state.interrupt_notice_pending = True
             return {
                 "continue_": False,
                 "stopReason": "Interrupted by user",
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": (
+                        "System: The user interrupted your previous response via /stop. "
+                        "Stop current work immediately and wait for the next user message."
+                    ),
+                },
             }
         return None
 
@@ -275,6 +380,7 @@ def _make_interrupt_check(state: HookState) -> CheckFn:
 def _make_immutable_check(config: OBSConfig) -> CheckFn:
     """Create a check that wraps on_pre_tool_use() into SDK callback format.
 
+    Handles native-tool denylists and immutable-write guards.
     Only meaningful for PreToolUse events — returns None for other events.
     """
 
@@ -294,8 +400,7 @@ def _make_immutable_check(config: OBSConfig) -> CheckFn:
         if result is None:
             return None
 
-        # Convert the existing deny dict to SyncHookJSONOutput format
-        return {"hookSpecificOutput": result.get("hookSpecificOutput", {})}
+        return result
 
     return _check
 
@@ -467,7 +572,7 @@ def create_hook_matchers(
 ) -> dict[str, list[HookMatcher]]:
     """Build hook matcher dict ready for ClaudeAgentOptions(hooks=...).
 
-    PreToolUse pipeline: interrupt check -> immutable guard -> queue check
+    PreToolUse pipeline: interrupt check -> native/immutable guard -> queue check
     PostToolUse pipeline: queue check
     """
     interrupt_check = _make_interrupt_check(state)

@@ -27,6 +27,12 @@ logger = logging.getLogger("obs_agent.session")
 
 ensure_raw_uuid_patch()
 
+_DEFAULT_SDK_ENV: dict[str, str] = {
+    # Disable optional background/product traffic in Claude Code subprocesses.
+    # This reduces daemon fragility from non-essential SDK side-channels.
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+}
+
 
 class SessionManager:
     """Manages agent session lifecycle via ClaudeSDKClient.
@@ -98,13 +104,18 @@ class SessionManager:
         # for background fork result delivery
         tool_server = create_obs_tools(self.config, lambda: self._session_id, hook_state=self.hook_state)
 
+        effective_env = {
+            **_DEFAULT_SDK_ENV,
+            **self._sdk_env_overrides,
+        }
+
         options = ClaudeAgentOptions(
             hooks=hook_matchers,
             mcp_servers={"obs-agent": tool_server},
             cwd=str(self.config.vault_path),
             permission_mode="bypassPermissions",
             setting_sources=["project"],
-            env=self._sdk_env_overrides.copy(),
+            env=effective_env,
             max_buffer_size=self.config.max_buffer_size,
         )
 

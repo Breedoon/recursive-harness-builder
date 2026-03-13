@@ -723,7 +723,7 @@ class TestTelegramLiveForumTopics:
         assert f"ALIVE-{tag}" in topic_b_alive.text, live_tg_forum.failure_context()
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
 
-    async def test_live_stop_pauses_auto_resume_until_new_message(
+    async def test_live_stop_interrupts_and_topic_stays_responsive(
         self,
         live_tg_forum: _LiveForumHarness,
     ) -> None:
@@ -760,7 +760,6 @@ class TestTelegramLiveForumTopics:
         assert "interrupt sent" in stop_trace.output.lower(), live_tg_forum.failure_context()
 
         await live_tg_forum.platform.wait_for_prompt(thread_id=thread_id, timeout=180.0)
-        await live_tg_forum.platform.wait_for_silence(thread_id=thread_id, seconds=8.0)
 
         resume_trace = await live_tg_forum.platform.send(
             (
@@ -1744,7 +1743,7 @@ class TestTelegramLiveForumTopics:
             f"{live_tg_forum.failure_context()}"
         )
 
-    async def test_live_native_task_vs_fork_task_parity_semantics(
+    async def test_live_native_task_is_denied_while_fork_task_remains_available(
         self,
         live_tg_forum: _LiveForumHarness,
     ) -> None:
@@ -1754,18 +1753,12 @@ class TestTelegramLiveForumTopics:
         native_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
         await live_tg_forum.platform.send(
             (
-                "This is a deterministic parity integration test. "
-                "Use the native Task tool exactly once with run_in_background=true and description "
+                "This is a deterministic policy integration test. "
+                "Call the native Task tool exactly once with run_in_background=true and description "
                 f"NATIVE-{tag}. "
-                f"Task prompt: 'Use Bash to run sleep 20 and then respond with only NATIVE-DONE-{tag}.' "
-                "Do not call tools in parallel; execute exactly one tool call at a time and wait for each result. "
-                "Capture the returned agentId. Then, in this same turn: "
-                "call TaskOutput with block=false timeout=1 on that agentId; "
-                "call TaskStop on that agentId; "
-                "call TaskStop again on that agentId; "
-                "call TaskOutput again with block=false timeout=1. "
-                "Now classify results into this schema: "
-                '{"task_available":bool,"launch_ok":bool,"first_output":"not_ready|no_task|other","second_stop":"killed|no_task|other","final_output":"no_task|sibling_error|other"}. '
+                "Do not call other native Task* tools. "
+                "Classify the outcome into this schema: "
+                '{"task_available":bool,"launch_ok":bool,"blocked":bool}. '
                 f"Reply with exactly one line: NATIVE-PARITY-{tag}: <json>"
             ),
             require_done=False,
@@ -1779,11 +1772,9 @@ class TestTelegramLiveForumTopics:
             timeout=360.0,
         )
         native_payload = _extract_json_object(native_line.text)
-        assert native_payload.get("task_available") is True, live_tg_forum.failure_context()
-        assert native_payload.get("launch_ok") is True, live_tg_forum.failure_context()
-        assert native_payload.get("first_output") in {"not_ready", "no_task"}, live_tg_forum.failure_context()
-        assert native_payload.get("second_stop") in {"killed", "no_task"}, live_tg_forum.failure_context()
-        assert native_payload.get("final_output") in {"no_task", "sibling_error"}, live_tg_forum.failure_context()
+        assert native_payload.get("launch_ok") is False, live_tg_forum.failure_context()
+        assert native_payload.get("blocked") is True, live_tg_forum.failure_context()
+        assert isinstance(native_payload.get("task_available"), bool), live_tg_forum.failure_context()
 
         fork_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
         await live_tg_forum.platform.send(
@@ -1828,7 +1819,7 @@ class TestTelegramLiveForumTopics:
         await live_tg_forum.platform.send(
             (
                 "This is a deterministic parity integration test. "
-                "Execute one short native Task and one short ForkTask run first. "
+                "Attempt one native Task launch and one short ForkTask run first. "
                 f"Native Task description REPORT-NATIVE-{tag}, prompt 'Reply with only REPORT-NATIVE-DONE-{tag}'. "
                 f"ForkTask description REPORT-FORK-{tag}, prompt 'Reply with only REPORT-FORK-DONE-{tag}', run_in_background='true'. "
                 "After both are launched, compare usability and behavior from your own tool-caller perspective. "

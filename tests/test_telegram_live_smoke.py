@@ -14,6 +14,7 @@ import pytest
 from tests.evals.platform_telegram_forum import TelegramForumPlatform
 from tests.test_telegram_live_forum_topics import (
     _extract_agent_id,
+    _extract_json_object,
     _extract_topic_link,
     _reset_general,
     _send_and_wait_for_token,
@@ -167,20 +168,6 @@ class TestTelegramLiveSmoke:
             token="agent task launched",
             timeout=240.0,
         )
-        await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=parent_thread_id,
-            after_message_id=fresh_baseline,
-            token="notification: agent task running",
-            timeout=300.0,
-        )
-        await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=parent_thread_id,
-            after_message_id=fresh_baseline,
-            token="notification: agent task idle",
-            timeout=360.0,
-        )
         fresh_thread_id, _ = _extract_topic_link(fresh_launch.text)
         fresh_done = await _wait_for_message_containing(
             live_tg_forum,
@@ -195,6 +182,411 @@ class TestTelegramLiveSmoke:
             thread_id=parent_thread_id,
         )
         assert parent_session_after == parent_session_before, live_tg_forum.failure_context()
+
+    async def test_live_smoke_stop_all_interrupts_parent_and_delegated_tasks(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        parent_thread_id = await live_tg_forum.platform.create_topic(f"Smoke StopAll {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only STOP-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"STOP-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        setup_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic smoke stop-all test. "
+                "Do not call tools in parallel; execute exactly one tool call at a time. "
+                "Use AgentTask exactly twice with fork=true and run_in_background=true. "
+                f"First AgentTask description STOP-A-{tag}, prompt "
+                f"'Use Bash to run sleep 180 and then reply with only CHILD-A-LATE-{tag}.' "
+                f"Second AgentTask description STOP-B-{tag}, prompt "
+                f"'Use Bash to run sleep 180 and then reply with only CHILD-B-LATE-{tag}.' "
+                "Capture the returned handles and reply with exactly one line in this schema: "
+                f'STOP-SETUP-{tag}: {{"child_task_ids":["<id1>","<id2>"]}}'
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=240.0,
+        )
+        setup_line = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=setup_baseline,
+            token=f"STOP-SETUP-{tag}:",
+            timeout=360.0,
+        )
+        setup_payload = _extract_json_object(setup_line.text)
+        child_ids_raw = setup_payload.get("child_task_ids")
+        assert isinstance(child_ids_raw, list), live_tg_forum.failure_context()
+        child_task_ids = [
+            str(value).strip()
+            for value in child_ids_raw
+            if str(value).strip()
+        ]
+        assert len(child_task_ids) >= 2, live_tg_forum.failure_context()
+
+        deadline = asyncio.get_running_loop().time() + 180.0
+        child_threads: set[int] = set()
+        while asyncio.get_running_loop().time() < deadline and len(child_threads) < 2:
+            recent = await live_tg_forum.platform.get_recent_messages(
+                thread_id=parent_thread_id,
+                limit=200,
+            )
+            for msg in recent:
+                if msg.message_id <= setup_baseline:
+                    continue
+                if "fork task launched" not in msg.text.lower():
+                    continue
+                try:
+                    thread_id, _ = _extract_topic_link(msg.text)
+                except AssertionError:
+                    continue
+                child_threads.add(thread_id)
+            if len(child_threads) < 2:
+                await asyncio.sleep(1.0)
+        assert len(child_threads) >= 2, live_tg_forum.failure_context()
+
+        forbidden_tokens = [
+            f"PARENT-ALL-LATE-{tag}",
+            f"CHILD-A-LATE-{tag}",
+            f"CHILD-B-LATE-{tag}",
+        ]
+        child_late_tokens = [
+            f"CHILD-A-LATE-{tag}",
+            f"CHILD-B-LATE-{tag}",
+        ]
+        inspected_threads = {parent_thread_id, *child_threads}
+
+        parent_busy_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        await live_tg_forum.platform.send_nowait(
+            (
+                "This is a deterministic smoke stop-all test. "
+                f"Use Bash to run sleep 180, then reply with only PARENT-ALL-LATE-{tag}."
+            ),
+            thread_id=parent_thread_id,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=parent_busy_baseline,
+            token="working",
+            timeout=120.0,
+        )
+
+        stop_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        stop_trace = await live_tg_forum.platform.send_control(
+            f"/stop@{live_tg_forum.bot_username} all",
+            thread_id=parent_thread_id,
+            timeout=120.0,
+        )
+        normalized_stop = stop_trace.output.lower()
+        assert (
+            "interrupt sent to all topics" in normalized_stop
+            or "interrupt sent" in normalized_stop
+        ), live_tg_forum.failure_context()
+
+        for child_thread_id in sorted(child_threads):
+            child_recent = await live_tg_forum.platform.get_recent_messages(
+                thread_id=child_thread_id,
+                limit=200,
+            )
+            completed_before_stop = any(
+                message.message_id <= stop_baseline
+                and any(token in message.text for token in child_late_tokens)
+                for message in child_recent
+            )
+            if completed_before_stop:
+                continue
+            stopped = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=child_thread_id,
+                token="fork task stopped",
+                timeout=300.0,
+            )
+            assert "fork task stopped" in stopped.text.lower(), live_tg_forum.failure_context()
+
+        for thread_id in inspected_threads:
+            recent = await live_tg_forum.platform.get_recent_messages(thread_id=thread_id, limit=200)
+            for token in forbidden_tokens:
+                assert not any(
+                    message.message_id > stop_baseline and token in message.text
+                    for message in recent
+                ), live_tg_forum.failure_context()
+
+    async def test_live_smoke_stop_interrupts_parent_but_not_delegated_children(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        parent_thread_id = await live_tg_forum.platform.create_topic(f"Smoke StopSingle {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only STOP-SINGLE-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"STOP-SINGLE-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        setup_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic smoke stop test. "
+                "Do not call tools in parallel; execute exactly one tool call at a time. "
+                "Use AgentTask exactly twice with fork=true and run_in_background=true. "
+                f"First AgentTask description SINGLE-A-{tag}, prompt "
+                f"'Use Bash to run sleep 45 and then reply with only CHILD-SINGLE-A-DONE-{tag}.' "
+                f"Second AgentTask description SINGLE-B-{tag}, prompt "
+                f"'Use Bash to run sleep 45 and then reply with only CHILD-SINGLE-B-DONE-{tag}.' "
+                "Capture the returned handles and reply with exactly one line in this schema: "
+                f'STOP-SINGLE-SETUP-{tag}: {{"child_task_ids":["<id1>","<id2>"]}}'
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=240.0,
+        )
+        setup_line = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=setup_baseline,
+            token=f"STOP-SINGLE-SETUP-{tag}:",
+            timeout=360.0,
+        )
+        setup_payload = _extract_json_object(setup_line.text)
+        child_ids_raw = setup_payload.get("child_task_ids")
+        assert isinstance(child_ids_raw, list), live_tg_forum.failure_context()
+        child_task_ids = [
+            str(value).strip()
+            for value in child_ids_raw
+            if str(value).strip()
+        ]
+        assert len(child_task_ids) >= 2, live_tg_forum.failure_context()
+
+        child_threads: set[int] = set()
+        deadline = asyncio.get_running_loop().time() + 180.0
+        while asyncio.get_running_loop().time() < deadline and len(child_threads) < 2:
+            recent = await live_tg_forum.platform.get_recent_messages(
+                thread_id=parent_thread_id,
+                limit=200,
+            )
+            for msg in recent:
+                if msg.message_id <= setup_baseline:
+                    continue
+                if "fork task launched" not in msg.text.lower():
+                    continue
+                try:
+                    thread_id, _ = _extract_topic_link(msg.text)
+                except AssertionError:
+                    continue
+                child_threads.add(thread_id)
+            if len(child_threads) < 2:
+                await asyncio.sleep(1.0)
+        assert len(child_threads) >= 2, live_tg_forum.failure_context()
+
+        parent_busy_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        await live_tg_forum.platform.send_nowait(
+            (
+                "This is a deterministic smoke stop test. "
+                f"Use Bash to run sleep 35, then reply with only PARENT-SINGLE-LATE-{tag}."
+            ),
+            thread_id=parent_thread_id,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=parent_busy_baseline,
+            token="working",
+            timeout=120.0,
+        )
+
+        stop_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        stop_trace = await live_tg_forum.platform.send_control(
+            f"/stop@{live_tg_forum.bot_username}",
+            thread_id=parent_thread_id,
+            timeout=120.0,
+        )
+        normalized_stop = stop_trace.output.lower()
+        assert "interrupt sent" in normalized_stop, live_tg_forum.failure_context()
+        assert "interrupt sent to all topics" not in normalized_stop, live_tg_forum.failure_context()
+
+        completion_trace = await live_tg_forum.platform.wait_for_prompt_after(
+            after_message_id=stop_baseline,
+            thread_id=parent_thread_id,
+            timeout=240.0,
+            require_done=True,
+        )
+        assert "context:" in completion_trace.output.lower(), live_tg_forum.failure_context()
+
+        child_tokens = [
+            f"CHILD-SINGLE-A-DONE-{tag}",
+            f"CHILD-SINGLE-B-DONE-{tag}",
+        ]
+        for token in child_tokens:
+            found = False
+            wait_deadline = asyncio.get_running_loop().time() + 420.0
+            while asyncio.get_running_loop().time() < wait_deadline and not found:
+                for child_thread_id in sorted(child_threads):
+                    recent = await live_tg_forum.platform.get_recent_messages(
+                        thread_id=child_thread_id,
+                        limit=200,
+                    )
+                    if any(token in message.text for message in recent):
+                        found = True
+                        break
+                if not found:
+                    await asyncio.sleep(1.0)
+            assert found, live_tg_forum.failure_context()
+
+        for child_thread_id in sorted(child_threads):
+            recent = await live_tg_forum.platform.get_recent_messages(thread_id=child_thread_id, limit=200)
+            combined = "\n".join(message.text.lower() for message in recent)
+            assert "fork task stopped" not in combined, live_tg_forum.failure_context()
+
+        forbidden_parent_tokens = [
+            f"PARENT-SINGLE-LATE-{tag}",
+        ]
+        parent_recent = await live_tg_forum.platform.get_recent_messages(
+            thread_id=parent_thread_id,
+            limit=240,
+        )
+        parent_combined = "\n".join(message.text for message in parent_recent)
+        for token in forbidden_parent_tokens:
+            assert token not in parent_combined, live_tg_forum.failure_context()
+
+    async def test_live_smoke_queued_message_gets_working_marker_on_delivery(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        thread_id = await live_tg_forum.platform.create_topic(f"Smoke QueueWorking {tag}")
+
+        start_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
+        await live_tg_forum.platform.send_nowait(
+            (
+                "This is a deterministic queue marker smoke test. "
+                f"Use Bash to run sleep 25, then reply with only QUEUE-FIRST-DONE-{tag}."
+            ),
+            thread_id=thread_id,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_id,
+            after_message_id=start_baseline,
+            token="working",
+            timeout=120.0,
+        )
+
+        queue_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
+        await live_tg_forum.platform.send_nowait(
+            (
+                "This is a deterministic queue marker smoke test. "
+                f"Reply with only QUEUE-SECOND-DONE-{tag}."
+            ),
+            thread_id=thread_id,
+        )
+        received = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_id,
+            after_message_id=queue_baseline,
+            token="received",
+            timeout=120.0,
+        )
+        delivered_working = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_id,
+            after_message_id=received.message_id,
+            token="working",
+            timeout=300.0,
+        )
+        assert delivered_working.message_id > received.message_id, live_tg_forum.failure_context()
+
+        cleanup_stop = await live_tg_forum.platform.send_control(
+            f"/stop@{live_tg_forum.bot_username}",
+            thread_id=thread_id,
+            timeout=120.0,
+        )
+        assert "interrupt sent" in cleanup_stop.output.lower(), live_tg_forum.failure_context()
+        completion = await live_tg_forum.platform.wait_for_prompt_after(
+            after_message_id=received.message_id,
+            thread_id=thread_id,
+            timeout=240.0,
+            require_done=True,
+        )
+        assert "context:" in completion.output.lower(), live_tg_forum.failure_context()
+
+    async def test_live_smoke_stop_completion_is_terminal_marker_under_race(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        thread_id = await live_tg_forum.platform.create_topic(f"Smoke StopOrder {tag}")
+
+        attempts = 5
+        for attempt in range(attempts):
+            run_tag = f"{tag}-{attempt}"
+            busy_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
+            await live_tg_forum.platform.send_nowait(
+                (
+                    "This is a deterministic completion-order race smoke test. "
+                    "Do several tool calls and stay busy: "
+                    "run Bash sleep 35, then reply with only "
+                    f"ORDER-LATE-{run_tag}."
+                ),
+                thread_id=thread_id,
+            )
+            await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=thread_id,
+                after_message_id=busy_baseline,
+                token="working",
+                timeout=120.0,
+            )
+
+            stop_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
+            stop_trace = await live_tg_forum.platform.send_control(
+                f"/stop@{live_tg_forum.bot_username}",
+                thread_id=thread_id,
+                timeout=120.0,
+            )
+            assert "interrupt sent" in stop_trace.output.lower(), live_tg_forum.failure_context()
+            completion_trace = await live_tg_forum.platform.wait_for_prompt_after(
+                after_message_id=stop_baseline,
+                thread_id=thread_id,
+                timeout=240.0,
+                require_done=True,
+            )
+            assert "context:" in completion_trace.output.lower(), live_tg_forum.failure_context()
+
+            await asyncio.sleep(2.0)
+            recent = await live_tg_forum.platform.get_recent_messages(
+                thread_id=thread_id,
+                limit=240,
+            )
+            after_stop = [m for m in recent if m.message_id > stop_baseline]
+            completion_messages = [
+                m for m in after_stop if "context:" in m.text.lower()
+            ]
+            assert completion_messages, live_tg_forum.failure_context()
+            last_completion_id = max(message.message_id for message in completion_messages)
+            trailing = [
+                message for message in after_stop
+                if message.message_id > last_completion_id
+            ]
+            assert not trailing, (
+                f"Found messages after completion marker on attempt {attempt}: {trailing}\n"
+                + live_tg_forum.failure_context()
+            )
 
     async def test_live_smoke_stress_multi_chat_multi_bot_and_collisions(
         self,

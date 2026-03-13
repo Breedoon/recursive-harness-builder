@@ -27,10 +27,12 @@ from obs_agent.telegram import (
     TelegramRoute,
     TelegramBot,
     _ForkTaskRecord,
+    _PRIORITY_ASSISTANT,
     _TopicScheduleRecord,
     _RunOutcome,
     _TelegramMessageBinding,
     create_telegram_app,
+    run_telegram_bot,
 )
 
 # Near-zero gap for fast test execution (real default is 1.0s)
@@ -412,6 +414,38 @@ class TestTelegramMessageFlow:
         calls = [c.kwargs for c in ctx.bot.send_message.call_args_list]
         assert "<i>I should inspect CLAUDE.md first.</i>" in calls[2]["text"]
 
+    async def test_queue_delivery_emits_working_when_queued_message_is_delivered(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        events = [
+            StatusEvent(
+                type="queue_delivered",
+                summary="queued message delivered",
+                count=1,
+                messages=["follow-up while busy"],
+            ),
+            TurnEndEvent(jsonl_uuid="assistant-uuid", message_role="assistant", has_text=False),
+            DoneEvent(),
+        ]
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                _ = msg
+                for event in events:
+                    yield event
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            update = _make_update("test", message_id=42)
+            ctx = _make_context()
+            await bot.handle_message(update, ctx)
+
+        texts = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
+        working_count = sum(1 for text in texts if text == "<u><i>working</i></u>")
+        assert working_count == 2
+
     async def test_notification_status_renders_system_heading_and_cursive_body(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         events = [
@@ -618,6 +652,69 @@ class TestBackgroundPoller:
             assert kwargs["extra_pending"] == [QueuedMessage(text="queued bg result")]
             assert "queued updates arrived while idle" in kwargs["user_text"]
 
+    async def test_auto_delivery_waits_for_transport_backlog_to_drain(self, config):
+        bot = TelegramBot(
+            config,
+            fragment_gap=_TEST_GAP,
+            background_poll_seconds=0.01,
+            enable_background_poller=True,
+        )
+        fake_ptb_bot = MagicMock()
+        fake_ptb_bot.send_message = AsyncMock()
+
+        state = _state(bot)
+        state.last_bot = fake_ptb_bot
+        state.hook_state.message_queue.put_nowait("queued while chat still draining")
+        bot._chat_pending_ops[state.route.chat_id] = 1
+
+        with patch.object(bot, "_run_and_send", new_callable=AsyncMock) as mock_run:
+            await bot._ensure_background_poller(fake_ptb_bot)
+            await asyncio.sleep(0.05)
+            assert mock_run.await_count == 0
+
+            bot._chat_pending_ops.pop(state.route.chat_id, None)
+            await asyncio.sleep(0.06)
+            await bot.shutdown()
+
+            assert mock_run.await_count == 1
+            kwargs = mock_run.call_args.kwargs
+            assert kwargs["state"] is state
+            assert kwargs["extra_pending"] == [QueuedMessage(text="queued while chat still draining")]
+            assert "queued updates arrived while idle" in kwargs["user_text"]
+
+    async def test_auto_delivery_stress_respects_transport_backlog(self, config):
+        bot = TelegramBot(
+            config,
+            fragment_gap=_TEST_GAP,
+            background_poll_seconds=0.005,
+            enable_background_poller=True,
+        )
+        fake_ptb_bot = MagicMock()
+        fake_ptb_bot.send_message = AsyncMock()
+
+        state = _state(bot)
+        state.last_bot = fake_ptb_bot
+        chat_id = state.route.chat_id
+
+        with patch.object(bot, "_run_and_send", new_callable=AsyncMock) as mock_run:
+            await bot._ensure_background_poller(fake_ptb_bot)
+            for attempt in range(8):
+                state.hook_state.message_queue.put_nowait(f"stress-queued-{attempt}")
+                bot._chat_pending_ops[chat_id] = 1
+
+                blocked_count = mock_run.await_count
+                await asyncio.sleep(0.01 + (attempt % 3) * 0.005)
+                assert mock_run.await_count == blocked_count
+
+                bot._chat_pending_ops.pop(chat_id, None)
+                deadline = asyncio.get_running_loop().time() + 0.25
+                while mock_run.await_count == blocked_count and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.005)
+
+                assert mock_run.await_count == blocked_count + 1
+
+            await bot.shutdown()
+
     async def test_run_and_send_preserves_pending_across_session_switch(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         state = _state(bot)
@@ -669,6 +766,166 @@ class TestBackgroundPoller:
                 reply_to_message_id=5,
             )
         ]
+
+    async def test_run_and_send_injects_interrupt_notice_once(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        assert state is not None
+        state.hook_state.interrupt_notice_pending = True
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=777))
+        captured_prompt: list[str] = []
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                captured_prompt.append(msg)
+                yield DoneEvent()
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+            await bot._run_and_send(
+                state=state,
+                user_text="hello",
+                bot=fake_bot,
+            )
+
+        assert len(captured_prompt) == 1
+        assert "user interrupted your previous response via /stop" in captured_prompt[0]
+        assert captured_prompt[0].strip().endswith("hello")
+        assert state.hook_state.interrupt_notice_pending is False
+
+    async def test_run_and_send_summary_uses_assistant_transport_priority(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=501))
+
+        with (
+            patch("obs_agent.telegram.ConversationRunner") as mock_runner,
+            patch.object(
+                bot,
+                "_send_system_message",
+                new_callable=AsyncMock,
+            ) as mock_send_system,
+        ):
+            mock_send_system.return_value = MagicMock(message_id=902)
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                _ = msg
+                yield DoneEvent()
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            await bot._run_and_send(
+                state=state,
+                user_text="hello",
+                bot=fake_bot,
+            )
+
+        summary_calls = [
+            call for call in mock_send_system.await_args_list
+            if "text" in call.kwargs and str(call.kwargs["text"]).startswith("context:")
+        ]
+        assert summary_calls, "Expected completion summary call"
+        assert summary_calls[-1].kwargs.get("priority") == _PRIORITY_ASSISTANT
+
+    async def test_run_and_send_drops_pending_messages_after_interrupt(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=601))
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+            instance.remaining_pending = [QueuedMessage(text="queued-after-stop")]
+
+            async def mock_run(msg):
+                _ = msg
+                state.hook_state.interrupt_requested = True
+                yield DoneEvent()
+
+            instance.run = mock_run
+            await bot._run_and_send(
+                state=state,
+                user_text="hello",
+                bot=fake_bot,
+            )
+
+        assert instance.remaining_pending == [QueuedMessage(text="queued-after-stop")]
+        assert state.pending_messages == []
+
+    async def test_run_and_send_completion_summary_reports_interrupt_discard_count(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=601))
+
+        with (
+            patch("obs_agent.telegram.ConversationRunner") as mock_runner,
+            patch.object(bot, "_send_system_message", new_callable=AsyncMock) as mock_send_system,
+        ):
+            mock_send_system.return_value = MagicMock(message_id=902)
+            instance = mock_runner.return_value
+            instance.remaining_pending = [
+                QueuedMessage(text="queued-after-stop-a"),
+                QueuedMessage(text="queued-after-stop-b"),
+            ]
+
+            async def mock_run(msg):
+                _ = msg
+                state.hook_state.interrupt_requested = True
+                yield DoneEvent()
+
+            instance.run = mock_run
+            await bot._run_and_send(
+                state=state,
+                user_text="hello",
+                bot=fake_bot,
+            )
+
+        summary_texts = [str(call.kwargs.get("text", "")) for call in mock_send_system.await_args_list]
+        assert any(
+            "interrupted; 2 queued messages discarded" in text and "context:" in text
+            for text in summary_texts
+        )
+
+    async def test_run_and_send_completion_summary_omits_zero_discard_suffix(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=601))
+
+        with (
+            patch("obs_agent.telegram.ConversationRunner") as mock_runner,
+            patch.object(bot, "_send_system_message", new_callable=AsyncMock) as mock_send_system,
+        ):
+            mock_send_system.return_value = MagicMock(message_id=903)
+            instance = mock_runner.return_value
+            instance.remaining_pending = []
+
+            async def mock_run(msg):
+                _ = msg
+                state.hook_state.interrupt_requested = True
+                yield DoneEvent()
+
+            instance.run = mock_run
+            await bot._run_and_send(
+                state=state,
+                user_text="hello",
+                bot=fake_bot,
+            )
+
+        summary_texts = [str(call.kwargs.get("text", "")) for call in mock_send_system.await_args_list]
+        assert any("interrupted" in text and "context:" in text for text in summary_texts)
+        assert all("queued messages discarded" not in text for text in summary_texts)
 
     async def test_route_warning_is_deprecated(self, config):
         config.telegram_notify_username = "breedoon"
@@ -2033,16 +2290,23 @@ class TestCommands:
         assert bot._schedule_ids_by_route.get(route_b, set()) == set()
         assert "unscheduled 2 schedule(s) across this chat" in ctx.bot.send_message.call_args.kwargs["text"]
 
-    async def test_stop_sets_interrupt_flag_and_pauses_auto_delivery(self, config):
+    async def test_stop_sets_interrupt_flag_and_calls_sdk_interrupt(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         state = _state(bot)
+        fake_client = MagicMock()
+        fake_client.interrupt = AsyncMock()
+        state.session_manager._client = fake_client
+        state.session_manager._connected = True
 
         update = _make_update("/stop")
         ctx = _make_context()
         await bot.handle_stop(update, ctx)
 
         assert state.hook_state.interrupt_flag is True
-        assert state.hook_state.pause_queue_delivery is True
+        assert state.hook_state.interrupt_requested is False
+        assert state.hook_state.interrupt_notice_pending is True
+        assert state.hook_state.pause_queue_delivery is False
+        fake_client.interrupt.assert_awaited_once()
         ctx.bot.send_message.assert_called_once()
         assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent</i></u>"
 
@@ -2050,6 +2314,14 @@ class TestCommands:
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         general = _state(bot)
         topic = _state(bot, thread_id=321)
+        general_client = MagicMock()
+        general_client.interrupt = AsyncMock()
+        topic_client = MagicMock()
+        topic_client.interrupt = AsyncMock()
+        general.session_manager._client = general_client
+        general.session_manager._connected = True
+        topic.session_manager._client = topic_client
+        topic.session_manager._connected = True
 
         update = _make_update("/stop all")
         ctx = _make_context()
@@ -2058,9 +2330,205 @@ class TestCommands:
 
         assert general.hook_state.interrupt_flag is True
         assert topic.hook_state.interrupt_flag is True
-        assert general.hook_state.pause_queue_delivery is True
-        assert topic.hook_state.pause_queue_delivery is True
+        assert general.hook_state.interrupt_notice_pending is True
+        assert topic.hook_state.interrupt_notice_pending is True
+        assert general.hook_state.pause_queue_delivery is False
+        assert topic.hook_state.pause_queue_delivery is False
+        general_client.interrupt.assert_awaited_once()
+        topic_client.interrupt.assert_awaited_once()
         assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
+
+    async def test_stop_all_with_mention_suffix_targets_all_routes(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        general = _state(bot)
+        topic = _state(bot, thread_id=321)
+        general_client = MagicMock()
+        general_client.interrupt = AsyncMock()
+        topic_client = MagicMock()
+        topic_client.interrupt = AsyncMock()
+        general.session_manager._client = general_client
+        general.session_manager._connected = True
+        topic.session_manager._client = topic_client
+        topic.session_manager._connected = True
+
+        update = _make_update("/stop all@obs_bot")
+        ctx = _make_context()
+        ctx.args = ["all@obs_bot"]
+        await bot.handle_stop(update, ctx)
+
+        assert general.hook_state.interrupt_flag is True
+        assert topic.hook_state.interrupt_flag is True
+        general_client.interrupt.assert_awaited_once()
+        topic_client.interrupt.assert_awaited_once()
+        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
+
+    async def test_stop_with_command_mention_targets_all_routes(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        general = _state(bot)
+        topic = _state(bot, thread_id=321)
+        general_client = MagicMock()
+        general_client.interrupt = AsyncMock()
+        topic_client = MagicMock()
+        topic_client.interrupt = AsyncMock()
+        general.session_manager._client = general_client
+        general.session_manager._connected = True
+        topic.session_manager._client = topic_client
+        topic.session_manager._connected = True
+
+        update = _make_update("/stop@obs_bot all")
+        ctx = _make_context()
+        ctx.args = ["all"]
+        await bot.handle_stop(update, ctx)
+
+        assert general.hook_state.interrupt_flag is True
+        assert topic.hook_state.interrupt_flag is True
+        general_client.interrupt.assert_awaited_once()
+        topic_client.interrupt.assert_awaited_once()
+        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
+
+    async def test_stop_does_not_mark_parent_agent_task_terminal_request(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        parent_route = TelegramRoute(chat_id=67890, thread_id=None)
+        child_route = TelegramRoute(chat_id=67890, thread_id=321)
+        parent_state = bot._get_state(parent_route)
+        child_state = bot._get_state(child_route)
+        assert parent_state is not None
+        assert child_state is not None
+        child_state.session_manager.set_session_id("sid-child")
+
+        record = _ForkTaskRecord(
+            task_id="task-agent",
+            parent_route=parent_route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=child_route,
+            child_session_id="sid-child",
+            prompt="Return READY",
+            is_fork=False,
+            launch_tool_name="AgentTask",
+        )
+        bot._fork_tasks_by_id["task-agent"] = record
+
+        update = _make_update("/stop", thread_id=None)
+        ctx = _make_context()
+        await bot.handle_stop(update, ctx)
+
+        assert record.terminal_request is None
+
+    async def test_stop_all_cancels_agent_task_children(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        parent_route = TelegramRoute(chat_id=67890, thread_id=None)
+        child_route = TelegramRoute(chat_id=67890, thread_id=321)
+        parent_state = bot._get_state(parent_route)
+        child_state = bot._get_state(child_route)
+        assert parent_state is not None
+        assert child_state is not None
+        child_state.session_manager.set_session_id("sid-child")
+        child_client = MagicMock()
+        child_client.interrupt = AsyncMock()
+        with patch.object(
+            child_state.session_manager,
+            "get_client",
+            AsyncMock(return_value=child_client),
+        ):
+            running = asyncio.create_task(asyncio.sleep(30))
+            record = _ForkTaskRecord(
+                task_id="task-agent-all",
+                parent_route=parent_route,
+                parent_session_id_at_launch="sid-parent",
+                parent_source_uuid="parent-source-uuid",
+                child_route=child_route,
+                child_session_id="sid-child",
+                prompt="Return READY",
+                is_fork=False,
+                launch_tool_name="AgentTask",
+            )
+            bot._fork_tasks_by_id["task-agent-all"] = record
+            bot._fork_task_tasks["task-agent-all"] = running
+
+            update = _make_update("/stop all", thread_id=None)
+            ctx = _make_context()
+            ctx.args = ["all"]
+            await bot.handle_stop(update, ctx)
+            await asyncio.sleep(0)
+
+        assert record.terminal_request == "stopped"
+        assert record.status == "stopped"
+        assert running.done()
+        child_client.interrupt.assert_awaited()
+
+    async def test_stop_all_cancels_multiple_child_tasks(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        parent_route = TelegramRoute(chat_id=67890, thread_id=None)
+        child_a_route = TelegramRoute(chat_id=67890, thread_id=321)
+        child_b_route = TelegramRoute(chat_id=67890, thread_id=322)
+        assert bot._get_state(parent_route) is not None
+        child_a_state = bot._get_state(child_a_route)
+        child_b_state = bot._get_state(child_b_route)
+        assert child_a_state is not None
+        assert child_b_state is not None
+        child_a_state.session_manager.set_session_id("sid-child-a")
+        child_b_state.session_manager.set_session_id("sid-child-b")
+        child_a_client = MagicMock()
+        child_a_client.interrupt = AsyncMock()
+        child_b_client = MagicMock()
+        child_b_client.interrupt = AsyncMock()
+
+        with (
+            patch.object(
+                child_a_state.session_manager,
+                "get_client",
+                AsyncMock(return_value=child_a_client),
+            ),
+            patch.object(
+                child_b_state.session_manager,
+                "get_client",
+                AsyncMock(return_value=child_b_client),
+            ),
+        ):
+            task_a = asyncio.create_task(asyncio.sleep(30))
+            task_b = asyncio.create_task(asyncio.sleep(30))
+            record_a = _ForkTaskRecord(
+                task_id="task-agent-a",
+                parent_route=parent_route,
+                parent_session_id_at_launch="sid-parent",
+                parent_source_uuid="parent-source-uuid",
+                child_route=child_a_route,
+                child_session_id="sid-child-a",
+                prompt="Return READY A",
+                is_fork=True,
+                launch_tool_name="ForkTask",
+            )
+            record_b = _ForkTaskRecord(
+                task_id="task-agent-b",
+                parent_route=parent_route,
+                parent_session_id_at_launch="sid-parent",
+                parent_source_uuid="parent-source-uuid",
+                child_route=child_b_route,
+                child_session_id="sid-child-b",
+                prompt="Return READY B",
+                is_fork=True,
+                launch_tool_name="ForkTask",
+            )
+            bot._fork_tasks_by_id["task-agent-a"] = record_a
+            bot._fork_tasks_by_id["task-agent-b"] = record_b
+            bot._fork_task_tasks["task-agent-a"] = task_a
+            bot._fork_task_tasks["task-agent-b"] = task_b
+
+            update = _make_update("/stop all", thread_id=None)
+            ctx = _make_context()
+            ctx.args = ["all"]
+            await bot.handle_stop(update, ctx)
+            await asyncio.sleep(0)
+
+        assert record_a.terminal_request == "stopped"
+        assert record_b.terminal_request == "stopped"
+        assert record_a.status == "stopped"
+        assert record_b.status == "stopped"
+        assert task_a.done()
+        assert task_b.done()
+        child_a_client.interrupt.assert_awaited()
+        child_b_client.interrupt.assert_awaited()
 
     async def test_report_writes_case_file_with_metadata(self, config):
         chat_id = -100555666777
@@ -2741,9 +3209,7 @@ class TestForkTaskRuntime:
         await monitor
         bot._fork_task_tasks.pop(record.task_id, None)
 
-        rendered = "\n".join(call["text"] for call in sent_messages)
-        assert "notification: agent task running" in rendered
-        assert "notification: agent task idle" in rendered
+        assert sent_messages == []
         await bot.shutdown()
 
     async def test_execute_fork_task_enqueues_parent_callback(self, config):
@@ -3931,6 +4397,34 @@ class TestCreateTelegramApp:
         config.telegram_allowed_user_ids = [12345]
         app = create_telegram_app(config)
         assert app is not None
+
+
+class TestRunTelegramBotSupervisor:
+    async def test_restarts_after_runtime_error(self, config):
+        run_once = AsyncMock(side_effect=[RuntimeError("boom"), asyncio.CancelledError()])
+        sleep_mock = AsyncMock()
+
+        with patch("obs_agent.telegram._run_telegram_bot_once", run_once), patch(
+            "obs_agent.telegram.asyncio.sleep", sleep_mock
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await run_telegram_bot(config)
+
+        assert run_once.await_count == 2
+        assert sleep_mock.await_count == 1
+
+    async def test_fatal_error_is_not_retried(self, config):
+        run_once = AsyncMock(side_effect=ValueError("bad config"))
+        sleep_mock = AsyncMock()
+
+        with patch("obs_agent.telegram._run_telegram_bot_once", run_once), patch(
+            "obs_agent.telegram.asyncio.sleep", sleep_mock
+        ):
+            with pytest.raises(ValueError, match="bad config"):
+                await run_telegram_bot(config)
+
+        assert run_once.await_count == 1
+        sleep_mock.assert_not_awaited()
 
 
 class TestFragmentBuffer:
