@@ -225,3 +225,67 @@ to avoid blind spots from isolated synthetic tests.
   - `test_fatal_error_is_not_retried`
 - `tests/test_session.py`
   - `test_includes_default_sdk_hardening_env`
+
+## 2026-03-13 Team Wake Reliability Addendum
+
+### A. Wake gap identified
+
+- Team worker wake-up depended primarily on in-process `SendInboxMessage`
+  notifier callbacks.
+- If unread inbox entries appeared without notifier delivery (process restart,
+  direct/native inbox write path, callback miss), idle workers could remain
+  asleep indefinitely.
+
+### B. Reliability fix (implemented)
+
+- Background poller now performs an inbox wake audit each cycle:
+  - iterates registered team worker task handles,
+  - reads latest unread message from `~/.claude/teams/<team>/inboxes/<agent>.json`,
+  - routes detection through the same `_handle_inbox_message_notification(...)`
+    path used by live notifier callbacks.
+- Behavior parity:
+  - if worker is currently running: set `wake_requested` with sender/summary/content
+    (deferred wake after completion),
+  - if worker is completed idle-ready: start immediate wake run,
+  - terminal workers (`failed`/`stopped`) are removed from team-worker mappings.
+
+### C. Multi-team scope safety
+
+- Polling uses `(team_name, agent_name)` keyed team-worker records, so same
+  agent name across different teams maps to separate inboxes and separate wakes.
+- No cross-team wake leakage is expected.
+
+### D. Regression coverage added
+
+- `tests/test_telegram.py`
+  - `test_inbox_poll_wakes_idle_team_worker_without_notifier`
+  - `test_poll_team_worker_inbox_sets_pending_wake_when_worker_is_running`
+  - `test_poll_team_worker_inbox_keeps_team_scopes_separate`
+- `tests/test_telegram_live_forum_topics.py`
+  - `test_live_idle_team_worker_wakes_from_polled_inbox`
+
+### E. Live verification run (2026-03-13)
+
+- `uv run pytest -q tests/test_telegram_live_forum_topics.py::TestTelegramLiveForumTopics::test_live_idle_team_worker_wakes_from_polled_inbox` -> passed
+- `uv run pytest -q tests/test_telegram_live_forum_topics.py::TestTelegramLiveForumTopics::test_live_super_task_team_workers_share_task_list_and_inbox` -> passed
+
+### F. Wake-source architecture audit
+
+- `user message`:
+  - trigger path: Telegram update handler -> `_process_message(...)`
+  - reliability: direct event path (no background polling dependency)
+- `schedule`:
+  - trigger path: background poller -> `_run_due_interval_schedules(...)` / `_process_stop_schedule_events(...)`
+  - reliability: periodic polling + persisted schedule state
+- `child completion`:
+  - trigger path: `_execute_fork_task(...)` enqueues callback payload to parent `message_queue`
+  - reliability: auto-delivery poller drains queue when route is idle
+- `team inbox message`:
+  - fast path: in-process `SendInboxMessage` notifier callback
+  - backstop path: `_poll_team_worker_inbox_wakes(...)` unread inbox file scan
+
+### G. Additional live wake verification (2026-03-13)
+
+- `uv run pytest -q tests/test_telegram_live_forum_topics.py::TestTelegramLiveForumTopics::test_live_fork_task_launches_child_and_parent_receives_result` -> passed
+- `uv run pytest -q tests/test_telegram_live_schedule.py::TestTelegramLiveSchedule::test_live_interval_schedule_runs_and_emits_completion_next_schedule` -> passed
+- `uv run pytest -q tests/test_telegram_live_forum_topics.py::TestTelegramLiveForumTopics::test_live_running_team_worker_consumes_polled_pending_wake_after_completion` -> passed

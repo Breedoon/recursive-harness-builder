@@ -59,6 +59,36 @@ class PersistedTeamWorkerState:
 
 
 @dataclass(frozen=True)
+class PersistedTaskHandleState:
+    task_id: str
+    parent_chat_id: int
+    parent_thread_id: int | None
+    parent_session_id_at_launch: str | None
+    parent_source_uuid: str | None
+    child_chat_id: int
+    child_thread_id: int | None
+    child_session_id: str
+    description: str | None
+    status: str
+    is_fork: bool
+    launch_tool_name: str
+    team_name: str | None
+    agent_name: str | None
+    idle_ready: bool
+    terminal_request: str | None
+    result_text: str | None
+    error: str | None
+    timeout_ms: int | None
+    max_turns: int | None
+    launch_parent_message_id: int | None
+    launch_child_message_id: int | None
+    child_completion_message_id: int | None
+    parent_callback_message_id: int | None
+    created_at: float
+    completed_at: float | None
+
+
+@dataclass(frozen=True)
 class PersistedTopicSchedule:
     schedule_id: str
     chat_id: int
@@ -93,6 +123,7 @@ class TelegramStateSnapshot:
     system_messages: list[PersistedSystemMessage] = field(default_factory=list)
     session_heads: dict[str, str] = field(default_factory=dict)
     team_worker_states: list[PersistedTeamWorkerState] = field(default_factory=list)
+    task_handle_states: list[PersistedTaskHandleState] = field(default_factory=list)
     topic_schedules: list[PersistedTopicSchedule] = field(default_factory=list)
 
 
@@ -196,6 +227,40 @@ class TelegramStateStore:
             CREATE INDEX IF NOT EXISTS idx_team_worker_state_route
                 ON team_worker_state(child_chat_id, child_thread_id);
 
+            CREATE TABLE IF NOT EXISTS task_handle_state (
+                task_id TEXT PRIMARY KEY,
+                parent_chat_id INTEGER NOT NULL,
+                parent_thread_id INTEGER,
+                parent_session_id_at_launch TEXT,
+                parent_source_uuid TEXT,
+                child_chat_id INTEGER NOT NULL,
+                child_thread_id INTEGER,
+                child_session_id TEXT NOT NULL,
+                description TEXT,
+                status TEXT NOT NULL,
+                is_fork INTEGER NOT NULL DEFAULT 1,
+                launch_tool_name TEXT NOT NULL DEFAULT 'ForkTask',
+                team_name TEXT,
+                agent_name TEXT,
+                idle_ready INTEGER NOT NULL DEFAULT 0,
+                terminal_request TEXT,
+                result_text TEXT,
+                error TEXT,
+                timeout_ms INTEGER,
+                max_turns INTEGER,
+                launch_parent_message_id INTEGER,
+                launch_child_message_id INTEGER,
+                child_completion_message_id INTEGER,
+                parent_callback_message_id INTEGER,
+                created_at REAL NOT NULL,
+                completed_at REAL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_handle_state_child_route
+                ON task_handle_state(child_chat_id, child_thread_id);
+            CREATE INDEX IF NOT EXISTS idx_task_handle_state_parent_route
+                ON task_handle_state(parent_chat_id, parent_thread_id);
+
             CREATE TABLE IF NOT EXISTS topic_schedule (
                 schedule_id TEXT PRIMARY KEY,
                 route_key TEXT NOT NULL,
@@ -283,6 +348,7 @@ class TelegramStateStore:
             "session_head",
             "system_message",
             "team_worker_state",
+            "task_handle_state",
             "topic_schedule",
         ):
             conn.execute(f"DELETE FROM {table} WHERE updated_at < ?", (cutoff,))
@@ -346,6 +412,39 @@ class TelegramStateStore:
                 status,
                 idle_ready
             FROM team_worker_state
+            ORDER BY updated_at ASC
+            """
+        ).fetchall()
+        task_handle_rows = conn.execute(
+            """
+            SELECT
+                task_id,
+                parent_chat_id,
+                parent_thread_id,
+                parent_session_id_at_launch,
+                parent_source_uuid,
+                child_chat_id,
+                child_thread_id,
+                child_session_id,
+                description,
+                status,
+                is_fork,
+                launch_tool_name,
+                team_name,
+                agent_name,
+                idle_ready,
+                terminal_request,
+                result_text,
+                error,
+                timeout_ms,
+                max_turns,
+                launch_parent_message_id,
+                launch_child_message_id,
+                child_completion_message_id,
+                parent_callback_message_id,
+                created_at,
+                completed_at
+            FROM task_handle_state
             ORDER BY updated_at ASC
             """
         ).fetchall()
@@ -452,6 +551,64 @@ class TelegramStateStore:
             for row in team_worker_rows
             if row["team_name"] and row["agent_name"] and row["task_id"] and row["child_session_id"]
         ]
+        task_handle_states = [
+            PersistedTaskHandleState(
+                task_id=str(row["task_id"]),
+                parent_chat_id=int(row["parent_chat_id"]),
+                parent_thread_id=(
+                    int(row["parent_thread_id"]) if row["parent_thread_id"] is not None else None
+                ),
+                parent_session_id_at_launch=(
+                    str(row["parent_session_id_at_launch"])
+                    if row["parent_session_id_at_launch"]
+                    else None
+                ),
+                parent_source_uuid=(
+                    str(row["parent_source_uuid"]) if row["parent_source_uuid"] else None
+                ),
+                child_chat_id=int(row["child_chat_id"]),
+                child_thread_id=(
+                    int(row["child_thread_id"]) if row["child_thread_id"] is not None else None
+                ),
+                child_session_id=str(row["child_session_id"]),
+                description=str(row["description"]) if row["description"] else None,
+                status=str(row["status"] or "completed"),
+                is_fork=bool(int(row["is_fork"] or 0)),
+                launch_tool_name=str(row["launch_tool_name"] or "ForkTask"),
+                team_name=str(row["team_name"]) if row["team_name"] else None,
+                agent_name=str(row["agent_name"]) if row["agent_name"] else None,
+                idle_ready=bool(int(row["idle_ready"] or 0)),
+                terminal_request=str(row["terminal_request"]) if row["terminal_request"] else None,
+                result_text=str(row["result_text"]) if row["result_text"] else None,
+                error=str(row["error"]) if row["error"] else None,
+                timeout_ms=int(row["timeout_ms"]) if row["timeout_ms"] is not None else None,
+                max_turns=int(row["max_turns"]) if row["max_turns"] is not None else None,
+                launch_parent_message_id=(
+                    int(row["launch_parent_message_id"])
+                    if row["launch_parent_message_id"] is not None
+                    else None
+                ),
+                launch_child_message_id=(
+                    int(row["launch_child_message_id"])
+                    if row["launch_child_message_id"] is not None
+                    else None
+                ),
+                child_completion_message_id=(
+                    int(row["child_completion_message_id"])
+                    if row["child_completion_message_id"] is not None
+                    else None
+                ),
+                parent_callback_message_id=(
+                    int(row["parent_callback_message_id"])
+                    if row["parent_callback_message_id"] is not None
+                    else None
+                ),
+                created_at=float(row["created_at"] or 0.0),
+                completed_at=float(row["completed_at"]) if row["completed_at"] is not None else None,
+            )
+            for row in task_handle_rows
+            if row["task_id"] and row["child_session_id"]
+        ]
         topic_schedules = [
             PersistedTopicSchedule(
                 schedule_id=str(row["schedule_id"]),
@@ -518,6 +675,7 @@ class TelegramStateStore:
             system_messages=system_messages,
             session_heads=session_heads,
             team_worker_states=team_worker_states,
+            task_handle_states=task_handle_states,
             topic_schedules=topic_schedules,
         )
 
@@ -779,6 +937,154 @@ class TelegramStateStore:
               )
             """,
             (chat_id, thread_id, thread_id),
+        )
+
+    def upsert_task_handle_state(
+        self,
+        *,
+        task_id: str,
+        parent_chat_id: int,
+        parent_thread_id: int | None,
+        parent_session_id_at_launch: str | None,
+        parent_source_uuid: str | None,
+        child_chat_id: int,
+        child_thread_id: int | None,
+        child_session_id: str,
+        description: str | None,
+        status: str,
+        is_fork: bool,
+        launch_tool_name: str,
+        team_name: str | None,
+        agent_name: str | None,
+        idle_ready: bool,
+        terminal_request: str | None,
+        result_text: str | None,
+        error: str | None,
+        timeout_ms: int | None,
+        max_turns: int | None,
+        launch_parent_message_id: int | None,
+        launch_child_message_id: int | None,
+        child_completion_message_id: int | None,
+        parent_callback_message_id: int | None,
+        created_at: float,
+        completed_at: float | None,
+    ) -> None:
+        conn = self._require_conn()
+        now = time.time()
+        conn.execute(
+            """
+            INSERT INTO task_handle_state (
+                task_id,
+                parent_chat_id,
+                parent_thread_id,
+                parent_session_id_at_launch,
+                parent_source_uuid,
+                child_chat_id,
+                child_thread_id,
+                child_session_id,
+                description,
+                status,
+                is_fork,
+                launch_tool_name,
+                team_name,
+                agent_name,
+                idle_ready,
+                terminal_request,
+                result_text,
+                error,
+                timeout_ms,
+                max_turns,
+                launch_parent_message_id,
+                launch_child_message_id,
+                child_completion_message_id,
+                parent_callback_message_id,
+                created_at,
+                completed_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                parent_chat_id=excluded.parent_chat_id,
+                parent_thread_id=excluded.parent_thread_id,
+                parent_session_id_at_launch=excluded.parent_session_id_at_launch,
+                parent_source_uuid=excluded.parent_source_uuid,
+                child_chat_id=excluded.child_chat_id,
+                child_thread_id=excluded.child_thread_id,
+                child_session_id=excluded.child_session_id,
+                description=excluded.description,
+                status=excluded.status,
+                is_fork=excluded.is_fork,
+                launch_tool_name=excluded.launch_tool_name,
+                team_name=excluded.team_name,
+                agent_name=excluded.agent_name,
+                idle_ready=excluded.idle_ready,
+                terminal_request=excluded.terminal_request,
+                result_text=excluded.result_text,
+                error=excluded.error,
+                timeout_ms=excluded.timeout_ms,
+                max_turns=excluded.max_turns,
+                launch_parent_message_id=excluded.launch_parent_message_id,
+                launch_child_message_id=excluded.launch_child_message_id,
+                child_completion_message_id=excluded.child_completion_message_id,
+                parent_callback_message_id=excluded.parent_callback_message_id,
+                created_at=excluded.created_at,
+                completed_at=excluded.completed_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                task_id,
+                parent_chat_id,
+                parent_thread_id,
+                parent_session_id_at_launch,
+                parent_source_uuid,
+                child_chat_id,
+                child_thread_id,
+                child_session_id,
+                description,
+                status,
+                1 if is_fork else 0,
+                launch_tool_name,
+                team_name,
+                agent_name,
+                1 if idle_ready else 0,
+                terminal_request,
+                result_text,
+                error,
+                timeout_ms,
+                max_turns,
+                launch_parent_message_id,
+                launch_child_message_id,
+                child_completion_message_id,
+                parent_callback_message_id,
+                float(created_at),
+                completed_at,
+                now,
+            ),
+        )
+
+    def delete_task_handle_state(self, *, task_id: str) -> None:
+        conn = self._require_conn()
+        conn.execute("DELETE FROM task_handle_state WHERE task_id = ?", (task_id,))
+
+    def delete_task_handle_states_for_route(self, *, chat_id: int, thread_id: int | None) -> None:
+        conn = self._require_conn()
+        conn.execute(
+            """
+            DELETE FROM task_handle_state
+            WHERE (
+                child_chat_id = ?
+                AND (
+                    child_thread_id = ?
+                    OR (child_thread_id IS NULL AND ? IS NULL)
+                )
+            ) OR (
+                parent_chat_id = ?
+                AND (
+                    parent_thread_id = ?
+                    OR (parent_thread_id IS NULL AND ? IS NULL)
+                )
+            )
+            """,
+            (chat_id, thread_id, thread_id, chat_id, thread_id, thread_id),
         )
 
     def upsert_topic_schedule(

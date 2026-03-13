@@ -1419,7 +1419,62 @@ class TelegramBot:
             self._topic_schedules_by_id[record.schedule_id] = record
             self._schedule_ids_by_route.setdefault(route, set()).add(record.schedule_id)
 
+        for entry in snapshot.task_handle_states:
+            child_route = TelegramRoute(
+                chat_id=entry.child_chat_id,
+                thread_id=entry.child_thread_id,
+            )
+            parent_route = TelegramRoute(
+                chat_id=entry.parent_chat_id,
+                thread_id=entry.parent_thread_id,
+            )
+            child_state = self._get_state(child_route, create=True)
+            assert child_state is not None
+            if entry.child_session_id and child_state.session_id != entry.child_session_id:
+                child_state.session_manager.set_session_id(entry.child_session_id)
+                self._route_by_session_id[entry.child_session_id] = child_route
+                self._persist_state_for_route(child_route)
+
+            record = _ForkTaskRecord(
+                task_id=entry.task_id,
+                parent_route=parent_route,
+                parent_session_id_at_launch=entry.parent_session_id_at_launch or entry.child_session_id,
+                parent_source_uuid=entry.parent_source_uuid or self._session_heads.get(entry.child_session_id, ""),
+                child_route=child_route,
+                child_session_id=entry.child_session_id,
+                prompt="",
+                description=entry.description,
+                timeout_ms=entry.timeout_ms,
+                max_turns=entry.max_turns,
+                status=entry.status or "completed",
+                created_at=entry.created_at or time.time(),
+                completed_at=entry.completed_at,
+                launch_parent_message_id=entry.launch_parent_message_id,
+                launch_child_message_id=entry.launch_child_message_id,
+                child_completion_message_id=entry.child_completion_message_id,
+                parent_callback_message_id=entry.parent_callback_message_id,
+                error=entry.error,
+                terminal_request=entry.terminal_request,
+                result_text=entry.result_text,
+                is_fork=entry.is_fork,
+                launch_tool_name=entry.launch_tool_name or ("ForkTask" if entry.is_fork else "AgentTask"),
+                team_name=entry.team_name,
+                agent_name=entry.agent_name,
+                idle_ready=entry.idle_ready,
+                emit_parent_callback=False,
+            )
+            self._fork_tasks_by_id[record.task_id] = record
+            if record.idle_ready and record.status not in {"failed", "stopped"}:
+                self._fork_task_by_child_route[child_route] = record.task_id
+            if not record.is_fork:
+                key = self._team_worker_key(record.team_name, record.agent_name)
+                if key is not None:
+                    self._team_worker_records[key] = record.task_id
+            self._persist_task_handle_record(record)
+
         for entry in snapshot.team_worker_states:
+            if entry.task_id in self._fork_tasks_by_id:
+                continue
             key = self._team_worker_key(entry.team_name, entry.agent_name)
             if key is None:
                 continue
@@ -1462,6 +1517,7 @@ class TelegramBot:
             if record.idle_ready and record.status not in {"failed", "stopped"}:
                 self._fork_task_by_child_route[child_route] = record.task_id
             self._persist_team_worker_record(record)
+            self._persist_task_handle_record(record)
 
     def _set_topic_metadata(
         self,
@@ -2745,8 +2801,39 @@ class TelegramBot:
             idle_ready=record.idle_ready,
         )
 
+    def _persist_task_handle_record(self, record: _ForkTaskRecord) -> None:
+        self._state_store.upsert_task_handle_state(
+            task_id=record.task_id,
+            parent_chat_id=record.parent_route.chat_id,
+            parent_thread_id=record.parent_route.thread_id,
+            parent_session_id_at_launch=record.parent_session_id_at_launch or None,
+            parent_source_uuid=record.parent_source_uuid or None,
+            child_chat_id=record.child_route.chat_id,
+            child_thread_id=record.child_route.thread_id,
+            child_session_id=record.child_session_id,
+            description=record.description,
+            status=record.status,
+            is_fork=record.is_fork,
+            launch_tool_name=record.launch_tool_name,
+            team_name=record.team_name,
+            agent_name=record.agent_name,
+            idle_ready=record.idle_ready,
+            terminal_request=record.terminal_request,
+            result_text=record.result_text,
+            error=record.error,
+            timeout_ms=record.timeout_ms,
+            max_turns=record.max_turns,
+            launch_parent_message_id=record.launch_parent_message_id,
+            launch_child_message_id=record.launch_child_message_id,
+            child_completion_message_id=record.child_completion_message_id,
+            parent_callback_message_id=record.parent_callback_message_id,
+            created_at=record.created_at,
+            completed_at=record.completed_at,
+        )
+
     def _register_team_worker_record(self, record: _ForkTaskRecord) -> None:
         self._remove_team_worker_mappings_for_task(record.task_id)
+        self._persist_task_handle_record(record)
         if record.is_fork:
             return
         key = self._team_worker_key(record.team_name, record.agent_name)
@@ -2841,6 +2928,7 @@ class TelegramBot:
 
             self._fork_task_by_child_route.pop(record.child_route, None)
             self._remove_team_worker_mappings_for_task(task_id)
+            self._persist_task_handle_record(record)
 
     def _task_not_found_result(self, task_id: str) -> dict[str, Any]:
         text = f"No task found with ID: {task_id}"
@@ -2940,6 +3028,7 @@ class TelegramBot:
         retrieval_status: str,
         status: str,
         output: str | None,
+        output_file: str | None = None,
     ) -> str:
         parts = [f"<retrieval_status>{retrieval_status}</retrieval_status>"]
         parts.append("")
@@ -2948,6 +3037,9 @@ class TelegramBot:
         parts.append("<task_type>local_agent</task_type>")
         parts.append("")
         parts.append(f"<status>{status}</status>")
+        if output_file:
+            parts.append("")
+            parts.append(f"<output_file>{output_file}</output_file>")
         if output:
             parts.append("")
             parts.append("<output>")
@@ -2962,6 +3054,7 @@ class TelegramBot:
         retrieval_status: str,
         status: str,
         output: str | None,
+        output_file: str | None = None,
     ) -> dict[str, Any]:
         task = {
             "task_id": record.task_id,
@@ -2971,6 +3064,8 @@ class TelegramBot:
         }
         if record.description:
             task["description"] = record.description
+        if output_file:
+            task["output_file"] = output_file
         if output:
             task["output"] = output
         return {
@@ -2982,6 +3077,7 @@ class TelegramBot:
                         retrieval_status=retrieval_status,
                         status=status,
                         output=output,
+                        output_file=output_file,
                     ),
                 }
             ],
@@ -3006,9 +3102,18 @@ class TelegramBot:
         return "\n".join(lines)
 
     def _coerce_timeout_ms(self, value: Any) -> int:
+        default_timeout_ms = max(int(self._config.bg_fork_timeout * 1000), 1)
         if value is None:
-            return int(self._config.bg_fork_timeout * 1000)
-        return max(int(value), 1)
+            return default_timeout_ms
+        parsed = max(int(value), 1)
+        if parsed < default_timeout_ms:
+            logger.info(
+                "AgentTask/ForkTask timeout clamped to default floor requested_ms=%s floor_ms=%s",
+                parsed,
+                default_timeout_ms,
+            )
+            return default_timeout_ms
+        return parsed
 
     def _coerce_max_turns(self, value: Any) -> int | None:
         if value is None:
@@ -3609,6 +3714,10 @@ class TelegramBot:
             thread_id=route.thread_id,
         )
         self._state_store.delete_team_worker_states_for_route(
+            chat_id=route.chat_id,
+            thread_id=route.thread_id,
+        )
+        self._state_store.delete_task_handle_states_for_route(
             chat_id=route.chat_id,
             thread_id=route.thread_id,
         )
@@ -4923,6 +5032,7 @@ class TelegramBot:
                 await asyncio.sleep(self._background_poll_seconds)
                 await self._process_stop_schedule_events()
                 await self._run_due_interval_schedules()
+                await self._poll_team_worker_inbox_wakes()
                 for state in list(self._states_by_route.values()):
                     bot = self._bot_for_state(state)
                     if bot is None:
@@ -5493,6 +5603,81 @@ class TelegramBot:
             lines.append(f"Latest content preview: {preview}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _team_inbox_path(team_name: str, agent_name: str) -> Path:
+        return Path.home() / ".claude" / "teams" / team_name / "inboxes" / f"{agent_name}.json"
+
+    def _latest_unread_team_inbox_message(
+        self,
+        *,
+        team_name: str,
+        agent_name: str,
+    ) -> tuple[str | None, str | None, str | None] | None:
+        inbox_path = self._team_inbox_path(team_name, agent_name)
+        if not inbox_path.exists():
+            return None
+        try:
+            loaded = json.loads(inbox_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug("Failed reading team inbox for wake poll: %s", inbox_path, exc_info=True)
+            return None
+        if not isinstance(loaded, list):
+            return None
+        latest_unread: dict[str, Any] | None = None
+        for item in loaded:
+            if not isinstance(item, dict):
+                continue
+            if bool(item.get("read", False)):
+                continue
+            latest_unread = item
+        if latest_unread is None:
+            return None
+        sender = str(latest_unread.get("from") or "").strip() or None
+        summary = str(latest_unread.get("summary") or "").strip() or None
+        content = (
+            str(
+                latest_unread.get("text")
+                or latest_unread.get("content")
+                or ""
+            ).strip()
+            or None
+        )
+        return sender, summary, content
+
+    async def _poll_team_worker_inbox_wakes(self) -> None:
+        task_ids = list(dict.fromkeys(self._team_worker_records.values()))
+        for task_id in task_ids:
+            record = self._fork_tasks_by_id.get(task_id)
+            if record is None:
+                self._remove_team_worker_mappings_for_task(task_id)
+                continue
+            if record.is_fork:
+                continue
+            if record.status in {"failed", "stopped", "killed"} or record.terminal_request in {"failed", "stopped", "killed"}:
+                self._remove_team_worker_mappings_for_task(record.task_id)
+                continue
+            team_name = (record.team_name or "").strip()
+            agent_name = (record.agent_name or "").strip()
+            if not team_name or not agent_name:
+                continue
+            latest = self._latest_unread_team_inbox_message(
+                team_name=team_name,
+                agent_name=agent_name,
+            )
+            if latest is None:
+                continue
+            sender, summary, content = latest
+            await self._handle_inbox_message_notification(
+                sender_route=record.child_route,
+                payload={
+                    "team_name": team_name,
+                    "recipient": agent_name,
+                    "sender": sender,
+                    "summary": summary,
+                    "content": content,
+                },
+            )
+
     async def _start_idle_team_worker_wake(
         self,
         *,
@@ -5592,7 +5777,7 @@ class TelegramBot:
         )
         if record is None:
             return
-        if record.status in {"failed", "stopped"} or record.terminal_request in {"failed", "stopped"}:
+        if record.status in {"failed", "stopped", "killed"} or record.terminal_request in {"failed", "stopped", "killed"}:
             self._remove_team_worker_mappings_for_task(record.task_id)
             return
 
@@ -5605,10 +5790,12 @@ class TelegramBot:
             record.wake_source_sender = sender
             record.wake_source_summary = summary
             record.wake_source_content = content
+            self._persist_task_handle_record(record)
             return
         if record.status == "completed" and record.terminal_request is None:
             record.idle_ready = True
         if not record.idle_ready:
+            self._persist_task_handle_record(record)
             return
 
         try:
@@ -6110,6 +6297,7 @@ class TelegramBot:
             parent_state.active_fork_task_ids.discard(task_id)
 
         if record.terminal_request == "failed":
+            self._persist_task_handle_record(record)
             self._fork_task_by_child_route.pop(record.child_route, None)
             return
 
@@ -6216,6 +6404,7 @@ class TelegramBot:
             except Exception:
                 logger.debug("Failed to add parent backlink to child terminal message", exc_info=True)
 
+        self._persist_task_handle_record(record)
         if (
             record.idle_ready
             and record.terminal_request is None
@@ -6248,10 +6437,9 @@ class TelegramBot:
         record = self._fork_tasks_by_id.get(task_id)
         if record is None:
             return self._task_not_found_result(task_id)
-        if record.terminal_request in {"stopped", "killed"}:
-            return self._task_not_found_result(task_id)
 
         task = self._fork_task_tasks.get(task_id)
+        output_file = self._record_output_file(record)
         if task is not None and not task.done():
             if block:
                 try:
@@ -6268,11 +6456,29 @@ class TelegramBot:
                     retrieval_status="not_ready",
                     status="running",
                     output=running_output,
+                    output_file=output_file,
                 )
 
-        if record.status in {"completed", "stopped", "failed"}:
+        if record.terminal_request in {"stopped", "killed"}:
+            terminal_status = "stopped"
+        elif record.status in {"completed", "stopped", "failed"}:
+            terminal_status = record.status
+        else:
             return self._task_not_found_result(task_id)
-        return self._task_not_found_result(task_id)
+
+        if terminal_status == "failed":
+            terminal_output = (record.error or record.result_text or "").strip() or None
+        else:
+            terminal_output = (record.result_text or "").strip() or None
+
+        retrieval_status = "completed" if terminal_status == "completed" else terminal_status
+        return self._build_fork_task_output_result(
+            record=record,
+            retrieval_status=retrieval_status,
+            status=terminal_status,
+            output=terminal_output,
+            output_file=output_file,
+        )
 
     async def _fork_task_stop(
         self,
@@ -6295,6 +6501,7 @@ class TelegramBot:
             record.completed_at = time.time()
             self._fork_task_by_child_route.pop(record.child_route, None)
             self._remove_team_worker_mappings_for_task(task_id)
+            self._persist_task_handle_record(record)
             return {
                 "content": [
                     {
@@ -6323,6 +6530,7 @@ class TelegramBot:
             return self._task_not_running_result(task_id, status="killed")
 
         record.terminal_request = "stopped"
+        self._persist_task_handle_record(record)
         child_state = self._get_state(record.child_route, create=False)
         if child_state is not None:
             child_state.hook_state.interrupt_flag = True

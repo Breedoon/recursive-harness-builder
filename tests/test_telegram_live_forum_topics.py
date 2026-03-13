@@ -331,6 +331,36 @@ def _build_busy_files(vault_path: Path, count: int = 48) -> None:
         )
 
 
+def _append_unread_inbox_message(
+    *,
+    team_name: str,
+    recipient: str,
+    content: str,
+    summary: str,
+    sender: str,
+) -> None:
+    inbox_path = Path.home() / ".claude" / "teams" / team_name / "inboxes" / f"{recipient}.json"
+    inbox_path.parent.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, object]] = []
+    if inbox_path.exists():
+        try:
+            loaded = json.loads(inbox_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                entries = [item for item in loaded if isinstance(item, dict)]
+        except Exception:
+            entries = []
+    entries.append(
+        {
+            "from": sender,
+            "text": content,
+            "summary": summary,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "read": False,
+        }
+    )
+    inbox_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
+
+
 @dataclass
 class _LiveForumHarness:
     platform: TelegramForumPlatform
@@ -1431,7 +1461,7 @@ class TestTelegramLiveForumTopics:
         )
         assert secret in resumed_message.text, live_tg_forum.failure_context()
 
-    async def test_live_fork_task_output_after_completion_returns_not_found(
+    async def test_live_fork_task_output_after_completion_returns_completed(
         self,
         live_tg_forum: _LiveForumHarness,
     ) -> None:
@@ -1449,12 +1479,97 @@ class TestTelegramLiveForumTopics:
                 f"'This is a deterministic integration test inside a child topic. Reply with only STABLE-{tag}.' "
                 "Capture the returned agentId, then call ForkTaskOutput with block=true timeout=120000. "
                 "After it completes, call ForkTaskOutput again on the same task_id with block=false timeout=1. "
-                f"Reply with only STABLE-{tag} if both ForkTaskOutput calls report no task found for that completed handle, otherwise reply with only OTHER."
+                f"Reply with only STABLE-{tag} if both ForkTaskOutput calls report completed status for that handle, otherwise reply with only OTHER."
             ),
             timeout=180.0,
         )
 
         assert f"STABLE-{tag}" in result_trace.output, live_tg_forum.failure_context()
+        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
+
+    async def test_live_agent_task_resume_survives_daemon_restart(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        prime_trace = await live_tg_forum.platform.send(
+            f"This is a deterministic integration test. Reply with only PRIME-{tag}.",
+        )
+        assert f"PRIME-{tag}" in prime_trace.output, live_tg_forum.failure_context()
+        baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
+
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic integration test. "
+                f"Use the AgentTask tool exactly once with description RESTART-{tag}, "
+                "fork=false, run_in_background=true, and prompt "
+                f"'This is a deterministic integration test inside a child topic. Reply with only FIRST-{tag}.' "
+                f"After launching it, reply with only LAUNCHED-{tag}."
+            ),
+            require_done=False,
+            timeout=90.0,
+        )
+        launch_system = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=None,
+            after_message_id=baseline,
+            token="agent task launched:",
+            timeout=180.0,
+        )
+        child_thread_id, _ = _extract_topic_link(launch_system.text)
+        launch_child = await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            token="agentId:",
+            timeout=180.0,
+        )
+        task_id = _extract_agent_id(launch_child.text)
+        first_child = await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            token=f"FIRST-{tag}",
+            timeout=180.0,
+        )
+        assert f"FIRST-{tag}" in first_child.text, live_tg_forum.failure_context()
+
+        _stop_bot(live_tg_forum.proc)
+        assert live_tg_forum.temp_root is not None
+        live_tg_forum.proc, live_tg_forum.log_file = _start_bot(
+            live_tg_forum.vault_path,
+            live_tg_forum.temp_root,
+            state_db_path=live_tg_forum.state_db_path,
+        )
+        await asyncio.sleep(5.0)
+
+        resume_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic integration test. "
+                f"Resume the existing AgentTask handle {task_id} by calling AgentTask once with "
+                f"resume={task_id}, fork=false, run_in_background=true, description RESTART-RESUME-{tag}, "
+                "and prompt "
+                f"'This is a deterministic integration test inside the resumed child topic. Reply with only SECOND-{tag}.' "
+                f"After launching resumed work, reply with only RESUMED-{tag}."
+            ),
+            require_done=False,
+            timeout=120.0,
+        )
+        resumed_parent = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=None,
+            after_message_id=resume_baseline,
+            token=f"RESUMED-{tag}",
+            timeout=240.0,
+        )
+        assert f"RESUMED-{tag}" in resumed_parent.text, live_tg_forum.failure_context()
+        second_child = await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            token=f"SECOND-{tag}",
+            timeout=240.0,
+        )
+        assert f"SECOND-{tag}" in second_child.text, live_tg_forum.failure_context()
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
 
     async def test_live_fork_task_multi_handle_stop_is_isolated(
@@ -2225,3 +2340,157 @@ class TestTelegramLiveForumTopics:
             timeout=420.0,
         )
         assert f"TEAM-B-OK-{tag}" in worker_b_done.text, live_tg_forum.failure_context()
+
+    async def test_live_idle_team_worker_wakes_from_polled_inbox(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        team_name = f"live-polled-team-{tag}"
+        worker_name = f"live-polled-worker-{tag[:4]}"
+        inbox_token = f"POLLED-WAKE-{tag}"
+        parent_thread_id = await live_tg_forum.platform.create_topic(f"Team Poll Wake {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic integration test. Reply with only POLL-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"POLL-PRIME-{tag}",
+            timeout=240.0,
+        )
+
+        launch_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic integration test for team wake polling. "
+                "Use AgentTask exactly once with fork=false, "
+                f"team_name={team_name}, name={worker_name}, description POLL-WORKER-{tag}, and prompt "
+                "'Call TeamCreate with team_name="
+                f"{team_name}. "
+                f"Then reply with only POLL-IDLE-{tag}.' "
+                f"After launch, reply with only POLL-LAUNCHED-{tag}."
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=180.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=launch_baseline,
+            token=f"POLL-LAUNCHED-{tag}",
+            timeout=240.0,
+        )
+        launch_message = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=launch_baseline,
+            token="agent task launched",
+            timeout=240.0,
+        )
+        worker_thread_id, _ = _extract_topic_link(launch_message.text)
+        await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+            token=f"POLL-IDLE-{tag}",
+            timeout=420.0,
+        )
+
+        wake_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=worker_thread_id)
+        _append_unread_inbox_message(
+            team_name=team_name,
+            recipient=worker_name,
+            content=inbox_token,
+            summary="polled wake",
+            sender="external-live-test",
+        )
+        wake_message = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+            after_message_id=wake_baseline,
+            token="agent task wake: teammate message received",
+            timeout=240.0,
+        )
+        assert "agent task wake: teammate message received" in wake_message.text.lower(), (
+            live_tg_forum.failure_context()
+        )
+        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
+
+    async def test_live_running_team_worker_consumes_polled_pending_wake_after_completion(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        team_name = f"live-pending-team-{tag}"
+        worker_name = f"live-pending-worker-{tag[:4]}"
+        first_token = f"POLL-FIRST-{tag}"
+        parent_thread_id = await live_tg_forum.platform.create_topic(f"Team Pending Wake {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic integration test. Reply with only PENDING-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"PENDING-PRIME-{tag}",
+            timeout=240.0,
+        )
+
+        launch_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic integration test for pending team wake polling. "
+                "Use AgentTask exactly once with fork=false, "
+                f"team_name={team_name}, name={worker_name}, description PENDING-WORKER-{tag}, and prompt "
+                "'Call TeamCreate with team_name="
+                f"{team_name}. "
+                "Then use Bash exactly once to run sleep 20. "
+                f"After sleep finishes, reply with only {first_token}.' "
+                f"After launch, reply with only PENDING-LAUNCHED-{tag}."
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=240.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=launch_baseline,
+            token=f"PENDING-LAUNCHED-{tag}",
+            timeout=240.0,
+        )
+        launch_message = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=launch_baseline,
+            token="agent task launched",
+            timeout=240.0,
+        )
+        worker_thread_id, _ = _extract_topic_link(launch_message.text)
+
+        await asyncio.sleep(4.0)
+        _append_unread_inbox_message(
+            team_name=team_name,
+            recipient=worker_name,
+            content=f"pending polled wake message {tag}",
+            summary="pending polled wake",
+            sender="external-live-test",
+        )
+
+        first_done = await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+            token=first_token,
+            timeout=300.0,
+        )
+        wake_message = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+            after_message_id=first_done.message_id,
+            token="agent task wake: teammate message received",
+            timeout=240.0,
+        )
+        assert "agent task wake: teammate message received" in wake_message.text.lower(), (
+            live_tg_forum.failure_context()
+        )
+        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()

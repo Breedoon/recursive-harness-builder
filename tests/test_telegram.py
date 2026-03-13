@@ -715,6 +715,76 @@ class TestBackgroundPoller:
 
             await bot.shutdown()
 
+    async def test_inbox_poll_wakes_idle_team_worker_without_notifier(self, config, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bot = TelegramBot(
+            config,
+            fragment_gap=_TEST_GAP,
+            background_poll_seconds=0.01,
+            enable_background_poller=True,
+        )
+        child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        child_state = bot._get_state(child_route, topic_title="General - Team Worker")
+        assert child_state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=930))
+        child_state.last_bot = fake_bot
+        child_state.session_manager.set_session_id("sid-child")
+        bot._session_heads["sid-child"] = "child-head-uuid"
+
+        record = _ForkTaskRecord(
+            task_id="task-team",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=child_route,
+            child_session_id="sid-child",
+            prompt="Old prompt",
+            description="Team Worker",
+            team_name="team-alpha",
+            agent_name="worker-a",
+            is_fork=False,
+            status="completed",
+            idle_ready=True,
+        )
+        bot._fork_tasks_by_id["task-team"] = record
+        bot._fork_task_by_child_route[child_route] = "task-team"
+        bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
+
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "from": "worker-b",
+                        "text": "poll wake message",
+                        "summary": "handoff",
+                        "timestamp": "2026-03-13T00:00:00Z",
+                        "read": False,
+                    }
+                ],
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock) as schedule_mock:
+            try:
+                await bot._ensure_background_poller(fake_bot)
+                deadline = asyncio.get_running_loop().time() + 0.35
+                while schedule_mock.await_count == 0 and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.01)
+            finally:
+                await bot.shutdown()
+
+        assert schedule_mock.await_count == 1
+        schedule_mock.assert_awaited_once_with(task_id="task-team", parent_state=child_state)
+        assert record.status == "launched"
+        assert record.idle_ready is False
+        assert "Latest sender: worker-b." in record.prompt
+        assert "Latest content preview: poll wake message" in record.prompt
+
     async def test_run_and_send_preserves_pending_across_session_switch(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         state = _state(bot)
@@ -3494,6 +3564,150 @@ class TestForkTaskRuntime:
         assert record.wake_source_content == "process item 8"
         await bot.shutdown()
 
+    async def test_poll_team_worker_inbox_sets_pending_wake_when_worker_is_running(
+        self,
+        config,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        record = _ForkTaskRecord(
+            task_id="task-team",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=child_route,
+            child_session_id="sid-child",
+            prompt="Old prompt",
+            description="Team Worker",
+            team_name="team-alpha",
+            agent_name="worker-a",
+            is_fork=False,
+            status="launched",
+        )
+        bot._fork_tasks_by_id["task-team"] = record
+        bot._fork_task_by_child_route[child_route] = "task-team"
+        bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "from": "worker-b",
+                        "text": "process item 8",
+                        "summary": "handoff",
+                        "timestamp": "2026-03-13T00:00:00Z",
+                        "read": False,
+                    }
+                ],
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        running = asyncio.create_task(asyncio.sleep(30))
+        bot._fork_task_tasks["task-team"] = running
+        try:
+            await bot._poll_team_worker_inbox_wakes()
+        finally:
+            running.cancel()
+            with suppress(asyncio.CancelledError):
+                await running
+
+        assert record.wake_requested is True
+        assert record.wake_source_sender == "worker-b"
+        assert record.wake_source_summary == "handoff"
+        assert record.wake_source_content == "process item 8"
+        await bot.shutdown()
+
+    async def test_poll_team_worker_inbox_keeps_team_scopes_separate(
+        self,
+        config,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route_a = TelegramRoute(chat_id=-10067890, thread_id=321)
+        route_b = TelegramRoute(chat_id=-10067890, thread_id=322)
+        state_a = bot._get_state(route_a, topic_title="General - Team A")
+        state_b = bot._get_state(route_b, topic_title="General - Team B")
+        assert state_a is not None
+        assert state_b is not None
+        state_a.session_manager.set_session_id("sid-a")
+        state_b.session_manager.set_session_id("sid-b")
+        bot._session_heads["sid-a"] = "uuid-a"
+        bot._session_heads["sid-b"] = "uuid-b"
+        state_a.last_bot = MagicMock(send_message=AsyncMock(return_value=MagicMock(message_id=941)))
+        state_b.last_bot = MagicMock(send_message=AsyncMock(return_value=MagicMock(message_id=942)))
+
+        record_a = _ForkTaskRecord(
+            task_id="task-team-a",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=route_a,
+            child_session_id="sid-a",
+            prompt="Old prompt A",
+            description="Team Worker A",
+            team_name="team-alpha",
+            agent_name="worker-shared",
+            is_fork=False,
+            status="completed",
+            idle_ready=True,
+        )
+        record_b = _ForkTaskRecord(
+            task_id="task-team-b",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=route_b,
+            child_session_id="sid-b",
+            prompt="Old prompt B",
+            description="Team Worker B",
+            team_name="team-beta",
+            agent_name="worker-shared",
+            is_fork=False,
+            status="completed",
+            idle_ready=True,
+        )
+        bot._fork_tasks_by_id[record_a.task_id] = record_a
+        bot._fork_tasks_by_id[record_b.task_id] = record_b
+        bot._fork_task_by_child_route[route_a] = record_a.task_id
+        bot._fork_task_by_child_route[route_b] = record_b.task_id
+        bot._team_worker_records[("team-alpha", "worker-shared")] = record_a.task_id
+        bot._team_worker_records[("team-beta", "worker-shared")] = record_b.task_id
+
+        inbox_path = tmp_path / ".claude" / "teams" / "team-beta" / "inboxes" / "worker-shared.json"
+        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "from": "worker-peer",
+                        "text": "team-beta message",
+                        "summary": "beta-summary",
+                        "timestamp": "2026-03-13T00:00:00Z",
+                        "read": False,
+                    }
+                ],
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock) as schedule_mock:
+            await bot._poll_team_worker_inbox_wakes()
+
+        schedule_mock.assert_awaited_once_with(task_id="task-team-b", parent_state=state_b)
+        assert record_a.status == "completed"
+        assert record_b.status == "launched"
+        assert record_b.idle_ready is False
+        await bot.shutdown()
+
     async def test_execute_super_task_triggers_pending_idle_wake_after_completion(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         parent_route = TelegramRoute(chat_id=-10067890, thread_id=None)
@@ -3686,7 +3900,7 @@ class TestForkTaskRuntime:
         assert "<retrieval_status>not_ready</retrieval_status>" in result["content"][0]["text"]
         assert "<status>running</status>" in result["content"][0]["text"]
 
-    async def test_fork_task_output_reports_not_found_after_completion(self, config):
+    async def test_fork_task_output_reports_completed_after_completion(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
         record = _ForkTaskRecord(
@@ -3707,9 +3921,13 @@ class TestForkTaskRuntime:
             args={"task_id": "task-123", "block": False, "timeout": 1},
         )
 
-        assert result["is_error"] is True
-        assert "<tool_use_error>No task found with ID: task-123</tool_use_error>" in result["content"][0]["text"]
-        assert result["tool_use_result"] == "Error: No task found with ID: task-123"
+        assert "<retrieval_status>completed</retrieval_status>" in result["content"][0]["text"]
+        assert "<status>completed</status>" in result["content"][0]["text"]
+        assert "<output>" in result["content"][0]["text"]
+        assert "READY" in result["content"][0]["text"]
+        assert result["tool_use_result"]["retrieval_status"] == "completed"
+        assert result["tool_use_result"]["task"]["status"] == "completed"
+        assert result["tool_use_result"]["task"]["result"] == "READY"
 
     async def test_fork_task_output_blocking_timeout_returns_timeout(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -3767,7 +3985,61 @@ class TestForkTaskRuntime:
         assert first["content"][0]["text"] == second["content"][0]["text"]
         assert first["tool_use_result"] == second["tool_use_result"]
 
-    async def test_fork_task_output_on_stopped_handle_returns_not_found(self, config):
+    async def test_fork_task_output_terminal_request_stopped_reports_stopped(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        record = _ForkTaskRecord(
+            task_id="task-123",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=child_route,
+            child_session_id="sid-child",
+            prompt="Return READY",
+            status="launched",
+            terminal_request="stopped",
+            result_text="PARTIAL",
+        )
+        bot._fork_tasks_by_id["task-123"] = record
+
+        result = await bot._fork_task_output(
+            route=record.parent_route,
+            args={"task_id": "task-123", "block": False, "timeout": 1},
+        )
+
+        assert "<retrieval_status>stopped</retrieval_status>" in result["content"][0]["text"]
+        assert "<status>stopped</status>" in result["content"][0]["text"]
+        assert result["tool_use_result"]["retrieval_status"] == "stopped"
+        assert result["tool_use_result"]["task"]["status"] == "stopped"
+
+    async def test_fork_task_output_includes_output_file_when_available(self, config, tmp_path):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        record = _ForkTaskRecord(
+            task_id="task-123",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=child_route,
+            child_session_id="sid-child",
+            prompt="Return READY",
+            status="completed",
+            result_text="READY",
+        )
+        bot._fork_tasks_by_id["task-123"] = record
+        output_path = tmp_path / "sid-child.jsonl"
+        output_path.write_text('{"type":"assistant"}\n', encoding="utf-8")
+
+        with patch("obs_agent.telegram.find_session_jsonl", return_value=output_path):
+            result = await bot._fork_task_output(
+                route=record.parent_route,
+                args={"task_id": "task-123", "block": False, "timeout": 1},
+            )
+
+        assert f"<output_file>{output_path}</output_file>" in result["content"][0]["text"]
+        assert result["tool_use_result"]["task"]["output_file"] == str(output_path)
+
+    async def test_fork_task_output_on_stopped_handle_returns_stopped(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
         record = _ForkTaskRecord(
@@ -3787,8 +4059,10 @@ class TestForkTaskRuntime:
             args={"task_id": "task-123", "block": False, "timeout": 1},
         )
 
-        assert result["is_error"] is True
-        assert "No task found with ID: task-123" in result["content"][0]["text"]
+        assert "<retrieval_status>stopped</retrieval_status>" in result["content"][0]["text"]
+        assert "<status>stopped</status>" in result["content"][0]["text"]
+        assert result["tool_use_result"]["retrieval_status"] == "stopped"
+        assert result["tool_use_result"]["task"]["status"] == "stopped"
 
     async def test_fork_task_output_unknown_handle_returns_not_found(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -4179,6 +4453,23 @@ class TestForkTaskRuntime:
         assert bot._normalize_resume_task_id("false") is None
         assert bot._normalize_resume_task_id("NULL") is None
         assert bot._normalize_resume_task_id("task-123") == "task-123"
+
+    def test_coerce_timeout_ms_uses_config_default_floor(self, config):
+        config.bg_fork_timeout = 600.0
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        assert bot._coerce_timeout_ms(None) == 600_000
+        assert bot._coerce_timeout_ms(120_000) == 600_000
+        assert bot._coerce_timeout_ms("300000") == 600_000
+        assert bot._coerce_timeout_ms(900_000) == 900_000
+
+    def test_coerce_timeout_ms_respects_custom_default_floor(self, config):
+        config.bg_fork_timeout = 300.0
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        assert bot._coerce_timeout_ms(None) == 300_000
+        assert bot._coerce_timeout_ms(120_000) == 300_000
+        assert bot._coerce_timeout_ms(450_000) == 450_000
 
     async def test_resolve_fork_source_falls_back_to_latest_persisted_uuid(self, config, tmp_path):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -4920,4 +5211,74 @@ class TestTelegramStatePersistence:
             task_id="task-team-1",
             parent_state=restored_child_state,
         )
+        await restored.shutdown()
+
+    async def test_non_team_task_handle_is_restored_and_resumable_after_restart(self, config):
+        first = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        parent_route = TelegramRoute(chat_id=67890, thread_id=None)
+        child_route = TelegramRoute(chat_id=67890, thread_id=654)
+        parent_state = first._get_state(parent_route)
+        child_state = first._get_state(child_route, topic_title="General - Worker")
+        assert parent_state is not None
+        assert child_state is not None
+        parent_state.session_manager.set_session_id("sid-parent")
+        child_state.session_manager.set_session_id("sid-child")
+        first._bind_state_session(parent_state)
+        first._bind_state_session(child_state)
+        first._set_session_head(session_id="sid-parent", jsonl_uuid="uuid-parent")
+        first._set_session_head(session_id="sid-child", jsonl_uuid="uuid-child")
+        first._persist_state_for_route(parent_route)
+        first._persist_state_for_route(child_route)
+
+        record = _ForkTaskRecord(
+            task_id="task-restart-1",
+            parent_route=parent_route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="uuid-parent",
+            child_route=child_route,
+            child_session_id="sid-child",
+            prompt="",
+            description="Restartable worker",
+            status="completed",
+            is_fork=False,
+            launch_tool_name="AgentTask",
+            team_name=None,
+            agent_name=None,
+            idle_ready=False,
+            emit_parent_callback=False,
+        )
+        first._fork_tasks_by_id[record.task_id] = record
+        first._register_team_worker_record(record)
+        await first.shutdown()
+
+        restored = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        await restored.initialize_runtime()
+
+        restored_record = restored._fork_tasks_by_id.get("task-restart-1")
+        assert restored_record is not None
+        assert restored_record.child_route == child_route
+        assert restored_record.child_session_id == "sid-child"
+        assert restored_record.status == "completed"
+
+        restored_parent = restored._get_state(parent_route)
+        assert restored_parent is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(side_effect=[MagicMock(message_id=931), MagicMock(message_id=932)])
+        restored_parent.last_bot = fake_bot
+
+        with patch.object(restored, "_schedule_fork_task", new_callable=AsyncMock) as schedule_mock:
+            launched = await restored._launch_fork_task(
+                route=parent_route,
+                args={
+                    "prompt": "Resume and report READY",
+                    "description": "Restart resume",
+                    "fork": False,
+                    "resume": "task-restart-1",
+                    "task_tool_name": "AgentTask",
+                },
+            )
+
+        assert "AgentTask launched successfully." in launched["content"][0]["text"]
+        assert "agentId: task-restart-1" in launched["content"][0]["text"]
+        schedule_mock.assert_awaited_once()
         await restored.shutdown()

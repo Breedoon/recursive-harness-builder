@@ -48,6 +48,34 @@ def test_state_store_roundtrip_snapshot(tmp_path):
         status="completed",
         idle_ready=True,
     )
+    store.upsert_task_handle_state(
+        task_id="task-1",
+        parent_chat_id=-1001,
+        parent_thread_id=42,
+        parent_session_id_at_launch="sid-1",
+        parent_source_uuid="uuid-1",
+        child_chat_id=-1001,
+        child_thread_id=99,
+        child_session_id="sid-child",
+        description="Team worker",
+        status="completed",
+        is_fork=False,
+        launch_tool_name="AgentTask",
+        team_name="team-alpha",
+        agent_name="worker-a",
+        idle_ready=True,
+        terminal_request=None,
+        result_text="done",
+        error=None,
+        timeout_ms=600000,
+        max_turns=20,
+        launch_parent_message_id=902,
+        launch_child_message_id=903,
+        child_completion_message_id=904,
+        parent_callback_message_id=905,
+        created_at=123.0,
+        completed_at=456.0,
+    )
     store.upsert_topic_schedule(
         schedule_id="sched-1",
         chat_id=-1001,
@@ -116,6 +144,29 @@ def test_state_store_roundtrip_snapshot(tmp_path):
     assert worker.description == "Team worker"
     assert worker.status == "completed"
     assert worker.idle_ready is True
+    assert len(snapshot.task_handle_states) == 1
+    handle = snapshot.task_handle_states[0]
+    assert handle.task_id == "task-1"
+    assert handle.parent_chat_id == -1001
+    assert handle.parent_thread_id == 42
+    assert handle.child_chat_id == -1001
+    assert handle.child_thread_id == 99
+    assert handle.child_session_id == "sid-child"
+    assert handle.status == "completed"
+    assert handle.is_fork is False
+    assert handle.launch_tool_name == "AgentTask"
+    assert handle.team_name == "team-alpha"
+    assert handle.agent_name == "worker-a"
+    assert handle.idle_ready is True
+    assert handle.result_text == "done"
+    assert handle.timeout_ms == 600000
+    assert handle.max_turns == 20
+    assert handle.launch_parent_message_id == 902
+    assert handle.launch_child_message_id == 903
+    assert handle.child_completion_message_id == 904
+    assert handle.parent_callback_message_id == 905
+    assert handle.created_at == 123.0
+    assert handle.completed_at == 456.0
     assert len(snapshot.topic_schedules) == 1
     schedule = snapshot.topic_schedules[0]
     assert schedule.schedule_id == "sched-1"
@@ -181,6 +232,34 @@ def test_state_store_prune_removes_expired_rows(tmp_path):
             status="completed",
             idle_ready=True,
         )
+        store.upsert_task_handle_state(
+            task_id="task-old",
+            parent_chat_id=-1002,
+            parent_thread_id=None,
+            parent_session_id_at_launch="sid-old",
+            parent_source_uuid="uuid-old",
+            child_chat_id=-1002,
+            child_thread_id=None,
+            child_session_id="sid-old-child",
+            description=None,
+            status="completed",
+            is_fork=False,
+            launch_tool_name="AgentTask",
+            team_name="team-old",
+            agent_name="worker-old",
+            idle_ready=True,
+            terminal_request=None,
+            result_text=None,
+            error=None,
+            timeout_ms=600000,
+            max_turns=None,
+            launch_parent_message_id=None,
+            launch_child_message_id=None,
+            child_completion_message_id=None,
+            parent_callback_message_id=None,
+            created_at=10.0,
+            completed_at=10.0,
+        )
         store.upsert_topic_schedule(
             schedule_id="sched-old",
             chat_id=-1002,
@@ -217,6 +296,7 @@ def test_state_store_prune_removes_expired_rows(tmp_path):
     assert snapshot.system_messages == []
     assert snapshot.session_heads == {}
     assert snapshot.team_worker_states == []
+    assert snapshot.task_handle_states == []
     assert snapshot.topic_schedules == []
     store.close()
 
@@ -293,6 +373,35 @@ def test_state_store_delete_route_and_bindings(tmp_path):
         retry_attempt_count=0,
     )
     store.delete_team_worker_states_for_route(chat_id=-1003, thread_id=123)
+    store.upsert_task_handle_state(
+        task_id="task-3",
+        parent_chat_id=-1003,
+        parent_thread_id=123,
+        parent_session_id_at_launch="sid-3",
+        parent_source_uuid="uuid-3",
+        child_chat_id=-1003,
+        child_thread_id=123,
+        child_session_id="sid-3-child",
+        description="Worker",
+        status="completed",
+        is_fork=False,
+        launch_tool_name="AgentTask",
+        team_name="team-gamma",
+        agent_name="worker-g",
+        idle_ready=True,
+        terminal_request=None,
+        result_text=None,
+        error=None,
+        timeout_ms=600000,
+        max_turns=10,
+        launch_parent_message_id=None,
+        launch_child_message_id=None,
+        child_completion_message_id=None,
+        parent_callback_message_id=None,
+        created_at=1.0,
+        completed_at=2.0,
+    )
+    store.delete_task_handle_states_for_route(chat_id=-1003, thread_id=123)
     store.delete_topic_schedules_for_route(chat_id=-1003, thread_id=123)
 
     snapshot = store.load_snapshot()
@@ -300,6 +409,7 @@ def test_state_store_delete_route_and_bindings(tmp_path):
     assert snapshot.message_bindings == []
     assert snapshot.system_messages == []
     assert snapshot.team_worker_states == []
+    assert snapshot.task_handle_states == []
     assert snapshot.topic_schedules == []
     store.close()
 
@@ -335,4 +445,72 @@ def test_state_store_delete_team_worker_by_task(tmp_path):
     snapshot = store.load_snapshot()
     assert len(snapshot.team_worker_states) == 1
     assert snapshot.team_worker_states[0].task_id == "task-b"
+    store.close()
+
+
+def test_state_store_delete_task_handle_by_task(tmp_path):
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+    store.upsert_task_handle_state(
+        task_id="task-a",
+        parent_chat_id=-1004,
+        parent_thread_id=None,
+        parent_session_id_at_launch="sid-a",
+        parent_source_uuid="uuid-a",
+        child_chat_id=-1004,
+        child_thread_id=None,
+        child_session_id="sid-a-child",
+        description=None,
+        status="completed",
+        is_fork=True,
+        launch_tool_name="ForkTask",
+        team_name=None,
+        agent_name=None,
+        idle_ready=False,
+        terminal_request=None,
+        result_text=None,
+        error=None,
+        timeout_ms=600000,
+        max_turns=20,
+        launch_parent_message_id=None,
+        launch_child_message_id=None,
+        child_completion_message_id=None,
+        parent_callback_message_id=None,
+        created_at=1.0,
+        completed_at=2.0,
+    )
+    store.upsert_task_handle_state(
+        task_id="task-b",
+        parent_chat_id=-1004,
+        parent_thread_id=None,
+        parent_session_id_at_launch="sid-b",
+        parent_source_uuid="uuid-b",
+        child_chat_id=-1004,
+        child_thread_id=44,
+        child_session_id="sid-b-child",
+        description=None,
+        status="completed",
+        is_fork=True,
+        launch_tool_name="ForkTask",
+        team_name=None,
+        agent_name=None,
+        idle_ready=False,
+        terminal_request=None,
+        result_text=None,
+        error=None,
+        timeout_ms=600000,
+        max_turns=20,
+        launch_parent_message_id=None,
+        launch_child_message_id=None,
+        child_completion_message_id=None,
+        parent_callback_message_id=None,
+        created_at=1.0,
+        completed_at=2.0,
+    )
+
+    store.delete_task_handle_state(task_id="task-a")
+    snapshot = store.load_snapshot()
+    assert len(snapshot.task_handle_states) == 1
+    assert snapshot.task_handle_states[0].task_id == "task-b"
     store.close()
