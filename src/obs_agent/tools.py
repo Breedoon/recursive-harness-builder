@@ -26,6 +26,7 @@ from obs_agent.context_stats import (
     build_context_snapshot,
     format_context_snapshot_lines,
 )
+from obs_agent.lineage import find_latest_obs_bootstrap_for_session
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -90,6 +91,15 @@ def create_obs_tools(
     ``ForkTask`` can delegate launch behavior through hook_state callbacks.
     """
 
+    def _current_obs_bootstrap():
+        session_id = get_session_id()
+        if not session_id and hook_state is not None:
+            session_id = hook_state.session_id
+        return find_latest_obs_bootstrap_for_session(
+            session_id=session_id,
+            cwd=config.vault_path,
+        )
+
     async def _launch_task(
         args: dict,
         *,
@@ -97,7 +107,7 @@ def create_obs_tools(
         default_fork: bool,
     ) -> dict:
         prompt = str(args.get("prompt", "")).strip()
-        description = str(args.get("description", "")).strip() or None
+        description = str(args.get("alias") or args.get("description") or "").strip() or None
         resume = _normalize_resume_arg(args.get("resume"))
         run_in_background = args.get("run_in_background")
         team_name = str(args.get("team_name", "")).strip() or None
@@ -174,9 +184,13 @@ def create_obs_tools(
                 "type": "string",
                 "description": "Full task prompt for the forked child session",
             },
+            "alias": {
+                "type": "string",
+                "description": "Short stable alias for the child agent/topic.",
+            },
             "description": {
                 "type": "string",
-                "description": "Short user-facing label for the child topic",
+                "description": "Deprecated alias for alias.",
             },
             "resume": {
                 "type": "string",
@@ -217,9 +231,13 @@ def create_obs_tools(
                 "type": "string",
                 "description": "Full task prompt for the child session",
             },
+            "alias": {
+                "type": "string",
+                "description": "Short stable alias for the child agent/topic.",
+            },
             "description": {
                 "type": "string",
-                "description": "Short user-facing label for the child topic",
+                "description": "Deprecated alias for alias.",
             },
             "resume": {
                 "type": "string",
@@ -597,17 +615,53 @@ def create_obs_tools(
         return await _cron_delete(args, tool_name="CronDelete")
 
     async def _send_inbox_message(args: dict) -> dict:
-        team_name = str(args.get("team_name", "")).strip()
+        bootstrap = _current_obs_bootstrap()
+        team_name = str(args.get("team_name", "")).strip() or (
+            bootstrap.root_team_key if bootstrap is not None else ""
+        )
         recipient = str(args.get("recipient", "")).strip()
         content = str(args.get("content", "")).strip()
         summary = str(args.get("summary", "")).strip() or None
-        sender = str(args.get("sender", "")).strip() or "obs-worker"
+        sender = str(args.get("sender", "")).strip() or (
+            bootstrap.native_agent_name if bootstrap is not None and bootstrap.native_agent_name else "obs-worker"
+        )
         if not team_name:
-            return _error_result("Cannot use SendInboxMessage: team_name is required")
+            return _error_result(
+                "Cannot use SendInboxMessage: team_name is required or must be inferable from current lineage"
+            )
         if not recipient:
             return _error_result("Cannot use SendInboxMessage: recipient is required")
         if not content:
             return _error_result("Cannot use SendInboxMessage: content is required")
+        if hook_state is not None and hook_state.inbox_recipient_validator is not None:
+            try:
+                validation = await hook_state.inbox_recipient_validator(
+                    {
+                        "team_name": team_name,
+                        "recipient": recipient,
+                    }
+                )
+            except Exception:
+                logger.warning("SendInboxMessage validator failed", exc_info=True)
+                validation = {"deliverable": True}
+            deliverable = bool(validation.get("deliverable", True)) if isinstance(validation, dict) else bool(validation)
+            if not deliverable:
+                reason = ""
+                if isinstance(validation, dict):
+                    reason = str(validation.get("reason") or "").strip()
+                reason = reason or "recipient is not a live agent in this tree"
+                response = {
+                    "success": False,
+                    "delivered": False,
+                    "team_name": team_name,
+                    "recipient": recipient,
+                    "error": reason,
+                }
+                return {
+                    "content": [{"type": "text", "text": f"message undelivered: {reason}"}],
+                    "tool_use_result": response,
+                    "is_error": True,
+                }
 
         inbox_path = (
             Path.home()
@@ -663,12 +717,21 @@ def create_obs_tools(
         }
 
     async def _read_inbox(args: dict) -> dict:
-        team_name = str(args.get("team_name", "")).strip()
-        agent = str(args.get("agent", "")).strip()
+        bootstrap = _current_obs_bootstrap()
+        team_name = str(args.get("team_name", "")).strip() or (
+            bootstrap.root_team_key if bootstrap is not None else ""
+        )
+        agent = str(args.get("agent", "")).strip() or (
+            bootstrap.native_agent_name if bootstrap is not None else ""
+        )
         if not team_name:
-            return _error_result("Cannot use ReadInbox: team_name is required")
+            return _error_result(
+                "Cannot use ReadInbox: team_name is required or must be inferable from current lineage"
+            )
         if not agent:
-            return _error_result("Cannot use ReadInbox: agent is required")
+            return _error_result(
+                "Cannot use ReadInbox: agent is required or must be inferable from current lineage"
+            )
         include_read = bool(args.get("include_read", False))
         mark_read = bool(args.get("mark_read", True))
         try:
@@ -728,7 +791,7 @@ def create_obs_tools(
         "SendInboxMessage",
         "Write a message to a native-compatible team inbox JSON file.",
         {
-            "team_name": {"type": "string", "description": "Team name"},
+            "team_name": {"type": "string", "description": "Optional team name; defaults to current tree root team"},
             "recipient": {"type": "string", "description": "Recipient agent name"},
             "content": {"type": "string", "description": "Message body"},
             "summary": {"type": "string", "description": "Optional short summary"},
@@ -742,8 +805,8 @@ def create_obs_tools(
         "ReadInbox",
         "Read messages from a native-compatible team inbox JSON file.",
         {
-            "team_name": {"type": "string", "description": "Team name"},
-            "agent": {"type": "string", "description": "Agent inbox to read"},
+            "team_name": {"type": "string", "description": "Optional team name; defaults to current tree root team"},
+            "agent": {"type": "string", "description": "Optional agent inbox name; defaults to current native agent projection"},
             "include_read": {"type": "boolean", "description": "Include already-read messages"},
             "mark_read": {"type": "boolean", "description": "Mark unread messages as read"},
             "limit": {"type": "integer", "description": "Maximum number of messages to return"},
@@ -787,6 +850,39 @@ def create_obs_tools(
     async def context_info(args: dict) -> dict:
         return {"content": [{"type": "text", "text": await _render_context_and_session()}]}
 
+    @tool(
+        "session_lineage",
+        "Return the current OBS lineage/bootstrap identity for this session.",
+        {
+            "include_xml": {
+                "type": "boolean",
+                "description": "Include the raw bootstrap XML payload in the response. Defaults to false.",
+            },
+        },
+    )
+    async def session_lineage(args: dict) -> dict:
+        include_xml = bool(args.get("include_xml", False))
+        bootstrap = _current_obs_bootstrap()
+        if bootstrap is None:
+            return _error_result("Cannot use session_lineage: no OBS bootstrap found for current session")
+        payload = {
+            "lineage": list(bootstrap.lineage),
+            "lineage_length": len(bootstrap.lineage),
+            "origin": bootstrap.origin,
+            "is_fork": bootstrap.is_fork,
+            "session_id": bootstrap.session_id or get_session_id(),
+            "agent_id": bootstrap.agent_id,
+            "parent_session_id": bootstrap.parent_session_id,
+            "root_team_key": bootstrap.root_team_key,
+            "native_agent_name": bootstrap.native_agent_name,
+        }
+        if include_xml:
+            payload["xml"] = bootstrap.raw_xml
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=True)}],
+            "tool_use_result": payload,
+        }
+
     server = create_sdk_mcp_server(
         "obs-agent",
         tools=[
@@ -803,6 +899,7 @@ def create_obs_tools(
             fork_task_stop,
             session_info,
             context_info,
+            session_lineage,
         ],
     )
     return server

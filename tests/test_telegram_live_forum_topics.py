@@ -148,6 +148,11 @@ def _start_bot(
     resolved_state_db = state_db_path or (temp_root.parent / "telegram-state.sqlite3")
     env["OBS_TELEGRAM_STATE_DB_PATH"] = str(resolved_state_db)
     env["OBS_TELEGRAM_DROP_PENDING_UPDATES"] = "1"
+    # Live tests intentionally overlap parent/child traffic in one forum chat.
+    # Use conservative transport pacing so flood control does not dominate the signal.
+    env.setdefault("OBS_TELEGRAM_TRANSPORT_BASE_CHAT_INTERVAL_SECONDS", "1.2")
+    env.setdefault("OBS_TELEGRAM_TRANSPORT_MAX_CHAT_INTERVAL_SECONDS", "15.0")
+    env.setdefault("OBS_TELEGRAM_TYPING_ACTIONS_ENABLED", "0")
     # Native Task* parity harness requires the built-in task tools enabled.
     env.setdefault("CLAUDE_CODE_ENABLE_TASKS", "1")
 
@@ -460,28 +465,37 @@ async def _session_id_for_route(
 async def _ensure_cached_forum_chat_id() -> int:
     global _CACHED_FORUM_CHAT_ID
 
-    if _CACHED_FORUM_CHAT_ID is not None:
-        return _CACHED_FORUM_CHAT_ID
-
-    for key in ("OBS_TELEGRAM_TEST_FORUM_CHAT_ID", "TELEGRAM_TEST_FORUM_CHAT_ID"):
-        raw = (os.environ.get(key) or "").strip()
-        if not raw:
-            continue
-        try:
-            _CACHED_FORUM_CHAT_ID = int(raw)
-            return _CACHED_FORUM_CHAT_ID
-        except ValueError:
-            continue
-
     bootstrap = TelegramForumPlatform()
     await bootstrap.connect()
     try:
+        if _CACHED_FORUM_CHAT_ID is not None:
+            if await bootstrap._probe_forum_chat(_CACHED_FORUM_CHAT_ID):
+                return _CACHED_FORUM_CHAT_ID
+            _CACHED_FORUM_CHAT_ID = None
+
+        for key in ("OBS_TELEGRAM_TEST_FORUM_CHAT_ID", "TELEGRAM_TEST_FORUM_CHAT_ID"):
+            raw = (os.environ.get(key) or "").strip()
+            if not raw:
+                continue
+            try:
+                configured_chat_id = int(raw)
+            except ValueError:
+                continue
+            if await bootstrap._probe_forum_chat(configured_chat_id):
+                _CACHED_FORUM_CHAT_ID = configured_chat_id
+                return _CACHED_FORUM_CHAT_ID
+
         # Prefer reusing an existing valid forum chat to avoid Telegram
         # CreateChannel flood-wait throttling across long live suites.
         _CACHED_FORUM_CHAT_ID = await bootstrap.provision_forum_chat()
         return _CACHED_FORUM_CHAT_ID
     finally:
         await bootstrap.close()
+
+
+def _clear_cached_forum_chat_id() -> None:
+    global _CACHED_FORUM_CHAT_ID
+    _CACHED_FORUM_CHAT_ID = None
 
 
 @pytest_asyncio.fixture

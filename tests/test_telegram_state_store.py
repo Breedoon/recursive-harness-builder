@@ -20,6 +20,12 @@ def test_state_store_roundtrip_snapshot(tmp_path):
         child_fork_base_title="General",
         notify_on_completion=False,
         last_inbound_message_id=777,
+        agent_lineage=("General", "Worker"),
+        pending_obs_bootstrap=(
+            "<obs-bootstrap version='1'><obs-lineage>"
+            "<obs-node name='General' /><obs-node name='Worker' />"
+            "</obs-lineage></obs-bootstrap>"
+        ),
     )
     store.upsert_message_binding(
         chat_id=-1001,
@@ -115,6 +121,9 @@ def test_state_store_roundtrip_snapshot(tmp_path):
     assert route_state.child_fork_base_title == "General"
     assert route_state.notify_on_completion is False
     assert route_state.last_inbound_message_id == 777
+    assert route_state.agent_lineage == ("General", "Worker")
+    assert route_state.pending_obs_bootstrap is not None
+    assert "<obs-bootstrap" in route_state.pending_obs_bootstrap
 
     assert len(snapshot.message_bindings) == 1
     binding = snapshot.message_bindings[0]
@@ -185,6 +194,59 @@ def test_state_store_roundtrip_snapshot(tmp_path):
     assert schedule.max_retry_attempts == 2
     assert schedule.retry_delay_seconds == 45
     assert schedule.retry_attempt_count == 1
+    store.close()
+
+
+def test_state_store_keeps_fresh_task_rows_without_child_session_id(tmp_path):
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    store.upsert_team_worker_state(
+        team_name="team-alpha",
+        agent_name="worker-a",
+        task_id="task-fresh",
+        child_chat_id=-1001,
+        child_thread_id=42,
+        child_session_id="",
+        description="Fresh worker",
+        status="launched",
+        idle_ready=False,
+    )
+    store.upsert_task_handle_state(
+        task_id="task-fresh",
+        parent_chat_id=-1001,
+        parent_thread_id=1,
+        parent_session_id_at_launch="sid-parent",
+        parent_source_uuid="uuid-parent",
+        child_chat_id=-1001,
+        child_thread_id=42,
+        child_session_id="",
+        description="Fresh worker",
+        status="launched",
+        is_fork=False,
+        launch_tool_name="AgentTask",
+        team_name="team-alpha",
+        agent_name="worker-a",
+        idle_ready=False,
+        terminal_request=None,
+        result_text=None,
+        error=None,
+        timeout_ms=600000,
+        max_turns=8,
+        launch_parent_message_id=10,
+        launch_child_message_id=11,
+        child_completion_message_id=None,
+        parent_callback_message_id=None,
+        created_at=123.0,
+        completed_at=None,
+    )
+
+    snapshot = store.load_snapshot()
+    assert len(snapshot.team_worker_states) == 1
+    assert snapshot.team_worker_states[0].child_session_id == ""
+    assert len(snapshot.task_handle_states) == 1
+    assert snapshot.task_handle_states[0].child_session_id == ""
     store.close()
 
 

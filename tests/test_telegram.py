@@ -20,6 +20,7 @@ import pytest
 from telegram.error import BadRequest, TelegramError
 
 from obs_agent.events import StatusEvent
+from obs_agent.lineage import native_agent_name_for_lineage, root_team_key_for_lineage
 from obs_agent.queueing import QueuedMessage
 from obs_agent.runner import DoneEvent, TextEvent, TurnEndEvent
 from obs_agent.telegram import (
@@ -865,6 +866,57 @@ class TestBackgroundPoller:
         assert "user interrupted your previous response via /stop" in captured_prompt[0]
         assert captured_prompt[0].strip().endswith("hello")
         assert state.hook_state.interrupt_notice_pending is False
+
+    async def test_run_and_send_primes_trunk_lineage_before_first_client_connect(
+        self,
+        config,
+        monkeypatch,
+        tmp_path,
+    ):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        assert state is not None
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=777))
+        observed: dict[str, object] = {}
+
+        async def fake_get_client():
+            observed["session_id"] = state.session_id
+            observed["env"] = state.session_manager.sdk_env_overrides
+            return MagicMock()
+
+        with (
+            patch.object(state.session_manager, "get_client", AsyncMock(side_effect=fake_get_client)),
+            patch("obs_agent.telegram.ConversationRunner") as mock_runner,
+        ):
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                observed["prompt"] = msg
+                yield DoneEvent()
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+            await bot._run_and_send(
+                state=state,
+                user_text="hello",
+                bot=fake_bot,
+            )
+
+        assert observed.get("session_id") is None
+        assert state.agent_lineage == ("General",)
+        env = observed["env"]
+        assert isinstance(env, dict)
+        assert env["CLAUDE_CODE_TEAM_NAME"] == root_team_key_for_lineage(("General",))
+        assert env["CLAUDE_CODE_TASK_LIST_ID"] == root_team_key_for_lineage(("General",))
+        assert env["CLAUDE_CODE_AGENT_NAME"] == native_agent_name_for_lineage(("General",))
+        prompt = str(observed.get("prompt") or "")
+        assert prompt.startswith("<obs-bootstrap")
+        assert "<origin>trunk_start</origin>" in prompt
+        assert "<session_id>" not in prompt
+        assert prompt.strip().endswith("hello")
 
     async def test_run_and_send_summary_uses_assistant_transport_priority(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -2247,13 +2299,23 @@ class TestForkViaReply:
 
 
 class TestCommands:
-    async def test_clear_resets_route_state(self, config):
+    async def test_clear_resets_route_state_and_keeps_identity(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
-        state = _state(bot)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route, topic_title="Root Worker")
+        assert state is not None
         state.pending_messages = [QueuedMessage(text="x")]
         state.hook_state.interrupt_flag = True
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root", "Worker"),
+            origin="agent_task_fresh",
+            is_fork=False,
+        )
+        team_name = root_team_key_for_lineage(("Root", "Worker"))
+        agent_name = native_agent_name_for_lineage(("Root", "Worker"))
 
-        update = _make_update("/clear")
+        update = _make_update("/clear", thread_id=321)
         ctx = _make_context()
 
         with patch.object(state.session_manager, "async_reset", new_callable=AsyncMock) as mock_reset:
@@ -2262,8 +2324,13 @@ class TestCommands:
         mock_reset.assert_called_once()
         assert state.pending_messages == []
         assert state.hook_state.interrupt_flag is False
+        assert state.agent_lineage == ("Root", "Worker")
+        assert bot._resolve_route_inbox_target(team_name=team_name, agent_name=agent_name) is state
         ctx.bot.send_message.assert_called_once()
-        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>session cleared</i></u>"
+        assert (
+            ctx.bot.send_message.call_args.kwargs["text"]
+            == "<u><i>session cleared; agent identity was kept</i></u>"
+        )
 
     async def test_clear_mentions_unschedule_when_topic_has_schedule(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -2290,8 +2357,152 @@ class TestCommands:
         await bot.handle_clear(update, ctx)
         assert (
             ctx.bot.send_message.call_args.kwargs["text"]
-            == "<u><i>session cleared; schedule was kept. Use /unschedule to remove this topic schedule.</i></u>"
+            == "<u><i>session cleared; schedule was kept; agent identity was kept. Use /unschedule to remove this topic schedule.</i></u>"
         )
+
+    async def test_new_reseeds_route_as_new_trunk_identity(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route, topic_title="Old Topic")
+        assert state is not None
+        state.topic_icon_custom_emoji_id = "emoji-old"
+        bot._set_topic_metadata(route=route, title="Old Topic", icon_custom_emoji_id="emoji-old")
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Old Topic",),
+            origin="trunk_start",
+            is_fork=False,
+        )
+        old_team_name = root_team_key_for_lineage(("Old Topic",))
+        old_agent_name = native_agent_name_for_lineage(("Old Topic",))
+
+        update = _make_update("/new ⚡ Fresh Start", thread_id=321)
+        ctx = _make_context()
+        ctx.args = ["⚡", "Fresh", "Start"]
+        ctx.bot.edit_forum_topic = AsyncMock(return_value=True)
+
+        with (
+            patch.object(state.session_manager, "async_reset", new_callable=AsyncMock) as mock_reset,
+            patch.object(
+                bot,
+                "_resolve_new_topic_visibility",
+                AsyncMock(return_value=("Fresh Start", "⚡", "emoji-new")),
+            ),
+        ):
+            await bot.handle_new(update, ctx)
+
+        mock_reset.assert_called_once()
+        ctx.bot.edit_forum_topic.assert_awaited_once_with(
+            chat_id=67890,
+            message_thread_id=321,
+            name="Fresh Start",
+            icon_custom_emoji_id="emoji-new",
+        )
+        assert state.agent_lineage == ("Fresh Start",)
+        assert state.pending_obs_bootstrap is not None
+        assert "Fresh Start" in state.pending_obs_bootstrap
+        assert bot._resolve_route_inbox_target(
+            team_name=old_team_name,
+            agent_name=old_agent_name,
+        ) is None
+        assert bot._resolve_route_inbox_target(
+            team_name=root_team_key_for_lineage(("Fresh Start",)),
+            agent_name=native_agent_name_for_lineage(("Fresh Start",)),
+        ) is state
+        assert (
+            ctx.bot.send_message.call_args.kwargs["text"]
+            == "<u><i>new trunk session created: ⚡ Fresh Start</i></u>"
+        )
+
+    async def test_new_visibility_uses_requested_valid_emoji_and_name(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route, topic_title="Old Topic")
+        assert state is not None
+
+        fake_bot = MagicMock()
+        fake_bot.get_forum_topic_icon_stickers = AsyncMock(
+            return_value=[
+                SimpleNamespace(emoji="⚡", custom_emoji_id="emoji-requested"),
+                SimpleNamespace(emoji="🔥", custom_emoji_id="emoji-other"),
+            ]
+        )
+
+        title, emoji, icon = await bot._resolve_new_topic_visibility(
+            state=state,
+            bot=fake_bot,
+            raw_args="⚡ Fresh Start",
+        )
+
+        assert title == "Fresh Start"
+        assert emoji == "⚡"
+        assert icon == "emoji-requested"
+
+    async def test_new_visibility_generates_random_title_and_non_current_emoji(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route, topic_title="Old Topic")
+        assert state is not None
+        state.topic_icon_custom_emoji_id = "emoji-old"
+
+        fake_bot = MagicMock()
+        fake_bot.get_forum_topic_icon_stickers = AsyncMock(
+            return_value=[
+                SimpleNamespace(emoji="⚡", custom_emoji_id="emoji-old"),
+                SimpleNamespace(emoji="🔥", custom_emoji_id="emoji-new"),
+            ]
+        )
+
+        with patch.object(bot, "_random_topic_title", return_value="Fresh Orbit"):
+            title, emoji, icon = await bot._resolve_new_topic_visibility(
+                state=state,
+                bot=fake_bot,
+                raw_args=None,
+            )
+
+        assert title == "Fresh Orbit"
+        assert emoji == "🔥"
+        assert icon == "emoji-new"
+
+    async def test_deleted_route_becomes_undeliverable_until_same_lineage_is_respawned(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        child_route = TelegramRoute(chat_id=67890, thread_id=654)
+        child_state = bot._get_state(child_route, topic_title="Root - Worker")
+        assert child_state is not None
+        child_state.session_manager.set_session_id("sid-worker")
+        bot._bind_state_session(child_state)
+        bot._prime_obs_bootstrap(
+            child_state,
+            lineage=("Root", "Worker"),
+            origin="agent_task_fresh",
+            is_fork=False,
+            session_id="sid-worker",
+        )
+        team_name = root_team_key_for_lineage(("Root", "Worker"))
+        agent_name = native_agent_name_for_lineage(("Root", "Worker"))
+
+        assert bot._recipient_delivery_status(team_name=team_name, agent_name=agent_name)["deliverable"] is True
+
+        await bot._drop_route_state(child_route, terminal_status="failed")
+
+        after_delete = bot._recipient_delivery_status(team_name=team_name, agent_name=agent_name)
+        assert after_delete["deliverable"] is False
+        assert "deleted" in after_delete["reason"]
+
+        reborn_state = bot._get_state(child_route, topic_title="Root - Worker")
+        assert reborn_state is not None
+        reborn_state.session_manager.set_session_id("sid-worker-new")
+        bot._bind_state_session(reborn_state)
+        bot._prime_obs_bootstrap(
+            reborn_state,
+            lineage=("Root", "Worker"),
+            origin="agent_task_fresh",
+            is_fork=False,
+            session_id="sid-worker-new",
+        )
+
+        assert bot._recipient_delivery_status(team_name=team_name, agent_name=agent_name)["deliverable"] is True
+        await bot.shutdown()
 
     async def test_unschedule_removes_topic_schedules(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -2887,7 +3098,7 @@ class TestTopicCommands:
         assert mock_fork.call_args.kwargs["target_uuid"] == "older-uuid"
         ctx.bot.create_forum_topic.assert_awaited_once_with(
             chat_id=67890,
-            name="Focused topic",
+            name="General - Focused topic",
             icon_custom_emoji_id=None,
         )
 
@@ -3086,8 +3297,7 @@ class TestForkTaskRuntime:
         state.session_manager.set_session_id("sid-root")
 
         fake_task_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
-        fake_child_sid = uuid.UUID("22222222-2222-2222-2222-222222222222")
-        with patch("obs_agent.telegram.uuid.uuid4", side_effect=[fake_task_id, fake_child_sid]), patch(
+        with patch("obs_agent.telegram.uuid.uuid4", side_effect=[fake_task_id]), patch(
             "obs_agent.telegram.fork_session_jsonl"
         ) as mock_fork, patch.object(bot, "_execute_fork_task", new_callable=AsyncMock):
             launched = await bot._launch_fork_task(
@@ -3112,7 +3322,7 @@ class TestForkTaskRuntime:
         assert "agentId: 11111111-1111-1111-1111-111111111111" in launch_text
         record = bot._fork_tasks_by_id["11111111-1111-1111-1111-111111111111"]
         assert record.is_fork is False
-        assert record.child_session_id == "22222222-2222-2222-2222-222222222222"
+        assert record.child_session_id == ""
         assert record.launch_tool_name == "AgentTask"
         assert record.team_name == "team-alpha"
         assert record.agent_name == "worker-a"
@@ -3120,9 +3330,13 @@ class TestForkTaskRuntime:
         assert "agent task launched by agent" in send_calls[0].kwargs["text"]
         assert "team_name: team-alpha" in send_calls[0].kwargs["text"]
         assert "agent_name: worker-a" in send_calls[0].kwargs["text"]
-        assert "session launched, your new session id is 22222222-2222-2222-2222-222222222222" in send_calls[1].kwargs["text"]
+        assert (
+            send_calls[1].kwargs["text"]
+            == "<u><i>session launched; a fresh session id will be assigned on first turn</i></u>"
+        )
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=333))
         assert child_state is not None
+        assert child_state.session_id is None
         child_env = child_state.session_manager.create_options().env
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
@@ -3347,15 +3561,13 @@ class TestForkTaskRuntime:
         assert "open child completion" in send_calls[1].kwargs["text"]
         assert "https://t.me/c/67890/321/910" in send_calls[1].kwargs["text"]
         run_text = run_mock.await_args.kwargs["user_text"]
-        assert "<team_context>" in run_text
-        assert "<team_name>team-alpha</team_name>" in run_text
-        assert "<agent_name>worker-a</agent_name>" in run_text
-        assert "SendInboxMessage" in run_text
-        assert "ReadInbox" in run_text
+        assert run_text == "Return SECRET-42"
         fake_bot.edit_message_text.assert_awaited_once()
         assert "subtask: fork completed" in fake_bot.edit_message_text.await_args.kwargs["text"]
         assert "return_to_parent: https://t.me/c/67890/911" in fake_bot.edit_message_text.await_args.kwargs["text"]
-        assert child_route not in bot._fork_task_by_child_route
+        assert record.idle_ready is True
+        assert bot._fork_task_by_child_route[child_route] == "task-123"
+        assert bot._team_worker_records[("team-alpha", "worker-a")] == "task-123"
 
     async def test_execute_super_task_team_worker_stays_idle_ready(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -3518,6 +3730,58 @@ class TestForkTaskRuntime:
         schedule_mock.assert_awaited_once_with(task_id="task-team", parent_state=child_state)
         assert record.status == "launched"
         assert record.idle_ready is False
+        await bot.shutdown()
+
+    async def test_inbox_message_wakes_idle_forked_team_worker(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        child_state = bot._get_state(child_route, topic_title="General - Fork Worker")
+        assert child_state is not None
+        fake_bot = MagicMock()
+        wake_message = MagicMock()
+        wake_message.message_id = 937
+        fake_bot.send_message = AsyncMock(return_value=wake_message)
+        child_state.last_bot = fake_bot
+        child_state.session_manager.set_session_id("sid-fork-child")
+        bot._session_heads["sid-fork-child"] = "fork-child-head-uuid"
+
+        record = _ForkTaskRecord(
+            task_id="task-fork-team",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=child_route,
+            child_session_id="sid-fork-child",
+            prompt="Old fork prompt",
+            description="Fork Worker",
+            team_name="team-alpha",
+            agent_name="worker-fork",
+            is_fork=True,
+            status="completed",
+            idle_ready=True,
+        )
+        bot._fork_tasks_by_id["task-fork-team"] = record
+        bot._fork_task_by_child_route[child_route] = "task-fork-team"
+        bot._team_worker_records[("team-alpha", "worker-fork")] = "task-fork-team"
+
+        with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock) as schedule_mock:
+            await bot._handle_inbox_message_notification(
+                sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
+                payload={
+                    "team_name": "team-alpha",
+                    "recipient": "worker-fork",
+                    "sender": "worker-b",
+                    "summary": "handoff",
+                    "content": "please process fork item 7",
+                },
+            )
+
+        schedule_mock.assert_awaited_once_with(task_id="task-fork-team", parent_state=child_state)
+        assert record.status == "launched"
+        assert record.idle_ready is False
+        assert "ReadInbox" in record.prompt
+        assert "agent=worker-fork" in record.prompt
+        assert fake_bot.send_message.await_count == 1
         await bot.shutdown()
 
     async def test_inbox_message_sets_pending_wake_when_worker_is_running(self, config):
@@ -3706,6 +3970,123 @@ class TestForkTaskRuntime:
         assert record_a.status == "completed"
         assert record_b.status == "launched"
         assert record_b.idle_ready is False
+        await bot.shutdown()
+
+    async def test_inbox_message_wakes_idle_lineage_route_and_merges_queued_updates(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=654)
+        state = bot._get_state(route, topic_title="General - Fork Child")
+        assert state is not None
+        state.session_manager.set_session_id("sid-route-child")
+        bot._bind_state_session(state)
+        bot._set_session_head(session_id="sid-route-child", jsonl_uuid="uuid-route-child")
+        fake_bot = MagicMock()
+        wake_message = MagicMock()
+        wake_message.message_id = 943
+        fake_bot.send_message = AsyncMock(return_value=wake_message)
+        state.last_bot = fake_bot
+        lineage = ("General", "Fork Child")
+        team_name = root_team_key_for_lineage(lineage)
+        agent_name = native_agent_name_for_lineage(lineage)
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=lineage,
+            origin="user_fork",
+            is_fork=True,
+            session_id="sid-route-child",
+        )
+        state.hook_state.message_queue.put_nowait(
+            QueuedMessage(text="queued user followup", telegram_message_id=944)
+        )
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            AsyncMock(return_value=_RunOutcome(assistant_text="ROUTE-WAKE-OK")),
+        ) as run_mock:
+            await bot._handle_inbox_message_notification(
+                sender_route=TelegramRoute(chat_id=-10067890, thread_id=777),
+                payload={
+                    "team_name": team_name,
+                    "recipient": agent_name,
+                    "sender": "worker-peer",
+                    "summary": "handoff",
+                    "content": "route wake item 17",
+                },
+            )
+
+        run_mock.assert_awaited_once()
+        kwargs = run_mock.await_args.kwargs
+        assert kwargs["state"] is state
+        assert kwargs["bot"] is fake_bot
+        assert "ReadInbox" in kwargs["user_text"]
+        assert f"team_name={team_name}" in kwargs["user_text"]
+        assert f"agent={agent_name}" in kwargs["user_text"]
+        assert kwargs["trigger_message"].telegram_message_id == 943
+        assert kwargs["extra_pending"] is not None
+        assert [message.text for message in kwargs["extra_pending"]] == ["queued user followup"]
+        assert fake_bot.send_message.await_count == 1
+        await bot.shutdown()
+
+    async def test_poll_team_worker_inbox_wakes_idle_lineage_route_without_task_handle(
+        self,
+        config,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=654)
+        state = bot._get_state(route, topic_title="General - Fork Child")
+        assert state is not None
+        state.session_manager.set_session_id("sid-route-child")
+        bot._bind_state_session(state)
+        bot._set_session_head(session_id="sid-route-child", jsonl_uuid="uuid-route-child")
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=944))
+        state.last_bot = fake_bot
+        lineage = ("General", "Fork Child")
+        team_name = root_team_key_for_lineage(lineage)
+        agent_name = native_agent_name_for_lineage(lineage)
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=lineage,
+            origin="user_fork",
+            is_fork=True,
+            session_id="sid-route-child",
+        )
+
+        inbox_path = tmp_path / ".claude" / "teams" / team_name / "inboxes" / f"{agent_name}.json"
+        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "from": "worker-peer",
+                        "text": "poll wake payload",
+                        "summary": "poll-handoff",
+                        "timestamp": "2026-03-14T00:00:00Z",
+                        "read": False,
+                    }
+                ],
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            AsyncMock(return_value=_RunOutcome(assistant_text="POLL-WAKE-OK")),
+        ) as run_mock:
+            await bot._poll_team_worker_inbox_wakes()
+
+        run_mock.assert_awaited_once()
+        kwargs = run_mock.await_args.kwargs
+        assert kwargs["state"] is state
+        assert kwargs["bot"] is fake_bot
+        assert "poll wake payload" in kwargs["user_text"]
+        assert fake_bot.send_message.await_count == 1
         await bot.shutdown()
 
     async def test_execute_super_task_triggers_pending_idle_wake_after_completion(self, config):
@@ -5024,6 +5405,14 @@ class TestTelegramStatePersistence:
         state_topic.child_fork_count = 2
         state_topic.child_fork_base_title = "General - Worker"
         state_topic.notify_on_completion = False
+        state_topic.agent_lineage = ("General", "Worker")
+        state_topic.pending_obs_bootstrap = (
+            "<obs-bootstrap version='1'><obs-lineage>"
+            "<obs-node name='General' /><obs-node name='Worker' />"
+            "</obs-lineage><fork_context><origin>agent_task_fresh</origin>"
+            "<is_fork>false</is_fork><session_id>sid-topic</session_id></fork_context>"
+            "</obs-bootstrap>"
+        )
         state_topic.session_manager.set_session_id("sid-topic")
         bot._bind_state_session(state_topic)
         bot._set_session_head(session_id="sid-topic", jsonl_uuid="uuid-topic")
@@ -5068,12 +5457,19 @@ class TestTelegramStatePersistence:
         assert restored_topic.topic_icon_custom_emoji_id == "emoji-1"
         assert restored_topic.child_fork_count == 2
         assert restored_topic.notify_on_completion is True
+        assert restored_topic.agent_lineage == ("General", "Worker")
+        assert restored_topic.pending_obs_bootstrap is not None
+        assert "<obs-bootstrap" in restored_topic.pending_obs_bootstrap
         assert restored._route_by_session_id["sid-general"] == route_general
         assert restored._route_by_session_id["sid-topic"] == route_topic
         assert restored._route_by_session_id["sid-other"] == route_other_chat
         assert restored._session_heads["sid-general"] == "uuid-general"
         assert restored._session_heads["sid-topic"] == "uuid-topic"
         assert restored._session_heads["sid-other"] == "uuid-other"
+        restored_topic_env = restored_topic.session_manager.sdk_env_overrides
+        assert restored_topic_env["CLAUDE_CODE_TEAM_NAME"] == root_team_key_for_lineage(("General", "Worker"))
+        assert restored_topic_env["CLAUDE_CODE_TASK_LIST_ID"] == root_team_key_for_lineage(("General", "Worker"))
+        assert restored_topic_env["CLAUDE_CODE_AGENT_NAME"] == native_agent_name_for_lineage(("General", "Worker"))
         assert restored._message_map[(67890, 55)].jsonl_uuid == "uuid-general"
         assert restored._message_map[(67890, 88)].jsonl_uuid == "uuid-topic"
         assert restored._message_map[(67991, 12)].jsonl_uuid == "uuid-other"
@@ -5081,6 +5477,10 @@ class TestTelegramStatePersistence:
         assert restored._last_inbound_message_id_by_route[route_general] == 57
         assert restored._last_inbound_message_id_by_route[route_topic] == 90
         assert restored._last_inbound_message_id_by_route[route_other_chat] == 12
+        assert restored._resolve_route_inbox_target(
+            team_name=root_team_key_for_lineage(("General", "Worker")),
+            agent_name=native_agent_name_for_lineage(("General", "Worker")),
+        ) is restored_topic
         await restored.shutdown()
 
     async def test_pre_restart_message_remains_forkable(self, config):
@@ -5211,6 +5611,121 @@ class TestTelegramStatePersistence:
             task_id="task-team-1",
             parent_state=restored_child_state,
         )
+        await restored.shutdown()
+
+    async def test_idle_fork_team_worker_is_restored_and_wakeable_after_restart(self, config):
+        first = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        child_route = TelegramRoute(chat_id=67890, thread_id=654)
+        child_state = first._get_state(child_route, topic_title="General - Fork Worker")
+        assert child_state is not None
+        child_state.session_manager.set_session_id("sid-fork-child")
+        first._bind_state_session(child_state)
+        first._set_session_head(session_id="sid-fork-child", jsonl_uuid="uuid-fork-child")
+        first._persist_state_for_route(child_route)
+
+        record = _ForkTaskRecord(
+            task_id="task-fork-team-1",
+            parent_route=TelegramRoute(chat_id=67890, thread_id=321),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="uuid-parent",
+            child_route=child_route,
+            child_session_id="sid-fork-child",
+            prompt="",
+            description="Fork Worker",
+            status="completed",
+            is_fork=True,
+            team_name="team-alpha",
+            agent_name="worker-fork",
+            idle_ready=True,
+            emit_parent_callback=False,
+        )
+        first._fork_tasks_by_id[record.task_id] = record
+        first._register_team_worker_record(record)
+        first._fork_task_by_child_route[child_route] = record.task_id
+        await first.shutdown()
+
+        restored = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        await restored.initialize_runtime()
+
+        restored_record = restored._fork_tasks_by_id.get("task-fork-team-1")
+        assert restored_record is not None
+        assert restored_record.idle_ready is True
+        assert restored._team_worker_records[("team-alpha", "worker-fork")] == "task-fork-team-1"
+        assert restored._fork_task_by_child_route[child_route] == "task-fork-team-1"
+
+        restored_child_state = restored._get_state(child_route)
+        assert restored_child_state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=992))
+        restored_child_state.last_bot = fake_bot
+
+        with patch.object(restored, "_schedule_fork_task", new_callable=AsyncMock) as schedule_mock:
+            await restored._handle_inbox_message_notification(
+                sender_route=TelegramRoute(chat_id=67890, thread_id=444),
+                payload={
+                    "team_name": "team-alpha",
+                    "recipient": "worker-fork",
+                    "sender": "worker-b",
+                    "summary": "handoff",
+                    "content": "process fork after restart",
+                },
+            )
+
+        schedule_mock.assert_awaited_once_with(
+            task_id="task-fork-team-1",
+            parent_state=restored_child_state,
+        )
+        await restored.shutdown()
+
+    async def test_idle_lineage_route_is_restored_and_wakeable_after_restart(self, config):
+        first = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        child_route = TelegramRoute(chat_id=67890, thread_id=655)
+        child_state = first._get_state(child_route, topic_title="General - Fork Child")
+        assert child_state is not None
+        child_state.session_manager.set_session_id("sid-route-lineage")
+        first._bind_state_session(child_state)
+        first._set_session_head(session_id="sid-route-lineage", jsonl_uuid="uuid-route-lineage")
+        first._prime_obs_bootstrap(
+            child_state,
+            lineage=("General", "Fork Child"),
+            origin="user_fork",
+            is_fork=True,
+            session_id="sid-route-lineage",
+        )
+        await first.shutdown()
+
+        restored = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        await restored.initialize_runtime()
+
+        restored_child_state = restored._get_state(child_route)
+        assert restored_child_state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=993))
+        restored_child_state.last_bot = fake_bot
+        team_name = root_team_key_for_lineage(("General", "Fork Child"))
+        agent_name = native_agent_name_for_lineage(("General", "Fork Child"))
+
+        with patch.object(
+            restored,
+            "_run_and_send",
+            AsyncMock(return_value=_RunOutcome(assistant_text="RESTORED-ROUTE-WAKE-OK")),
+        ) as run_mock:
+            await restored._handle_inbox_message_notification(
+                sender_route=TelegramRoute(chat_id=67890, thread_id=444),
+                payload={
+                    "team_name": team_name,
+                    "recipient": agent_name,
+                    "sender": "worker-b",
+                    "summary": "handoff",
+                    "content": "process restored route wake",
+                },
+            )
+
+        run_mock.assert_awaited_once()
+        assert restored._resolve_route_inbox_target(
+            team_name=team_name,
+            agent_name=agent_name,
+        ) is restored_child_state
         await restored.shutdown()
 
     async def test_non_team_task_handle_is_restored_and_resumable_after_restart(self, config):

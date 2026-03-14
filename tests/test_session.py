@@ -4,8 +4,10 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from claude_agent_sdk import ProcessError
 
 from obs_agent.hooks import HookPipeline, HookState
+from obs_agent.prompt import build_obs_platform_appendix
 from obs_agent.session import SessionManager
 
 
@@ -69,10 +71,14 @@ class TestResumeWindow:
 
 
 class TestCreateOptions:
-    def test_no_manual_system_prompt(self, config):
+    def test_appends_obs_platform_instructions_to_system_prompt(self, config):
         mgr = SessionManager(config=config)
         options = mgr.create_options()
-        assert options.system_prompt is None
+        assert options.system_prompt == {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": build_obs_platform_appendix(),
+        }
 
     def test_includes_hooks(self, config):
         mgr = SessionManager(config=config)
@@ -210,6 +216,49 @@ class TestClientLifecycle:
         assert first is not second
         mock_client1.disconnect.assert_called_once()
         mock_client2.connect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_client_retries_connect_failures(self, config):
+        mgr = SessionManager(config=config)
+        failing_client = AsyncMock()
+        failing_client.connect.side_effect = ProcessError("connect failed", exit_code=1)
+        succeeding_client = AsyncMock()
+
+        with (
+            patch(
+                "obs_agent.session.ClaudeSDKClient",
+                side_effect=[failing_client, succeeding_client],
+            ),
+            patch("obs_agent.session.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            client = await mgr.get_client()
+
+        assert client is succeeding_client
+        failing_client.connect.assert_called_once()
+        failing_client.disconnect.assert_called_once()
+        succeeding_client.connect.assert_called_once()
+        mock_sleep.assert_awaited_once()
+        assert mgr._connected is True
+
+    @pytest.mark.asyncio
+    async def test_get_client_raises_after_exhausting_connect_retries(self, config):
+        mgr = SessionManager(config=config)
+        clients = [AsyncMock() for _ in range(3)]
+        for client in clients:
+            client.connect.side_effect = ProcessError("connect failed", exit_code=1)
+
+        with (
+            patch("obs_agent.session.ClaudeSDKClient", side_effect=clients),
+            patch("obs_agent.session.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            with pytest.raises(ProcessError, match="connect failed"):
+                await mgr.get_client()
+
+        assert mock_sleep.await_count == 2
+        for client in clients:
+            client.disconnect.assert_called_once()
+        assert mgr._client is None
+        assert mgr._connected is False
 
     @pytest.mark.asyncio
     async def test_disconnect_cleans_up(self, config):

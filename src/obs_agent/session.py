@@ -18,6 +18,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 from obs_agent._sdk_patch import ensure_raw_uuid_patch
 from obs_agent.hooks import HookState, create_hook_matchers
+from obs_agent.prompt import build_obs_platform_appendix
 from obs_agent.tools import create_obs_tools
 
 if TYPE_CHECKING:
@@ -32,6 +33,8 @@ _DEFAULT_SDK_ENV: dict[str, str] = {
     # This reduces daemon fragility from non-essential SDK side-channels.
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
 }
+_CLIENT_CONNECT_MAX_ATTEMPTS = 3
+_CLIENT_CONNECT_RETRY_DELAY_SECONDS = 1.0
 
 
 class SessionManager:
@@ -117,6 +120,11 @@ class SessionManager:
             setting_sources=["project"],
             env=effective_env,
             max_buffer_size=self.config.max_buffer_size,
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": build_obs_platform_appendix(),
+            },
         )
 
         # Resume if within cache window, otherwise fresh
@@ -126,6 +134,42 @@ class SessionManager:
             options.resume = None
 
         return options
+
+    async def _connect_client_with_retry(
+        self,
+        *,
+        options: ClaudeAgentOptions,
+    ) -> ClaudeSDKClient:
+        """Create and connect a new SDK client with bounded retries."""
+        last_error: Exception | None = None
+        for attempt in range(1, _CLIENT_CONNECT_MAX_ATTEMPTS + 1):
+            client = ClaudeSDKClient(options)
+            try:
+                await asyncio.create_task(client.connect())
+            except Exception as exc:
+                last_error = exc
+                try:
+                    await client.disconnect()
+                except Exception:
+                    logger.debug("Error during failed client cleanup", exc_info=True)
+                if attempt >= _CLIENT_CONNECT_MAX_ATTEMPTS:
+                    break
+                logger.warning(
+                    "ClaudeSDKClient.connect failed attempt=%s/%s; retrying",
+                    attempt,
+                    _CLIENT_CONNECT_MAX_ATTEMPTS,
+                    exc_info=True,
+                )
+                await asyncio.sleep(_CLIENT_CONNECT_RETRY_DELAY_SECONDS)
+                continue
+            self._client = client
+            self._connected = True
+            return client
+
+        self._client = None
+        self._connected = False
+        assert last_error is not None
+        raise last_error
 
     # Keep public alias for backward compatibility (used by tests)
     def create_options(self) -> ClaudeAgentOptions:
@@ -155,12 +199,7 @@ class SessionManager:
 
             # Create fresh client
             options = self._build_options()
-            self._client = ClaudeSDKClient(options)
-            # Run connect() in a detached task so the SDK's internal task
-            # group outlives the HTTP request that triggered the connection.
-            await asyncio.create_task(self._client.connect())
-            self._connected = True
-            return self._client
+            return await self._connect_client_with_retry(options=options)
 
     async def disconnect(self) -> None:
         """Disconnect current client (for daemon shutdown or reconnect)."""
@@ -202,10 +241,7 @@ class SessionManager:
             # Ensure should_resume() returns True for the new options build.
             self.last_activity = time.time()
             options = self._build_options()
-            self._client = ClaudeSDKClient(options)
-            await asyncio.create_task(self._client.connect())
-            self._connected = True
-            return self._client
+            return await self._connect_client_with_retry(options=options)
 
     async def soft_reset(self) -> None:
         """Disconnect client but preserve session_id for future reconnect.
