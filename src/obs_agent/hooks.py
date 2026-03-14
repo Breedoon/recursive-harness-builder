@@ -225,6 +225,7 @@ class HookState:
     cron_creator: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     cron_lister: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     cron_deleter: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    inbox_recipient_validator: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     inbox_message_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     stop_event_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     current_tool_use_id: str | None = None

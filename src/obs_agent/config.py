@@ -59,6 +59,10 @@ class OBSConfig:
     telegram_transcription_script: Path = field(
         default_factory=lambda: _DEFAULT_TELEGRAM_TRANSCRIPTION_SCRIPT
     )
+    telegram_transport_base_chat_interval_seconds: float = 0.35
+    telegram_transport_max_chat_interval_seconds: float = 5.0
+    telegram_typing_action_interval_seconds: float = 4.0
+    telegram_typing_actions_enabled: bool = True
 
     # --- Class Methods ---
 
@@ -113,6 +117,19 @@ class OBSConfig:
             kwargs["telegram_state_retention_days"] = int(tg_state_retention)
         if tg_transcribe := os.environ.get("OBS_TELEGRAM_TRANSCRIPTION_SCRIPT"):
             kwargs["telegram_transcription_script"] = Path(tg_transcribe)
+        if tg_transport_base := os.environ.get("OBS_TELEGRAM_TRANSPORT_BASE_CHAT_INTERVAL_SECONDS"):
+            kwargs["telegram_transport_base_chat_interval_seconds"] = float(tg_transport_base)
+        if tg_transport_max := os.environ.get("OBS_TELEGRAM_TRANSPORT_MAX_CHAT_INTERVAL_SECONDS"):
+            kwargs["telegram_transport_max_chat_interval_seconds"] = float(tg_transport_max)
+        if tg_typing_interval := os.environ.get("OBS_TELEGRAM_TYPING_ACTION_INTERVAL_SECONDS"):
+            kwargs["telegram_typing_action_interval_seconds"] = float(tg_typing_interval)
+        if tg_typing_enabled := os.environ.get("OBS_TELEGRAM_TYPING_ACTIONS_ENABLED"):
+            kwargs["telegram_typing_actions_enabled"] = tg_typing_enabled.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
 
         return cls(**kwargs)
 

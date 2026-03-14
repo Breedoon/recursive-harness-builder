@@ -345,7 +345,10 @@ class TelegramForumPlatform:
 
     async def close(self) -> None:
         if self._client is not None:
-            await self._client.disconnect()
+            try:
+                await asyncio.wait_for(self._client.disconnect(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("TelegramForumPlatform.disconnect timed out; abandoning client")
             self._client = None
 
     async def create_topic(self, name: str) -> int:
@@ -397,7 +400,10 @@ class TelegramForumPlatform:
         # Under heavy fork fanout, thread-local messages may be sparse within global
         # chat history, so scan a deeper window before giving up.
         scan_limit = min(max(limit * 40, 200), 10_000)
-        async for message in self._client.iter_messages(self._chat_id, limit=scan_limit):
+        iter_kwargs: dict[str, Any] = {"limit": scan_limit}
+        if thread_id is not None:
+            iter_kwargs["reply_to"] = thread_id
+        async for message in self._client.iter_messages(self._chat_id, **iter_kwargs):
             if message.sender_id not in self._bot_sender_ids:
                 continue
             message_thread_id = _forum_thread_id(message)

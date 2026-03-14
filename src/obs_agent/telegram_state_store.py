@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,8 @@ class PersistedRouteState:
     child_fork_base_title: str | None
     notify_on_completion: bool
     last_inbound_message_id: int | None
+    agent_lineage: tuple[str, ...] | None = None
+    pending_obs_bootstrap: str | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +159,19 @@ class TelegramStateStore:
             raise RuntimeError("TelegramStateStore is not initialized")
         return self._conn
 
+    @staticmethod
+    def _decode_lineage_json(raw: object) -> tuple[str, ...] | None:
+        if raw is None:
+            return None
+        try:
+            loaded = json.loads(str(raw))
+        except Exception:
+            return None
+        if not isinstance(loaded, list):
+            return None
+        lineage = tuple(str(item).strip() for item in loaded if str(item).strip())
+        return lineage or None
+
     def _create_schema(self) -> None:
         conn = self._require_conn()
         conn.executescript(
@@ -171,6 +187,8 @@ class TelegramStateStore:
                 child_fork_base_title TEXT,
                 notify_on_completion INTEGER NOT NULL DEFAULT 1,
                 last_inbound_message_id INTEGER,
+                agent_lineage_json TEXT,
+                pending_obs_bootstrap TEXT,
                 updated_at REAL NOT NULL
             );
 
@@ -320,6 +338,16 @@ class TelegramStateStore:
             column="retry_attempt_count",
             declaration="INTEGER NOT NULL DEFAULT 0",
         )
+        self._ensure_column_exists(
+            table="route_state",
+            column="agent_lineage_json",
+            declaration="TEXT",
+        )
+        self._ensure_column_exists(
+            table="route_state",
+            column="pending_obs_bootstrap",
+            declaration="TEXT",
+        )
         # Completion summaries are now always-on across all topic types.
         conn.execute(
             """
@@ -366,7 +394,9 @@ class TelegramStateStore:
                 child_fork_count,
                 child_fork_base_title,
                 notify_on_completion,
-                last_inbound_message_id
+                last_inbound_message_id,
+                agent_lineage_json,
+                pending_obs_bootstrap
             FROM route_state
             ORDER BY updated_at ASC
             """
@@ -501,6 +531,12 @@ class TelegramStateStore:
                     if row["last_inbound_message_id"] is not None
                     else None
                 ),
+                agent_lineage=self._decode_lineage_json(row["agent_lineage_json"]),
+                pending_obs_bootstrap=(
+                    str(row["pending_obs_bootstrap"])
+                    if row["pending_obs_bootstrap"]
+                    else None
+                ),
             )
             for row in route_rows
         ]
@@ -549,7 +585,7 @@ class TelegramStateStore:
                 idle_ready=bool(int(row["idle_ready"] or 0)),
             )
             for row in team_worker_rows
-            if row["team_name"] and row["agent_name"] and row["task_id"] and row["child_session_id"]
+            if row["team_name"] and row["agent_name"] and row["task_id"]
         ]
         task_handle_states = [
             PersistedTaskHandleState(
@@ -607,7 +643,7 @@ class TelegramStateStore:
                 completed_at=float(row["completed_at"]) if row["completed_at"] is not None else None,
             )
             for row in task_handle_rows
-            if row["task_id"] and row["child_session_id"]
+            if row["task_id"]
         ]
         topic_schedules = [
             PersistedTopicSchedule(
@@ -691,6 +727,8 @@ class TelegramStateStore:
         child_fork_base_title: str | None,
         notify_on_completion: bool,
         last_inbound_message_id: int | None,
+        agent_lineage: tuple[str, ...] | None = None,
+        pending_obs_bootstrap: str | None = None,
     ) -> None:
         conn = self._require_conn()
         now = time.time()
@@ -708,8 +746,10 @@ class TelegramStateStore:
                 child_fork_base_title,
                 notify_on_completion,
                 last_inbound_message_id,
+                agent_lineage_json,
+                pending_obs_bootstrap,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(route_key) DO UPDATE SET
                 session_id=excluded.session_id,
                 topic_title=excluded.topic_title,
@@ -718,6 +758,8 @@ class TelegramStateStore:
                 child_fork_base_title=excluded.child_fork_base_title,
                 notify_on_completion=excluded.notify_on_completion,
                 last_inbound_message_id=excluded.last_inbound_message_id,
+                agent_lineage_json=excluded.agent_lineage_json,
+                pending_obs_bootstrap=excluded.pending_obs_bootstrap,
                 updated_at=excluded.updated_at
             """,
             (
@@ -731,6 +773,15 @@ class TelegramStateStore:
                 child_fork_base_title,
                 1 if notify_on_completion else 0,
                 last_inbound_message_id,
+                (
+                    json.dumps(
+                        [str(item).strip() for item in agent_lineage if str(item).strip()],
+                        ensure_ascii=True,
+                    )
+                    if agent_lineage
+                    else None
+                ),
+                pending_obs_bootstrap,
                 now,
             ),
         )

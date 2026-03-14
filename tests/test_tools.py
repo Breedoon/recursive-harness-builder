@@ -11,6 +11,7 @@ import pytest
 
 from obs_agent.config import OBSConfig
 from obs_agent.hooks import HookState
+from obs_agent.lineage import ObsBootstrap
 
 
 def _capture_tools(monkeypatch):
@@ -72,6 +73,7 @@ class TestForkTaskTool:
             "ForkTaskStop",
             "session_info",
             "context_info",
+            "session_lineage",
         ]
 
     @pytest.mark.asyncio
@@ -195,6 +197,29 @@ class TestForkTaskTool:
         assert "ForkTask launched successfully." in result["content"][0]["text"]
         assert "agentId: task-123" in result["content"][0]["text"]
         assert "telegram_topic: https://t.me/c/1/2" in result["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_agent_task_alias_maps_to_transport_description(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler(
+            {
+                "prompt": "Do work",
+                "alias": "child-researcher",
+                "fork": True,
+            }
+        )
+
+        assert result["content"][0]["text"] == "ok"
+        state.fork_task_launcher.assert_awaited_once()
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["description"] == "child-researcher"
 
     @pytest.mark.asyncio
     async def test_fork_task_treats_false_resume_as_missing(self, monkeypatch, skill_config):
@@ -437,6 +462,142 @@ class TestForkTaskTool:
         assert persisted[0]["read"] is True
 
     @pytest.mark.asyncio
+    async def test_inbox_tools_infer_current_team_and_agent(self, monkeypatch, skill_config, tmp_path):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
+            lambda **_: ObsBootstrap(
+                raw_xml="<obs-bootstrap version='1' />",
+                lineage=("Root", "Child"),
+                origin="agent_task_fresh",
+                is_fork=False,
+                session_id="sid-123",
+                agent_id="task-123",
+                parent_session_id="sid-parent",
+                root_team_key="obs-tree-root-123",
+                native_agent_name="obs-agent-child-123",
+            ),
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
+        send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
+        read_handler = _tool_handler(captured["tools"], "ReadInbox")
+
+        send_result = await send_handler(
+            {
+                "recipient": "obs-agent-peer-999",
+                "content": "hello inferred team",
+            }
+        )
+        assert json.loads(send_result["content"][0]["text"])["success"] is True
+
+        inbox_path = (
+            tmp_path
+            / ".claude"
+            / "teams"
+            / "obs-tree-root-123"
+            / "inboxes"
+            / "obs-agent-peer-999.json"
+        )
+        persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
+        assert persisted[0]["from"] == "obs-agent-child-123"
+
+        self_inbox = (
+            tmp_path
+            / ".claude"
+            / "teams"
+            / "obs-tree-root-123"
+            / "inboxes"
+            / "obs-agent-child-123.json"
+        )
+        self_inbox.parent.mkdir(parents=True, exist_ok=True)
+        self_inbox.write_text(
+            json.dumps(
+                [
+                    {
+                        "from": "obs-agent-peer-999",
+                        "text": "reply payload",
+                        "summary": "reply",
+                        "timestamp": "2026-03-14T00:00:00Z",
+                        "read": False,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        read_result = await read_handler({})
+        payload = json.loads(read_result["content"][0]["text"])
+        assert payload["team_name"] == "obs-tree-root-123"
+        assert payload["agent"] == "obs-agent-child-123"
+        assert payload["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_session_lineage_returns_current_bootstrap(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr(
+            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
+            lambda **_: ObsBootstrap(
+                raw_xml="<obs-bootstrap version='1'><obs-lineage><obs-node name='Root' /></obs-lineage></obs-bootstrap>",
+                lineage=("Root",),
+                origin="trunk_start",
+                is_fork=False,
+                session_id="sid-123",
+                agent_id=None,
+                parent_session_id=None,
+                root_team_key="obs-tree-root-123",
+                native_agent_name="obs-agent-root-123",
+            ),
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
+        handler = _tool_handler(captured["tools"], "session_lineage")
+
+        result = await handler({})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["lineage"] == ["Root"]
+        assert payload["lineage_length"] == 1
+        assert payload["origin"] == "trunk_start"
+        assert payload["root_team_key"] == "obs-tree-root-123"
+        assert "xml" not in payload
+
+        result_with_xml = await handler({"include_xml": True})
+        payload_with_xml = json.loads(result_with_xml["content"][0]["text"])
+        assert payload_with_xml["xml"].startswith("<obs-bootstrap")
+
+    @pytest.mark.asyncio
+    async def test_session_lineage_falls_back_to_current_session_id_when_bootstrap_omits_it(
+        self,
+        monkeypatch,
+        skill_config,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr(
+            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
+            lambda **_: ObsBootstrap(
+                raw_xml="<obs-bootstrap version='1'><obs-lineage><obs-node name='Root' /></obs-lineage></obs-bootstrap>",
+                lineage=("Root",),
+                origin="trunk_start",
+                is_fork=False,
+                session_id=None,
+                agent_id=None,
+                parent_session_id=None,
+                root_team_key="obs-tree-root-123",
+                native_agent_name="obs-agent-root-123",
+            ),
+        )
+        create_obs_tools(skill_config, lambda: "sid-live", hook_state=HookState())
+        handler = _tool_handler(captured["tools"], "session_lineage")
+
+        result = await handler({})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["session_id"] == "sid-live"
+
+    @pytest.mark.asyncio
     async def test_send_inbox_message_notifies_transport_hook(self, monkeypatch, skill_config, tmp_path):
         from obs_agent.tools import create_obs_tools
 
@@ -467,6 +628,45 @@ class TestForkTaskTool:
                 "summary": "greeting",
             }
         )
+
+    @pytest.mark.asyncio
+    async def test_send_inbox_message_reports_undelivered_when_recipient_is_dead(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        state = HookState()
+        state.inbox_recipient_validator = AsyncMock(
+            return_value={
+                "deliverable": False,
+                "reason": "recipient was deleted",
+            }
+        )
+        state.inbox_message_notifier = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
+
+        result = await send_handler(
+            {
+                "team_name": "team-alpha",
+                "recipient": "worker-a",
+                "content": "hello team",
+                "summary": "greeting",
+                "sender": "lead",
+            }
+        )
+
+        assert result["is_error"] is True
+        assert "message undelivered: recipient was deleted" == result["content"][0]["text"]
+        assert result["tool_use_result"]["delivered"] is False
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        assert not inbox_path.exists()
+        state.inbox_message_notifier.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_inbox_message_concurrent_writes_are_not_lost(self, monkeypatch, skill_config, tmp_path):

@@ -1,4 +1,4 @@
-"""System prompt builder - reads CLAUDE.md from vault root.
+"""System prompt helpers.
 
 Previously assembled identity, context, behavior, skills, safety, and vault map
 sections in code. Now all of that lives in CLAUDE.md in the vault, following the
@@ -35,3 +35,23 @@ def build_system_prompt(config: OBSConfig) -> str:
             "Your CLAUDE.md file is missing — ask the user to restore it."
         )
     return content
+
+
+def build_obs_platform_appendix() -> str:
+    """Return OBS-specific runtime instructions appended to every session."""
+    return (
+        "OBS platform notes:\n"
+        "- Native Task and ForkTask are disabled in this environment. "
+        "Use AgentTask to launch subagents, AgentTaskOutput to inspect them, and "
+        "AgentTaskStop to stop or interrupt them.\n"
+        "- Teams are enabled by default for all agents in the same lineage tree. "
+        "Use SendInboxMessage to message teammates and ReadInbox to read teammate messages.\n"
+        "- Your lineage defines your location in the team tree. "
+        "Lineage is the ordered list of agent names from the trunk agent to you. "
+        "Example: [Trunk, Research, Parser] means you are the Parser agent inside "
+        "Research inside Trunk, and you can message any other agent in that same tree.\n"
+        "- Use the session_lineage tool when you need your exact lineage, root team key, "
+        "or native agent name.\n"
+        "- If you are resumed or woken because teammate messages may have arrived, "
+        "check ReadInbox before assuming there is nothing to do."
+    )
