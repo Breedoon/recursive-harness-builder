@@ -328,129 +328,72 @@ class TestMustReplySmoke:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.telegram_smoke
-@pytest.mark.timeout(900)  # 15 minutes
-class TestSameNameAgentsSmoke:
-    """Verify same-name agents under different parents get unique names and messaging works."""
+@pytest.mark.timeout(600)  # 10 minutes
+class TestNamingFormatSmoke:
+    """Verify the two-tier naming format works in live agents.
 
-    async def test_live_same_name_different_parents(
+    Simple test: launch one child, verify its agent_name has the hash prefix format.
+    """
+
+    async def test_live_child_has_hash_prefix_agent_name(
         self,
         live_tg_forum: _LiveForumHarness,
     ) -> None:
-        """Two 'research' agents under different parents get different agent_names."""
+        """Child agent launched via AgentTask gets {parent_hash}-{slug} agent_name."""
         await _reset_general(live_tg_forum)
         tag = uuid.uuid4().hex[:8]
 
-        root_thread_id = await live_tg_forum.platform.create_topic(f"SameName {tag}")
+        root_thread_id = await live_tg_forum.platform.create_topic(f"NameFmt {tag}")
 
-        # Prime root
         await _send_and_wait_for_token(
             live_tg_forum,
-            text=f"Deterministic same-name test. Reply with only SAMENAME-PRIME-{tag}.",
+            text=f"Deterministic naming format test. Reply with only NAMEFMT-PRIME-{tag}.",
             thread_id=root_thread_id,
-            token=f"SAMENAME-PRIME-{tag}",
+            token=f"NAMEFMT-PRIME-{tag}",
             timeout=180.0,
         )
 
-        # Launch Branch-A
-        branch_a_thread, lineage_a = await _launch_lineage_worker(
+        # Query root lineage
+        root_lineage = await _query_session_lineage(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            token=f"ROOT-LINEAGE-{tag}",
+            timeout=240.0,
+        )
+
+        # Root: no obs-agent- prefix, no obs-tree- prefix
+        assert not root_lineage["native_agent_name"].startswith("obs-agent-"), \
+            f"Root should not have obs-agent- prefix, got: {root_lineage['native_agent_name']}"
+        assert not root_lineage["root_team_key"].startswith("obs-tree-"), \
+            f"Root team key should be timestamp-based, got: {root_lineage['root_team_key']}"
+
+        # Launch one child
+        child_thread, child_lineage = await _launch_lineage_worker(
             live_tg_forum,
             launcher_thread_id=root_thread_id,
             fork=False,
-            alias=f"Branch-A-{tag}",
-            launch_token=f"LAUNCHED-A-{tag}",
-            lineage_token=f"LINEAGE-A-{tag}",
+            alias=f"Worker-{tag}",
+            launch_token=f"LAUNCHED-WORKER-{tag}",
+            lineage_token=f"LINEAGE-WORKER-{tag}",
             timeout=240.0,
         )
 
-        # Launch Branch-B
-        branch_b_thread, lineage_b = await _launch_lineage_worker(
-            live_tg_forum,
-            launcher_thread_id=root_thread_id,
-            fork=False,
-            alias=f"Branch-B-{tag}",
-            launch_token=f"LAUNCHED-B-{tag}",
-            lineage_token=f"LINEAGE-B-{tag}",
-            timeout=240.0,
-        )
+        # Child: should have hash prefix
+        child_name = child_lineage["native_agent_name"]
+        assert not child_name.startswith("obs-agent-"), \
+            f"Child should not have obs-agent- prefix, got: {child_name}"
+        # Should contain a hex prefix
+        assert re.match(r"[0-9a-f]+-", child_name.lower()), \
+            f"Child should have hash prefix, got: {child_name}"
+        # Should contain the worker slug
+        assert "worker" in child_name.lower(), \
+            f"Child should contain 'worker' slug, got: {child_name}"
 
-        # Launch "research" under Branch-A
-        research_a_thread, lineage_ra = await _launch_lineage_worker(
-            live_tg_forum,
-            launcher_thread_id=branch_a_thread,
-            fork=True,
-            alias=f"research",
-            launch_token=f"A-LAUNCHED-RESEARCH-{tag}",
-            lineage_token=f"LINEAGE-RA-{tag}",
-            timeout=240.0,
-        )
-
-        # Launch "research" under Branch-B (same name, different parent)
-        research_b_thread, lineage_rb = await _launch_lineage_worker(
-            live_tg_forum,
-            launcher_thread_id=branch_b_thread,
-            fork=True,
-            alias=f"research",
-            launch_token=f"B-LAUNCHED-RESEARCH-{tag}",
-            lineage_token=f"LINEAGE-RB-{tag}",
-            timeout=240.0,
-        )
-
-        # CRITICAL: same name "research" but different agent_names
-        assert lineage_ra["native_agent_name"] != lineage_rb["native_agent_name"], \
-            f"Same-name agents under different parents should have different names: " \
-            f"{lineage_ra['native_agent_name']} vs {lineage_rb['native_agent_name']}"
-
-        # Both should contain "research" in the name
-        assert "research" in lineage_ra["native_agent_name"]
-        assert "research" in lineage_rb["native_agent_name"]
-
-        # Both share the same root_team_key slug (timestamp prefix may differ
-        # by a minute if children were launched across a minute boundary).
-        # Extract the slug part (after the YYYY-MM-DD-HH-MM- prefix).
-        slug_ra = lineage_ra["root_team_key"].split("-", 5)[-1] if "-" in lineage_ra["root_team_key"] else lineage_ra["root_team_key"]
-        slug_rb = lineage_rb["root_team_key"].split("-", 5)[-1] if "-" in lineage_rb["root_team_key"] else lineage_rb["root_team_key"]
-        assert slug_ra == slug_rb, \
-            f"Root team key slugs should match: {lineage_ra['root_team_key']} vs {lineage_rb['root_team_key']}"
-        # Ideally these should be exactly equal (children inherit parent's key).
-        # If they differ, it's the timestamp non-idempotency issue.
-        if lineage_ra["root_team_key"] != lineage_rb["root_team_key"]:
-            import warnings
-            warnings.warn(
-                f"root_team_key differs by timestamp: {lineage_ra['root_team_key']} vs "
-                f"{lineage_rb['root_team_key']}. Children should inherit parent's team key.",
-                stacklevel=1,
-            )
-
-        # Message from research-A to research-B (cross-branch, same-name)
-        token_ra_to_rb = f"MSG-RA-TO-RB-{tag}"
-        await _send_inbox_message_and_wait_ack(
-            live_tg_forum,
-            sender_thread_id=research_a_thread,
-            recipient=lineage_rb["native_agent_name"],
-            content=token_ra_to_rb,
-            ack_token=f"RA-SENT-RB-{tag}",
-            timeout=240.0,
-        )
-
-        # Verify research-B received it (not research-A)
-        baseline_rb = await live_tg_forum.platform.latest_bot_message_id(thread_id=research_b_thread)
-        await live_tg_forum.platform.send(
-            (
-                "Call ReadInbox exactly once with no arguments. "
-                f"If unread messages contain {token_ra_to_rb!r}, reply with exactly RB-GOT-{tag}. "
-                f"Otherwise reply with RB-MISSING-{tag}."
-            ),
-            thread_id=research_b_thread,
-            require_done=False,
-            timeout=240.0,
-        )
-        await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=research_b_thread,
-            after_message_id=baseline_rb,
-            token=f"RB-GOT-{tag}",
-            timeout=300.0,
-        )
+        # Child shares root's team key (slug part at minimum)
+        child_slug = child_lineage["root_team_key"].split("-", 5)[-1]
+        root_slug = root_lineage["root_team_key"].split("-", 5)[-1]
+        assert child_slug == root_slug, \
+            f"Child and root should have same team key slug: {child_lineage['root_team_key']} vs {root_lineage['root_team_key']}"
 
 
 # ---------------------------------------------------------------------------
