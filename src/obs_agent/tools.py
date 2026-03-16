@@ -176,11 +176,17 @@ def create_obs_tools(
         default_fork: bool,
     ) -> dict:
         prompt = str(args.get("prompt", "")).strip()
-        description = str(args.get("alias") or args.get("description") or "").strip() or None
+        # 'name', 'alias', and 'description' all serve as the display name
+        # (lineage alias). With two-tier naming, this is NOT the machine
+        # agent_name — that is computed from the lineage by
+        # _create_child_fork_topic via native_agent_name_for_lineage.
+        description = str(
+            args.get("alias") or args.get("description") or args.get("name") or ""
+        ).strip() or None
         resume = _normalize_resume_arg(args.get("resume"))
         run_in_background = args.get("run_in_background")
         team_name = str(args.get("team_name", "")).strip() or None
-        agent_name = str(args.get("name") or args.get("agent_name") or "").strip() or None
+        agent_name = str(args.get("agent_name") or "").strip() or None
         fork = default_fork
         if "fork" in args:
             try:
