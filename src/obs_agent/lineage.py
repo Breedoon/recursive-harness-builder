@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -52,20 +54,53 @@ def lineage_fingerprint(lineage: Sequence[str]) -> str:
     return digest[:10]
 
 
-def root_team_key_for_lineage(lineage: Sequence[str]) -> str:
-    """Project a lineage tree onto one safe native team key."""
+def root_team_key_for_lineage(
+    lineage: Sequence[str],
+    *,
+    timestamp: float | None = None,
+) -> str:
+    """Project a lineage tree onto a timestamp-based native team key.
+
+    Format: ``YYYY-MM-DD-HH-MM-{slug}``
+
+    *timestamp* defaults to the current UTC time.  Passing an explicit value
+    makes the result deterministic (useful for tests and for idempotent
+    restores from persisted state).
+    """
     if not lineage:
         return "obs-tree-root-0000000000"
     root = normalize_lineage_name(lineage[0])
-    return f"obs-tree-{slugify_projection_label(root, fallback='root')}-{lineage_fingerprint((root,))}"
+    slug = slugify_projection_label(root, fallback="root")
+    ts = timestamp if timestamp is not None else time.time()
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    prefix = dt.strftime("%Y-%m-%d-%H-%M")
+    return f"{prefix}-{slug}"
 
 
 def native_agent_name_for_lineage(lineage: Sequence[str]) -> str:
-    """Project a lineage member onto one safe native agent name."""
+    """Project a lineage member onto one safe native agent name.
+
+    Two-tier naming:
+    - **Trunk** (single-element lineage): just the slug, no prefix.
+      E.g. ``("My Topic",)`` → ``"my-topic"``
+    - **Child** (multi-element lineage): ``{parent_lineage_hash}-{slug}``.
+      E.g. ``("Root", "Worker")`` → ``"{hash_of_Root}-worker"``
+
+    The parent hash is the fingerprint of the lineage *up to but not including*
+    the leaf, ensuring siblings under the same parent share a prefix while
+    same-named children under different parents get unique names.
+    """
     if not lineage:
-        return "obs-agent-root-0000000000"
+        return "root"
     leaf = normalize_lineage_name(lineage[-1])
-    return f"obs-agent-{slugify_projection_label(leaf, fallback='node')}-{lineage_fingerprint(tuple(lineage))}"
+    slug = slugify_projection_label(leaf, fallback="node")
+    if len(lineage) == 1:
+        # Trunk: no hash prefix
+        return slug
+    # Child: prefix with parent lineage hash
+    parent_lineage = tuple(normalize_lineage_name(n) for n in lineage[:-1])
+    parent_hash = lineage_fingerprint(parent_lineage)
+    return f"{parent_hash}-{slug}"
 
 
 def build_obs_bootstrap_xml(
@@ -79,15 +114,20 @@ def build_obs_bootstrap_xml(
     root_team_key: str | None = None,
     native_agent_name: str | None = None,
 ) -> str:
-    """Serialize the canonical OBS bootstrap XML envelope."""
+    """Serialize the canonical OBS bootstrap XML envelope.
+
+    Each ``obs-node`` element carries both a human-readable ``name`` and the
+    machine-safe ``agent_name`` that can be used for messaging.
+    """
     root = ET.Element("obs-bootstrap", {"version": "1"})
     lineage_el = ET.SubElement(root, "obs-lineage")
-    for node_name in lineage:
-        ET.SubElement(
-            lineage_el,
-            "obs-node",
-            {"name": normalize_lineage_name(node_name)},
-        )
+    normalized = [normalize_lineage_name(n) for n in lineage]
+    for idx, node_name in enumerate(normalized):
+        attrs: dict[str, str] = {"name": node_name}
+        # Compute the agent_name for the sub-lineage up to and including this node
+        sub_lineage = tuple(normalized[: idx + 1])
+        attrs["agent_name"] = native_agent_name_for_lineage(sub_lineage)
+        ET.SubElement(lineage_el, "obs-node", attrs)
 
     fork_context = ET.SubElement(root, "fork_context")
     ET.SubElement(fork_context, "origin").text = origin
