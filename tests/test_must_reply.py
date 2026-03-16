@@ -234,16 +234,10 @@ class TestMustReplyEdgeCases:
 class TestScheduleOverlapRemoval:
     """Verify _validate_schedule_overlap is removed."""
 
-    @pytest.mark.xfail(reason="Schedule rearchitecture not implemented yet — overlap removal")
     async def test_sc1_overlapping_schedules_coexist(self):
-        """Two schedules with overlapping time windows can both be created.
-
-        Currently _validate_schedule_overlap rejects this. After the redesign,
-        it should be removed entirely, allowing free coexistence.
-        """
+        """_validate_schedule_overlap has been removed — verified."""
         from obs_agent.telegram import TelegramBot
 
-        # The function _validate_schedule_overlap should NOT exist after redesign
         assert not hasattr(TelegramBot, "_validate_schedule_overlap"), \
             "_validate_schedule_overlap should be removed in the schedule rearchitecture"
 

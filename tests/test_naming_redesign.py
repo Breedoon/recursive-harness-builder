@@ -140,39 +140,45 @@ class TestFingerprint:
 # ---------------------------------------------------------------------------
 
 
-class TestCurrentProjectionBaseline:
-    """Baseline tests for current naming format.
+class TestProjectionFormat:
+    """Tests for the REDESIGNED naming format.
 
-    These document the CURRENT behavior (obs-tree-*, obs-agent-*).
-    When the redesign lands, these tests will be updated to assert the NEW format:
-    - root_team_key: timestamp-based (YYYY-MM-DD-HH-MM-{slug})
-    - native_agent_name: trunk = {slug} (no prefix), child = {parent_hash}-{slug}
+    - root_team_key: YYYY-MM-DD-HH-MM-{slug} (timestamp-based)
+    - native_agent_name: trunk = {slug}, child = {parent_hash}-{slug}
     """
 
-    def test_n9_root_team_key_format(self):
-        """Root team key has obs-tree- prefix, slug, and hash."""
-        key = root_team_key_for_lineage(("My Chat",))
-        assert key.startswith("obs-tree-")
+    def test_n9_root_team_key_timestamp_format(self):
+        """Root team key has timestamp prefix + slug."""
+        key = root_team_key_for_lineage(("My Chat",), timestamp=1710561600.0)
         assert "my-chat" in key
-        # Format: obs-tree-{slug}-{hash10}
-        parts = key.split("-")
-        assert len(parts) >= 4  # obs, tree, slug..., hash
+        # Should NOT have obs-tree- prefix
+        assert not key.startswith("obs-tree-")
+        # Should match YYYY-MM-DD-HH-MM-{slug}
+        assert re.match(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-my-chat", key)
 
     def test_n10_root_team_key_empty_lineage(self):
         """Empty lineage returns sentinel."""
         key = root_team_key_for_lineage(())
         assert key == "obs-tree-root-0000000000"
 
-    def test_n11_native_agent_name_format(self):
-        """Native agent name has obs-agent- prefix, leaf slug, and hash."""
+    def test_n11_native_agent_name_child_format(self):
+        """Child agent name has {parent_hash}-{slug} format."""
         name = native_agent_name_for_lineage(("Root Topic", "Child Topic", "worker-a"))
-        assert name.startswith("obs-agent-")
+        # Should NOT have obs-agent- prefix
+        assert not name.startswith("obs-agent-")
         assert "worker-a" in name
+        # Should have a hash prefix (10 hex chars + dash)
+        assert re.match(r"[0-9a-f]{10}-worker-a$", name)
+
+    def test_n11b_native_agent_name_trunk_format(self):
+        """Trunk agent name is just the slug — no prefix, no hash."""
+        name = native_agent_name_for_lineage(("My Topic",))
+        assert name == "my-topic"
 
     def test_n12_native_agent_name_empty_lineage(self):
-        """Empty lineage returns sentinel."""
+        """Empty lineage returns 'root'."""
         name = native_agent_name_for_lineage(())
-        assert name == "obs-agent-root-0000000000"
+        assert name == "root"
 
     def test_n13_same_leaf_different_path_different_name(self):
         """Same leaf name under different parents produces different agent names."""
@@ -237,43 +243,38 @@ class TestCollisionAndEdgeCases:
 
 
 class TestRedesignedNamingFormat:
-    """Tests for the NEW naming format from the redesign.
+    """Tests for the NEW naming format — these PASS with the redesign."""
 
-    These tests will FAIL until the implementation changes are made.
-    They define the target behavior:
-    - Trunk agent_name: just the slug (no obs-agent- prefix, no hash)
-    - Child agent_name: {parent_lineage_hash}-{slug}
-    - Team name: timestamp-based (YYYY-MM-DD-HH-MM-{slug})
-    """
-
-    @pytest.mark.xfail(reason="Redesign not implemented yet — new trunk naming format")
     def test_trunk_agent_name_no_prefix(self):
         """Trunk agent has no hash prefix — just the slug."""
         name = native_agent_name_for_lineage(("My Topic",))
-        assert name == "my-topic"  # No obs-agent- prefix, no hash
+        assert name == "my-topic"
 
-    @pytest.mark.xfail(reason="Redesign not implemented yet — child naming format")
     def test_child_agent_name_has_parent_hash(self):
         """Child agent has {parent_hash}-{slug} format."""
         name = native_agent_name_for_lineage(("Root", "Worker"))
         parent_hash = lineage_fingerprint(("Root",))
         assert name == f"{parent_hash}-worker"
 
-    @pytest.mark.xfail(reason="Redesign not implemented yet — deep child naming")
     def test_deep_child_agent_name(self):
         """Deep child uses hash of parent lineage (not full lineage)."""
         name = native_agent_name_for_lineage(("Root", "A", "B", "C"))
         parent_hash = lineage_fingerprint(("Root", "A", "B"))
         assert name == f"{parent_hash}-c"
 
-    @pytest.mark.xfail(reason="Redesign not implemented yet — timestamp team names")
     def test_timestamp_team_name_format(self):
         """Team name uses timestamp instead of obs-tree- prefix."""
         team_name = root_team_key_for_lineage(("My Topic",))
-        # Should NOT start with obs-tree-
         assert not team_name.startswith("obs-tree-")
-        # Should match YYYY-MM-DD-HH-MM-{slug} pattern
         assert re.match(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-my-topic", team_name)
+
+    def test_timestamp_team_name_deterministic_with_explicit_ts(self):
+        """Passing explicit timestamp makes team name deterministic."""
+        ts = 1710561600.0  # 2024-03-16 08:00 UTC
+        key1 = root_team_key_for_lineage(("Test",), timestamp=ts)
+        key2 = root_team_key_for_lineage(("Test",), timestamp=ts)
+        assert key1 == key2
+        assert key1.endswith("-test")
 
 
 # ---------------------------------------------------------------------------
@@ -282,9 +283,8 @@ class TestRedesignedNamingFormat:
 
 
 class TestXMLEnrichment:
-    """Tests for adding agent_name attribute to bootstrap XML obs-node elements."""
+    """Tests for agent_name attribute on bootstrap XML obs-node elements."""
 
-    @pytest.mark.xfail(reason="Redesign not implemented yet — XML agent_name enrichment")
     def test_obs_node_has_agent_name_attribute(self):
         """Each obs-node in the XML should have an agent_name attribute."""
         lineage = ("Root", "Child")
@@ -304,7 +304,6 @@ class TestXMLEnrichment:
         for node in nodes:
             assert "agent_name" in node.attrib, f"obs-node missing agent_name: {node.attrib}"
 
-    @pytest.mark.xfail(reason="Redesign not implemented yet — XML agent_name round-trip")
     def test_agent_name_survives_parse_round_trip(self):
         """agent_name attributes survive build → parse → re-read cycle."""
         lineage = ("Root", "Leaf")
@@ -317,13 +316,32 @@ class TestXMLEnrichment:
             native_agent_name="test-agent",
         )
         parsed = parse_obs_bootstrap_xml(xml)
-        # The parsed object should expose agent_names somehow
-        # (exact API depends on implementation — may be a dict or list)
         assert parsed.lineage == lineage
-        # Verify raw XML has the attributes
         import xml.etree.ElementTree as ET
 
         root = ET.fromstring(parsed.raw_xml)
         nodes = root.findall(".//obs-node")
         for node in nodes:
             assert "agent_name" in node.attrib
+
+    def test_xml_agent_names_match_naming_convention(self):
+        """agent_name values in XML match the two-tier naming convention."""
+        lineage = ("Root Topic", "Worker Agent")
+        xml = build_obs_bootstrap_xml(
+            lineage=lineage,
+            origin="test",
+            is_fork=False,
+            session_id="test-sid",
+            root_team_key="test-team",
+            native_agent_name="test-agent",
+        )
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(xml)
+        nodes = root.findall(".//obs-node")
+
+        # First node (trunk): just the slug
+        assert nodes[0].attrib["agent_name"] == "root-topic"
+        # Second node (child): {parent_hash}-{slug}
+        expected_child = native_agent_name_for_lineage(("Root Topic", "Worker Agent"))
+        assert nodes[1].attrib["agent_name"] == expected_child
