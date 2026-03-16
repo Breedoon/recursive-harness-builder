@@ -307,6 +307,36 @@ class _TopicScheduleRecord:
     retry_attempt_count: int = 0
 
 
+def reply_wake_schedule_id(route: TelegramRoute) -> str:
+    """Return the deterministic schedule ID for a reply_wake on *route*."""
+    thread = route.thread_id if route.thread_id is not None else "general"
+    return f"reply-wake-{route.chat_id}-{thread}"
+
+
+def create_reply_wake_schedule(route: TelegramRoute) -> _TopicScheduleRecord:
+    """Create a reply_wake schedule record for *route*.
+
+    Parameters match the design spec: interval_seconds=1, max_runs=3,
+    deterministic schedule ID.
+    """
+    return _TopicScheduleRecord(
+        schedule_id=reply_wake_schedule_id(route),
+        route=route,
+        description="reply_wake: agent has unreplied must_reply messages",
+        schedule_mode="interval",
+        cron_expr=None,
+        trigger_kind="interval",
+        interval_seconds=1,
+        prompt=(
+            "(System: You have unreplied must_reply messages. "
+            "Check your inbox with ReadInbox and reply to the senders "
+            "using SendInboxMessage before continuing other work.)"
+        ),
+        max_runs=3,
+        run_count=0,
+    )
+
+
 @dataclass(frozen=True)
 class _DefaultScheduleTemplate:
     schedule_mode: str

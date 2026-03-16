@@ -45,6 +45,22 @@ def _error_result(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "is_error": True}
 
 
+def validate_must_reply_recipient(
+    *, sender: str, recipient: str, must_reply: bool
+) -> dict[str, Any]:
+    """Check whether a must_reply message is valid.
+
+    Returns ``{"ok": True}`` on success or ``{"ok": False, "error": "..."}``
+    when the message should be rejected (e.g. must_reply to self).
+    """
+    if not must_reply:
+        return {"ok": True}
+    if sender == recipient:
+        return {"ok": False, "error": "must_reply to self is blocked (would cause infinite wake loop)"}
+    return {"ok": True}
+
+
+
 def _transport_unavailable(tool_name: str) -> dict:
     return _error_result(
         f"Cannot use {tool_name}: this transport does not provide task orchestration"
@@ -647,6 +663,11 @@ def create_obs_tools(
             return _error_result("Cannot use SendInboxMessage: recipient is required")
         if not content:
             return _error_result("Cannot use SendInboxMessage: content is required")
+        # Block must_reply to self (would cause infinite wake loop)
+        if must_reply and sender == recipient:
+            return _error_result(
+                "Cannot send must_reply to yourself — this would cause an infinite wake loop."
+            )
         if hook_state is not None and hook_state.inbox_recipient_validator is not None:
             try:
                 validation = await hook_state.inbox_recipient_validator(
