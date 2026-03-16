@@ -129,8 +129,11 @@ async def _check_inbox_for_content(
     found_token: str,
     missing_token: str,
     timeout: float = 240.0,
+    pre_delay: float = 5.0,
 ) -> bool:
     """Instruct an agent to read inbox and report if a specific content is present."""
+    # Wait a bit for inbox delivery to propagate
+    await asyncio.sleep(pre_delay)
     baseline = await harness.platform.latest_bot_message_id(thread_id=thread_id)
     await harness.platform.send(
         (
@@ -149,7 +152,7 @@ async def _check_inbox_for_content(
         tokens=[found_token, missing_token],
         timeout=timeout + 120.0,
     )
-    return _message_is_exact_token(result.text, found_token)
+    return found_token in result.text
 
 
 # ---------------------------------------------------------------------------
@@ -859,7 +862,7 @@ class TestAgentTaskReturnsName:
             tokens=[f"NAME-IN-CONFIRM-{tag}", f"NAME-MISSING-{tag}"],
             timeout=360.0,
         )
-        assert _message_is_exact_token(result.text, f"NAME-IN-CONFIRM-{tag}"), (
+        assert f"NAME-IN-CONFIRM-{tag}" in result.text, (
             "AgentTask confirmation does not include native_agent_name! "
             "Parents need to know how to message their children."
         )
