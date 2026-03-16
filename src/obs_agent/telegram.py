@@ -6776,7 +6776,11 @@ class TelegramBot:
             "ForkTask" if is_fork else "AgentTask"
         )
         team_name = str(args.get("team_name") or "").strip() or None
-        agent_name = str(args.get("agent_name") or args.get("name") or "").strip() or None
+        # With two-tier naming, the 'name' parameter is a display name (alias),
+        # NOT the machine agent_name. The agent_name is computed from the lineage
+        # by _create_child_fork_topic via native_agent_name_for_lineage.
+        # Only use an explicit 'agent_name' if it's provided separately.
+        agent_name = str(args.get("agent_name") or "").strip() or None
         source_session_id: str | None = None
         source_uuid: str | None = None
         source_route = route
