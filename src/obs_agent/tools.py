@@ -947,7 +947,7 @@ def create_obs_tools(
             "content": {"type": "string", "description": "Message body"},
             "summary": {"type": "string", "description": "Optional short summary"},
             "sender": {"type": "string", "description": "Optional sender label"},
-            "must_reply": {"type": "boolean", "description": "If true, recipient will be reminded to reply. Creates a reply_wake schedule (interval=1s, max_runs=3)."},
+            "must_reply": {"type": "boolean", "description": "ADVANCED: Do NOT use unless explicitly instructed. Forces recipient to reply via wake schedule. Default false."},
         },
     )
     async def send_inbox_message(args: dict) -> dict:
