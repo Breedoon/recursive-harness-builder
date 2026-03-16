@@ -5886,19 +5886,50 @@ class TelegramBot:
             default_team_name, default_agent_name = self._default_team_projection(child_lineage)
             team_name = (team_name or "").strip() or default_team_name
             agent_name = (agent_name or "").strip() or default_agent_name
-            # Collision detection: check in-memory records for ACTIVE agents.
-            # We only block if a live/running agent has the same name — stale inbox
-            # files from completed agents should not block new ones.
-            existing_key = self._team_worker_key(team_name or "", agent_name or "")
-            if existing_key is not None and existing_key in self._team_worker_records:
-                # Verify the existing agent is actually alive (not completed/failed)
-                existing_task_id = self._team_worker_records.get(existing_key)
-                existing_record = self._fork_tasks_by_id.get(existing_task_id or "") if existing_task_id else None
-                if existing_record is not None and existing_record.status not in {"completed", "failed", "stopped", "killed"}:
-                    raise RuntimeError(
-                        f"Agent name collision: '{agent_name}' already exists in team '{team_name}'. "
-                        f"Two children under the same parent cannot have the same name."
-                    )
+            # Collision detection: aggressive filesystem-based check.
+            # If an inbox file exists for this agent_name → name is taken.
+            # For auto-generated names (F1, F2...): auto-increment past taken names.
+            # For user-specified names: error on collision.
+            is_auto_generated = bool(
+                re.match(r"^F\d+$", normalized_lineage_name, re.IGNORECASE)
+            )
+            if team_name and agent_name:
+                inbox_path = (
+                    Path.home() / ".claude" / "teams" / team_name
+                    / "inboxes" / f"{agent_name}.json"
+                )
+                if inbox_path.exists():
+                    if is_auto_generated:
+                        # Auto-increment: try F2, F3, ... until we find a free name
+                        counter = int(normalized_lineage_name[1:])
+                        for attempt in range(100):
+                            counter += 1
+                            candidate_name = f"F{counter}"
+                            candidate_lineage = parent_lineage + (candidate_name,)
+                            _, candidate_agent = self._default_team_projection(candidate_lineage)
+                            candidate_inbox = (
+                                Path.home() / ".claude" / "teams" / team_name
+                                / "inboxes" / f"{candidate_agent}.json"
+                            )
+                            if not candidate_inbox.exists():
+                                # Found a free name — update everything
+                                normalized_lineage_name = candidate_name
+                                child_lineage = candidate_lineage
+                                agent_name = candidate_agent
+                                # Update the parent's fork counter so next auto-gen starts from here
+                                parent_state.child_fork_count = counter
+                                self._persist_state_for_route(parent_state.route)
+                                break
+                        else:
+                            raise RuntimeError(
+                                f"Agent name collision: could not find a free auto-generated name "
+                                f"after 100 attempts in team '{team_name}'."
+                            )
+                    else:
+                        raise RuntimeError(
+                            f"Agent name collision: '{agent_name}' already exists in team '{team_name}'. "
+                            f"Choose a different name for this child agent."
+                        )
         await self._activate_route_session(child_state, child_session_id or None)
         child_state.session_manager.set_sdk_env_overrides(
             self._build_team_worker_env(
