@@ -157,9 +157,9 @@ class TestProjectionFormat:
         assert re.match(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-my-chat", key)
 
     def test_n10_root_team_key_empty_lineage(self):
-        """Empty lineage returns sentinel."""
+        """Empty lineage returns timestamp-format sentinel with 'root' slug."""
         key = root_team_key_for_lineage(())
-        assert key == "obs-tree-root-0000000000"
+        assert key == "0000-00-00-00-00-root"
 
     def test_n11_native_agent_name_child_format(self):
         """Child agent name has {parent_hash}-{slug} format."""

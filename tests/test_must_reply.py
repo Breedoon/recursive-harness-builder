@@ -28,36 +28,24 @@ import pytest
 class TestMustReplyInboxFields:
     """Verify must_reply and replied fields on inbox messages."""
 
-    def test_m1_must_reply_fields_in_source(self):
-        """The SendInboxMessage handler writes must_reply and replied fields.
+    def test_m1_detect_must_reply_completions_is_callable(self):
+        """detect_must_reply_completions exists and handles basic input."""
+        from obs_agent.tools import detect_must_reply_completions
 
-        Verifies the implementation source code handles must_reply.
-        End-to-end verification is done in live smoke tests.
-        """
-        import inspect
-        from obs_agent import tools as tools_mod
+        # Test with empty inbox — no must_reply messages
+        updated, all_replied = detect_must_reply_completions([], "agent-a")
+        assert updated == []
+        assert all_replied is True  # No obligations = all cleared
 
-        source = inspect.getsource(tools_mod)
-        # Verify the must_reply param is handled in SendInboxMessage
-        assert "must_reply" in source, \
-            "SendInboxMessage implementation should handle must_reply parameter"
-        # Verify replied field is set
-        assert "replied" in source, \
-            "SendInboxMessage should set replied field"
+    def test_m2_validate_must_reply_recipient_is_callable(self):
+        """validate_must_reply_recipient exists and returns structured result."""
+        from obs_agent.tools import validate_must_reply_recipient
 
-    async def test_m2_send_inbox_message_schema_has_must_reply(self):
-        """The SendInboxMessage MCP tool declaration should include must_reply param."""
-        # The tool is declared via @tool decorator in tools.py
-        # Checking whether the parameter is in the schema requires inspecting
-        # the tool registration — which happens in create_obs_tools.
-        # For now, verify the source code has the param in the tool args dict.
-        import inspect
-        from obs_agent import tools as tools_mod
-
-        source = inspect.getsource(tools_mod)
-        # Check that SendInboxMessage tool def includes must_reply
-        assert '"must_reply"' in source or "'must_reply'" in source, \
-            "SendInboxMessage tool schema should include must_reply parameter"
+        result = validate_must_reply_recipient(
+            sender="agent-a", recipient="agent-b", must_reply=True
+        )
+        assert isinstance(result, dict)
+        assert "ok" in result
 
 
 class TestReplyDetection:
@@ -294,14 +282,23 @@ class TestMustReplyEdgeCases:
         result = validate_must_reply_recipient(sender="agent-a", recipient="agent-a", must_reply=False)
         assert result.get("ok") is True, "Non-must_reply self-send should be allowed"
 
-    async def test_concurrent_inbox_writes_preserve_must_reply(self, tmp_path):
-        """Two must_reply messages written to same inbox both have correct fields."""
-        # Verify source code handles must_reply
-        import inspect
-        from obs_agent import tools as tools_mod
+    def test_concurrent_detect_completions_is_idempotent(self):
+        """Calling detect_must_reply_completions twice on same entries is safe."""
+        from obs_agent.tools import detect_must_reply_completions
 
-        source = inspect.getsource(tools_mod)
-        assert '"must_reply"' in source or "'must_reply'" in source
+        entries = [
+            {"from": "agent-a", "text": "Task", "must_reply": True, "replied": False},
+        ]
+
+        # First call marks replied
+        updated, all_replied = detect_must_reply_completions(entries, "agent-a")
+        assert updated[0]["replied"] is True
+        assert all_replied is True
+
+        # Second call on already-replied entries is a no-op
+        updated2, all_replied2 = detect_must_reply_completions(updated, "agent-a")
+        assert updated2[0]["replied"] is True
+        assert all_replied2 is True
 
 
 # ---------------------------------------------------------------------------
@@ -365,54 +362,112 @@ class TestScheduleCoexistence:
 
 
 class TestCronDeleteBlocked:
-    """Verify agents cannot delete schedules via CronDelete."""
+    """Verify agents cannot delete schedules via CronDelete MCP tool."""
 
-    def test_sc5_cron_delete_returns_error(self):
-        """CronDelete tool handler returns an error (blocked for agents).
+    def test_sc5_cron_delete_mcp_tool_returns_error(self):
+        """The CronDelete MCP tool handler returns an error (blocked for agents).
 
-        The implementer blocked CronDelete at the tool handler level — the function
-        itself returns an error, rather than using _BLOCKED_NATIVE_MODE_TOOLS.
+        The blocking is at the MCP tool layer (tools.py), not the internal
+        _cron_delete method on TelegramBot. This is the correct layer since
+        agents call tools, not internal methods.
         """
+        # Verify the MCP tool handler source contains the blocking logic.
+        # This is a targeted check — the tool's cron_delete function returns
+        # _error_result("CronDelete is disabled for agents...") immediately.
+        from obs_agent.tools import create_obs_tools
+
+        # Can't easily call the tool closure directly without full setup,
+        # but we can verify the blocking exists by checking what the tool
+        # handler does. The live smoke test verifies end-to-end.
         import inspect
         from obs_agent import tools as tools_mod
 
+        # Find the cron_delete function body — it should return an error immediately
         source = inspect.getsource(tools_mod)
-        # Verify the cron_delete function contains the blocking logic
-        assert "CronDelete is disabled" in source or "cron_delete.*disabled" in source, \
-            "CronDelete should return an error for agents"
+        # The function should have both CronDelete and "disabled" in it
+        # We look for the specific error message pattern
+        assert "CronDelete is disabled" in source, \
+            "CronDelete MCP tool should return error for agents"
+
+    async def test_sc5b_internal_cron_delete_still_works(self, config):
+        """TelegramBot._cron_delete still works — it's the user /unschedule path.
+
+        The blocking is only at the MCP tool layer. The internal method
+        must still work for /unschedule command handling.
+        """
+        from obs_agent.telegram import TelegramBot, TelegramRoute, _TopicScheduleRecord
+
+        bot = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=None)
+        bot._get_state(route)
+
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-internal",
+                route=route,
+                description="test",
+                schedule_mode="interval",
+                cron_expr=None,
+                trigger_kind="interval",
+                interval_seconds=300,
+                prompt="test",
+            )
+        )
+
+        # Internal _cron_delete should still work (used by /unschedule)
+        result = await bot._cron_delete(route=route, args={"id": "sched-internal"})
+        assert result.get("is_error") is not True, \
+            "Internal _cron_delete should work for /unschedule path"
+        assert "sched-internal" not in bot._schedule_ids_by_route.get(route, set())
 
 
 class TestUnscheduleNextOnly:
     """Verify /unschedule without args deletes only the next upcoming schedule."""
 
-    @pytest.mark.xfail(reason="/unschedule next-only needs handle_unschedule call in test")
     async def test_sc3_unschedule_no_args_deletes_next_only(self, config):
-        """With 3 schedules at t+10, t+30, t+60, only t+10 is deleted."""
+        """With 3 schedules, /unschedule deletes only the soonest.
+
+        Note: The handler-level test is in test_telegram.py
+        (test_unschedule_no_args_removes_next_upcoming_only).
+        This test verifies at the bot internal level.
+        """
+        from unittest.mock import AsyncMock, MagicMock
         from obs_agent.telegram import TelegramBot, TelegramRoute, _TopicScheduleRecord
 
         bot = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=None)
+        bot._get_state(route)
         now = time.time()
 
         for sid, offset in [("sched-10", 10), ("sched-30", 30), ("sched-60", 60)]:
-            record = _TopicScheduleRecord(
-                schedule_id=sid,
-                route=route,
-                description=f"test-{sid}",
-                schedule_mode="interval",
-                cron_expr=None,
-                trigger_kind="interval",
-                interval_seconds=offset,
-                prompt=f"tick-{sid}",
-                max_runs=10,
-                next_run_at=now + offset,
+            bot._register_topic_schedule(
+                _TopicScheduleRecord(
+                    schedule_id=sid,
+                    route=route,
+                    description=f"test-{sid}",
+                    schedule_mode="interval",
+                    cron_expr=None,
+                    trigger_kind="interval",
+                    interval_seconds=offset,
+                    prompt=f"tick-{sid}",
+                    max_runs=10,
+                    next_run_at=now + offset,
+                )
             )
-            bot._register_topic_schedule(record)
 
         assert len(bot._schedule_ids_by_route.get(route, set())) == 3
 
-        # Need to call handle_unschedule with a mock update/context
-        # The test in test_telegram.py already covers this at the handler level
+        # Simulate /unschedule with no args via handle_unschedule
+        update = MagicMock()
+        update.effective_user.id = 12345
+        update.effective_message.chat_id = 67890
+        update.effective_message.message_thread_id = None
+        ctx = MagicMock()
+        ctx.args = []  # No args = delete next upcoming
+        ctx.bot.send_message = AsyncMock(return_value=MagicMock(message_id=999))
+
+        await bot.handle_unschedule(update, ctx)
+
         remaining = bot._schedule_ids_by_route.get(route, set())
         assert "sched-10" not in remaining, "soonest schedule should be deleted"
         assert "sched-30" in remaining, "later schedules should remain"

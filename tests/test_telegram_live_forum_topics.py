@@ -139,6 +139,10 @@ def _start_bot(
         time.sleep(0.5)
 
     env = os.environ.copy()
+    # Ensure the subprocess imports from this worktree's src/, not the
+    # installed (possibly production) package.
+    worktree_src = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = worktree_src + (":" + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
     env["OBS_VAULT_PATH"] = str(vault_path)
     sender_tokens = _resolve_sender_tokens()
     env["OBS_TELEGRAM_BOT_TOKEN"] = sender_tokens[0]
