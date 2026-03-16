@@ -60,6 +60,54 @@ def validate_must_reply_recipient(
     return {"ok": True}
 
 
+def detect_must_reply_completions(
+    inbox_entries: list[dict],
+    recipient_of_outgoing_message: str,
+) -> tuple[list[dict], bool]:
+    """Mark must_reply messages from *recipient_of_outgoing_message* as replied.
+
+    When agent B sends a message to agent A, B calls this on B's own inbox
+    entries to mark must_reply messages from A as ``replied: True``.
+
+    Returns ``(updated_entries, all_replied)`` where *all_replied* indicates
+    whether every must_reply message in *inbox_entries* is now replied.
+    """
+    changed = False
+    for entry in inbox_entries:
+        if (
+            isinstance(entry, dict)
+            and entry.get("must_reply") is True
+            and entry.get("replied") is not True
+            and entry.get("from") == recipient_of_outgoing_message
+        ):
+            entry["replied"] = True
+            changed = True
+    # Check if ALL must_reply obligations are now cleared
+    all_replied = not any(
+        isinstance(e, dict)
+        and e.get("must_reply") is True
+        and e.get("replied") is not True
+        for e in inbox_entries
+    )
+    return inbox_entries, all_replied
+
+
+def check_and_clear_must_reply_obligations(
+    inbox_entries: list[dict],
+) -> bool:
+    """Check whether all must_reply messages have been replied to.
+
+    Returns ``True`` if there are no unreplied must_reply messages
+    (i.e. the reply_wake schedule can be deleted).
+    """
+    return not any(
+        isinstance(e, dict)
+        and e.get("must_reply") is True
+        and e.get("replied") is not True
+        for e in inbox_entries
+    )
+
+
 
 def _transport_unavailable(tool_name: str) -> dict:
     return _error_result(
@@ -734,6 +782,7 @@ def create_obs_tools(
         # inbox for must_reply messages FROM that recipient that are unreplied.
         # If found, mark them replied.  When ALL must_reply messages are replied,
         # delete the reply_wake schedule.
+        # Reply detection: mark must_reply messages from `recipient` in our inbox as replied
         if sender and sender != recipient:
             sender_inbox_path = (
                 Path.home()
@@ -749,45 +798,36 @@ def create_obs_tools(
                     try:
                         sender_entries = json.loads(sender_inbox_path.read_text(encoding="utf-8"))
                         if isinstance(sender_entries, list):
-                            changed = False
-                            for entry in sender_entries:
-                                if (
-                                    isinstance(entry, dict)
-                                    and entry.get("must_reply") is True
-                                    and entry.get("replied") is not True
-                                    and entry.get("from") == recipient
-                                ):
-                                    entry["replied"] = True
-                                    changed = True
-                            if changed:
+                            updated, all_replied = detect_must_reply_completions(
+                                sender_entries, recipient
+                            )
+                            # Only write if something changed
+                            if any(
+                                e.get("replied") is True
+                                for e in updated
+                                if e.get("must_reply") is True and e.get("from") == recipient
+                            ):
                                 sender_inbox_path.write_text(
-                                    json.dumps(sender_entries, ensure_ascii=True),
+                                    json.dumps(updated, ensure_ascii=True),
                                     encoding="utf-8",
                                 )
-                                # Check if ALL must_reply messages are now replied
-                                has_unreplied = any(
-                                    isinstance(e, dict)
-                                    and e.get("must_reply") is True
-                                    and e.get("replied") is not True
-                                    for e in sender_entries
-                                )
-                                if not has_unreplied and hook_state is not None:
-                                    # All must_reply messages are replied — signal
-                                    # schedule cleanup (handled by telegram.py)
-                                    if hook_state.inbox_message_notifier is not None:
-                                        try:
-                                            await hook_state.inbox_message_notifier(
-                                                {
-                                                    "team_name": team_name,
-                                                    "recipient": sender,
-                                                    "sender": recipient,
-                                                    "content": "__reply_wake_clear__",
-                                                    "summary": "all must_reply messages replied",
-                                                    "_reply_wake_clear": True,
-                                                }
-                                            )
-                                        except Exception:
-                                            logger.warning("Reply wake clear notification failed", exc_info=True)
+                            if all_replied and hook_state is not None:
+                                # All must_reply messages are replied — signal
+                                # schedule cleanup (handled by telegram.py)
+                                if hook_state.inbox_message_notifier is not None:
+                                    try:
+                                        await hook_state.inbox_message_notifier(
+                                            {
+                                                "team_name": team_name,
+                                                "recipient": sender,
+                                                "sender": recipient,
+                                                "content": "__reply_wake_clear__",
+                                                "summary": "all must_reply messages replied",
+                                                "_reply_wake_clear": True,
+                                            }
+                                        )
+                                    except Exception:
+                                        logger.warning("Reply wake clear notification failed", exc_info=True)
                     except Exception:
                         logger.warning("Reply detection: failed reading sender inbox %s", sender_inbox_path, exc_info=True)
 
