@@ -1928,6 +1928,22 @@ class TelegramBot:
             native_agent_name_for_lineage(lineage),
         )
 
+    def _get_parent_team_key(self, state: TelegramSessionState) -> str | None:
+        """Extract the root_team_key from a state's SDK env overrides or bootstrap."""
+        env = state.session_manager.sdk_env_overrides
+        team = env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
+        if team:
+            return team
+        # Fallback: check pending bootstrap
+        if state.pending_obs_bootstrap:
+            try:
+                bootstrap = parse_obs_bootstrap_xml(state.pending_obs_bootstrap)
+                if bootstrap.root_team_key:
+                    return bootstrap.root_team_key
+            except Exception:
+                pass
+        return None
+
     def _find_existing_team_key_for_lineage(
         self,
         lineage: tuple[str, ...],
@@ -5883,8 +5899,11 @@ class TelegramBot:
                 session_id=source_session_id or parent_state.session_id,
             )
             child_lineage = parent_lineage + (normalized_lineage_name,)
-            default_team_name, default_agent_name = self._default_team_projection(child_lineage)
-            team_name = (team_name or "").strip() or default_team_name
+            # Children inherit the parent's root_team_key — only trunk generates
+            # a new timestamp-based key. The agent_name is always computed fresh.
+            default_agent_name = native_agent_name_for_lineage(child_lineage)
+            parent_team_key = self._get_parent_team_key(parent_state)
+            team_name = (team_name or "").strip() or parent_team_key or root_team_key_for_lineage(child_lineage)
             agent_name = (agent_name or "").strip() or default_agent_name
             # Collision detection: aggressive filesystem-based check.
             # If an inbox file exists for this agent_name → name is taken.
