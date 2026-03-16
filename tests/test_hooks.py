@@ -113,16 +113,14 @@ class TestPreToolUseNativeToolGuard:
         reason = result["hookSpecificOutput"]["permissionDecisionReason"]
         assert "AgentTask" in reason
 
-    def test_blocks_native_task_tool_with_mcp_prefix(self, config):
+    def test_allows_native_task_output_tool(self, config):
+        """TaskOutput is allowed (read-only, useful for background bash)."""
         result = on_pre_tool_use(
             tool_name="mcp__native__TaskOutput",
             tool_input={"task_id": "abc"},
             config=config,
         )
-        assert result is not None
-        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
-        assert "AgentTaskOutput" in reason
+        assert result is None  # None means allowed
 
     def test_blocks_native_inbox_send_tool(self, config):
         result = on_pre_tool_use(

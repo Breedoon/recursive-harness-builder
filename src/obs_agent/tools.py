@@ -193,6 +193,7 @@ def create_obs_tools(
                 fork = _coerce_bool_arg(args.get("fork"), name="fork")
             except ValueError:
                 return _error_result(f"Cannot launch {tool_name}: fork must be true or false")
+        # Kept for internal/future use — not exposed in MCP schema but still processed if passed
         timeout_ms_raw = args.get("timeout_ms")
         max_turns_raw = args.get("max_turns")
         if not prompt:
@@ -275,14 +276,7 @@ def create_obs_tools(
                 "type": "boolean",
                 "description": "Must be true for ForkTask",
             },
-            "timeout_ms": {
-                "type": "integer",
-                "description": "Optional timeout budget in milliseconds for the child task",
-            },
-            "max_turns": {
-                "type": "integer",
-                "description": "Optional max turns for child execution; defaults to unbounded if omitted",
-            },
+            # timeout_ms and max_turns: kept for internal/future use — not exposed in MCP schema
             "name": {
                 "type": "string",
                 "description": "Optional worker name (team workflows).",
@@ -326,14 +320,7 @@ def create_obs_tools(
                 "type": "boolean",
                 "description": "Must be true for AgentTask",
             },
-            "timeout_ms": {
-                "type": "integer",
-                "description": "Optional timeout budget in milliseconds for the child task",
-            },
-            "max_turns": {
-                "type": "integer",
-                "description": "Optional max turns for child execution; defaults to unbounded if omitted",
-            },
+            # timeout_ms and max_turns: kept for internal/future use — not exposed in MCP schema
             "name": {
                 "type": "string",
                 "description": "Optional worker name (team workflows).",

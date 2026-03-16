@@ -42,7 +42,7 @@ _BLOCKED_FILE_PATTERNS = [".env"]
 
 # Native delegation tools are blocked so orchestration is forced through
 # OBS-managed AgentTask/ForkTask tooling.
-_BLOCKED_NATIVE_TASK_TOOLS = {"Task", "TaskOutput", "TaskStop"}
+_BLOCKED_NATIVE_TASK_TOOLS = {"Task", "TaskStop"}  # TaskOutput allowed (read-only, useful for background bash)
 
 # Native team inbox tools are blocked so worker messaging is forced through
 # OBS-managed SendInboxMessage/ReadInbox implementations.
@@ -114,10 +114,11 @@ def on_pre_tool_use(
     if normalized_tool_name in _BLOCKED_NATIVE_TASK_TOOLS:
         return _deny(
             "Blocked by platform policy: native Task tools are disabled in Telegram runtime. "
-            "Use AgentTask, AgentTaskOutput, and AgentTaskStop instead.",
+            "Use AgentTask, AgentTaskOutput, and AgentTaskStop instead. "
+            "TaskOutput is allowed for reading background task output.",
             additional_context=(
-                "System: Native Task tools are disabled by platform policy in Telegram runtime. "
-                "Do not retry Task/TaskOutput/TaskStop; switch to AgentTask tools."
+                "System: Native Task/TaskStop tools are disabled by platform policy in Telegram runtime. "
+                "Do not retry Task/TaskStop; switch to AgentTask tools. TaskOutput is allowed."
             ),
             show_system_message=True,
         )
