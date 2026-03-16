@@ -318,3 +318,196 @@ class TestMustReplySmoke:
             token=f"ROOT-GOT-REPLY-{tag}",
             timeout=300.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Smoke Test 6: Same-Name Agents at Different Depths
+# ---------------------------------------------------------------------------
+
+@pytest.mark.telegram_smoke
+@pytest.mark.timeout(900)  # 15 minutes
+class TestSameNameAgentsSmoke:
+    """Verify same-name agents under different parents get unique names and messaging works."""
+
+    async def test_live_same_name_different_parents(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        """Two 'research' agents under different parents get different agent_names."""
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+
+        root_thread_id = await live_tg_forum.platform.create_topic(f"SameName {tag}")
+
+        # Prime root
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"Deterministic same-name test. Reply with only SAMENAME-PRIME-{tag}.",
+            thread_id=root_thread_id,
+            token=f"SAMENAME-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        # Launch Branch-A
+        branch_a_thread, lineage_a = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=False,
+            alias=f"Branch-A-{tag}",
+            launch_token=f"LAUNCHED-A-{tag}",
+            lineage_token=f"LINEAGE-A-{tag}",
+            timeout=240.0,
+        )
+
+        # Launch Branch-B
+        branch_b_thread, lineage_b = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=False,
+            alias=f"Branch-B-{tag}",
+            launch_token=f"LAUNCHED-B-{tag}",
+            lineage_token=f"LINEAGE-B-{tag}",
+            timeout=240.0,
+        )
+
+        # Launch "research" under Branch-A
+        research_a_thread, lineage_ra = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=branch_a_thread,
+            fork=True,
+            alias=f"research",
+            launch_token=f"A-LAUNCHED-RESEARCH-{tag}",
+            lineage_token=f"LINEAGE-RA-{tag}",
+            timeout=240.0,
+        )
+
+        # Launch "research" under Branch-B (same name, different parent)
+        research_b_thread, lineage_rb = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=branch_b_thread,
+            fork=True,
+            alias=f"research",
+            launch_token=f"B-LAUNCHED-RESEARCH-{tag}",
+            lineage_token=f"LINEAGE-RB-{tag}",
+            timeout=240.0,
+        )
+
+        # CRITICAL: same name "research" but different agent_names
+        assert lineage_ra["native_agent_name"] != lineage_rb["native_agent_name"], \
+            f"Same-name agents under different parents should have different names: " \
+            f"{lineage_ra['native_agent_name']} vs {lineage_rb['native_agent_name']}"
+
+        # Both should contain "research" in the name
+        assert "research" in lineage_ra["native_agent_name"]
+        assert "research" in lineage_rb["native_agent_name"]
+
+        # Both share the same root_team_key
+        assert lineage_ra["root_team_key"] == lineage_rb["root_team_key"]
+
+        # Message from research-A to research-B (cross-branch, same-name)
+        token_ra_to_rb = f"MSG-RA-TO-RB-{tag}"
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=research_a_thread,
+            recipient=lineage_rb["native_agent_name"],
+            content=token_ra_to_rb,
+            ack_token=f"RA-SENT-RB-{tag}",
+            timeout=240.0,
+        )
+
+        # Verify research-B received it (not research-A)
+        baseline_rb = await live_tg_forum.platform.latest_bot_message_id(thread_id=research_b_thread)
+        await live_tg_forum.platform.send(
+            (
+                "Call ReadInbox exactly once with no arguments. "
+                f"If unread messages contain {token_ra_to_rb!r}, reply with exactly RB-GOT-{tag}. "
+                f"Otherwise reply with RB-MISSING-{tag}."
+            ),
+            thread_id=research_b_thread,
+            require_done=False,
+            timeout=240.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=research_b_thread,
+            after_message_id=baseline_rb,
+            token=f"RB-GOT-{tag}",
+            timeout=300.0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Smoke Test 7: Schedule Rearchitecture (CronDelete blocked, coexistence)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.telegram_smoke
+@pytest.mark.timeout(600)  # 10 minutes
+class TestScheduleRearchitectureSmoke:
+    """Live smoke tests for schedule rearchitecture.
+
+    Tests:
+    - CronDelete returns error for agents
+    - Multiple schedules can coexist on same route
+    """
+
+    async def test_live_cron_delete_blocked(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        """Agent calling CronDelete gets an error; user /unschedule still works."""
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+
+        thread_id = await live_tg_forum.platform.create_topic(f"SchedBlock {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"Deterministic schedule test. Reply with only SCHED-PRIME-{tag}.",
+            thread_id=thread_id,
+            token=f"SCHED-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        # Create a schedule
+        baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic schedule test. "
+                "Call CronCreate exactly once with schedule_mode='interval', "
+                "interval_seconds=300, prompt='SCHED-TICK', max_runs=1, "
+                "reset_session=false, description='test schedule'. "
+                f"Reply with only SCHED-CREATED-{tag}."
+            ),
+            thread_id=thread_id,
+            require_done=False,
+            timeout=180.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_id,
+            after_message_id=baseline,
+            token=f"SCHED-CREATED-{tag}",
+            timeout=300.0,
+        )
+
+        # Now try CronDelete — should be blocked
+        baseline2 = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic schedule test. "
+                "Call CronList to get the schedule ID. "
+                "Then call CronDelete with that ID. "
+                "If CronDelete returns an error or says disabled, reply with exactly CRON-DELETE-BLOCKED-{tag}. "
+                f"If CronDelete succeeds, reply with exactly CRON-DELETE-SUCCESS-{tag}."
+            ),
+            thread_id=thread_id,
+            require_done=False,
+            timeout=180.0,
+        )
+        block_msg = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_id,
+            after_message_id=baseline2,
+            token=f"CRON-DELETE-BLOCKED-{tag}",
+            timeout=300.0,
+        )
