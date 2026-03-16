@@ -236,6 +236,29 @@ class TestCollisionAndEdgeCases:
         fp_lower = lineage_fingerprint(("root",))
         assert fp_upper != fp_lower
 
+    def test_n17_same_name_same_parent_produces_identical_agent_name(self):
+        """Two children with same name under same parent produce IDENTICAL agent names.
+
+        This is the collision that the collision detection should catch at launch time.
+        The naming function itself doesn't prevent this — it's the TelegramBot
+        that checks _team_worker_records before launching.
+        """
+        name_1 = native_agent_name_for_lineage(("Root", "worker"))
+        name_2 = native_agent_name_for_lineage(("Root", "worker"))
+        assert name_1 == name_2  # Same input → same output (deterministic)
+
+    def test_n18_same_name_different_parent_produces_different_agent_name(self):
+        """Two children with same name under different parents produce DIFFERENT agent names.
+
+        This is NOT a collision — it's fine. Different parents = different hash prefixes.
+        """
+        name_a = native_agent_name_for_lineage(("Root", "Branch-A", "worker"))
+        name_b = native_agent_name_for_lineage(("Root", "Branch-B", "worker"))
+        assert name_a != name_b
+        # Both end with -worker
+        assert name_a.endswith("-worker")
+        assert name_b.endswith("-worker")
+
 
 # ---------------------------------------------------------------------------
 # Redesigned naming format tests (will FAIL until implementation lands)
