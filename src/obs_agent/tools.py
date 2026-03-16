@@ -727,6 +727,11 @@ def create_obs_tools(
             return _error_result(
                 "Cannot send must_reply to yourself — this would cause an infinite wake loop."
             )
+        # Messages are ALWAYS delivered to the inbox file. The validator is
+        # advisory — it determines whether a wake attempt will be made, but
+        # never blocks delivery. The only definition of "dead" is: the user
+        # deleted the topic. We discover that lazily on wake failure.
+        _recipient_wakeable = True
         if hook_state is not None and hook_state.inbox_recipient_validator is not None:
             try:
                 validation = await hook_state.inbox_recipient_validator(
@@ -738,24 +743,7 @@ def create_obs_tools(
             except Exception:
                 logger.warning("SendInboxMessage validator failed", exc_info=True)
                 validation = {"deliverable": True}
-            deliverable = bool(validation.get("deliverable", True)) if isinstance(validation, dict) else bool(validation)
-            if not deliverable:
-                reason = ""
-                if isinstance(validation, dict):
-                    reason = str(validation.get("reason") or "").strip()
-                reason = reason or "recipient is not a live agent in this tree"
-                response = {
-                    "success": False,
-                    "delivered": False,
-                    "team_name": team_name,
-                    "recipient": recipient,
-                    "error": reason,
-                }
-                return {
-                    "content": [{"type": "text", "text": f"message undelivered: {reason}"}],
-                    "tool_use_result": response,
-                    "is_error": True,
-                }
+            _recipient_wakeable = bool(validation.get("deliverable", True)) if isinstance(validation, dict) else bool(validation)
 
         inbox_path = (
             Path.home()
@@ -813,15 +801,20 @@ def create_obs_tools(
                                 sender_entries, recipient
                             )
                             # Only write if something changed
-                            if any(
+                            replied_something = any(
                                 e.get("replied") is True
                                 for e in updated
                                 if e.get("must_reply") is True and e.get("from") == recipient
-                            ):
+                            )
+                            if replied_something:
                                 sender_inbox_path.write_text(
                                     json.dumps(updated, ensure_ascii=True),
                                     encoding="utf-8",
                                 )
+                                # This message IS a reply to a must_reply —
+                                # suppress must_reply on the outgoing notification
+                                # to prevent infinite ping-pong loops.
+                                must_reply = False
                             if all_replied and hook_state is not None:
                                 # All must_reply messages are replied — signal
                                 # schedule cleanup (handled by telegram.py)
@@ -848,7 +841,12 @@ def create_obs_tools(
             "recipient": recipient,
             "message_count": len(entries),
         }
-        if hook_state is not None and hook_state.inbox_message_notifier is not None:
+        if not _recipient_wakeable:
+            response["warning"] = (
+                "Message delivered to inbox but recipient may not be active. "
+                "The agent may read it when next woken."
+            )
+        if hook_state is not None and hook_state.inbox_message_notifier is not None and _recipient_wakeable:
             try:
                 notification_payload: dict[str, Any] = {
                     "team_name": team_name,
@@ -1013,7 +1011,7 @@ def create_obs_tools(
         },
     )
     async def session_lineage(args: dict) -> dict:
-        include_xml = bool(args.get("include_xml", False))
+        include_xml = _coerce_bool_arg(args.get("include_xml", False), name="include_xml")
         bootstrap = _current_obs_bootstrap()
         if bootstrap is None:
             return _error_result("Cannot use session_lineage: no OBS bootstrap found for current session")
