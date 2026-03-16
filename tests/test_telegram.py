@@ -909,9 +909,11 @@ class TestBackgroundPoller:
         assert state.agent_lineage == ("General",)
         env = observed["env"]
         assert isinstance(env, dict)
-        assert env["CLAUDE_CODE_TEAM_NAME"] == root_team_key_for_lineage(("General",))
-        assert env["CLAUDE_CODE_TASK_LIST_ID"] == root_team_key_for_lineage(("General",))
-        assert env["CLAUDE_CODE_AGENT_NAME"] == native_agent_name_for_lineage(("General",))
+        # Team key has timestamp prefix + slug — verify format, not exact value
+        assert env["CLAUDE_CODE_TEAM_NAME"].endswith("-general")
+        assert env["CLAUDE_CODE_TASK_LIST_ID"] == env["CLAUDE_CODE_TEAM_NAME"]
+        # Bug 4 fix: trunk agent_name = full team key
+        assert env["CLAUDE_CODE_AGENT_NAME"] == env["CLAUDE_CODE_TEAM_NAME"]
         prompt = str(observed.get("prompt") or "")
         assert "<obs-bootstrap" in prompt  # bootstrap is prepended (after system-note)
         assert "<origin>trunk_start</origin>" in prompt
