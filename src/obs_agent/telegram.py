@@ -5886,24 +5886,19 @@ class TelegramBot:
             default_team_name, default_agent_name = self._default_team_projection(child_lineage)
             team_name = (team_name or "").strip() or default_team_name
             agent_name = (agent_name or "").strip() or default_agent_name
-            # Collision detection: check in-memory records AND filesystem
+            # Collision detection: check in-memory records for ACTIVE agents.
+            # We only block if a live/running agent has the same name — stale inbox
+            # files from completed agents should not block new ones.
             existing_key = self._team_worker_key(team_name or "", agent_name or "")
-            collision = False
             if existing_key is not None and existing_key in self._team_worker_records:
-                collision = True
-            elif team_name and agent_name:
-                # Also check inbox files (survives daemon restart)
-                inbox_path = (
-                    Path.home() / ".claude" / "teams" / team_name
-                    / "inboxes" / f"{agent_name}.json"
-                )
-                if inbox_path.exists():
-                    collision = True
-            if collision:
-                raise RuntimeError(
-                    f"Agent name collision: '{agent_name}' already exists in team '{team_name}'. "
-                    f"Two children under the same parent cannot have the same name."
-                )
+                # Verify the existing agent is actually alive (not completed/failed)
+                existing_task_id = self._team_worker_records.get(existing_key)
+                existing_record = self._fork_tasks_by_id.get(existing_task_id or "") if existing_task_id else None
+                if existing_record is not None and existing_record.status not in {"completed", "failed", "stopped", "killed"}:
+                    raise RuntimeError(
+                        f"Agent name collision: '{agent_name}' already exists in team '{team_name}'. "
+                        f"Two children under the same parent cannot have the same name."
+                    )
         await self._activate_route_session(child_state, child_session_id or None)
         child_state.session_manager.set_sdk_env_overrides(
             self._build_team_worker_env(
