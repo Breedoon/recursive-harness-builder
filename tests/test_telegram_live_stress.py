@@ -137,8 +137,8 @@ async def _check_inbox_for_content(
     baseline = await harness.platform.latest_bot_message_id(thread_id=thread_id)
     await harness.platform.send(
         (
-            "Call ReadInbox exactly once with no arguments. "
-            f"If unread messages contain {look_for!r}, reply with exactly {found_token}. "
+            "Call ReadInbox exactly once with include_read=true. "
+            f"If ANY messages (read or unread) contain {look_for!r}, reply with exactly {found_token}. "
             f"Otherwise reply with {missing_token}."
         ),
         thread_id=thread_id,
