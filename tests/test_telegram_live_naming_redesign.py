@@ -136,11 +136,14 @@ class TestNamingRedesignSmoke:
         assert lineage_b["lineage_length"] == "2"
 
         # Child agent names should have hash prefix (not obs-agent-)
-        assert not lineage_a["native_agent_name"].startswith("obs-agent-")
-        assert not lineage_b["native_agent_name"].startswith("obs-agent-")
-        # Should contain a 10-char hex prefix
+        assert not lineage_a["native_agent_name"].startswith("obs-agent-"), \
+            f"Child should not have obs-agent- prefix, got: {lineage_a['native_agent_name']}"
+        assert not lineage_b["native_agent_name"].startswith("obs-agent-"), \
+            f"Child should not have obs-agent- prefix, got: {lineage_b['native_agent_name']}"
+        # Should contain a 10-char hex prefix followed by dash and slug
         assert re.match(r"[0-9a-f]{10}-", lineage_a["native_agent_name"]), \
-            f"Child should have hash prefix, got: {lineage_a['native_agent_name']}"
+            f"Child should have 10-char hash prefix, got: {lineage_a['native_agent_name']}. " \
+            f"Is the naming redesign applied at the launch path?"
 
         # Phase 3: Launch grandchild from Alpha
         worker_c_thread, lineage_c = await _launch_lineage_worker(
