@@ -5842,6 +5842,13 @@ class TelegramBot:
             default_team_name, default_agent_name = self._default_team_projection(child_lineage)
             team_name = (team_name or "").strip() or default_team_name
             agent_name = (agent_name or "").strip() or default_agent_name
+            # Collision detection: check if an agent with this name already exists
+            existing_key = self._team_worker_key(team_name or "", agent_name or "")
+            if existing_key is not None and existing_key in self._team_worker_records:
+                raise RuntimeError(
+                    f"Agent name collision: '{agent_name}' already exists in team '{team_name}'. "
+                    f"Two children under the same parent cannot have the same name."
+                )
         await self._activate_route_session(child_state, child_session_id or None)
         child_state.session_manager.set_sdk_env_overrides(
             self._build_team_worker_env(
@@ -6392,6 +6399,52 @@ class TelegramBot:
         recipient = str(payload.get("recipient") or "").strip()
         if not team_name or not recipient:
             return
+
+        # Handle reply_wake_clear signal: all must_reply messages replied
+        if payload.get("_reply_wake_clear"):
+            # Find and delete the reply_wake schedule for the recipient's route
+            recipient_state = self._resolve_route_inbox_target(
+                team_name=team_name,
+                agent_name=recipient,
+            )
+            if recipient_state is not None:
+                wake_id = reply_wake_schedule_id(recipient_state.route)
+                if wake_id in self._topic_schedules_by_id:
+                    self._delete_topic_schedule(wake_id)
+                    logger.info(
+                        "Deleted reply_wake schedule %s: all must_reply messages replied",
+                        wake_id,
+                    )
+            return
+
+        # Create reply_wake schedule if this is a must_reply message
+        if payload.get("_must_reply"):
+            recipient_state = self._resolve_route_inbox_target(
+                team_name=team_name,
+                agent_name=recipient,
+            )
+            if recipient_state is not None:
+                wake_record = create_reply_wake_schedule(recipient_state.route)
+                existing = self._topic_schedules_by_id.get(wake_record.schedule_id)
+                if existing is not None:
+                    # Upsert: reset run_count to 0 (3 fresh attempts)
+                    existing.run_count = 0
+                    existing.enabled = True
+                    existing.next_run_at = time.time() + (existing.interval_seconds or 1)
+                    self._register_topic_schedule(existing)
+                    logger.info(
+                        "Upserted reply_wake schedule %s: reset run_count to 0",
+                        wake_record.schedule_id,
+                    )
+                else:
+                    wake_record.next_run_at = time.time() + (wake_record.interval_seconds or 1)
+                    self._register_topic_schedule(wake_record)
+                    logger.info(
+                        "Created reply_wake schedule %s for route=%s",
+                        wake_record.schedule_id,
+                        recipient_state.route,
+                    )
+
         record = self._resolve_team_worker_record(
             team_name=team_name,
             agent_name=recipient,

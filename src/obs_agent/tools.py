@@ -839,15 +839,16 @@ def create_obs_tools(
         }
         if hook_state is not None and hook_state.inbox_message_notifier is not None:
             try:
-                await hook_state.inbox_message_notifier(
-                    {
-                        "team_name": team_name,
-                        "recipient": recipient,
-                        "sender": sender,
-                        "content": content,
-                        "summary": summary,
-                    }
-                )
+                notification_payload: dict[str, Any] = {
+                    "team_name": team_name,
+                    "recipient": recipient,
+                    "sender": sender,
+                    "content": content,
+                    "summary": summary,
+                }
+                if must_reply:
+                    notification_payload["_must_reply"] = True
+                await hook_state.inbox_message_notifier(notification_payload)
             except Exception:
                 logger.warning("SendInboxMessage notifier failed", exc_info=True)
         return {
