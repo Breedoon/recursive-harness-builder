@@ -582,6 +582,7 @@ class TelegramBot:
         self._team_worker_records: dict[tuple[str, str], str] = {}
         self._route_inbox_targets: dict[tuple[str, str], TelegramRoute] = {}
         self._route_inbox_target_keys_by_route: dict[TelegramRoute, tuple[str, str]] = {}
+        self._chat_titles: dict[int, str] = {}
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
         self._schedule_running_by_route: set[TelegramRoute] = set()
@@ -1125,7 +1126,7 @@ class TelegramBot:
 
     def _default_topic_title(self, route: TelegramRoute) -> str:
         if route.thread_id is None:
-            return "General"
+            return self._chat_titles.get(route.chat_id) or "General"
         return f"Topic {route.thread_id}"
 
     @staticmethod
@@ -1354,14 +1355,6 @@ class TelegramBot:
                     record.schedule_mode,
                 )
                 return
-        overlap_error = self._validate_schedule_overlap(
-            route=route,
-            start_ts=record.from_ts,
-            end_ts=record.until_ts,
-        )
-        if overlap_error:
-            logger.warning("Skipping default schedule for %s: %s", route, overlap_error)
-            return
         self._register_topic_schedule(record)
         logger.info(
             "Applied default schedule from settings route=%s mode=%s max_runs=%s",
@@ -2073,52 +2066,8 @@ class TelegramBot:
         parsed = datetime.fromisoformat(normalized)
         return parsed.timestamp()
 
-    @staticmethod
-    def _window_overlap(
-        *,
-        start_a: float | None,
-        end_a: float | None,
-        start_b: float | None,
-        end_b: float | None,
-    ) -> bool:
-        left_a = float("-inf") if start_a is None else float(start_a)
-        right_a = float("inf") if end_a is None else float(end_a)
-        left_b = float("-inf") if start_b is None else float(start_b)
-        right_b = float("inf") if end_b is None else float(end_b)
-        return max(left_a, left_b) < min(right_a, right_b)
-
-    def _validate_schedule_overlap(
-        self,
-        *,
-        route: TelegramRoute,
-        start_ts: float | None,
-        end_ts: float | None,
-    ) -> str | None:
-        now = time.time()
-        active_schedule_id = self._active_schedule_execution_by_route.get(route)
-        for existing in self._active_schedules_for_route(route):
-            if self._schedule_is_exhausted(existing, now):
-                existing.enabled = False
-                existing.next_run_at = None
-                self._register_topic_schedule(existing)
-                continue
-            if (
-                active_schedule_id == existing.schedule_id
-                and existing.max_runs is not None
-                and (existing.run_count + 1) >= existing.max_runs
-            ):
-                continue
-            if self._window_overlap(
-                start_a=start_ts,
-                end_a=end_ts,
-                start_b=existing.from_ts,
-                end_b=existing.until_ts,
-            ):
-                return (
-                    "CronCreate failed: overlapping schedule window for this topic. "
-                    "Only non-overlapping [from, until) windows are allowed."
-                )
-        return None
+    # Schedule overlap validation removed — multiple schedules coexist freely.
+    # Shorter intervals fire first; after max_runs exhaustion, longer ones take over.
 
     def _next_cron_fire_ts(
         self,
@@ -2231,19 +2180,6 @@ class TelegramBot:
             if self._schedule_is_exhausted(parent_record, now):
                 continue
             if not self._schedule_should_inherit(record=parent_record, is_fork=is_fork):
-                continue
-            overlap_error = self._validate_schedule_overlap(
-                route=child_route,
-                start_ts=parent_record.from_ts,
-                end_ts=parent_record.until_ts,
-            )
-            if overlap_error:
-                logger.info(
-                    "Skipping inherited schedule due to overlap parent_route=%s child_route=%s schedule_id=%s",
-                    parent_route,
-                    child_route,
-                    parent_record.schedule_id,
-                )
                 continue
             child_record = _TopicScheduleRecord(
                 schedule_id=uuid.uuid4().hex[:8],
@@ -2415,14 +2351,6 @@ class TelegramBot:
             return self._cron_error_result(
                 "CronCreate failed: inherit must be none, fork, or all"
             )
-
-        overlap_error = self._validate_schedule_overlap(
-            route=route,
-            start_ts=from_ts,
-            end_ts=until_ts,
-        )
-        if overlap_error:
-            return self._cron_error_result(overlap_error)
 
         now = time.time()
         schedule_id = uuid.uuid4().hex[:8]
@@ -4205,6 +4133,12 @@ class TelegramBot:
 
         await self._ensure_background_poller(context.bot)
         message = update.effective_message
+        # Cache the group chat title for General topic naming
+        chat = getattr(message, "chat", None)
+        if chat is not None:
+            chat_title = getattr(chat, "title", None)
+            if isinstance(chat_title, str) and chat_title.strip():
+                self._chat_titles[message.chat_id] = chat_title.strip()
         route = self._route_for_message(message)
         state = self._get_state(route)
         if state is not None:
@@ -4441,7 +4375,6 @@ class TelegramBot:
             )
             return
 
-        deleted = 0
         if context.args:
             target_id = context.args[0].strip()
             record = self._topic_schedules_by_id.get(target_id)
@@ -4454,18 +4387,37 @@ class TelegramBot:
                 )
                 return
             self._delete_topic_schedule(target_id)
-            deleted = 1
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=f"unscheduled 1 schedule for this topic: {target_id}",
+                disable_notification=True,
+            )
         else:
-            for schedule_id in schedule_ids:
-                self._delete_topic_schedule(schedule_id)
-                deleted += 1
-
-        await self._send_system_message(
-            route=route,
-            bot=context.bot,
-            text=f"unscheduled {deleted} schedule(s) for this topic",
-            disable_notification=True,
-        )
+            # Delete only the next upcoming schedule (soonest next_run_at)
+            records = [
+                self._topic_schedules_by_id[sid]
+                for sid in schedule_ids
+                if sid in self._topic_schedules_by_id
+            ]
+            # Sort by next_run_at; schedules without next_run_at go last
+            records.sort(key=lambda r: r.next_run_at if r.next_run_at is not None else float("inf"))
+            if records:
+                next_record = records[0]
+                self._delete_topic_schedule(next_record.schedule_id)
+                await self._send_system_message(
+                    route=route,
+                    bot=context.bot,
+                    text=f"unscheduled next upcoming schedule: {next_record.schedule_id}",
+                    disable_notification=True,
+                )
+            else:
+                await self._send_system_message(
+                    route=route,
+                    bot=context.bot,
+                    text="no schedules attached to this topic",
+                    disable_notification=True,
+                )
 
     async def handle_context(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

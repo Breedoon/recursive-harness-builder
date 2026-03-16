@@ -16,7 +16,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
@@ -612,7 +612,15 @@ def create_obs_tools(
         },
     )
     async def cron_delete(args: dict) -> dict:
-        return await _cron_delete(args, tool_name="CronDelete")
+        # Agent-initiated schedule deletion is deprecated.
+        # Agents were deleting their own schedules unprompted, undermining user intent.
+        # Users can still delete schedules via /unschedule command.
+        # Considering reintroduction with guardrails (e.g., user confirmation,
+        # only delete schedules the agent created).
+        return _error_result(
+            "CronDelete is disabled for agents. "
+            "Schedules can only be removed by the user via /unschedule command."
+        )
 
     async def _send_inbox_message(args: dict) -> dict:
         bootstrap = _current_obs_bootstrap()
@@ -625,6 +633,7 @@ def create_obs_tools(
         sender = str(args.get("sender", "")).strip() or (
             bootstrap.native_agent_name if bootstrap is not None and bootstrap.native_agent_name else "obs-worker"
         )
+        must_reply = bool(args.get("must_reply", False))
         if not team_name:
             return _error_result(
                 "Cannot use SendInboxMessage: team_name is required or must be inferable from current lineage"
@@ -682,15 +691,79 @@ def create_obs_tools(
                         entries = [item for item in loaded if isinstance(item, dict)]
                 except Exception:
                     logger.warning("Failed reading inbox JSON: %s", inbox_path, exc_info=True)
-            message = {
+            message: dict[str, Any] = {
                 "from": sender,
                 "text": content,
                 "summary": summary or "",
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "read": False,
             }
+            if must_reply:
+                message["must_reply"] = True
+                message["replied"] = False
             entries.append(message)
             inbox_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
+
+        # Reply detection: if we just sent a message to `recipient`, check our OWN
+        # inbox for must_reply messages FROM that recipient that are unreplied.
+        # If found, mark them replied.  When ALL must_reply messages are replied,
+        # delete the reply_wake schedule.
+        if sender and sender != recipient:
+            sender_inbox_path = (
+                Path.home()
+                / ".claude"
+                / "teams"
+                / team_name
+                / "inboxes"
+                / f"{sender}.json"
+            )
+            if sender_inbox_path.exists():
+                sender_lock = _inbox_lock(sender_inbox_path)
+                async with sender_lock:
+                    try:
+                        sender_entries = json.loads(sender_inbox_path.read_text(encoding="utf-8"))
+                        if isinstance(sender_entries, list):
+                            changed = False
+                            for entry in sender_entries:
+                                if (
+                                    isinstance(entry, dict)
+                                    and entry.get("must_reply") is True
+                                    and entry.get("replied") is not True
+                                    and entry.get("from") == recipient
+                                ):
+                                    entry["replied"] = True
+                                    changed = True
+                            if changed:
+                                sender_inbox_path.write_text(
+                                    json.dumps(sender_entries, ensure_ascii=True),
+                                    encoding="utf-8",
+                                )
+                                # Check if ALL must_reply messages are now replied
+                                has_unreplied = any(
+                                    isinstance(e, dict)
+                                    and e.get("must_reply") is True
+                                    and e.get("replied") is not True
+                                    for e in sender_entries
+                                )
+                                if not has_unreplied and hook_state is not None:
+                                    # All must_reply messages are replied — signal
+                                    # schedule cleanup (handled by telegram.py)
+                                    if hook_state.inbox_message_notifier is not None:
+                                        try:
+                                            await hook_state.inbox_message_notifier(
+                                                {
+                                                    "team_name": team_name,
+                                                    "recipient": sender,
+                                                    "sender": recipient,
+                                                    "content": "__reply_wake_clear__",
+                                                    "summary": "all must_reply messages replied",
+                                                    "_reply_wake_clear": True,
+                                                }
+                                            )
+                                        except Exception:
+                                            logger.warning("Reply wake clear notification failed", exc_info=True)
+                    except Exception:
+                        logger.warning("Reply detection: failed reading sender inbox %s", sender_inbox_path, exc_info=True)
 
         response = {
             "success": True,
@@ -796,6 +869,7 @@ def create_obs_tools(
             "content": {"type": "string", "description": "Message body"},
             "summary": {"type": "string", "description": "Optional short summary"},
             "sender": {"type": "string", "description": "Optional sender label"},
+            "must_reply": {"type": "boolean", "description": "If true, recipient will be reminded to reply. Creates a reply_wake schedule (interval=1s, max_runs=3)."},
         },
     )
     async def send_inbox_message(args: dict) -> dict:
