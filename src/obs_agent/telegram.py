@@ -3458,18 +3458,12 @@ class TelegramBot:
             )
         return "\n".join(lines)
 
-    def _coerce_timeout_ms(self, value: Any) -> int:
-        default_timeout_ms = max(int(self._config.bg_fork_timeout * 1000), 1)
+    def _coerce_timeout_ms(self, value: Any) -> int | None:
+        # No timeout by default — agents run until they finish naturally.
+        # timeout_ms is hidden from MCP schema; only set internally if needed.
         if value is None:
-            return default_timeout_ms
+            return None
         parsed = max(int(value), 1)
-        if parsed < default_timeout_ms:
-            logger.info(
-                "AgentTask/ForkTask timeout clamped to default floor requested_ms=%s floor_ms=%s",
-                parsed,
-                default_timeout_ms,
-            )
-            return default_timeout_ms
         return parsed
 
     def _coerce_max_turns(self, value: Any) -> int | None:
