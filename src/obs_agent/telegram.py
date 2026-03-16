@@ -4964,6 +4964,22 @@ class TelegramBot:
             if state.pending_obs_bootstrap:
                 pending_bootstrap_active = state.pending_obs_bootstrap
                 run_user_text = f"{pending_bootstrap_active}\n\n{run_user_text}"
+            # Prepend server timestamp + context stats to user messages
+            _now_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            _ctx_snapshot = build_context_snapshot(
+                session_id=state.session_id,
+                data=state.hook_state.last_result_data,
+                context_window_estimate_tokens=self._config.context_window_estimate_tokens,
+                cwd=self._config.vault_path,
+            )
+            _ctx_remaining = _ctx_snapshot.get("estimated_context_remaining_tokens", 0)
+            _ctx_pct = _ctx_snapshot.get("estimated_context_remaining_pct", 0.0)
+            if state.hook_state.last_result_data is not None:
+                _ctx_line = f"\nContext: ~{_ctx_remaining:,} tokens remaining ({_ctx_pct:.0f}%)"
+            else:
+                _ctx_line = "\nContext: first turn"
+            run_user_text = f"<system-note>\nTime: {_now_str}{_ctx_line}\n</system-note>\n\n{run_user_text}"
+
             working_message = None
             try:
                 working_message = await self._send_system_message(

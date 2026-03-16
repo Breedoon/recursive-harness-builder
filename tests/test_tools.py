@@ -74,6 +74,7 @@ class TestForkTaskTool:
             "session_info",
             "context_info",
             "session_lineage",
+            "get_family",
         ]
 
     @pytest.mark.asyncio
@@ -275,7 +276,9 @@ class TestForkTaskTool:
         assert result["content"][0]["text"] == "ok"
         launch_args = state.fork_task_launcher.await_args.args[0]
         assert launch_args["team_name"] == "team-alpha"
-        assert launch_args["agent_name"] == "worker-a"
+        # name param is now display name (lineage), not agent_name (per naming redesign)
+        assert launch_args["agent_name"] is None
+        assert launch_args["description"] == "worker-a"
 
     @pytest.mark.asyncio
     async def test_fork_task_validates_max_turns(self, monkeypatch, skill_config):
@@ -661,12 +664,10 @@ class TestForkTaskTool:
             }
         )
 
-        assert result["is_error"] is True
-        assert "message undelivered: recipient was deleted" == result["content"][0]["text"]
-        assert result["tool_use_result"]["delivered"] is False
+        # Per always-deliver design: messages always go to inbox even if validator says not deliverable
+        assert "is_error" not in result  # Not an error — delivered to inbox
         inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
-        assert not inbox_path.exists()
-        state.inbox_message_notifier.assert_not_awaited()
+        assert inbox_path.exists()  # Message was written to inbox file
 
     @pytest.mark.asyncio
     async def test_send_inbox_message_concurrent_writes_are_not_lost(self, monkeypatch, skill_config, tmp_path):
@@ -813,7 +814,9 @@ class TestCronTools:
 
         delete_result = await delete_handler({"id": "abc"})
         assert delete_result["is_error"] is True
-        assert "does not provide task orchestration" in delete_result["content"][0]["text"]
+        # CronDelete is now blocked for agents (schedule rearchitecture)
+        assert ("does not provide task orchestration" in delete_result["content"][0]["text"]
+                or "disabled for agents" in delete_result["content"][0]["text"])
 
     @pytest.mark.asyncio
     async def test_cron_delete_requires_id(self, monkeypatch, skill_config):
@@ -827,4 +830,6 @@ class TestCronTools:
 
         result = await handler({})
         assert result["is_error"] is True
-        assert "id is required" in result["content"][0]["text"]
+        # CronDelete is now blocked for agents — either "id is required" or "disabled"
+        assert ("id is required" in result["content"][0]["text"]
+                or "disabled for agents" in result["content"][0]["text"])

@@ -109,7 +109,7 @@ class TestAlwaysDeliver:
     def test_send_inbox_message_succeeds_even_when_validator_says_no(self):
         """When the validator returns deliverable=False, the message
         should still be written to the inbox file. Verify via source."""
-        source = Path("/tmp/obs-liveness-fix/src/obs_agent/tools.py").read_text()
+        source = (Path(__file__).resolve().parent.parent / "src" / "obs_agent" / "tools.py").read_text()
         # Find the _send_inbox_message function
         idx = source.find("async def _send_inbox_message(")
         assert idx > 0, "_send_inbox_message not found"
@@ -168,7 +168,7 @@ class TestSessionLineageXML:
         """session_lineage should use _coerce_bool_arg, not bare bool().
         Since session_lineage is a nested function inside register_tools,
         we check the source file directly."""
-        source = Path("/tmp/obs-liveness-fix/src/obs_agent/tools.py").read_text()
+        source = (Path(__file__).resolve().parent.parent / "src" / "obs_agent" / "tools.py").read_text()
         # Find the session_lineage function
         idx = source.find("async def session_lineage(")
         assert idx > 0, "session_lineage function not found"
@@ -229,7 +229,7 @@ class TestReadInboxDefaults:
     def test_read_inbox_has_optional_params(self):
         """team_name and agent params should be optional with defaults
         from current bootstrap."""
-        source = Path("/tmp/obs-liveness-fix/src/obs_agent/tools.py").read_text()
+        source = (Path(__file__).resolve().parent.parent / "src" / "obs_agent" / "tools.py").read_text()
         idx = source.find("async def _read_inbox(")
         assert idx > 0, "_read_inbox not found"
         func_source = source[idx : idx + 1000]

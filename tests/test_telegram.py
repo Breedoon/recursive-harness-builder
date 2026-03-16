@@ -913,7 +913,7 @@ class TestBackgroundPoller:
         assert env["CLAUDE_CODE_TASK_LIST_ID"] == root_team_key_for_lineage(("General",))
         assert env["CLAUDE_CODE_AGENT_NAME"] == native_agent_name_for_lineage(("General",))
         prompt = str(observed.get("prompt") or "")
-        assert prompt.startswith("<obs-bootstrap")
+        assert "<obs-bootstrap" in prompt  # bootstrap is prepended (after system-note)
         assert "<origin>trunk_start</origin>" in prompt
         assert "<session_id>" not in prompt
         assert prompt.strip().endswith("hello")
