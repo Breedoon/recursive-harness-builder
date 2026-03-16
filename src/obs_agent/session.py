@@ -32,6 +32,9 @@ _DEFAULT_SDK_ENV: dict[str, str] = {
     # Disable optional background/product traffic in Claude Code subprocesses.
     # This reduces daemon fragility from non-essential SDK side-channels.
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    # Disable background tasks (skill auto-improvement, magic docs, plugin autoupdate).
+    # The skill_improvement_apply feature crashes headless SDK sessions.
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
 }
 _CLIENT_CONNECT_MAX_ATTEMPTS = 3
 _CLIENT_CONNECT_RETRY_DELAY_SECONDS = 1.0
