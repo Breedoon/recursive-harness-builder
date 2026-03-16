@@ -1277,7 +1277,8 @@ class TestTopicScheduling:
         assert record.trigger_kind == "cron"
         assert record.next_run_at == 1200.0
 
-    async def test_cron_create_rejects_overlapping_windows(self, config):
+    async def test_cron_create_allows_overlapping_windows(self, config):
+        """Overlapping schedule windows are now allowed (overlap validation removed)."""
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=891)
         state = bot._get_state(route)
@@ -1296,6 +1297,7 @@ class TestTopicScheduling:
         )
         assert "is_error" not in first
 
+        # Previously this would be rejected — now it should succeed
         overlap = await bot._cron_create(
             route=route,
             args={
@@ -1307,21 +1309,11 @@ class TestTopicScheduling:
                 "until": "2030-03-10T11:30:00Z",
             },
         )
-        assert overlap["is_error"] is True
-        assert "overlapping schedule window" in overlap["content"][0]["text"]
+        assert "is_error" not in overlap, "Overlapping windows should now be allowed"
 
-        adjacent = await bot._cron_create(
-            route=route,
-            args={
-                "schedule_mode": "interval",
-                "interval_seconds": 120,
-                "cron": "*/2 * * * *",
-                "prompt": "third",
-                "from": "2030-03-10T11:00:00Z",
-                "until": "2030-03-10T12:00:00Z",
-            },
-        )
-        assert "is_error" not in adjacent
+        # Both schedules should coexist
+        route_schedules = bot._schedule_ids_by_route.get(route, set())
+        assert len(route_schedules) == 2
 
     async def test_due_interval_schedule_executes_once_and_advances(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -1500,55 +1492,42 @@ class TestTopicScheduling:
         assert f"from={from_local}" in summary
         assert f"until={until_local}" in summary
 
-    async def test_overlap_validation_ignores_exhausted_and_inflight_final_schedule(self, config):
+    async def test_overlap_validation_removed_allows_free_coexistence(self, config):
+        """Overlap validation was removed — schedules freely coexist.
+
+        Previously tested that exhausted/inflight schedules were ignored during
+        overlap validation. Now there's no validation at all, so any number
+        of schedules on the same route just work.
+        """
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=7914)
         state = bot._get_state(route)
         assert state is not None
 
-        exhausted = _TopicScheduleRecord(
-            schedule_id="sched-exhausted-overlap",
-            route=route,
-            description="Exhausted",
-            cron_expr="*/1 * * * *",
-            trigger_kind="interval",
-            interval_seconds=60,
-            prompt="run",
-            schedule_mode="interval",
-            max_runs=1,
-            run_count=1,
-            from_ts=900.0,
-            until_ts=None,
-            next_run_at=1000.0,
-        )
-        inflight_final = _TopicScheduleRecord(
-            schedule_id="sched-inflight-final",
-            route=route,
-            description="InflightFinal",
-            cron_expr="*/1 * * * *",
-            trigger_kind="interval",
-            interval_seconds=60,
-            prompt="run",
-            schedule_mode="interval",
-            max_runs=2,
-            run_count=1,
-            from_ts=900.0,
-            until_ts=None,
-            next_run_at=1000.0,
-        )
-        bot._register_topic_schedule(exhausted)
-        bot._register_topic_schedule(inflight_final)
-        bot._active_schedule_execution_by_route[route] = "sched-inflight-final"
+        # _validate_schedule_overlap should no longer exist
+        assert not hasattr(bot, "_validate_schedule_overlap"), \
+            "_validate_schedule_overlap should be removed"
 
-        with patch("obs_agent.telegram.time.time", return_value=1000.0):
-            overlap_error = bot._validate_schedule_overlap(
-                route=route,
-                start_ts=950.0,
-                end_ts=1200.0,
+        # Register multiple schedules on same route — all should succeed
+        for i in range(3):
+            bot._register_topic_schedule(
+                _TopicScheduleRecord(
+                    schedule_id=f"sched-{i}",
+                    route=route,
+                    description=f"Schedule {i}",
+                    cron_expr="*/1 * * * *",
+                    trigger_kind="interval",
+                    interval_seconds=60,
+                    prompt=f"run {i}",
+                    schedule_mode="interval",
+                    from_ts=900.0,
+                    until_ts=None,
+                    next_run_at=1000.0,
+                )
             )
 
-        assert overlap_error is None
-        assert bot._topic_schedules_by_id["sched-exhausted-overlap"].enabled is False
+        route_schedules = bot._schedule_ids_by_route.get(route, set())
+        assert len(route_schedules) == 3
 
     async def test_interval_schedule_failure_consumes_run_count_and_notifies_user(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -2504,15 +2483,63 @@ class TestCommands:
         assert bot._recipient_delivery_status(team_name=team_name, agent_name=agent_name)["deliverable"] is True
         await bot.shutdown()
 
-    async def test_unschedule_removes_topic_schedules(self, config):
+    async def test_unschedule_no_args_removes_next_upcoming_only(self, config):
+        """'/unschedule' without args removes only the next-upcoming schedule."""
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=1)
+        assert bot._get_state(route) is not None
+
+        # Register two schedules with different next_run_at
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-soon",
+                route=route,
+                description="Soon",
+                schedule_mode="interval",
+                cron_expr="*/5 * * * *",
+                trigger_kind="interval",
+                interval_seconds=10,
+                prompt="run soon",
+                reset_session=False,
+                next_run_at=5000.0,
+            )
+        )
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-later",
+                route=route,
+                description="Later",
+                schedule_mode="interval",
+                cron_expr="*/5 * * * *",
+                trigger_kind="interval",
+                interval_seconds=300,
+                prompt="run later",
+                reset_session=False,
+                next_run_at=9000.0,
+            )
+        )
+        assert len(bot._schedule_ids_by_route.get(route, set())) == 2
+
+        update = _make_update("/unschedule", thread_id=1)
+        ctx = _make_context()
+        await bot.handle_unschedule(update, ctx)
+
+        remaining = bot._schedule_ids_by_route.get(route, set())
+        assert "sched-soon" not in remaining, "Soonest schedule should be removed"
+        assert "sched-later" in remaining, "Later schedule should remain"
+        msg = ctx.bot.send_message.call_args.kwargs["text"]
+        assert "unscheduled" in msg.lower() or "sched-soon" in msg
+
+    async def test_unschedule_single_schedule_removes_it(self, config):
+        """'/unschedule' with only one schedule removes it (backward compatible)."""
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=1)
         assert bot._get_state(route) is not None
         bot._register_topic_schedule(
             _TopicScheduleRecord(
-                schedule_id="sched-remove",
+                schedule_id="sched-only",
                 route=route,
-                description="Removable",
+                description="Only one",
                 schedule_mode="interval",
                 cron_expr="*/5 * * * *",
                 trigger_kind="interval",
@@ -2526,7 +2553,8 @@ class TestCommands:
         ctx = _make_context()
         await bot.handle_unschedule(update, ctx)
         assert bot._schedule_ids_by_route.get(route, set()) == set()
-        assert "unscheduled 1 schedule(s)" in ctx.bot.send_message.call_args.kwargs["text"]
+        msg = ctx.bot.send_message.call_args.kwargs["text"]
+        assert "unscheduled" in msg.lower() or "sched-only" in msg
 
     async def test_unschedule_all_removes_chat_schedules(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
