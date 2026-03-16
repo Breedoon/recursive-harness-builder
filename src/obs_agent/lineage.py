@@ -68,7 +68,7 @@ def root_team_key_for_lineage(
     restores from persisted state).
     """
     if not lineage:
-        return "obs-tree-root-0000000000"
+        return "0000-00-00-00-00-root"
     root = normalize_lineage_name(lineage[0])
     slug = slugify_projection_label(root, fallback="root")
     ts = timestamp if timestamp is not None else time.time()

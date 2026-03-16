@@ -53,6 +53,7 @@ from obs_agent.lineage import (
     normalize_lineage_name,
     parse_obs_bootstrap_xml,
     root_team_key_for_lineage,
+    slugify_projection_label,
 )
 from obs_agent.queueing import QueuedMessage, coerce_queued_message
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent, TurnEndEvent
@@ -1477,13 +1478,27 @@ class TelegramBot:
                     )
                 )
             elif state.agent_lineage:
-                default_team_name, default_agent_name = self._default_team_projection(state.agent_lineage)
-                state.session_manager.set_sdk_env_overrides(
-                    self._build_team_worker_env(
-                        team_name=default_team_name,
-                        agent_name=default_agent_name,
+                # On restore without bootstrap: derive agent name (deterministic)
+                # but do NOT generate a new timestamp team key — try to find existing
+                default_agent_name = native_agent_name_for_lineage(state.agent_lineage)
+                # Scan for existing team dir matching this lineage's slug
+                existing_team_key = self._find_existing_team_key_for_lineage(state.agent_lineage)
+                if existing_team_key:
+                    state.session_manager.set_sdk_env_overrides(
+                        self._build_team_worker_env(
+                            team_name=existing_team_key,
+                            agent_name=default_agent_name,
+                        )
                     )
-                )
+                else:
+                    # Truly first creation — generate timestamp team key
+                    default_team_name, _ = self._default_team_projection(state.agent_lineage)
+                    state.session_manager.set_sdk_env_overrides(
+                        self._build_team_worker_env(
+                            team_name=default_team_name,
+                            agent_name=default_agent_name,
+                        )
+                    )
             if entry.session_id:
                 state.session_manager.set_session_id(entry.session_id)
                 self._route_by_session_id[entry.session_id] = route
@@ -1912,6 +1927,35 @@ class TelegramBot:
             root_team_key_for_lineage(lineage),
             native_agent_name_for_lineage(lineage),
         )
+
+    def _find_existing_team_key_for_lineage(
+        self,
+        lineage: tuple[str, ...],
+    ) -> str | None:
+        """Find an existing team directory whose slug matches this lineage.
+
+        When restoring after restart, we need the ORIGINAL team key (with its
+        timestamp) rather than generating a new one.  Scans ``~/.claude/teams/``
+        for directories ending in ``-{slug}`` where *slug* is derived from the
+        lineage root.
+        """
+        if not lineage:
+            return None
+        root = normalize_lineage_name(lineage[0])
+        slug = slugify_projection_label(root, fallback="root")
+        teams_dir = Path.home() / ".claude" / "teams"
+        if not teams_dir.is_dir():
+            return None
+        # Find the most recent team dir matching the slug suffix
+        candidates = []
+        for d in teams_dir.iterdir():
+            if d.is_dir() and d.name.endswith(f"-{slug}"):
+                candidates.append(d.name)
+        if not candidates:
+            return None
+        # Return the most recent (lexicographically last, since timestamp prefix sorts)
+        candidates.sort()
+        return candidates[-1]
 
     def _state_inbox_projection(
         self,
@@ -5842,9 +5886,20 @@ class TelegramBot:
             default_team_name, default_agent_name = self._default_team_projection(child_lineage)
             team_name = (team_name or "").strip() or default_team_name
             agent_name = (agent_name or "").strip() or default_agent_name
-            # Collision detection: check if an agent with this name already exists
+            # Collision detection: check in-memory records AND filesystem
             existing_key = self._team_worker_key(team_name or "", agent_name or "")
+            collision = False
             if existing_key is not None and existing_key in self._team_worker_records:
+                collision = True
+            elif team_name and agent_name:
+                # Also check inbox files (survives daemon restart)
+                inbox_path = (
+                    Path.home() / ".claude" / "teams" / team_name
+                    / "inboxes" / f"{agent_name}.json"
+                )
+                if inbox_path.exists():
+                    collision = True
+            if collision:
                 raise RuntimeError(
                     f"Agent name collision: '{agent_name}' already exists in team '{team_name}'. "
                     f"Two children under the same parent cannot have the same name."
