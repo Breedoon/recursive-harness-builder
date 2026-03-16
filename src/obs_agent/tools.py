@@ -26,7 +26,12 @@ from obs_agent.context_stats import (
     build_context_snapshot,
     format_context_snapshot_lines,
 )
-from obs_agent.lineage import find_latest_obs_bootstrap_for_session
+from obs_agent.lineage import (
+    find_latest_obs_bootstrap_for_session,
+    lineage_fingerprint,
+    native_agent_name_for_lineage,
+    normalize_lineage_name,
+)
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -939,7 +944,7 @@ def create_obs_tools(
         bootstrap = _current_obs_bootstrap()
         if bootstrap is None:
             return _error_result("Cannot use session_lineage: no OBS bootstrap found for current session")
-        payload = {
+        payload: dict[str, Any] = {
             "lineage": list(bootstrap.lineage),
             "lineage_length": len(bootstrap.lineage),
             "origin": bootstrap.origin,
@@ -949,12 +954,94 @@ def create_obs_tools(
             "parent_session_id": bootstrap.parent_session_id,
             "root_team_key": bootstrap.root_team_key,
             "native_agent_name": bootstrap.native_agent_name,
+            "path": "/".join(bootstrap.lineage),
         }
+        # Compute agent_names for each node in the lineage
+        agent_names = []
+        for i in range(len(bootstrap.lineage)):
+            sub = bootstrap.lineage[: i + 1]
+            agent_names.append(native_agent_name_for_lineage(sub))
+        payload["agent_names"] = agent_names
         if include_xml:
             payload["xml"] = bootstrap.raw_xml
         return {
             "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=True)}],
             "tool_use_result": payload,
+        }
+
+    @tool(
+        "get_family",
+        "Find relatives in the team tree — children, siblings, or parent — by scanning inbox files.",
+        {
+            "who": {
+                "type": "string",
+                "description": "One of: children, siblings, parent, all",
+            },
+        },
+    )
+    async def get_family(args: dict) -> dict:
+        who = str(args.get("who", "all")).strip().lower()
+        if who not in {"children", "siblings", "parent", "all"}:
+            return _error_result("get_family: 'who' must be one of: children, siblings, parent, all")
+        bootstrap = _current_obs_bootstrap()
+        if bootstrap is None:
+            return _error_result("Cannot use get_family: no OBS bootstrap found")
+        if not bootstrap.root_team_key or not bootstrap.native_agent_name:
+            return _error_result("Cannot use get_family: missing team key or agent name")
+        if not bootstrap.lineage:
+            return _error_result("Cannot use get_family: empty lineage")
+
+        inboxes_dir = (
+            Path.home()
+            / ".claude"
+            / "teams"
+            / bootstrap.root_team_key
+            / "inboxes"
+        )
+        result: dict[str, list[str]] = {}
+        all_agents = []
+        if inboxes_dir.is_dir():
+            for f in inboxes_dir.iterdir():
+                if f.suffix == ".json" and f.stem:
+                    all_agents.append(f.stem)
+
+        my_lineage = bootstrap.lineage
+        my_agent_name = bootstrap.native_agent_name
+        my_hash = lineage_fingerprint(tuple(normalize_lineage_name(n) for n in my_lineage))
+
+        # Children: agents whose name starts with my lineage hash
+        if who in {"children", "all"}:
+            children = [
+                name for name in all_agents
+                if name.startswith(f"{my_hash}-") and name != my_agent_name
+            ]
+            result["children"] = children
+
+        # Parent: derive from my agent_name's hash prefix
+        if who in {"parent", "all"}:
+            if len(my_lineage) > 1:
+                parent_lineage = my_lineage[:-1]
+                parent_name = native_agent_name_for_lineage(parent_lineage)
+                result["parent"] = [parent_name] if parent_name in all_agents else []
+            else:
+                result["parent"] = []  # trunk has no parent
+
+        # Siblings: agents with same parent hash prefix as me
+        if who in {"siblings", "all"}:
+            if len(my_lineage) > 1:
+                parent_lineage = tuple(normalize_lineage_name(n) for n in my_lineage[:-1])
+                parent_hash = lineage_fingerprint(parent_lineage)
+                siblings = [
+                    name for name in all_agents
+                    if name.startswith(f"{parent_hash}-") and name != my_agent_name
+                ]
+                result["siblings"] = siblings
+            else:
+                result["siblings"] = []  # trunk has no siblings
+
+        return {
+            "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=True)}],
+            "tool_use_result": result,
         }
 
     server = create_sdk_mcp_server(
@@ -974,6 +1061,7 @@ def create_obs_tools(
             session_info,
             context_info,
             session_lineage,
+            get_family,
         ],
     )
     return server
