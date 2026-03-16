@@ -866,3 +866,201 @@ class TestAgentTaskReturnsName:
             "AgentTask confirmation does not include native_agent_name! "
             "Parents need to know how to message their children."
         )
+
+
+# ---------------------------------------------------------------------------
+# TEST: Phantom notification deduplication (Bug 1 - P0)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+@pytest.mark.timeout(600)  # 10 minutes
+class TestPhantomNotificationDedup:
+    """Verify that inbox message wakes happen exactly once, not repeatedly.
+
+    BUG: _poll_team_worker_inbox_wakes runs every 3s and re-triggers
+    notifications for the same unread message until the SDK marks it read.
+    This causes phantom "New teammate messages arrived" notifications.
+    """
+
+    async def test_live_inbox_wake_fires_once_not_repeatedly(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        """Send a message to a child agent. Verify it gets woken exactly once."""
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+
+        # Create root topic
+        root_thread = await live_tg_forum.platform.create_topic(f"DedupTest {tag}")
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"Deterministic dedup test. Reply with only DEDUP-PRIME-{tag}.",
+            thread_id=root_thread,
+            token=f"DEDUP-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        # Query lineage to get root's agent_name
+        root_lineage = await _query_session_lineage(
+            live_tg_forum,
+            thread_id=root_thread,
+            token=f"DEDUP-LINEAGE-{tag}",
+            timeout=240.0,
+        )
+
+        # Launch child worker
+        child_thread, child_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread,
+            fork=False,
+            alias=f"DedupChild-{tag}",
+            launch_token=f"DEDUP-LAUNCH-{tag}",
+            lineage_token=f"DEDUP-CHILD-{tag}",
+            timeout=240.0,
+        )
+
+        # Extract child's agent_name
+        child_agent = _extract_lineage_fact_line(child_lineage, "native_agent_name")
+        assert child_agent, "Failed to extract child agent_name"
+
+        # Wait for child to finish initial turn and go idle
+        await asyncio.sleep(15)
+
+        # Record the baseline message count in child's topic
+        baseline_child = await live_tg_forum.platform.latest_bot_message_id(
+            thread_id=child_thread,
+        )
+
+        # Root sends an inbox message to child
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=root_thread,
+            recipient=child_agent,
+            content=f"DEDUP-PAYLOAD-{tag}",
+            ack_token=f"DEDUP-SENT-{tag}",
+            timeout=240.0,
+        )
+
+        # Wait for child to be woken and process the message
+        # The child should receive the message and produce a response
+        await asyncio.sleep(30)
+
+        # Now count how many NEW bot messages appeared in the child's topic
+        # after the baseline. Each "wake" produces at least one message.
+        recent = await live_tg_forum.platform.get_recent_messages(
+            thread_id=child_thread,
+            limit=40,
+        )
+        new_messages = [
+            m for m in recent
+            if m.message_id > baseline_child
+        ]
+
+        # Count how many contain the "New teammate messages arrived" pattern
+        wake_messages = [
+            m for m in new_messages
+            if "teammate messages" in m.text.lower()
+            or "new teammate" in m.text.lower()
+        ]
+
+        # The child should have been woken at most ONCE for this message.
+        # Before the fix, the poller would re-trigger every 3 seconds,
+        # causing multiple wake messages. We allow 1-2 (initial wake +
+        # possible one race), but more than 3 is definitely a bug.
+        assert len(wake_messages) <= 3, (
+            f"PHANTOM NOTIFICATION BUG: Child received {len(wake_messages)} "
+            f"wake notifications for a single inbox message! "
+            f"Expected at most 1-2. Messages:\n"
+            + "\n".join(f"  [{m.message_id}] {m.text[:100]}" for m in wake_messages)
+        )
+
+    async def test_live_no_phantom_wakes_after_message_read(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        """After a child reads and processes an inbox message, no more wakes should come."""
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+
+        # Create root and child
+        root_thread = await live_tg_forum.platform.create_topic(f"NoPhantom {tag}")
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"Deterministic phantom test. Reply with only PHANTOM-PRIME-{tag}.",
+            thread_id=root_thread,
+            token=f"PHANTOM-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        child_thread, child_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread,
+            fork=False,
+            alias=f"PhantomChild-{tag}",
+            launch_token=f"PHANTOM-LAUNCH-{tag}",
+            lineage_token=f"PHANTOM-CHILD-{tag}",
+            timeout=240.0,
+        )
+        child_agent = _extract_lineage_fact_line(child_lineage, "native_agent_name")
+        assert child_agent, "Failed to extract child agent_name"
+
+        # Wait for child to finish initial turn and go idle
+        await asyncio.sleep(15)
+
+        # Root sends message to child
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=root_thread,
+            recipient=child_agent,
+            content=f"PHANTOM-MSG-{tag}",
+            ack_token=f"PHANTOM-SENT-{tag}",
+            timeout=240.0,
+        )
+
+        # Instruct child to read its inbox (this marks message as read via SDK)
+        await _instruct_read_and_reply(
+            live_tg_forum,
+            thread_id=child_thread,
+            look_for=f"PHANTOM-MSG-{tag}",
+            reply_to=_extract_lineage_fact_line(
+                await _query_session_lineage(
+                    live_tg_forum,
+                    thread_id=root_thread,
+                    token=f"PHANTOM-ROOT-AGENT-{tag}",
+                    timeout=120.0,
+                ),
+                "native_agent_name",
+            ) or "unknown",
+            reply_content=f"PHANTOM-REPLY-{tag}",
+            ack_token=f"PHANTOM-REPLIED-{tag}",
+            timeout=240.0,
+        )
+
+        # Now wait and verify NO MORE wakes happen
+        post_reply_baseline = await live_tg_forum.platform.latest_bot_message_id(
+            thread_id=child_thread,
+        )
+
+        # Wait 20 seconds (6+ poll cycles at 3s each)
+        await asyncio.sleep(20)
+
+        # Check for any new messages in child topic after reply
+        recent = await live_tg_forum.platform.get_recent_messages(
+            thread_id=child_thread,
+            limit=20,
+        )
+        phantom_messages = [
+            m for m in recent
+            if m.message_id > post_reply_baseline
+            and ("teammate messages" in m.text.lower()
+                 or "new teammate" in m.text.lower())
+        ]
+
+        assert len(phantom_messages) == 0, (
+            f"PHANTOM BUG: {len(phantom_messages)} wake notifications appeared "
+            f"AFTER the child already read and replied to the message! "
+            f"The poller should not re-trigger for already-read messages.\n"
+            + "\n".join(f"  [{m.message_id}] {m.text[:100]}" for m in phantom_messages)
+        )
