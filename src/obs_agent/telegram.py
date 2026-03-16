@@ -331,7 +331,9 @@ def create_reply_wake_schedule(route: TelegramRoute) -> _TopicScheduleRecord:
         prompt=(
             "(System: You have unreplied must_reply messages. "
             "Check your inbox with ReadInbox and reply to the senders "
-            "using SendInboxMessage before continuing other work.)"
+            "using SendInboxMessage with must_reply=false. "
+            "Do NOT set must_reply=true on your replies — that would "
+            "create an infinite ping-pong loop.)"
         ),
         max_runs=3,
         run_count=0,
@@ -3176,34 +3178,47 @@ class TelegramBot:
         team_name: str | None,
         agent_name: str | None,
     ) -> dict[str, Any]:
+        """Check if recipient can be woken. This is advisory only — messages
+        are ALWAYS delivered to the inbox file regardless of this result.
+        This function MUST NOT have side effects (no mapping removal).
+        The only definition of "dead" is: the user deleted the topic."""
         record = self._resolve_team_worker_record(
             team_name=team_name,
             agent_name=agent_name,
         )
         if record is not None:
-            if record.status in {"failed", "stopped", "killed"} or record.terminal_request in {"failed", "stopped", "killed"}:
-                self._remove_team_worker_mappings_for_task(record.task_id)
-                return {
-                    "deliverable": False,
-                    "reason": "recipient is no longer live; the agent may have been replaced or deleted",
-                }
+            # Completed/stopped/failed agents are still messageable —
+            # they can be woken from idle. Only truly dead (topic deleted)
+            # agents are unwakeable, and we discover that lazily.
             child_state = self._get_state(record.child_route, create=False)
-            if child_state is None and self._fork_task_tasks.get(record.task_id) is None:
-                self._remove_team_worker_mappings_for_task(record.task_id)
-                return {
-                    "deliverable": False,
-                    "reason": "recipient route is unavailable; the agent may have been deleted",
-                }
-            return {"deliverable": True}
+            if child_state is not None:
+                return {"deliverable": True}
+            # State is gone but record exists — agent may have been
+            # cleaned up but inbox file persists. Still deliverable
+            # (message goes to inbox, wake is best-effort).
+            return {"deliverable": True, "warning": "agent state not in memory, wake may fail"}
         state = self._resolve_route_inbox_target(
             team_name=team_name,
             agent_name=agent_name,
         )
         if state is not None:
             return {"deliverable": True}
+        # No record and no route target — but inbox file may still exist.
+        # Since messages always deliver to inbox, return deliverable=True
+        # but note the agent may not be wakeable.
+        inbox_path = (
+            Path.home()
+            / ".claude"
+            / "teams"
+            / (team_name or "")
+            / "inboxes"
+            / f"{agent_name or ''}.json"
+        )
+        if inbox_path.exists():
+            return {"deliverable": True, "warning": "agent not tracked in memory, message will be in inbox but wake may fail"}
         return {
             "deliverable": False,
-            "reason": "recipient is not a live agent in this tree; the agent may have been replaced or deleted",
+            "reason": "no inbox found for recipient — agent may not exist in this tree",
         }
 
     def _mark_task_terminal_request(self, route: TelegramRoute, status: str) -> None:
@@ -6077,12 +6092,20 @@ class TelegramBot:
         output_file: str | None,
         topic_link: str | None,
         task_label: str,
+        native_agent_name: str | None = None,
+        team_name: str | None = None,
     ) -> str:
         lines = [
             f"{task_label} launched successfully.",
             f"agentId: {task_id}",
-            "The agent is working in the background. You will be notified automatically when it completes.",
         ]
+        if native_agent_name:
+            lines.append(f"native_agent_name: {native_agent_name}")
+        if team_name:
+            lines.append(f"team_name: {team_name}")
+        lines.append(
+            "The agent is working in the background. You will be notified automatically when it completes."
+        )
         if output_file:
             lines.append(f"output_file: {output_file}")
         if topic_link:
@@ -6527,14 +6550,15 @@ class TelegramBot:
                 wake_record = create_reply_wake_schedule(recipient_state.route)
                 existing = self._topic_schedules_by_id.get(wake_record.schedule_id)
                 if existing is not None:
-                    # Upsert: reset run_count to 0 (3 fresh attempts)
-                    existing.run_count = 0
+                    # Upsert: do NOT reset run_count — let max_runs cap apply
+                    # cumulatively to prevent infinite ping-pong loops.
                     existing.enabled = True
                     existing.next_run_at = time.time() + (existing.interval_seconds or 1)
                     self._register_topic_schedule(existing)
                     logger.info(
-                        "Upserted reply_wake schedule %s: reset run_count to 0",
+                        "Upserted reply_wake schedule %s: run_count=%d (preserved)",
                         wake_record.schedule_id,
+                        existing.run_count,
                     )
                 else:
                     wake_record.next_run_at = time.time() + (wake_record.interval_seconds or 1)
@@ -6766,6 +6790,8 @@ class TelegramBot:
                         output_file=self._record_output_file(record),
                         topic_link=child_link,
                         task_label=record.launch_tool_name,
+                        native_agent_name=record.agent_name,
+                        team_name=record.team_name,
                     ),
                 }
             ]
@@ -6934,6 +6960,8 @@ class TelegramBot:
                         output_file=self._record_output_file(record),
                         topic_link=child_link,
                         task_label=launch_tool_name,
+                        native_agent_name=record.agent_name,
+                        team_name=record.team_name,
                     ),
                 }
             ]
