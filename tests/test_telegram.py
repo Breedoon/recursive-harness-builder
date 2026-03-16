@@ -3324,6 +3324,8 @@ class TestForkTaskRuntime:
         )
         state.session_manager.set_session_id("sid-root")
 
+        # Use a unique team name to avoid collision with stale inbox files
+        unique_team = f"team-fresh-{uuid.uuid4().hex[:8]}"
         fake_task_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
         with patch("obs_agent.telegram.uuid.uuid4", side_effect=[fake_task_id]), patch(
             "obs_agent.telegram.fork_session_jsonl"
@@ -3334,8 +3336,7 @@ class TestForkTaskRuntime:
                     "prompt": "Start fresh and return READY-FRESH",
                     "description": "Fresh child",
                     "fork": False,
-                    "team_name": "team-alpha",
-                    "name": "worker-a",
+                    "team_name": unique_team,
                 },
             )
 
@@ -3352,12 +3353,14 @@ class TestForkTaskRuntime:
         assert record.is_fork is False
         assert record.child_session_id == ""
         assert record.launch_tool_name == "AgentTask"
-        assert record.team_name == "team-alpha"
-        assert record.agent_name == "worker-a"
+        assert record.team_name == unique_team
+        # With two-tier naming, agent_name is computed from lineage, not raw name param
+        assert record.agent_name is not None
+        assert "fresh-child" in record.agent_name.lower(), \
+            f"Agent name should contain 'fresh-child' slug, got: {record.agent_name}"
         send_calls = state.last_bot.send_message.await_args_list
         assert "agent task launched by agent" in send_calls[0].kwargs["text"]
-        assert "team_name: team-alpha" in send_calls[0].kwargs["text"]
-        assert "agent_name: worker-a" in send_calls[0].kwargs["text"]
+        assert f"team_name: {unique_team}" in send_calls[0].kwargs["text"]
         assert (
             send_calls[1].kwargs["text"]
             == "<u><i>session launched; a fresh session id will be assigned on first turn</i></u>"
@@ -3368,9 +3371,11 @@ class TestForkTaskRuntime:
         child_env = child_state.session_manager.create_options().env
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
-        assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == "team-alpha"
-        assert child_env["CLAUDE_CODE_TEAM_NAME"] == "team-alpha"
-        assert child_env["CLAUDE_CODE_AGENT_NAME"] == "worker-a"
+        assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == unique_team
+        assert child_env["CLAUDE_CODE_TEAM_NAME"] == unique_team
+        # Agent name should be computed (hash-prefix + slug), not raw alias
+        assert "fresh-child" in child_env["CLAUDE_CODE_AGENT_NAME"].lower(), \
+            f"Agent name env var should contain 'fresh-child', got: {child_env['CLAUDE_CODE_AGENT_NAME']}"
         await bot.shutdown()
 
     async def test_launch_agent_task_registers_named_team_workers_for_peer_discovery(
@@ -3432,8 +3437,12 @@ class TestForkTaskRuntime:
         payload = json.loads(team_config.read_text(encoding="utf-8"))
         members = payload.get("members") or []
         member_names = {str(member.get("name")) for member in members if isinstance(member, dict)}
-        assert "worker-a" in member_names
-        assert "worker-b" in member_names
+        # With two-tier naming, member names use {parent_hash}-{slug} format.
+        # The description ("Peer A", "Peer B") becomes the lineage name, slugified.
+        assert any("peer-a" in n for n in member_names), \
+            f"Expected a member with 'peer-a' in name, got: {member_names}"
+        assert any("peer-b" in n for n in member_names), \
+            f"Expected a member with 'peer-b' in name, got: {member_names}"
         await bot.shutdown()
 
     def test_build_super_task_lifecycle_html_uses_system_heading_and_cursive_body(self, config):
