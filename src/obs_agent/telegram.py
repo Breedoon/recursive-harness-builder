@@ -53,6 +53,7 @@ from obs_agent.lineage import (
     normalize_lineage_name,
     parse_obs_bootstrap_xml,
     root_team_key_for_lineage,
+    slugify_projection_label,
 )
 from obs_agent.queueing import QueuedMessage, coerce_queued_message
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent, TurnEndEvent
@@ -305,6 +306,36 @@ class _TopicScheduleRecord:
     max_retry_attempts: int = 0
     retry_delay_seconds: int = 30
     retry_attempt_count: int = 0
+
+
+def reply_wake_schedule_id(route: TelegramRoute) -> str:
+    """Return the deterministic schedule ID for a reply_wake on *route*."""
+    thread = route.thread_id if route.thread_id is not None else "general"
+    return f"reply-wake-{route.chat_id}-{thread}"
+
+
+def create_reply_wake_schedule(route: TelegramRoute) -> _TopicScheduleRecord:
+    """Create a reply_wake schedule record for *route*.
+
+    Parameters match the design spec: interval_seconds=1, max_runs=3,
+    deterministic schedule ID.
+    """
+    return _TopicScheduleRecord(
+        schedule_id=reply_wake_schedule_id(route),
+        route=route,
+        description="reply_wake: agent has unreplied must_reply messages",
+        schedule_mode="interval",
+        cron_expr=None,
+        trigger_kind="interval",
+        interval_seconds=1,
+        prompt=(
+            "(System: You have unreplied must_reply messages. "
+            "Check your inbox with ReadInbox and reply to the senders "
+            "using SendInboxMessage before continuing other work.)"
+        ),
+        max_runs=3,
+        run_count=0,
+    )
 
 
 @dataclass(frozen=True)
@@ -582,6 +613,7 @@ class TelegramBot:
         self._team_worker_records: dict[tuple[str, str], str] = {}
         self._route_inbox_targets: dict[tuple[str, str], TelegramRoute] = {}
         self._route_inbox_target_keys_by_route: dict[TelegramRoute, tuple[str, str]] = {}
+        self._chat_titles: dict[int, str] = {}
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
         self._schedule_running_by_route: set[TelegramRoute] = set()
@@ -1125,7 +1157,7 @@ class TelegramBot:
 
     def _default_topic_title(self, route: TelegramRoute) -> str:
         if route.thread_id is None:
-            return "General"
+            return self._chat_titles.get(route.chat_id) or "General"
         return f"Topic {route.thread_id}"
 
     @staticmethod
@@ -1354,14 +1386,6 @@ class TelegramBot:
                     record.schedule_mode,
                 )
                 return
-        overlap_error = self._validate_schedule_overlap(
-            route=route,
-            start_ts=record.from_ts,
-            end_ts=record.until_ts,
-        )
-        if overlap_error:
-            logger.warning("Skipping default schedule for %s: %s", route, overlap_error)
-            return
         self._register_topic_schedule(record)
         logger.info(
             "Applied default schedule from settings route=%s mode=%s max_runs=%s",
@@ -1454,13 +1478,27 @@ class TelegramBot:
                     )
                 )
             elif state.agent_lineage:
-                default_team_name, default_agent_name = self._default_team_projection(state.agent_lineage)
-                state.session_manager.set_sdk_env_overrides(
-                    self._build_team_worker_env(
-                        team_name=default_team_name,
-                        agent_name=default_agent_name,
+                # On restore without bootstrap: derive agent name (deterministic)
+                # but do NOT generate a new timestamp team key — try to find existing
+                default_agent_name = native_agent_name_for_lineage(state.agent_lineage)
+                # Scan for existing team dir matching this lineage's slug
+                existing_team_key = self._find_existing_team_key_for_lineage(state.agent_lineage)
+                if existing_team_key:
+                    state.session_manager.set_sdk_env_overrides(
+                        self._build_team_worker_env(
+                            team_name=existing_team_key,
+                            agent_name=default_agent_name,
+                        )
                     )
-                )
+                else:
+                    # Truly first creation — generate timestamp team key
+                    default_team_name, _ = self._default_team_projection(state.agent_lineage)
+                    state.session_manager.set_sdk_env_overrides(
+                        self._build_team_worker_env(
+                            team_name=default_team_name,
+                            agent_name=default_agent_name,
+                        )
+                    )
             if entry.session_id:
                 state.session_manager.set_session_id(entry.session_id)
                 self._route_by_session_id[entry.session_id] = route
@@ -1890,6 +1928,51 @@ class TelegramBot:
             native_agent_name_for_lineage(lineage),
         )
 
+    def _get_parent_team_key(self, state: TelegramSessionState) -> str | None:
+        """Extract the root_team_key from a state's SDK env overrides or bootstrap."""
+        env = state.session_manager.sdk_env_overrides
+        team = env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
+        if team:
+            return team
+        # Fallback: check pending bootstrap
+        if state.pending_obs_bootstrap:
+            try:
+                bootstrap = parse_obs_bootstrap_xml(state.pending_obs_bootstrap)
+                if bootstrap.root_team_key:
+                    return bootstrap.root_team_key
+            except Exception:
+                pass
+        return None
+
+    def _find_existing_team_key_for_lineage(
+        self,
+        lineage: tuple[str, ...],
+    ) -> str | None:
+        """Find an existing team directory whose slug matches this lineage.
+
+        When restoring after restart, we need the ORIGINAL team key (with its
+        timestamp) rather than generating a new one.  Scans ``~/.claude/teams/``
+        for directories ending in ``-{slug}`` where *slug* is derived from the
+        lineage root.
+        """
+        if not lineage:
+            return None
+        root = normalize_lineage_name(lineage[0])
+        slug = slugify_projection_label(root, fallback="root")
+        teams_dir = Path.home() / ".claude" / "teams"
+        if not teams_dir.is_dir():
+            return None
+        # Find the most recent team dir matching the slug suffix
+        candidates = []
+        for d in teams_dir.iterdir():
+            if d.is_dir() and d.name.endswith(f"-{slug}"):
+                candidates.append(d.name)
+        if not candidates:
+            return None
+        # Return the most recent (lexicographically last, since timestamp prefix sorts)
+        candidates.sort()
+        return candidates[-1]
+
     def _state_inbox_projection(
         self,
         state: TelegramSessionState,
@@ -2073,52 +2156,8 @@ class TelegramBot:
         parsed = datetime.fromisoformat(normalized)
         return parsed.timestamp()
 
-    @staticmethod
-    def _window_overlap(
-        *,
-        start_a: float | None,
-        end_a: float | None,
-        start_b: float | None,
-        end_b: float | None,
-    ) -> bool:
-        left_a = float("-inf") if start_a is None else float(start_a)
-        right_a = float("inf") if end_a is None else float(end_a)
-        left_b = float("-inf") if start_b is None else float(start_b)
-        right_b = float("inf") if end_b is None else float(end_b)
-        return max(left_a, left_b) < min(right_a, right_b)
-
-    def _validate_schedule_overlap(
-        self,
-        *,
-        route: TelegramRoute,
-        start_ts: float | None,
-        end_ts: float | None,
-    ) -> str | None:
-        now = time.time()
-        active_schedule_id = self._active_schedule_execution_by_route.get(route)
-        for existing in self._active_schedules_for_route(route):
-            if self._schedule_is_exhausted(existing, now):
-                existing.enabled = False
-                existing.next_run_at = None
-                self._register_topic_schedule(existing)
-                continue
-            if (
-                active_schedule_id == existing.schedule_id
-                and existing.max_runs is not None
-                and (existing.run_count + 1) >= existing.max_runs
-            ):
-                continue
-            if self._window_overlap(
-                start_a=start_ts,
-                end_a=end_ts,
-                start_b=existing.from_ts,
-                end_b=existing.until_ts,
-            ):
-                return (
-                    "CronCreate failed: overlapping schedule window for this topic. "
-                    "Only non-overlapping [from, until) windows are allowed."
-                )
-        return None
+    # Schedule overlap validation removed — multiple schedules coexist freely.
+    # Shorter intervals fire first; after max_runs exhaustion, longer ones take over.
 
     def _next_cron_fire_ts(
         self,
@@ -2231,19 +2270,6 @@ class TelegramBot:
             if self._schedule_is_exhausted(parent_record, now):
                 continue
             if not self._schedule_should_inherit(record=parent_record, is_fork=is_fork):
-                continue
-            overlap_error = self._validate_schedule_overlap(
-                route=child_route,
-                start_ts=parent_record.from_ts,
-                end_ts=parent_record.until_ts,
-            )
-            if overlap_error:
-                logger.info(
-                    "Skipping inherited schedule due to overlap parent_route=%s child_route=%s schedule_id=%s",
-                    parent_route,
-                    child_route,
-                    parent_record.schedule_id,
-                )
                 continue
             child_record = _TopicScheduleRecord(
                 schedule_id=uuid.uuid4().hex[:8],
@@ -2415,14 +2441,6 @@ class TelegramBot:
             return self._cron_error_result(
                 "CronCreate failed: inherit must be none, fork, or all"
             )
-
-        overlap_error = self._validate_schedule_overlap(
-            route=route,
-            start_ts=from_ts,
-            end_ts=until_ts,
-        )
-        if overlap_error:
-            return self._cron_error_result(overlap_error)
 
         now = time.time()
         schedule_id = uuid.uuid4().hex[:8]
@@ -4205,6 +4223,12 @@ class TelegramBot:
 
         await self._ensure_background_poller(context.bot)
         message = update.effective_message
+        # Cache the group chat title for General topic naming
+        chat = getattr(message, "chat", None)
+        if chat is not None:
+            chat_title = getattr(chat, "title", None)
+            if isinstance(chat_title, str) and chat_title.strip():
+                self._chat_titles[message.chat_id] = chat_title.strip()
         route = self._route_for_message(message)
         state = self._get_state(route)
         if state is not None:
@@ -4441,7 +4465,6 @@ class TelegramBot:
             )
             return
 
-        deleted = 0
         if context.args:
             target_id = context.args[0].strip()
             record = self._topic_schedules_by_id.get(target_id)
@@ -4454,18 +4477,37 @@ class TelegramBot:
                 )
                 return
             self._delete_topic_schedule(target_id)
-            deleted = 1
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=f"unscheduled 1 schedule for this topic: {target_id}",
+                disable_notification=True,
+            )
         else:
-            for schedule_id in schedule_ids:
-                self._delete_topic_schedule(schedule_id)
-                deleted += 1
-
-        await self._send_system_message(
-            route=route,
-            bot=context.bot,
-            text=f"unscheduled {deleted} schedule(s) for this topic",
-            disable_notification=True,
-        )
+            # Delete only the next upcoming schedule (soonest next_run_at)
+            records = [
+                self._topic_schedules_by_id[sid]
+                for sid in schedule_ids
+                if sid in self._topic_schedules_by_id
+            ]
+            # Sort by next_run_at; schedules without next_run_at go last
+            records.sort(key=lambda r: r.next_run_at if r.next_run_at is not None else float("inf"))
+            if records:
+                next_record = records[0]
+                self._delete_topic_schedule(next_record.schedule_id)
+                await self._send_system_message(
+                    route=route,
+                    bot=context.bot,
+                    text=f"unscheduled next upcoming schedule: {next_record.schedule_id}",
+                    disable_notification=True,
+                )
+            else:
+                await self._send_system_message(
+                    route=route,
+                    bot=context.bot,
+                    text="no schedules attached to this topic",
+                    disable_notification=True,
+                )
 
     async def handle_context(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -5857,9 +5899,56 @@ class TelegramBot:
                 session_id=source_session_id or parent_state.session_id,
             )
             child_lineage = parent_lineage + (normalized_lineage_name,)
-            default_team_name, default_agent_name = self._default_team_projection(child_lineage)
-            team_name = (team_name or "").strip() or default_team_name
+            # Children inherit the parent's root_team_key — only trunk generates
+            # a new timestamp-based key. The agent_name is always computed fresh.
+            default_agent_name = native_agent_name_for_lineage(child_lineage)
+            parent_team_key = self._get_parent_team_key(parent_state)
+            team_name = (team_name or "").strip() or parent_team_key or root_team_key_for_lineage(child_lineage)
             agent_name = (agent_name or "").strip() or default_agent_name
+            # Collision detection: aggressive filesystem-based check.
+            # If an inbox file exists for this agent_name → name is taken.
+            # For auto-generated names (F1, F2...): auto-increment past taken names.
+            # For user-specified names: error on collision.
+            is_auto_generated = bool(
+                re.match(r"^F\d+$", normalized_lineage_name, re.IGNORECASE)
+            )
+            if team_name and agent_name:
+                inbox_path = (
+                    Path.home() / ".claude" / "teams" / team_name
+                    / "inboxes" / f"{agent_name}.json"
+                )
+                if inbox_path.exists():
+                    if is_auto_generated:
+                        # Auto-increment: try F2, F3, ... until we find a free name
+                        counter = int(normalized_lineage_name[1:])
+                        for attempt in range(100):
+                            counter += 1
+                            candidate_name = f"F{counter}"
+                            candidate_lineage = parent_lineage + (candidate_name,)
+                            _, candidate_agent = self._default_team_projection(candidate_lineage)
+                            candidate_inbox = (
+                                Path.home() / ".claude" / "teams" / team_name
+                                / "inboxes" / f"{candidate_agent}.json"
+                            )
+                            if not candidate_inbox.exists():
+                                # Found a free name — update everything
+                                normalized_lineage_name = candidate_name
+                                child_lineage = candidate_lineage
+                                agent_name = candidate_agent
+                                # Update the parent's fork counter so next auto-gen starts from here
+                                parent_state.child_fork_count = counter
+                                self._persist_state_for_route(parent_state.route)
+                                break
+                        else:
+                            raise RuntimeError(
+                                f"Agent name collision: could not find a free auto-generated name "
+                                f"after 100 attempts in team '{team_name}'."
+                            )
+                    else:
+                        raise RuntimeError(
+                            f"Agent name collision: '{agent_name}' already exists in team '{team_name}'. "
+                            f"Choose a different name for this child agent."
+                        )
         await self._activate_route_session(child_state, child_session_id or None)
         child_state.session_manager.set_sdk_env_overrides(
             self._build_team_worker_env(
@@ -6410,6 +6499,52 @@ class TelegramBot:
         recipient = str(payload.get("recipient") or "").strip()
         if not team_name or not recipient:
             return
+
+        # Handle reply_wake_clear signal: all must_reply messages replied
+        if payload.get("_reply_wake_clear"):
+            # Find and delete the reply_wake schedule for the recipient's route
+            recipient_state = self._resolve_route_inbox_target(
+                team_name=team_name,
+                agent_name=recipient,
+            )
+            if recipient_state is not None:
+                wake_id = reply_wake_schedule_id(recipient_state.route)
+                if wake_id in self._topic_schedules_by_id:
+                    self._delete_topic_schedule(wake_id)
+                    logger.info(
+                        "Deleted reply_wake schedule %s: all must_reply messages replied",
+                        wake_id,
+                    )
+            return
+
+        # Create reply_wake schedule if this is a must_reply message
+        if payload.get("_must_reply"):
+            recipient_state = self._resolve_route_inbox_target(
+                team_name=team_name,
+                agent_name=recipient,
+            )
+            if recipient_state is not None:
+                wake_record = create_reply_wake_schedule(recipient_state.route)
+                existing = self._topic_schedules_by_id.get(wake_record.schedule_id)
+                if existing is not None:
+                    # Upsert: reset run_count to 0 (3 fresh attempts)
+                    existing.run_count = 0
+                    existing.enabled = True
+                    existing.next_run_at = time.time() + (existing.interval_seconds or 1)
+                    self._register_topic_schedule(existing)
+                    logger.info(
+                        "Upserted reply_wake schedule %s: reset run_count to 0",
+                        wake_record.schedule_id,
+                    )
+                else:
+                    wake_record.next_run_at = time.time() + (wake_record.interval_seconds or 1)
+                    self._register_topic_schedule(wake_record)
+                    logger.info(
+                        "Created reply_wake schedule %s for route=%s",
+                        wake_record.schedule_id,
+                        recipient_state.route,
+                    )
+
         record = self._resolve_team_worker_record(
             team_name=team_name,
             agent_name=recipient,
@@ -6660,7 +6795,11 @@ class TelegramBot:
             "ForkTask" if is_fork else "AgentTask"
         )
         team_name = str(args.get("team_name") or "").strip() or None
-        agent_name = str(args.get("agent_name") or args.get("name") or "").strip() or None
+        # With two-tier naming, the 'name' parameter is a display name (alias),
+        # NOT the machine agent_name. The agent_name is computed from the lineage
+        # by _create_child_fork_topic via native_agent_name_for_lineage.
+        # Only use an explicit 'agent_name' if it's provided separately.
+        agent_name = str(args.get("agent_name") or "").strip() or None
         source_session_id: str | None = None
         source_uuid: str | None = None
         source_route = route

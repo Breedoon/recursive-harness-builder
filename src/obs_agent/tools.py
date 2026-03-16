@@ -16,7 +16,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
@@ -26,7 +26,12 @@ from obs_agent.context_stats import (
     build_context_snapshot,
     format_context_snapshot_lines,
 )
-from obs_agent.lineage import find_latest_obs_bootstrap_for_session
+from obs_agent.lineage import (
+    find_latest_obs_bootstrap_for_session,
+    lineage_fingerprint,
+    native_agent_name_for_lineage,
+    normalize_lineage_name,
+)
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -38,6 +43,70 @@ _INBOX_FILE_LOCKS: dict[Path, asyncio.Lock] = {}
 
 def _error_result(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "is_error": True}
+
+
+def validate_must_reply_recipient(
+    *, sender: str, recipient: str, must_reply: bool
+) -> dict[str, Any]:
+    """Check whether a must_reply message is valid.
+
+    Returns ``{"ok": True}`` on success or ``{"ok": False, "error": "..."}``
+    when the message should be rejected (e.g. must_reply to self).
+    """
+    if not must_reply:
+        return {"ok": True}
+    if sender == recipient:
+        return {"ok": False, "error": "must_reply to self is blocked (would cause infinite wake loop)"}
+    return {"ok": True}
+
+
+def detect_must_reply_completions(
+    inbox_entries: list[dict],
+    recipient_of_outgoing_message: str,
+) -> tuple[list[dict], bool]:
+    """Mark must_reply messages from *recipient_of_outgoing_message* as replied.
+
+    When agent B sends a message to agent A, B calls this on B's own inbox
+    entries to mark must_reply messages from A as ``replied: True``.
+
+    Returns ``(updated_entries, all_replied)`` where *all_replied* indicates
+    whether every must_reply message in *inbox_entries* is now replied.
+    """
+    changed = False
+    for entry in inbox_entries:
+        if (
+            isinstance(entry, dict)
+            and entry.get("must_reply") is True
+            and entry.get("replied") is not True
+            and entry.get("from") == recipient_of_outgoing_message
+        ):
+            entry["replied"] = True
+            changed = True
+    # Check if ALL must_reply obligations are now cleared
+    all_replied = not any(
+        isinstance(e, dict)
+        and e.get("must_reply") is True
+        and e.get("replied") is not True
+        for e in inbox_entries
+    )
+    return inbox_entries, all_replied
+
+
+def check_and_clear_must_reply_obligations(
+    inbox_entries: list[dict],
+) -> bool:
+    """Check whether all must_reply messages have been replied to.
+
+    Returns ``True`` if there are no unreplied must_reply messages
+    (i.e. the reply_wake schedule can be deleted).
+    """
+    return not any(
+        isinstance(e, dict)
+        and e.get("must_reply") is True
+        and e.get("replied") is not True
+        for e in inbox_entries
+    )
+
 
 
 def _transport_unavailable(tool_name: str) -> dict:
@@ -107,11 +176,17 @@ def create_obs_tools(
         default_fork: bool,
     ) -> dict:
         prompt = str(args.get("prompt", "")).strip()
-        description = str(args.get("alias") or args.get("description") or "").strip() or None
+        # 'name', 'alias', and 'description' all serve as the display name
+        # (lineage alias). With two-tier naming, this is NOT the machine
+        # agent_name — that is computed from the lineage by
+        # _create_child_fork_topic via native_agent_name_for_lineage.
+        description = str(
+            args.get("alias") or args.get("description") or args.get("name") or ""
+        ).strip() or None
         resume = _normalize_resume_arg(args.get("resume"))
         run_in_background = args.get("run_in_background")
         team_name = str(args.get("team_name", "")).strip() or None
-        agent_name = str(args.get("name") or args.get("agent_name") or "").strip() or None
+        agent_name = str(args.get("agent_name") or "").strip() or None
         fork = default_fork
         if "fork" in args:
             try:
@@ -612,7 +687,20 @@ def create_obs_tools(
         },
     )
     async def cron_delete(args: dict) -> dict:
-        return await _cron_delete(args, tool_name="CronDelete")
+        # Agent-initiated schedule deletion is deprecated.
+        # Agents were deleting their own schedules unprompted, undermining user intent.
+        # Users can still delete schedules via /unschedule command.
+        # Considering reintroduction with guardrails (e.g., user confirmation,
+        # only delete schedules the agent created).
+        #
+        # NOTE: Blocking is at MCP tool layer only. TelegramBot._cron_delete
+        # still works (used by /unschedule command handler). If an agent ever
+        # bypasses MCP (e.g., direct method call via hook), it could still
+        # delete schedules. Low risk since agents always go through MCP tools.
+        return _error_result(
+            "CronDelete is disabled for agents. "
+            "Schedules can only be removed by the user via /unschedule command."
+        )
 
     async def _send_inbox_message(args: dict) -> dict:
         bootstrap = _current_obs_bootstrap()
@@ -625,6 +713,7 @@ def create_obs_tools(
         sender = str(args.get("sender", "")).strip() or (
             bootstrap.native_agent_name if bootstrap is not None and bootstrap.native_agent_name else "obs-worker"
         )
+        must_reply = bool(args.get("must_reply", False))
         if not team_name:
             return _error_result(
                 "Cannot use SendInboxMessage: team_name is required or must be inferable from current lineage"
@@ -633,6 +722,11 @@ def create_obs_tools(
             return _error_result("Cannot use SendInboxMessage: recipient is required")
         if not content:
             return _error_result("Cannot use SendInboxMessage: content is required")
+        # Block must_reply to self (would cause infinite wake loop)
+        if must_reply and sender == recipient:
+            return _error_result(
+                "Cannot send must_reply to yourself — this would cause an infinite wake loop."
+            )
         if hook_state is not None and hook_state.inbox_recipient_validator is not None:
             try:
                 validation = await hook_state.inbox_recipient_validator(
@@ -682,15 +776,71 @@ def create_obs_tools(
                         entries = [item for item in loaded if isinstance(item, dict)]
                 except Exception:
                     logger.warning("Failed reading inbox JSON: %s", inbox_path, exc_info=True)
-            message = {
+            message: dict[str, Any] = {
                 "from": sender,
                 "text": content,
                 "summary": summary or "",
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "read": False,
             }
+            if must_reply:
+                message["must_reply"] = True
+                message["replied"] = False
             entries.append(message)
             inbox_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
+
+        # Reply detection: if we just sent a message to `recipient`, check our OWN
+        # inbox for must_reply messages FROM that recipient that are unreplied.
+        # If found, mark them replied.  When ALL must_reply messages are replied,
+        # delete the reply_wake schedule.
+        # Reply detection: mark must_reply messages from `recipient` in our inbox as replied
+        if sender and sender != recipient:
+            sender_inbox_path = (
+                Path.home()
+                / ".claude"
+                / "teams"
+                / team_name
+                / "inboxes"
+                / f"{sender}.json"
+            )
+            if sender_inbox_path.exists():
+                sender_lock = _inbox_lock(sender_inbox_path)
+                async with sender_lock:
+                    try:
+                        sender_entries = json.loads(sender_inbox_path.read_text(encoding="utf-8"))
+                        if isinstance(sender_entries, list):
+                            updated, all_replied = detect_must_reply_completions(
+                                sender_entries, recipient
+                            )
+                            # Only write if something changed
+                            if any(
+                                e.get("replied") is True
+                                for e in updated
+                                if e.get("must_reply") is True and e.get("from") == recipient
+                            ):
+                                sender_inbox_path.write_text(
+                                    json.dumps(updated, ensure_ascii=True),
+                                    encoding="utf-8",
+                                )
+                            if all_replied and hook_state is not None:
+                                # All must_reply messages are replied — signal
+                                # schedule cleanup (handled by telegram.py)
+                                if hook_state.inbox_message_notifier is not None:
+                                    try:
+                                        await hook_state.inbox_message_notifier(
+                                            {
+                                                "team_name": team_name,
+                                                "recipient": sender,
+                                                "sender": recipient,
+                                                "content": "__reply_wake_clear__",
+                                                "summary": "all must_reply messages replied",
+                                                "_reply_wake_clear": True,
+                                            }
+                                        )
+                                    except Exception:
+                                        logger.warning("Reply wake clear notification failed", exc_info=True)
+                    except Exception:
+                        logger.warning("Reply detection: failed reading sender inbox %s", sender_inbox_path, exc_info=True)
 
         response = {
             "success": True,
@@ -700,15 +850,16 @@ def create_obs_tools(
         }
         if hook_state is not None and hook_state.inbox_message_notifier is not None:
             try:
-                await hook_state.inbox_message_notifier(
-                    {
-                        "team_name": team_name,
-                        "recipient": recipient,
-                        "sender": sender,
-                        "content": content,
-                        "summary": summary,
-                    }
-                )
+                notification_payload: dict[str, Any] = {
+                    "team_name": team_name,
+                    "recipient": recipient,
+                    "sender": sender,
+                    "content": content,
+                    "summary": summary,
+                }
+                if must_reply:
+                    notification_payload["_must_reply"] = True
+                await hook_state.inbox_message_notifier(notification_payload)
             except Exception:
                 logger.warning("SendInboxMessage notifier failed", exc_info=True)
         return {
@@ -796,6 +947,7 @@ def create_obs_tools(
             "content": {"type": "string", "description": "Message body"},
             "summary": {"type": "string", "description": "Optional short summary"},
             "sender": {"type": "string", "description": "Optional sender label"},
+            "must_reply": {"type": "boolean", "description": "ADVANCED: Do NOT use unless explicitly instructed. Forces recipient to reply via wake schedule. Default false."},
         },
     )
     async def send_inbox_message(args: dict) -> dict:
@@ -865,7 +1017,7 @@ def create_obs_tools(
         bootstrap = _current_obs_bootstrap()
         if bootstrap is None:
             return _error_result("Cannot use session_lineage: no OBS bootstrap found for current session")
-        payload = {
+        payload: dict[str, Any] = {
             "lineage": list(bootstrap.lineage),
             "lineage_length": len(bootstrap.lineage),
             "origin": bootstrap.origin,
@@ -875,12 +1027,94 @@ def create_obs_tools(
             "parent_session_id": bootstrap.parent_session_id,
             "root_team_key": bootstrap.root_team_key,
             "native_agent_name": bootstrap.native_agent_name,
+            "path": "/".join(bootstrap.lineage),
         }
+        # Compute agent_names for each node in the lineage
+        agent_names = []
+        for i in range(len(bootstrap.lineage)):
+            sub = bootstrap.lineage[: i + 1]
+            agent_names.append(native_agent_name_for_lineage(sub))
+        payload["agent_names"] = agent_names
         if include_xml:
             payload["xml"] = bootstrap.raw_xml
         return {
             "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=True)}],
             "tool_use_result": payload,
+        }
+
+    @tool(
+        "get_family",
+        "Find relatives in the team tree — children, siblings, or parent — by scanning inbox files.",
+        {
+            "who": {
+                "type": "string",
+                "description": "One of: children, siblings, parent, all",
+            },
+        },
+    )
+    async def get_family(args: dict) -> dict:
+        who = str(args.get("who", "all")).strip().lower()
+        if who not in {"children", "siblings", "parent", "all"}:
+            return _error_result("get_family: 'who' must be one of: children, siblings, parent, all")
+        bootstrap = _current_obs_bootstrap()
+        if bootstrap is None:
+            return _error_result("Cannot use get_family: no OBS bootstrap found")
+        if not bootstrap.root_team_key or not bootstrap.native_agent_name:
+            return _error_result("Cannot use get_family: missing team key or agent name")
+        if not bootstrap.lineage:
+            return _error_result("Cannot use get_family: empty lineage")
+
+        inboxes_dir = (
+            Path.home()
+            / ".claude"
+            / "teams"
+            / bootstrap.root_team_key
+            / "inboxes"
+        )
+        result: dict[str, list[str]] = {}
+        all_agents = []
+        if inboxes_dir.is_dir():
+            for f in inboxes_dir.iterdir():
+                if f.suffix == ".json" and f.stem:
+                    all_agents.append(f.stem)
+
+        my_lineage = bootstrap.lineage
+        my_agent_name = bootstrap.native_agent_name
+        my_hash = lineage_fingerprint(tuple(normalize_lineage_name(n) for n in my_lineage))
+
+        # Children: agents whose name starts with my lineage hash
+        if who in {"children", "all"}:
+            children = [
+                name for name in all_agents
+                if name.startswith(f"{my_hash}-") and name != my_agent_name
+            ]
+            result["children"] = children
+
+        # Parent: derive from my agent_name's hash prefix
+        if who in {"parent", "all"}:
+            if len(my_lineage) > 1:
+                parent_lineage = my_lineage[:-1]
+                parent_name = native_agent_name_for_lineage(parent_lineage)
+                result["parent"] = [parent_name] if parent_name in all_agents else []
+            else:
+                result["parent"] = []  # trunk has no parent
+
+        # Siblings: agents with same parent hash prefix as me
+        if who in {"siblings", "all"}:
+            if len(my_lineage) > 1:
+                parent_lineage = tuple(normalize_lineage_name(n) for n in my_lineage[:-1])
+                parent_hash = lineage_fingerprint(parent_lineage)
+                siblings = [
+                    name for name in all_agents
+                    if name.startswith(f"{parent_hash}-") and name != my_agent_name
+                ]
+                result["siblings"] = siblings
+            else:
+                result["siblings"] = []  # trunk has no siblings
+
+        return {
+            "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=True)}],
+            "tool_use_result": result,
         }
 
     server = create_sdk_mcp_server(
@@ -900,6 +1134,7 @@ def create_obs_tools(
             session_info,
             context_info,
             session_lineage,
+            get_family,
         ],
     )
     return server
