@@ -1045,10 +1045,11 @@ class TelegramBot:
             return await future
         except _TopicDeletedError:
             logger.warning(
-                "Topic deleted for route=%s — dropping route state",
+                "Topic deleted for route=%s — dropping route state and sending bounce-backs",
                 route,
             )
             await self._drop_route_state(route, terminal_status="failed")
+            await self._send_bounce_backs_for_dead_agent(route)
             return None
         finally:
             await self._maybe_stop_transport_worker()
@@ -6271,6 +6272,106 @@ class TelegramBot:
     @staticmethod
     def _team_inbox_path(team_name: str, agent_name: str) -> Path:
         return Path.home() / ".claude" / "teams" / team_name / "inboxes" / f"{agent_name}.json"
+
+    async def _send_bounce_backs_for_dead_agent(self, route: TelegramRoute) -> None:
+        """Notify senders of a dead agent that their messages may not have been read.
+
+        Scans the dead agent's inbox for unread messages, sends a bounce-back
+        to each unique sender, and voids any must_reply obligations.
+        """
+        # Find team_name and agent_name for this route
+        dead_team: str | None = None
+        dead_agent: str | None = None
+        for record in self._fork_tasks_by_id.values():
+            if record.child_route == route:
+                dead_team = (record.team_name or "").strip() or None
+                dead_agent = (record.agent_name or "").strip() or None
+                break
+        if not dead_team or not dead_agent:
+            # Also check route_inbox_targets (for trunk agents)
+            for (team, agent), target_route in list(self._route_inbox_targets.items()):
+                if target_route == route:
+                    dead_team, dead_agent = team, agent
+                    break
+        if not dead_team or not dead_agent:
+            logger.debug("Cannot send bounce-backs — no team/agent mapping for route=%s", route)
+            return
+
+        inbox_path = self._team_inbox_path(dead_team, dead_agent)
+        if not inbox_path.exists():
+            return
+
+        try:
+            entries = json.loads(inbox_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug("Failed reading dead agent inbox for bounce-back: %s", inbox_path, exc_info=True)
+            return
+
+        if not isinstance(entries, list):
+            return
+
+        # Collect unique senders with unread messages
+        senders_to_notify: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("read", False):
+                continue
+            sender = str(entry.get("from") or "").strip()
+            if sender and sender != "system":
+                senders_to_notify.add(sender)
+            # Void must_reply obligations
+            if entry.get("must_reply") and not entry.get("replied"):
+                entry["replied"] = True
+
+        # Write back the voided must_reply flags
+        try:
+            inbox_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
+        except Exception:
+            logger.debug("Failed writing voided must_reply flags: %s", inbox_path, exc_info=True)
+
+        # Delete reply_wake schedules for this route
+        reply_wake_id = f"reply-wake-{route.chat_id}-{route.thread_id or 'general'}"
+        existing = self._topic_schedules_by_id.get(reply_wake_id)
+        if existing is not None:
+            self._delete_topic_schedule(reply_wake_id)
+
+        # Send bounce-back to each unique sender
+        for sender_name in senders_to_notify:
+            sender_inbox = self._team_inbox_path(dead_team, sender_name)
+            sender_inbox.parent.mkdir(parents=True, exist_ok=True)
+            bounce_msg = {
+                "from": "system",
+                "text": (
+                    f"Agent {dead_agent} is no longer available — topic was deleted. "
+                    f"Your message may not have been read."
+                ),
+                "summary": "agent dead — message undeliverable",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "read": False,
+                "must_reply": False,
+                "replied": False,
+            }
+            try:
+                sender_entries: list = []
+                if sender_inbox.exists():
+                    sender_entries = json.loads(sender_inbox.read_text(encoding="utf-8"))
+                    if not isinstance(sender_entries, list):
+                        sender_entries = []
+                sender_entries.append(bounce_msg)
+                sender_inbox.write_text(json.dumps(sender_entries, ensure_ascii=True), encoding="utf-8")
+                logger.info(
+                    "Sent bounce-back to %s: agent %s is dead (topic deleted)",
+                    sender_name,
+                    dead_agent,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed sending bounce-back to %s for dead agent %s",
+                    sender_name,
+                    dead_agent,
+                    exc_info=True,
+                )
 
     def _latest_unread_team_inbox_message(
         self,

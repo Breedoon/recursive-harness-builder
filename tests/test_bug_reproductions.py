@@ -341,6 +341,141 @@ class TestBug3DeletedTopicRedirectsToGeneral:
 
 
 # ---------------------------------------------------------------------------
+# BUG 3b: Bounce-back notification for dead agents
+# When a topic is deleted and the bot discovers it (via "message thread not
+# found"), it should notify all agents who sent unread messages to the dead
+# agent. The notification should say the agent is dead and the message may
+# not be read. must_reply obligations should be voided.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+@pytest.mark.timeout(900)  # 15 minutes — complex multi-agent scenario
+class TestBug3bBounceBackForDeadAgent:
+    """When a topic is deleted, senders get notified that the agent is dead."""
+
+    @pytest.mark.xfail(
+        reason="NOT IMPLEMENTED: bounce-back notifications for dead agents",
+        strict=True,
+    )
+    async def test_senders_notified_when_agent_topic_deleted(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        """Build Root → Child, Root → Sibling. Both message Child.
+        Delete Child's topic. Both Root and Sibling should get a bounce-back
+        notification in their inboxes saying Child is dead.
+        """
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+
+        # Create root
+        root_thread = await live_tg_forum.platform.create_topic(f"Bounce {tag}")
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"Reply with only BOUNCE-ROOT-{tag}.",
+            thread_id=root_thread,
+            token=f"BOUNCE-ROOT-{tag}",
+            timeout=180.0,
+        )
+
+        # Launch Child and Sibling
+        child_thread, child_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread,
+            fork=False,
+            alias=f"BounceChild-{tag}",
+            launch_token=f"BOUNCE-LAUNCH-CHILD-{tag}",
+            lineage_token=f"BOUNCE-LIN-CHILD-{tag}",
+            timeout=240.0,
+        )
+        child_agent = _extract_lineage_fact_line(child_lineage, "native_agent_name")
+        assert child_agent, "Could not extract child agent_name"
+
+        sibling_thread, sibling_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread,
+            fork=False,
+            alias=f"BounceSibling-{tag}",
+            launch_token=f"BOUNCE-LAUNCH-SIB-{tag}",
+            lineage_token=f"BOUNCE-LIN-SIB-{tag}",
+            timeout=240.0,
+        )
+
+        # Wait for agents to settle
+        await asyncio.sleep(10)
+
+        # Root sends message to Child
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=root_thread,
+            recipient=child_agent,
+            content=f"BOUNCE-FROM-ROOT-{tag}",
+            ack_token=f"BOUNCE-ROOT-SENT-{tag}",
+            timeout=240.0,
+        )
+
+        # Sibling sends message to Child
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=sibling_thread,
+            recipient=child_agent,
+            content=f"BOUNCE-FROM-SIB-{tag}",
+            ack_token=f"BOUNCE-SIB-SENT-{tag}",
+            timeout=240.0,
+        )
+
+        # Delete Child's topic
+        await live_tg_forum.platform.delete_topic(child_thread)
+        await asyncio.sleep(5)
+
+        # Trigger the bounce-back by having Root try to wake Child
+        # (the bot will try to send to the deleted topic and discover it's gone)
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=root_thread,
+            recipient=child_agent,
+            content=f"BOUNCE-TRIGGER-{tag}",
+            ack_token=f"BOUNCE-TRIGGER-SENT-{tag}",
+            timeout=240.0,
+        )
+
+        # Wait for bounce-back to propagate
+        await asyncio.sleep(15)
+
+        # Check Root's inbox for a bounce-back notification
+        from tests.test_telegram_live_stress import _check_inbox_for_content
+        root_got_bounce = await _check_inbox_for_content(
+            live_tg_forum,
+            thread_id=root_thread,
+            look_for="dead",
+            found_token=f"ROOT-BOUNCE-YES-{tag}",
+            missing_token=f"ROOT-BOUNCE-NO-{tag}",
+            timeout=120.0,
+        )
+
+        # Check Sibling's inbox for a bounce-back notification
+        sib_got_bounce = await _check_inbox_for_content(
+            live_tg_forum,
+            thread_id=sibling_thread,
+            look_for="dead",
+            found_token=f"SIB-BOUNCE-YES-{tag}",
+            missing_token=f"SIB-BOUNCE-NO-{tag}",
+            timeout=120.0,
+        )
+
+        assert root_got_bounce, (
+            "BOUNCE-BACK MISSING: Root sent messages to Child, Child's topic was "
+            "deleted, but Root did NOT receive a bounce-back notification."
+        )
+        assert sib_got_bounce, (
+            "BOUNCE-BACK MISSING: Sibling sent messages to Child, Child's topic was "
+            "deleted, but Sibling did NOT receive a bounce-back notification."
+        )
+
+
+# ---------------------------------------------------------------------------
 # BUG 4: Trunk agent name != team name
 # Design spec says they should be identical.
 # ---------------------------------------------------------------------------
