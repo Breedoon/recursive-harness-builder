@@ -323,9 +323,8 @@ class TestLiveNeedsReplyBehavior:
             token=f"REPLY-LIN-{tag}",
             timeout=240.0,
         )
-        root_agent = _extract_lineage_fact_line(root_lineage, "agent_name")
-        if not root_agent:
-            root_agent = _extract_lineage_fact_line(root_lineage, "native_agent_name")
+        root_facts = _extract_lineage_fact_line(root_lineage)
+        root_agent = root_facts.get("agent_name") or root_facts.get("native_agent_name")
         assert root_agent, "Could not extract root agent name"
 
         # Launch child
@@ -338,9 +337,8 @@ class TestLiveNeedsReplyBehavior:
             lineage_token=f"REPLY-CHILD-LIN-{tag}",
             timeout=240.0,
         )
-        child_agent = _extract_lineage_fact_line(child_lineage, "agent_name")
-        if not child_agent:
-            child_agent = _extract_lineage_fact_line(child_lineage, "native_agent_name")
+        child_facts = _extract_lineage_fact_line(child_lineage)
+        child_agent = child_facts.get("agent_name") or child_facts.get("native_agent_name")
         assert child_agent, "Could not extract child agent name"
 
         # Wait for child to settle
