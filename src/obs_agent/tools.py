@@ -31,6 +31,7 @@ from obs_agent.lineage import (
     lineage_fingerprint,
     native_agent_name_for_lineage,
     normalize_lineage_name,
+    parse_obs_bootstrap_xml,
 )
 
 if TYPE_CHECKING:
@@ -164,10 +165,15 @@ def create_obs_tools(
         session_id = get_session_id()
         if not session_id and hook_state is not None:
             session_id = hook_state.session_id
-        return find_latest_obs_bootstrap_for_session(
+        result = find_latest_obs_bootstrap_for_session(
             session_id=session_id,
             cwd=config.vault_path,
         )
+        # Fallback: if JSONL doesn't have bootstrap yet (first turn race),
+        # try the pending bootstrap from hook_state (set by telegram.py).
+        if result is None and hook_state is not None and hook_state.pending_obs_bootstrap_xml:
+            result = parse_obs_bootstrap_xml(hook_state.pending_obs_bootstrap_xml)
+        return result
 
     async def _launch_task(
         args: dict,
