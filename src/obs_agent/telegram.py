@@ -6723,8 +6723,9 @@ class TelegramBot:
             str(args.get("agent_name") or args.get("name") or "").strip()
             or record.agent_name
         )
-        timeout_ms = self._coerce_timeout_ms(args.get("timeout_ms"))
-        max_turns = self._coerce_max_turns(args.get("max_turns"))
+        # timeout_ms and max_turns disabled — all agents run without limits.
+        timeout_ms = None
+        max_turns = None
         child_state = self._get_state(record.child_route, create=False)
         if child_state is None or state.last_bot is None:
             return self._task_not_found_result(task_id)
@@ -6900,8 +6901,9 @@ class TelegramBot:
         task_id = str(uuid.uuid4())
         description = str(args.get("alias") or args.get("description") or "").strip() or None
         prompt = str(args["prompt"])
-        timeout_ms = self._coerce_timeout_ms(args.get("timeout_ms"))
-        max_turns = self._coerce_max_turns(args.get("max_turns"))
+        # timeout_ms and max_turns disabled — all agents run without limits.
+        timeout_ms = None
+        max_turns = None
         lineage_name, topic_name = self._next_topic_alias_and_title(state, description)
         source_link = (
             self._build_message_link(source_route, source_message_id)
