@@ -275,6 +275,21 @@ class TestBug4ReplyMarksAllMessages:
 # Live smoke test: needs_reply=false messaging
 # ---------------------------------------------------------------------------
 
+from tests.test_telegram_live_forum_topics import (
+    _reset_general,
+    _send_and_wait_for_token,
+    _wait_for_message_after_containing,
+    _LiveForumHarness,
+    live_tg_forum,  # fixture import
+)
+from tests.test_telegram_live_smoke import (
+    _launch_lineage_worker,
+    _extract_lineage_fact_line,
+    _query_session_lineage,
+    _send_inbox_message_and_wait_ack,
+)
+
+
 @pytest.mark.integration
 @pytest.mark.telegram
 @pytest.mark.telegram_smoke
@@ -284,19 +299,9 @@ class TestLiveNeedsReplyBehavior:
 
     async def test_live_needs_reply_false_no_phantom_wakes(
         self,
-        live_tg_forum,
+        live_tg_forum: _LiveForumHarness,
     ) -> None:
         """Send a message with needs_reply=false. Verify NO wake schedule is created."""
-        from tests.test_telegram_live_forum_topics import (
-            _reset_general,
-            _send_and_wait_for_token,
-            _wait_for_message_after_containing,
-        )
-        from tests.test_telegram_live_smoke import (
-            _launch_lineage_worker,
-            _extract_lineage_fact_line,
-            _query_session_lineage,
-        )
 
         await _reset_general(live_tg_forum)
         tag = uuid.uuid4().hex[:8]
