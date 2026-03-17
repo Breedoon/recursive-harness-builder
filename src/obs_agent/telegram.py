@@ -2088,6 +2088,10 @@ class TelegramBot:
             child_session_id=session_id or state.session_id,
         )
         state.pending_obs_bootstrap = bootstrap_xml
+        # Also store in hook_state so session_lineage can find it on first turn
+        # (before the JSONL has the bootstrap written).
+        if state.hook_state is not None:
+            state.hook_state.pending_obs_bootstrap_xml = bootstrap_xml
         self._upsert_route_inbox_target(state)
         self._persist_state_for_route(state.route)
         return bootstrap_xml

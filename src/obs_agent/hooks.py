@@ -232,6 +232,7 @@ class HookState:
     current_tool_use_id: str | None = None
     schedule_run_active: bool = False
     execution_active: bool = False
+    pending_obs_bootstrap_xml: str | None = None  # set by telegram.py when bootstrap is primed
 
     def reset(self) -> None:
         """Clear all queued state for a fresh session.
