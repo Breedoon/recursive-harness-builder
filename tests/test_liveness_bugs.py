@@ -94,7 +94,7 @@ class TestMustReplyPingPongLoop:
         route = TelegramRoute(chat_id=12345, thread_id=678)
         schedule = create_reply_wake_schedule(route)
         assert "must_reply=false" in schedule.prompt.lower()
-        assert "do not set must_reply=true" in schedule.prompt.lower()
+        assert "acknowledgement" in schedule.prompt.lower()
 
 
 # ---------------------------------------------------------------------------

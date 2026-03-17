@@ -1,4 +1,12 @@
-"""Canonical lineage/bootstrap helpers for multi-level Telegram agent trees."""
+"""Canonical lineage/bootstrap helpers for multi-level Telegram agent trees.
+
+Naming convention (two-tier):
+  - **agent_name**: the routing/machine name (e.g., ``"6b25cfc451-fix"``).
+    Used for inbox files, messaging (sender/recipient), team config, env vars.
+    Deterministically derived from the lineage via :func:`agent_name_for_lineage`.
+  - **display_name**: the human-readable label (e.g., ``"Fix New Teams"``).
+    Used for topic titles, lineage XML node labels, user-facing text.
+"""
 
 from __future__ import annotations
 
@@ -32,7 +40,12 @@ class ObsBootstrap:
     agent_id: str | None
     parent_session_id: str | None
     root_team_key: str | None
-    native_agent_name: str | None
+    agent_name: str | None
+
+    @property
+    def native_agent_name(self) -> str | None:
+        """Backward-compat alias for agent_name."""
+        return self.agent_name
 
 
 def normalize_lineage_name(value: str | None) -> str:
@@ -103,6 +116,10 @@ def native_agent_name_for_lineage(lineage: Sequence[str]) -> str:
     return f"{parent_hash}-{slug}"
 
 
+# Canonical name — ``native_agent_name_for_lineage`` is kept as an alias.
+agent_name_for_lineage = native_agent_name_for_lineage
+
+
 def build_obs_bootstrap_xml(
     *,
     lineage: Sequence[str],
@@ -112,21 +129,23 @@ def build_obs_bootstrap_xml(
     agent_id: str | None = None,
     parent_session_id: str | None = None,
     root_team_key: str | None = None,
-    native_agent_name: str | None = None,
+    agent_name: str | None = None,
+    native_agent_name: str | None = None,  # Backward-compat alias for agent_name
 ) -> str:
-    """Serialize the canonical OBS bootstrap XML envelope.
+    """Serialize the canonical OBS bootstrap XML envelope (v2).
 
-    Each ``obs-node`` element carries both a human-readable ``name`` and the
-    machine-safe ``agent_name`` that can be used for messaging.
+    Each ``obs-node`` element carries both a human-readable ``display_name``
+    and the machine-safe ``agent_name`` that can be used for messaging.
     """
-    root = ET.Element("obs-bootstrap", {"version": "1"})
+    resolved_agent_name = agent_name or native_agent_name
+    root = ET.Element("obs-bootstrap", {"version": "2"})
     lineage_el = ET.SubElement(root, "obs-lineage")
     normalized = [normalize_lineage_name(n) for n in lineage]
     for idx, node_name in enumerate(normalized):
-        attrs: dict[str, str] = {"name": node_name}
+        attrs: dict[str, str] = {"display_name": node_name}
         # Compute the agent_name for the sub-lineage up to and including this node
         sub_lineage = tuple(normalized[: idx + 1])
-        attrs["agent_name"] = native_agent_name_for_lineage(sub_lineage)
+        attrs["agent_name"] = agent_name_for_lineage(sub_lineage)
         ET.SubElement(lineage_el, "obs-node", attrs)
 
     fork_context = ET.SubElement(root, "fork_context")
@@ -142,8 +161,8 @@ def build_obs_bootstrap_xml(
     team_context = ET.SubElement(root, "team_context")
     if root_team_key:
         ET.SubElement(team_context, "root_team_key").text = root_team_key
-    if native_agent_name:
-        ET.SubElement(team_context, "native_agent_name").text = native_agent_name
+    if resolved_agent_name:
+        ET.SubElement(team_context, "agent_name").text = resolved_agent_name
 
     return ET.tostring(root, encoding="unicode", short_empty_elements=True)
 
@@ -168,7 +187,9 @@ def parse_obs_bootstrap_xml(xml_text: str) -> ObsBootstrap:
     lineage: list[str] = []
     if lineage_el is not None:
         for node in lineage_el.findall("obs-node"):
-            lineage.append(normalize_lineage_name(node.attrib.get("name")))
+            # v2 uses display_name=, v1 uses name=. Try new first, fall back.
+            display = node.attrib.get("display_name") or node.attrib.get("name")
+            lineage.append(normalize_lineage_name(display))
 
     fork_context = root.find("fork_context")
     team_context = root.find("team_context")
@@ -183,6 +204,11 @@ def parse_obs_bootstrap_xml(xml_text: str) -> ObsBootstrap:
         return text or None
 
     is_fork_text = (_child_text(fork_context, "is_fork") or "").lower()
+    # v2 uses <agent_name>, v1 uses <native_agent_name>. Try new first.
+    resolved_agent = (
+        _child_text(team_context, "agent_name")
+        or _child_text(team_context, "native_agent_name")
+    )
     return ObsBootstrap(
         raw_xml=xml_text,
         lineage=tuple(item for item in lineage if item),
@@ -192,7 +218,7 @@ def parse_obs_bootstrap_xml(xml_text: str) -> ObsBootstrap:
         agent_id=_child_text(fork_context, "agent_id"),
         parent_session_id=_child_text(fork_context, "parent_session_id"),
         root_team_key=_child_text(team_context, "root_team_key"),
-        native_agent_name=_child_text(team_context, "native_agent_name"),
+        agent_name=resolved_agent,
     )
 
 

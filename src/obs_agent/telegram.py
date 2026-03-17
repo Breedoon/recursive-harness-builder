@@ -339,9 +339,9 @@ def create_reply_wake_schedule(route: TelegramRoute) -> _TopicScheduleRecord:
         prompt=(
             "(System: You have unreplied must_reply messages. "
             "Check your inbox with ReadInbox and reply to the senders "
-            "using SendInboxMessage with must_reply=false. "
-            "Do NOT set must_reply=true on your replies — that would "
-            "create an infinite ping-pong loop.)"
+            "using SendInboxMessage. "
+            "Consider using must_reply=false if your reply is an acknowledgement "
+            "or doesn't need an answer back.)"
         ),
         max_runs=3,
         run_count=0,
@@ -628,7 +628,6 @@ class TelegramBot:
         # unread message every poll cycle.  Cleared on daemon restart (correct:
         # you want to re-notify after restart) and when a NEW message arrives.
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
-        self._dropped_agent_keys: set[tuple[str, str]] = set()  # (team, agent) pairs freed for reuse
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
         self._schedule_running_by_route: set[TelegramRoute] = set()
@@ -5838,8 +5837,6 @@ class TelegramBot:
         # Track dropped agent names so collision detection allows respawn
         inbox_key = self._route_inbox_target_keys_by_route.get(route)
         self._remove_route_inbox_target(route)
-        if inbox_key is not None:
-            self._dropped_agent_keys.add(inbox_key)
         state = self._states_by_route.pop(route, None)
         self._route_locks.pop(route, None)
         self._prune_bindings_for_route(route)
@@ -5962,7 +5959,7 @@ class TelegramBot:
                     / "inboxes" / f"{agent_name}.json"
                 )
                 agent_key = self._team_worker_key(team_name, agent_name)
-                if inbox_path.exists() and agent_key not in self._dropped_agent_keys:
+                if inbox_path.exists():
                     if is_auto_generated:
                         # Auto-increment: try F2, F3, ... until we find a free name
                         counter = int(normalized_lineage_name[1:])
@@ -5995,9 +5992,6 @@ class TelegramBot:
                             f"Choose a different name for this child agent."
                         )
         # Clear dropped key if name is being reused (respawn)
-        if team_name and agent_name:
-            reuse_key = self._team_worker_key(team_name, agent_name)
-            self._dropped_agent_keys.discard(reuse_key)
         await self._activate_route_session(child_state, child_session_id or None)
         child_state.session_manager.set_sdk_env_overrides(
             self._build_team_worker_env(
@@ -6704,15 +6698,14 @@ class TelegramBot:
                 wake_record = create_reply_wake_schedule(recipient_state.route)
                 existing = self._topic_schedules_by_id.get(wake_record.schedule_id)
                 if existing is not None:
-                    # Upsert: do NOT reset run_count — let max_runs cap apply
-                    # cumulatively to prevent infinite ping-pong loops.
+                    # Upsert: reset run_count for the new message — fresh attempts.
                     existing.enabled = True
+                    existing.run_count = 0
                     existing.next_run_at = time.time() + (existing.interval_seconds or 1)
                     self._register_topic_schedule(existing)
                     logger.info(
-                        "Upserted reply_wake schedule %s: run_count=%d (preserved)",
+                        "Upserted reply_wake schedule %s: run_count reset to 0",
                         wake_record.schedule_id,
-                        existing.run_count,
                     )
                 else:
                     wake_record.next_run_at = time.time() + (wake_record.interval_seconds or 1)
@@ -6836,7 +6829,7 @@ class TelegramBot:
         )
         team_name = str(args.get("team_name") or "").strip() or record.team_name
         agent_name = (
-            str(args.get("agent_name") or args.get("name") or "").strip()
+            str(args.get("agent_name") or "").strip()
             or record.agent_name
         )
         # timeout_ms and max_turns disabled — all agents run without limits.
