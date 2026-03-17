@@ -43,10 +43,6 @@ class TestV2XMLRoundTrip:
     """build_obs_bootstrap_xml should produce v2 XML with display_name=
     and <agent_name>, and parse_obs_bootstrap_xml should read them back."""
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: XML still uses name= and <native_agent_name>",
-        strict=True,
-    )
     def test_v2_xml_has_display_name_attribute(self):
         xml = build_obs_bootstrap_xml(
             lineage=("Root", "Child"),
@@ -73,10 +69,6 @@ class TestV2XMLRoundTrip:
                 f"obs-node should use display_name=, not name=: {node.attrib}"
             )
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: XML still uses <native_agent_name>",
-        strict=True,
-    )
     def test_v2_xml_has_agent_name_element(self):
         xml = build_obs_bootstrap_xml(
             lineage=("Root",),
@@ -101,10 +93,6 @@ class TestV2XMLRoundTrip:
             "team_context should not have <native_agent_name> in v2"
         )
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: parse doesn't read display_name= or <agent_name>",
-        strict=True,
-    )
     def test_v2_xml_round_trip(self):
         xml = build_obs_bootstrap_xml(
             lineage=("Root", "Worker"),
@@ -159,10 +147,6 @@ class TestV1BackwardCompat:
         # Should work with old field name
         assert parsed.native_agent_name == "hash-child"
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: v1 parsed result should also expose agent_name alias",
-        strict=True,
-    )
     def test_v1_parsed_exposes_agent_name_field(self):
         """After refactor, the parsed result should have agent_name even for v1 input."""
         v1_xml = (
@@ -183,10 +167,6 @@ class TestV1BackwardCompat:
 
 class TestMixedAttributes:
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: parser doesn't check display_name= yet",
-        strict=True,
-    )
     def test_mixed_display_name_and_name_attributes(self):
         """Some nodes with display_name=, some with name= — all should parse."""
         xml = (
@@ -229,10 +209,6 @@ class TestNoVersionField:
 
 class TestAgentNameFunction:
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: function not renamed yet",
-        strict=True,
-    )
     def test_agent_name_for_lineage_exists(self):
         from obs_agent.lineage import agent_name_for_lineage
         # Should produce same results as native_agent_name_for_lineage
@@ -240,10 +216,6 @@ class TestAgentNameFunction:
         assert agent_name_for_lineage(("Root", "Child")) == native_agent_name_for_lineage(("Root", "Child"))
         assert agent_name_for_lineage(("A", "B", "C")) == native_agent_name_for_lineage(("A", "B", "C"))
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: function not renamed yet",
-        strict=True,
-    )
     def test_agent_name_for_lineage_importable(self):
         """The new name should be importable from lineage module."""
         from obs_agent.lineage import agent_name_for_lineage  # noqa: F401
@@ -279,26 +251,20 @@ class TestSessionLineageOutput:
 
 class TestMCPSchemaDisplayName:
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: MCP schema still uses alias/name, not display_name",
-        strict=True,
-    )
     def test_agent_task_schema_has_display_name(self):
         """AgentTask MCP schema should have display_name parameter."""
-        from obs_agent import tools
-        source = inspect.getsource(tools.register_tools)
-        # Find the AgentTask schema dict
+        from pathlib import Path
+        source = Path(__file__).resolve().parents[1].joinpath(
+            "src", "obs_agent", "tools.py"
+        ).read_text()
         assert '"display_name"' in source
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: old params should still be accepted as fallbacks",
-        strict=True,
-    )
     def test_launch_task_accepts_display_name_and_fallbacks(self):
         """_launch_task should read display_name first, then alias, then description, then name."""
-        from obs_agent import tools
-        source = inspect.getsource(tools._launch_task)
-        # Should try display_name first
+        from pathlib import Path
+        source = Path(__file__).resolve().parents[1].joinpath(
+            "src", "obs_agent", "tools.py"
+        ).read_text()
         assert "display_name" in source
 
 
@@ -330,10 +296,6 @@ class TestResumeBugFix:
 
 class TestDroppedAgentKeysRemoved:
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: _dropped_agent_keys still exists",
-        strict=True,
-    )
     def test_no_dropped_agent_keys_attribute(self):
         """TelegramBot should not have _dropped_agent_keys — aggressive collision, no respawn."""
         from obs_agent import telegram
@@ -350,10 +312,6 @@ class TestDroppedAgentKeysRemoved:
 
 class TestTerminologyComment:
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: terminology comment not added yet",
-        strict=True,
-    )
     def test_lineage_has_terminology_comment(self):
         """lineage.py should have a clear two-name terminology comment."""
         from obs_agent import lineage
@@ -369,10 +327,6 @@ class TestTerminologyComment:
 
 class TestBuildXMLNewParamName:
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: build_obs_bootstrap_xml still uses native_agent_name param",
-        strict=True,
-    )
     def test_build_accepts_agent_name_param(self):
         """build_obs_bootstrap_xml should accept agent_name= (not just native_agent_name=)."""
         xml = build_obs_bootstrap_xml(
