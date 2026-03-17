@@ -813,10 +813,9 @@ def create_obs_tools(
                                     json.dumps(updated, ensure_ascii=True),
                                     encoding="utf-8",
                                 )
-                                # This message IS a reply to a must_reply —
-                                # suppress must_reply on the outgoing notification
-                                # to prevent infinite ping-pong loops.
-                                must_reply = False
+                                # This message IS a reply to a must_reply.
+                                # Let the agent decide whether to set must_reply
+                                # on its reply — don't override.
                             if all_replied and hook_state is not None:
                                 # All must_reply messages are replied — signal
                                 # schedule cleanup (handled by telegram.py)

@@ -339,9 +339,9 @@ def create_reply_wake_schedule(route: TelegramRoute) -> _TopicScheduleRecord:
         prompt=(
             "(System: You have unreplied must_reply messages. "
             "Check your inbox with ReadInbox and reply to the senders "
-            "using SendInboxMessage with must_reply=false. "
-            "Do NOT set must_reply=true on your replies — that would "
-            "create an infinite ping-pong loop.)"
+            "using SendInboxMessage. "
+            "Consider using must_reply=false if your reply is an acknowledgement "
+            "or doesn't need an answer back.)"
         ),
         max_runs=3,
         run_count=0,
@@ -6698,15 +6698,14 @@ class TelegramBot:
                 wake_record = create_reply_wake_schedule(recipient_state.route)
                 existing = self._topic_schedules_by_id.get(wake_record.schedule_id)
                 if existing is not None:
-                    # Upsert: do NOT reset run_count — let max_runs cap apply
-                    # cumulatively to prevent infinite ping-pong loops.
+                    # Upsert: reset run_count for the new message — fresh attempts.
                     existing.enabled = True
+                    existing.run_count = 0
                     existing.next_run_at = time.time() + (existing.interval_seconds or 1)
                     self._register_topic_schedule(existing)
                     logger.info(
-                        "Upserted reply_wake schedule %s: run_count=%d (preserved)",
+                        "Upserted reply_wake schedule %s: run_count reset to 0",
                         wake_record.schedule_id,
-                        existing.run_count,
                     )
                 else:
                     wake_record.next_run_at = time.time() + (wake_record.interval_seconds or 1)
