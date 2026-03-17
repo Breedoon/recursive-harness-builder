@@ -6657,14 +6657,15 @@ class TelegramBot:
         if not team_name or not recipient:
             return
 
-        # Clear dedup keys for this agent so the NEW message triggers a wake.
-        # This is called both from the direct notification path (SendInboxMessage)
-        # and from the poller — the poller path already checked the dedup set,
-        # so clearing here only matters for the direct path.
-        self._notified_inbox_keys = {
-            k for k in self._notified_inbox_keys
-            if k[0] != team_name or k[1] != recipient
-        }
+        # Clear dedup keys for this agent so a genuinely NEW message triggers
+        # a wake.  Only do this when called from the DIRECT path (SendInboxMessage)
+        # — the poller already checked the dedup set, and clearing here would
+        # undo that check, causing phantom re-notifications every poll cycle.
+        if payload.get("_direct_send"):
+            self._notified_inbox_keys = {
+                k for k in self._notified_inbox_keys
+                if k[0] != team_name or k[1] != recipient
+            }
 
         # Handle reply_wake_clear signal: all must_reply messages replied
         if payload.get("_reply_wake_clear"):

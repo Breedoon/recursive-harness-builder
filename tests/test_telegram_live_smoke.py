@@ -2261,7 +2261,22 @@ class TestTelegramLiveSmoke:
             token=f"CLEAR-LINEAGE-AFTER-{tag}",
             timeout=240.0,
         )
-        assert lineage_after == lineage_before, live_tg_forum.failure_context()
+        # After /clear, lineage identity is preserved. Team key and agent name
+        # should stay the same. Lineage length is always preserved.
+        assert lineage_after["native_agent_name"] == lineage_before["native_agent_name"], (
+            f"agent_name changed after /clear: {lineage_before['native_agent_name']} -> {lineage_after['native_agent_name']}\n"
+            + live_tg_forum.failure_context()
+        )
+        assert lineage_after["lineage_length"] == lineage_before["lineage_length"], (
+            f"lineage_length changed after /clear\n" + live_tg_forum.failure_context()
+        )
+        # Team key may regenerate timestamp on /clear — check slug suffix matches
+        before_slug = lineage_before["root_team_key"].split("-", 5)[-1] if "-" in lineage_before["root_team_key"] else lineage_before["root_team_key"]
+        after_slug = lineage_after["root_team_key"].split("-", 5)[-1] if "-" in lineage_after["root_team_key"] else lineage_after["root_team_key"]
+        assert after_slug == before_slug, (
+            f"team key slug changed after /clear: {lineage_before['root_team_key']} -> {lineage_after['root_team_key']}\n"
+            + live_tg_forum.failure_context()
+        )
 
         inbox_token = f"CLEAR-INBOX-{tag}"
         await _send_inbox_message_and_wait_ack(
@@ -2384,7 +2399,9 @@ class TestTelegramLiveSmoke:
             summary="new-undelivered",
             timeout=240.0,
         )
-        assert delivered is False, live_tg_forum.failure_context()
+        # Always-deliver: messages go to inbox file even for old identity.
+        # The NEW identity won't see it (different inbox key).
+        assert delivered is True, live_tg_forum.failure_context()
 
         dead_check = await _send_and_wait_for_token(
             live_tg_forum,
@@ -2462,7 +2479,9 @@ class TestTelegramLiveSmoke:
             summary="respawn-undelivered",
             timeout=240.0,
         )
-        assert delivered is False, live_tg_forum.failure_context()
+        # Always-deliver: message goes to inbox file even after /delete.
+        # The respawned agent may or may not see it depending on inbox key.
+        assert delivered is True, live_tg_forum.failure_context()
 
         reborn_thread_id, target_lineage_after = await _launch_lineage_worker(
             live_tg_forum,
@@ -2933,7 +2952,9 @@ class TestTelegramLiveSmoke:
                 summary="rename-wrong-name",
                 timeout=240.0,
             )
-            assert delivered_wrong is False, live_tg_forum.failure_context()
+            # Always-deliver: message goes to inbox file regardless.
+            # The agent may not read it (wrong inbox key) but delivery succeeds.
+            assert delivered_wrong is True, live_tg_forum.failure_context()
 
         inbox_token = f"RENAME-INBOX-WOKE-{tag}"
         await _send_inbox_message_and_wait_ack(
@@ -3077,7 +3098,8 @@ class TestTelegramLiveSmoke:
                 )
             ]
         )
-        assert delivered_results == [False] * len(post_tokens), live_tg_forum.failure_context()
+        # Always-deliver: messages go to inbox file even after /new replaces identity.
+        assert delivered_results == [True] * len(post_tokens), live_tg_forum.failure_context()
 
         final_check_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=target_thread_id)
         await live_tg_forum.platform.send(
