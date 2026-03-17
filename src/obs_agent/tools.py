@@ -283,10 +283,7 @@ def create_obs_tools(
                 "type": "string",
                 "description": "Optional agentId to resume an existing fork task",
             },
-            "run_in_background": {
-                "type": "boolean",
-                "description": "Must be true for ForkTask",
-            },
+            # run_in_background: hardcoded true, not exposed in MCP schema
             # timeout_ms and max_turns: kept for internal/future use — not exposed in MCP schema
             "name": {
                 "type": "string",
@@ -331,10 +328,7 @@ def create_obs_tools(
                 "type": "boolean",
                 "description": "When true, fork from parent head; when false, start fresh",
             },
-            "run_in_background": {
-                "type": "boolean",
-                "description": "Must be true for AgentTask",
-            },
+            # run_in_background: hardcoded true, not exposed in MCP schema
             # timeout_ms and max_turns: kept for internal/future use — not exposed in MCP schema
             "name": {
                 "type": "string",
@@ -715,7 +709,8 @@ def create_obs_tools(
         sender = str(args.get("sender", "")).strip() or (
             bootstrap.native_agent_name if bootstrap is not None and bootstrap.native_agent_name else "obs-worker"
         )
-        must_reply = bool(args.get("must_reply", False))
+        # needs_reply is the canonical name; must_reply accepted for backward compat
+        must_reply = bool(args.get("needs_reply") or args.get("must_reply") or False)
         if not team_name:
             return _error_result(
                 "Cannot use SendInboxMessage: team_name is required or must be inferable from current lineage"
@@ -755,6 +750,14 @@ def create_obs_tools(
             / "inboxes"
             / f"{recipient}.json"
         )
+        # Validate recipient exists — inbox file must already exist.
+        # Inbox files are created when agents are launched, not on first message.
+        if not inbox_path.exists():
+            return {
+                "content": [{"type": "text", "text": f"recipient not found: no inbox exists for '{recipient}'"}],
+                "tool_use_result": {"success": False, "delivered": False, "error": f"recipient not found: no inbox for '{recipient}'"},
+                "is_error": True,
+            }
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         lock = _inbox_lock(inbox_path)
         async with lock:
@@ -948,7 +951,7 @@ def create_obs_tools(
             "content": {"type": "string", "description": "Message body"},
             "summary": {"type": "string", "description": "Optional short summary"},
             "sender": {"type": "string", "description": "Optional sender label"},
-            "must_reply": {"type": "boolean", "description": "ADVANCED: Do NOT use unless explicitly instructed. Forces recipient to reply via wake schedule. Default false."},
+            "needs_reply": {"type": "boolean", "description": "Set true when asking a question or sending a request that requires a response from the recipient. Default false."},
         },
     )
     async def send_inbox_message(args: dict) -> dict:
@@ -1095,7 +1098,11 @@ def create_obs_tools(
         if who in {"parent", "all"}:
             if len(my_lineage) > 1:
                 parent_lineage = my_lineage[:-1]
-                parent_name = native_agent_name_for_lineage(parent_lineage)
+                if len(parent_lineage) == 1:
+                    # Parent is trunk — trunk agent_name = team key
+                    parent_name = bootstrap.root_team_key or ""
+                else:
+                    parent_name = native_agent_name_for_lineage(parent_lineage)
                 result["parent"] = [parent_name] if parent_name in all_agents else []
             else:
                 result["parent"] = []  # trunk has no parent

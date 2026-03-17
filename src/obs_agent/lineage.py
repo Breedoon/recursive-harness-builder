@@ -90,12 +90,18 @@ def root_team_key_for_lineage(
     return f"{prefix}-{slug}"
 
 
-def native_agent_name_for_lineage(lineage: Sequence[str]) -> str:
+def native_agent_name_for_lineage(
+    lineage: Sequence[str],
+    *,
+    team_key: str | None = None,
+) -> str:
     """Project a lineage member onto one safe native agent name.
 
     Two-tier naming:
-    - **Trunk** (single-element lineage): just the slug, no prefix.
-      E.g. ``("My Topic",)`` → ``"my-topic"``
+    - **Trunk** (single-element lineage): the team key if provided,
+      otherwise just the slug.  In the Telegram runtime the trunk
+      agent_name *is* the team key (``_default_team_projection``
+      overrides this).
     - **Child** (multi-element lineage): ``{parent_lineage_hash}-{slug}``.
       E.g. ``("Root", "Worker")`` → ``"{hash_of_Root}-worker"``
 
@@ -108,8 +114,9 @@ def native_agent_name_for_lineage(lineage: Sequence[str]) -> str:
     leaf = normalize_lineage_name(lineage[-1])
     slug = slugify_projection_label(leaf, fallback="node")
     if len(lineage) == 1:
-        # Trunk: no hash prefix
-        return slug
+        # Trunk: use team key if provided (matches Telegram runtime),
+        # otherwise just the slug.
+        return team_key if team_key else slug
     # Child: prefix with parent lineage hash
     parent_lineage = tuple(normalize_lineage_name(n) for n in lineage[:-1])
     parent_hash = lineage_fingerprint(parent_lineage)

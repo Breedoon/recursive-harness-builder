@@ -86,15 +86,14 @@ class TestMustReplyPingPongLoop:
         # (it requires a full bot), but we verify the schedule's
         # initial state is correct.
 
-    def test_wake_prompt_tells_agent_must_reply_false(self):
-        """The reply_wake schedule prompt should explicitly tell the agent
-        to use must_reply=false."""
+    def test_wake_prompt_tells_agent_to_check_inbox(self):
+        """The reply_wake schedule prompt should tell the agent to check inbox."""
         from obs_agent.telegram import create_reply_wake_schedule, TelegramRoute
 
         route = TelegramRoute(chat_id=12345, thread_id=678)
         schedule = create_reply_wake_schedule(route)
-        assert "must_reply=false" in schedule.prompt.lower()
-        assert "acknowledgement" in schedule.prompt.lower()
+        assert "inbox" in schedule.prompt.lower()
+        assert "reply" in schedule.prompt.lower()
 
 
 # ---------------------------------------------------------------------------

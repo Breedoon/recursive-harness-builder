@@ -337,11 +337,9 @@ def create_reply_wake_schedule(route: TelegramRoute) -> _TopicScheduleRecord:
         trigger_kind="interval",
         interval_seconds=1,
         prompt=(
-            "(System: You have unreplied must_reply messages. "
+            "(System: You have messages you haven't replied to. "
             "Check your inbox with ReadInbox and reply to the senders "
-            "using SendInboxMessage. "
-            "Consider using must_reply=false if your reply is an acknowledgement "
-            "or doesn't need an answer back.)"
+            "using SendInboxMessage.)"
         ),
         max_runs=3,
         run_count=0,
