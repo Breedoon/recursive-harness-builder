@@ -45,7 +45,7 @@ class TestGetFamilyTrunkParent:
         for trunk parent), not in agent_name_for_lineage (pure function).
         Verify the tool source has the trunk special case.
         """
-        source = Path("/tmp/obs-final-fixes/src/obs_agent/tools.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / "src" / "obs_agent" / "tools.py").read_text()
         # The get_family tool should use root_team_key for trunk parent lookup
         assert "root_team_key" in source[source.index("get_family"):], (
             "get_family tool should use bootstrap.root_team_key for trunk parent lookup"
@@ -82,7 +82,7 @@ class TestRecipientValidation:
     def test_message_to_nonexistent_agent_should_error(self):
         """If no inbox file exists for the recipient, it's an error."""
         # Read the source to verify the check exists
-        source = Path("/tmp/obs-final-fixes/src/obs_agent/tools.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / "src" / "obs_agent" / "tools.py").read_text()
         # Should check if inbox file exists before writing
         assert "inbox_path.exists()" in source or "not inbox_path.exists()" in source, (
             "SendInboxMessage has no recipient validation — messages to "
@@ -100,14 +100,14 @@ class TestNeedsReplyRename:
 
     def test_schema_has_needs_reply(self):
         """SendInboxMessage schema should have needs_reply, not must_reply."""
-        source = Path("/tmp/obs-final-fixes/src/obs_agent/tools.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / "src" / "obs_agent" / "tools.py").read_text()
         assert '"needs_reply"' in source, (
             "SendInboxMessage schema should have 'needs_reply' parameter"
         )
 
     def test_schema_needs_reply_description(self):
         """needs_reply description should guide agents on when to use it."""
-        source = Path("/tmp/obs-final-fixes/src/obs_agent/tools.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / "src" / "obs_agent" / "tools.py").read_text()
         # Should mention questions or requests
         assert "question" in source.lower() or "request" in source.lower(), (
             "needs_reply description should mention questions or requests"
@@ -115,7 +115,7 @@ class TestNeedsReplyRename:
 
     def test_must_reply_still_accepted_as_fallback(self):
         """Old must_reply param should still work for backward compat."""
-        source = Path("/tmp/obs-final-fixes/src/obs_agent/tools.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / "src" / "obs_agent" / "tools.py").read_text()
         # Should read needs_reply first, fall back to must_reply
         assert "needs_reply" in source and "must_reply" in source, (
             "Should accept both needs_reply (new) and must_reply (compat)"
@@ -131,7 +131,7 @@ class TestRunInBackgroundRemoved:
 
     def test_run_in_background_not_in_schema(self):
         """Schema should not expose run_in_background."""
-        source = Path("/tmp/obs-final-fixes/src/obs_agent/tools.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / "src" / "obs_agent" / "tools.py").read_text()
         # Count occurrences in schema dicts — should not be a schema parameter
         # It should still exist in the handler code but not in the schema
         # Look for it specifically in the schema definition blocks

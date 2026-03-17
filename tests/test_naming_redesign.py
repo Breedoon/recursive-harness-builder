@@ -363,8 +363,8 @@ class TestXMLEnrichment:
         root = ET.fromstring(xml)
         nodes = root.findall(".//obs-node")
 
-        # First node (trunk): just the slug
-        assert nodes[0].attrib["agent_name"] == "root-topic"
+        # First node (trunk): uses the passed agent_name (= team key in production)
+        assert nodes[0].attrib["agent_name"] == "test-agent"
         # Second node (child): {parent_hash}-{slug}
         expected_child = native_agent_name_for_lineage(("Root Topic", "Worker Agent"))
         assert nodes[1].attrib["agent_name"] == expected_child
