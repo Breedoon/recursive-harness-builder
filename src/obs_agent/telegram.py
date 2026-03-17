@@ -241,6 +241,14 @@ class TelegramSessionState:
         return self.session_manager.session_id
 
 
+class _TopicDeletedError(Exception):
+    """Raised when a Telegram topic has been deleted (thread not found)."""
+
+    def __init__(self, route: "TelegramRoute") -> None:
+        self.route = route
+        super().__init__(f"Topic deleted for route {route}")
+
+
 @dataclass
 class _ForkTaskRecord:
     """In-memory lifecycle record for an agent-launched child topic."""
@@ -616,6 +624,10 @@ class TelegramBot:
         self._route_inbox_targets: dict[tuple[str, str], TelegramRoute] = {}
         self._route_inbox_target_keys_by_route: dict[TelegramRoute, tuple[str, str]] = {}
         self._chat_titles: dict[int, str] = {}
+        # Dedup set for inbox wake polling — prevents re-triggering the same
+        # unread message every poll cycle.  Cleared on daemon restart (correct:
+        # you want to re-notify after restart) and when a NEW message arrives.
+        self._notified_inbox_keys: set[tuple[str, str, str]] = set()
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
         self._schedule_running_by_route: set[TelegramRoute] = set()
@@ -852,6 +864,17 @@ class TelegramBot:
                         self._sender_chat_blacklist.setdefault(op.route.chat_id, set()).add(id(candidate))
                         last_error = exc
                         continue
+                    if (
+                        "message thread not found" in msg_lower
+                        or "topic_deleted" in msg_lower
+                        or "topic_closed" in msg_lower
+                    ):
+                        logger.warning(
+                            "Topic deleted/closed for route=%s: %s",
+                            op.route,
+                            exc,
+                        )
+                        raise _TopicDeletedError(op.route) from exc
                     raise
                 except TelegramError as exc:
                     attempt += 1
@@ -1020,6 +1043,13 @@ class TelegramBot:
         )
         try:
             return await future
+        except _TopicDeletedError:
+            logger.warning(
+                "Topic deleted for route=%s — dropping route state",
+                route,
+            )
+            await self._drop_route_state(route, terminal_status="failed")
+            return None
         finally:
             await self._maybe_stop_transport_worker()
 
@@ -1480,21 +1510,28 @@ class TelegramBot:
                     )
                 )
             elif state.agent_lineage:
-                # On restore without bootstrap: derive agent name (deterministic)
-                # but do NOT generate a new timestamp team key — try to find existing
-                default_agent_name = native_agent_name_for_lineage(state.agent_lineage)
-                # Scan for existing team dir matching this lineage's slug
-                existing_team_key = self._find_existing_team_key_for_lineage(state.agent_lineage)
-                if existing_team_key:
+                # On restore without bootstrap: check SDK env overrides for
+                # persisted team key.  NEVER regenerate a timestamp — the
+                # team key was set once at creation and must be restored.
+                env = state.session_manager.sdk_env_overrides
+                persisted_team = env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
+                persisted_agent = env.get("CLAUDE_CODE_AGENT_NAME", "").strip()
+                if persisted_team and persisted_agent:
+                    # Already restored from SQLite — nothing to do
+                    pass
+                elif persisted_team:
+                    # Have team but no agent name — derive it
+                    default_agent_name = native_agent_name_for_lineage(state.agent_lineage)
                     state.session_manager.set_sdk_env_overrides(
                         self._build_team_worker_env(
-                            team_name=existing_team_key,
+                            team_name=persisted_team,
                             agent_name=default_agent_name,
                         )
                     )
                 else:
-                    # Truly first creation — generate timestamp team key
-                    default_team_name, _ = self._default_team_projection(state.agent_lineage)
+                    # No persisted team key at all — this is truly first
+                    # creation (not a restart).  Generate a new team key.
+                    default_team_name, default_agent_name = self._default_team_projection(state.agent_lineage)
                     state.session_manager.set_sdk_env_overrides(
                         self._build_team_worker_env(
                             team_name=default_team_name,
@@ -1925,10 +1962,11 @@ class TelegramBot:
         self,
         lineage: tuple[str, ...],
     ) -> tuple[str, str]:
-        return (
-            root_team_key_for_lineage(lineage),
-            native_agent_name_for_lineage(lineage),
-        )
+        team_key = root_team_key_for_lineage(lineage)
+        if len(lineage) <= 1:
+            # Trunk: agent_name = team_key (they must be identical)
+            return team_key, team_key
+        return team_key, native_agent_name_for_lineage(lineage)
 
     def _get_parent_team_key(self, state: TelegramSessionState) -> str | None:
         """Extract the root_team_key from a state's SDK env overrides or bootstrap."""
@@ -1945,35 +1983,6 @@ class TelegramBot:
             except Exception:
                 pass
         return None
-
-    def _find_existing_team_key_for_lineage(
-        self,
-        lineage: tuple[str, ...],
-    ) -> str | None:
-        """Find an existing team directory whose slug matches this lineage.
-
-        When restoring after restart, we need the ORIGINAL team key (with its
-        timestamp) rather than generating a new one.  Scans ``~/.claude/teams/``
-        for directories ending in ``-{slug}`` where *slug* is derived from the
-        lineage root.
-        """
-        if not lineage:
-            return None
-        root = normalize_lineage_name(lineage[0])
-        slug = slugify_projection_label(root, fallback="root")
-        teams_dir = Path.home() / ".claude" / "teams"
-        if not teams_dir.is_dir():
-            return None
-        # Find the most recent team dir matching the slug suffix
-        candidates = []
-        for d in teams_dir.iterdir():
-            if d.is_dir() and d.name.endswith(f"-{slug}"):
-                candidates.append(d.name)
-        if not candidates:
-            return None
-        # Return the most recent (lexicographically last, since timestamp prefix sorts)
-        candidates.sort()
-        return candidates[-1]
 
     def _state_inbox_projection(
         self,
@@ -6323,6 +6332,11 @@ class TelegramBot:
             if latest is None:
                 continue
             sender, summary, content = latest
+            fingerprint = f"{sender}:{summary}:{content}"[:200]
+            dedup_key = (team_name, agent_name, fingerprint)
+            if dedup_key in self._notified_inbox_keys:
+                continue
+            self._notified_inbox_keys.add(dedup_key)
             await self._handle_inbox_message_notification(
                 sender_route=record.child_route,
                 payload={
@@ -6347,6 +6361,11 @@ class TelegramBot:
             if latest is None:
                 continue
             sender, summary, content = latest
+            fingerprint = f"{sender}:{summary}:{content}"[:200]
+            dedup_key = (key[0], key[1], fingerprint)
+            if dedup_key in self._notified_inbox_keys:
+                continue
+            self._notified_inbox_keys.add(dedup_key)
             await self._handle_inbox_message_notification(
                 sender_route=route,
                 payload={
@@ -6533,6 +6552,15 @@ class TelegramBot:
         if not team_name or not recipient:
             return
 
+        # Clear dedup keys for this agent so the NEW message triggers a wake.
+        # This is called both from the direct notification path (SendInboxMessage)
+        # and from the poller — the poller path already checked the dedup set,
+        # so clearing here only matters for the direct path.
+        self._notified_inbox_keys = {
+            k for k in self._notified_inbox_keys
+            if k[0] != team_name or k[1] != recipient
+        }
+
         # Handle reply_wake_clear signal: all must_reply messages replied
         if payload.get("_reply_wake_clear"):
             # Find and delete the reply_wake schedule for the recipient's route
@@ -6695,8 +6723,9 @@ class TelegramBot:
             str(args.get("agent_name") or args.get("name") or "").strip()
             or record.agent_name
         )
-        timeout_ms = self._coerce_timeout_ms(args.get("timeout_ms"))
-        max_turns = self._coerce_max_turns(args.get("max_turns"))
+        # timeout_ms and max_turns disabled — all agents run without limits.
+        timeout_ms = None
+        max_turns = None
         child_state = self._get_state(record.child_route, create=False)
         if child_state is None or state.last_bot is None:
             return self._task_not_found_result(task_id)
@@ -6872,8 +6901,9 @@ class TelegramBot:
         task_id = str(uuid.uuid4())
         description = str(args.get("alias") or args.get("description") or "").strip() or None
         prompt = str(args["prompt"])
-        timeout_ms = self._coerce_timeout_ms(args.get("timeout_ms"))
-        max_turns = self._coerce_max_turns(args.get("max_turns"))
+        # timeout_ms and max_turns disabled — all agents run without limits.
+        timeout_ms = None
+        max_turns = None
         lineage_name, topic_name = self._next_topic_alias_and_title(state, description)
         source_link = (
             self._build_message_link(source_route, source_message_id)
@@ -7497,16 +7527,29 @@ class TelegramBot:
         route = self._route_for_message(update.effective_message)
         if len(context.args) == 1 and context.args[0].strip().lower() == "all":
             targets = [candidate for candidate in self._routes_in_chat(route.chat_id) if candidate.thread_id is not None]
+            # Drop state FIRST (non-blocking cleanup), then fire-and-forget
+            # the Telegram topic deletion.  Previous implementation awaited
+            # each delete future sequentially which deadlocked when the
+            # transport worker was busy.
+            for target in targets:
+                await self._drop_route_state(target, terminal_status="failed")
             for target in targets:
                 try:
-                    await self._enqueue_delete_topic(
-                        route=target,
-                        fallback_bot=context.bot,
-                        priority=_PRIORITY_SYSTEM,
+                    await self._ensure_transport_worker()
+                    self._increment_pending_chat_ops(target.chat_id)
+                    await self._transport_queue.put(
+                        _TransportEnvelope(
+                            priority=_PRIORITY_SYSTEM,
+                            sequence=self._next_transport_sequence(),
+                            op=_TransportDeleteTopicOp(
+                                route=target,
+                                fallback_bot=context.bot,
+                                future=asyncio.get_running_loop().create_future(),
+                            ),
+                        )
                     )
                 except Exception:
-                    logger.debug("Failed deleting topic route=%s", target, exc_info=True)
-                await self._drop_route_state(target, terminal_status="failed")
+                    logger.debug("Failed enqueueing delete for route=%s", target, exc_info=True)
             reply_route = route if route.thread_id is None else TelegramRoute(chat_id=route.chat_id, thread_id=None)
             await self._send_system_message(
                 route=reply_route,

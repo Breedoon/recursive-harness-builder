@@ -393,3 +393,92 @@ class TestBug4TrunkNameEqualsTeamName:
             f"team name slug '{team_slug}' (from team_name '{team_name}'). "
             f"They should be identical."
         )
+
+
+# ---------------------------------------------------------------------------
+# BUG 5: Daemon restart creates new team instead of restoring old one
+# After daemon restart, the trunk agent gets a NEW team key (new timestamp)
+# instead of restoring the persisted one from the JSONL. This breaks all
+# inbox routing — messages go to the wrong team directory.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+@pytest.mark.timeout(600)
+class TestBug5RestartChangesTeam:
+    """Reproduce: daemon restart creates new team instead of restoring."""
+
+    @pytest.mark.xfail(
+        reason="BUG: daemon restart generates new timestamp team key "
+               "instead of restoring from JSONL — breaks inbox routing",
+        strict=True,
+    )
+    async def test_team_key_survives_daemon_restart(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        """Create a session, record team key, restart bot, verify same key."""
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+
+        # Create a topic and get its team key
+        thread_id = await live_tg_forum.platform.create_topic(f"Restart {tag}")
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"Reply with only RESTART-PRIME-{tag}.",
+            thread_id=thread_id,
+            token=f"RESTART-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        lineage_before = await _query_session_lineage(
+            live_tg_forum,
+            thread_id=thread_id,
+            token=f"RESTART-LIN1-{tag}",
+            timeout=240.0,
+        )
+        team_before = _extract_lineage_fact_line(lineage_before, "root_team_key")
+        agent_before = _extract_lineage_fact_line(lineage_before, "native_agent_name")
+        assert team_before, "Could not extract team key before restart"
+        assert agent_before, "Could not extract agent name before restart"
+
+        # Restart the bot
+        _stop_bot(live_tg_forum.proc)
+        await asyncio.sleep(3)
+        new_proc, new_log = _start_bot(
+            live_tg_forum.vault_path,
+            live_tg_forum.temp_root,
+            state_db_path=live_tg_forum.state_db_path,
+        )
+        live_tg_forum.proc = new_proc
+        live_tg_forum.log_file = new_log
+        await asyncio.sleep(10)  # Let bot reconnect
+
+        # Send a message to the same topic — should restore the session
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"After restart. Reply with only RESTART-AFTER-{tag}.",
+            thread_id=thread_id,
+            token=f"RESTART-AFTER-{tag}",
+            timeout=180.0,
+        )
+
+        lineage_after = await _query_session_lineage(
+            live_tg_forum,
+            thread_id=thread_id,
+            token=f"RESTART-LIN2-{tag}",
+            timeout=240.0,
+        )
+        team_after = _extract_lineage_fact_line(lineage_after, "root_team_key")
+        agent_after = _extract_lineage_fact_line(lineage_after, "native_agent_name")
+
+        assert team_after == team_before, (
+            f"RESTART TEAM BUG: team key changed after restart! "
+            f"Before: {team_before}, After: {team_after}. "
+            f"Team key should be deterministically restored from JSONL."
+        )
+        assert agent_after == agent_before, (
+            f"RESTART AGENT BUG: agent name changed after restart! "
+            f"Before: {agent_before}, After: {agent_after}."
+        )
