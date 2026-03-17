@@ -29,6 +29,7 @@ from obs_agent.context_stats import (
 from obs_agent.lineage import (
     find_latest_obs_bootstrap_for_session,
     lineage_fingerprint,
+    agent_name_for_lineage,
     native_agent_name_for_lineage,
     normalize_lineage_name,
     parse_obs_bootstrap_xml,
@@ -182,13 +183,13 @@ def create_obs_tools(
         default_fork: bool,
     ) -> dict:
         prompt = str(args.get("prompt", "")).strip()
-        # 'name', 'alias', and 'description' all serve as the display name
-        # (lineage alias). With two-tier naming, this is NOT the machine
-        # agent_name — that is computed from the lineage by
-        # _create_child_fork_topic via native_agent_name_for_lineage.
-        description = str(
-            args.get("alias") or args.get("description") or args.get("name") or ""
+        # display_name is the canonical param. alias/description/name are
+        # deprecated fallbacks. This is the human-readable label, NOT the
+        # machine agent_name (computed from lineage by agent_name_for_lineage).
+        display_name = str(
+            args.get("display_name") or args.get("alias") or args.get("description") or args.get("name") or ""
         ).strip() or None
+        description = display_name  # Internal payload still uses "description" key
         resume = _normalize_resume_arg(args.get("resume"))
         run_in_background = args.get("run_in_background")
         team_name = str(args.get("team_name", "")).strip() or None
@@ -266,13 +267,17 @@ def create_obs_tools(
                 "type": "string",
                 "description": "Full task prompt for the forked child session",
             },
+            "display_name": {
+                "type": "string",
+                "description": "Human-readable name for the child agent (used in topic titles and lineage).",
+            },
             "alias": {
                 "type": "string",
-                "description": "Short stable alias for the child agent/topic.",
+                "description": "Deprecated: use display_name.",
             },
             "description": {
                 "type": "string",
-                "description": "Deprecated alias for alias.",
+                "description": "Deprecated: use display_name.",
             },
             "resume": {
                 "type": "string",
@@ -285,7 +290,7 @@ def create_obs_tools(
             # timeout_ms and max_turns: kept for internal/future use — not exposed in MCP schema
             "name": {
                 "type": "string",
-                "description": "Optional worker name (team workflows).",
+                "description": "Deprecated: use display_name.",
             },
             "team_name": {
                 "type": "string",
@@ -306,13 +311,17 @@ def create_obs_tools(
                 "type": "string",
                 "description": "Full task prompt for the child session",
             },
+            "display_name": {
+                "type": "string",
+                "description": "Human-readable name for the child agent (used in topic titles and lineage).",
+            },
             "alias": {
                 "type": "string",
-                "description": "Short stable alias for the child agent/topic.",
+                "description": "Deprecated: use display_name.",
             },
             "description": {
                 "type": "string",
-                "description": "Deprecated alias for alias.",
+                "description": "Deprecated: use display_name.",
             },
             "resume": {
                 "type": "string",
@@ -329,7 +338,7 @@ def create_obs_tools(
             # timeout_ms and max_turns: kept for internal/future use — not exposed in MCP schema
             "name": {
                 "type": "string",
-                "description": "Optional worker name (team workflows).",
+                "description": "Deprecated: use display_name.",
             },
             "team_name": {
                 "type": "string",
@@ -1019,7 +1028,7 @@ def create_obs_tools(
             "agent_id": bootstrap.agent_id,
             "parent_session_id": bootstrap.parent_session_id,
             "root_team_key": bootstrap.root_team_key,
-            "native_agent_name": bootstrap.native_agent_name,
+            "agent_name": bootstrap.agent_name,
             "path": "/".join(bootstrap.lineage),
         }
         # Compute agent_names for each node in the lineage
