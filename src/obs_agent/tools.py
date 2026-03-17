@@ -821,6 +821,7 @@ def create_obs_tools(
                                                 "content": "__reply_wake_clear__",
                                                 "summary": "all must_reply messages replied",
                                                 "_reply_wake_clear": True,
+                                                "_direct_send": True,
                                             }
                                         )
                                     except Exception:
@@ -847,6 +848,7 @@ def create_obs_tools(
                     "sender": sender,
                     "content": content,
                     "summary": summary,
+                    "_direct_send": True,
                 }
                 if must_reply:
                     notification_payload["_must_reply"] = True
