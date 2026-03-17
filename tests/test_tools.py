@@ -629,6 +629,7 @@ class TestForkTaskTool:
                 "sender": "lead",
                 "content": "hello team",
                 "summary": "greeting",
+                "_direct_send": True,
             }
         )
 
