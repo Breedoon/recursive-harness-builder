@@ -227,15 +227,11 @@ class TestAgentNameFunction:
 
 class TestSessionLineageOutput:
 
-    @pytest.mark.xfail(
-        reason="NOT IMPLEMENTED: session_lineage still outputs native_agent_name",
-        strict=True,
-    )
     def test_session_lineage_output_has_agent_name_not_native(self):
         """session_lineage tool output should have 'agent_name' field."""
         # We can't easily call the tool, so inspect the source
         from obs_agent import tools
-        source = inspect.getsource(tools.register_tools)
+        source = inspect.getsource(tools.create_obs_tools)
         # The output dict should use "agent_name", not "native_agent_name"
         assert '"agent_name"' in source or "'agent_name'" in source
         # And should NOT have the old name in the output dict
