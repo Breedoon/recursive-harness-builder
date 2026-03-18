@@ -124,34 +124,44 @@ class TestIntegrationAudit:
         # Check for success indicators
         successes = [ind for ind in SUCCESS_INDICATORS if ind in full_lower]
 
-        # --- OUTPUT ---
-        print("\n" + "=" * 80)
-        print("INTEGRATION AUDIT RESULTS")
-        print("=" * 80)
+        # --- OUTPUT (to file and stdout) ---
+        report_path = Path("/tmp/obs-audit-report.txt")
+        lines: list[str] = []
+        def out(s: str = "") -> None:
+            print(s)
+            lines.append(s)
 
-        print(f"\nTotal bot messages: {len(all_messages)}")
-        print(f"Success indicators found: {successes}")
+        out("\n" + "=" * 80)
+        out("INTEGRATION AUDIT RESULTS")
+        out("=" * 80)
+
+        out(f"\nTotal bot messages: {len(all_messages)}")
+        out(f"Success indicators found: {successes}")
 
         if broken_found:
-            print(f"\n⚠️  BROKEN INDICATORS ({len(broken_found)}):")
+            out(f"\n⚠️  BROKEN INDICATORS ({len(broken_found)}):")
             for b in broken_found:
-                print(b)
+                out(b)
         else:
-            print("\n✅ No broken indicators found")
+            out("\n✅ No broken indicators found")
 
-        print(f"\n{'=' * 40}")
-        print("FINAL REPORT (last 3 substantial messages):")
-        print(f"{'=' * 40}")
-        print(final_report if final_report else "(no final report found)")
+        out(f"\n{"=" * 40}")
+        out("FINAL REPORT (last 3 substantial messages):")
+        out(f"{'=' * 40}")
+        out(final_report if final_report else "(no final report found)")
 
-        print(f"\n{'=' * 40}")
-        print("FULL CONVERSATION (all messages):")
-        print(f"{'=' * 40}")
+        out(f"\n{"=" * 40}")
+        out("FULL CONVERSATION (all messages):")
+        out(f"{'=' * 40}")
         for i, m in enumerate(all_messages):
             if m.text.strip():
-                print(f"\n[msg {i+1}, id={m.message_id}]")
-                print(m.text)
-                print("---")
+                out(f"\n[msg {i+1}, id={m.message_id}]")
+                out(m.text)
+                out("---")
+
+        # Write report to file for background runs
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        out(f"\n📄 Report written to {report_path}")
 
         # The test always "passes" — it's an audit, not a pass/fail.
         # The output is what matters. But flag if there are critical errors.
