@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -26,15 +27,22 @@ We recently shipped a multi-level team system with agent identities and messagin
 
 First, show me the raw bootstrap XML from your system prompt.
 
-Then find your lineage and identity.
+Then find your lineage and identity using whatever tools are available.
 
-Launch 5 sub-agents at 3 different depths — you decide the structure. Have each one check their own lineage and identity too.
+Launch 5 sub-agents at 3 different depths — you decide the structure. In their prompts, tell each one to: (1) check their own lineage/identity, (2) send a message to their parent, (3) report whether they received a system notification about unread messages when they were woken up.
 
-Once they're all running, have them message each other — cross-branch, different depths, leaf to root, whatever coverage you can get.
+Once they've all had time to work, wait 30 seconds without doing anything, then check your inbox. Note whether you received a system notification about new teammate messages (it would appear as a system message like "New teammate messages arrived"). Report: "Did I receive a system wake notification? Yes/No."
 
-After everyone has communicated, send each of them a message asking for their honest assessment of what worked and what didn't. Ask them to reply.
+Also try sending a message to one of your children using just their alias (e.g. just "Alpha" instead of the full hash-prefix name). Report whether alias-based messaging worked.
 
-Then give me a final report: which tools worked, which didn't, which messages were delivered, which agents got woken up properly, and any errors or surprising behavior.\
+After that, send each agent a message asking for their honest assessment. Ask them to reply.
+
+Then give me a final report. Specifically note:
+(a) Whether you and your agents received system notifications about unread messages
+(b) Whether alias-based messaging worked (sending to just the alias vs the full hash-prefix name)
+(c) Any tools that returned errors
+(d) Which messages were delivered and which weren't
+(e) Any surprising or broken behavior\
 """
 
 # Keywords that indicate broken functionality (not just preferences)
@@ -124,34 +132,44 @@ class TestIntegrationAudit:
         # Check for success indicators
         successes = [ind for ind in SUCCESS_INDICATORS if ind in full_lower]
 
-        # --- OUTPUT ---
-        print("\n" + "=" * 80)
-        print("INTEGRATION AUDIT RESULTS")
-        print("=" * 80)
+        # --- OUTPUT (to file and stdout) ---
+        report_path = Path("/tmp/obs-audit-report.txt")
+        lines: list[str] = []
+        def out(s: str = "") -> None:
+            print(s)
+            lines.append(s)
 
-        print(f"\nTotal bot messages: {len(all_messages)}")
-        print(f"Success indicators found: {successes}")
+        out("\n" + "=" * 80)
+        out("INTEGRATION AUDIT RESULTS")
+        out("=" * 80)
+
+        out(f"\nTotal bot messages: {len(all_messages)}")
+        out(f"Success indicators found: {successes}")
 
         if broken_found:
-            print(f"\n⚠️  BROKEN INDICATORS ({len(broken_found)}):")
+            out(f"\n⚠️  BROKEN INDICATORS ({len(broken_found)}):")
             for b in broken_found:
-                print(b)
+                out(b)
         else:
-            print("\n✅ No broken indicators found")
+            out("\n✅ No broken indicators found")
 
-        print(f"\n{'=' * 40}")
-        print("FINAL REPORT (last 3 substantial messages):")
-        print(f"{'=' * 40}")
-        print(final_report if final_report else "(no final report found)")
+        out(f"\n{"=" * 40}")
+        out("FINAL REPORT (last 3 substantial messages):")
+        out(f"{'=' * 40}")
+        out(final_report if final_report else "(no final report found)")
 
-        print(f"\n{'=' * 40}")
-        print("FULL CONVERSATION (all messages):")
-        print(f"{'=' * 40}")
+        out(f"\n{"=" * 40}")
+        out("FULL CONVERSATION (all messages):")
+        out(f"{'=' * 40}")
         for i, m in enumerate(all_messages):
             if m.text.strip():
-                print(f"\n[msg {i+1}, id={m.message_id}]")
-                print(m.text)
-                print("---")
+                out(f"\n[msg {i+1}, id={m.message_id}]")
+                out(m.text)
+                out("---")
+
+        # Write report to file for background runs
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        out(f"\n📄 Report written to {report_path}")
 
         # The test always "passes" — it's an audit, not a pass/fail.
         # The output is what matters. But flag if there are critical errors.
