@@ -22,9 +22,11 @@ from tests.test_telegram_live_forum_topics import (
 
 
 AUDIT_PROMPT = """\
-Show me the raw bootstrap XML from your system prompt first.
+We recently shipped a multi-level team system with agent identities and messaging. I want you to stress-test it.
 
-Then find your lineage and identity — figure out which tools are available to you for this.
+First, show me the raw bootstrap XML from your system prompt.
+
+Then find your lineage and identity.
 
 Launch 5 sub-agents at 3 different depths — you decide the structure. Have each one check their own lineage and identity too.
 
@@ -62,7 +64,7 @@ SUCCESS_INDICATORS = [
 @pytest.mark.integration
 @pytest.mark.telegram
 @pytest.mark.telegram_smoke
-@pytest.mark.timeout(900)  # 15 minutes max
+@pytest.mark.timeout(1200)  # 20 minutes max (audit needs 15, buffer for setup)
 class TestIntegrationAudit:
     """Open-ended integration audit of the team/messaging system."""
 
@@ -87,7 +89,7 @@ class TestIntegrationAudit:
 
         # Wait for the agent to work — check periodically for the
         # "final report" or timeout after 10 minutes
-        deadline = asyncio.get_running_loop().time() + 600  # 10 min
+        deadline = asyncio.get_running_loop().time() + 900  # 15 min
         last_message_id = 0
         stable_count = 0
         final_messages: list[str] = []
@@ -163,14 +165,18 @@ class TestIntegrationAudit:
             print("\n✅ No broken indicators found")
 
         print(f"\n{'=' * 40}")
-        print("FINAL REPORT FROM AGENT:")
+        print("FINAL REPORT (last 3 substantial messages):")
         print(f"{'=' * 40}")
-        print(final_report[:3000] if final_report else "(no final report found)")
+        print(final_report if final_report else "(no final report found)")
 
         print(f"\n{'=' * 40}")
-        print("FULL CONVERSATION:")
+        print("FULL CONVERSATION (all messages):")
         print(f"{'=' * 40}")
-        print(full_text[:8000])
+        for i, m in enumerate(all_messages):
+            if m.text.strip():
+                print(f"\n[msg {i+1}, id={m.message_id}]")
+                print(m.text)
+                print("---")
 
         # The test always "passes" — it's an audit, not a pass/fail.
         # The output is what matters. But flag if there are critical errors.
