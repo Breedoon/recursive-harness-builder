@@ -71,10 +71,9 @@ class TestIntegrationAudit:
         live_tg_forum: _LiveForumHarness,
     ) -> None:
         """Send an open-ended probe prompt, collect the final report."""
-        await _reset_general(live_tg_forum)
         tag = uuid.uuid4().hex[:8]
 
-        # Create a fresh topic for the audit
+        # Create a fresh topic for the audit (no /clear — preserves identity)
         thread_id = await live_tg_forum.platform.create_topic(f"Audit {tag}")
 
         # Send the audit prompt — don't require "done" marker,
@@ -123,12 +122,15 @@ class TestIntegrationAudit:
         # Build the full conversation text
         full_text = "\n\n---\n\n".join(m.text for m in all_messages if m.text.strip())
 
-        # Find the final report (last substantial message)
-        final_report = ""
+        # Find the final report — last 3 substantial messages (report may be split)
+        final_parts = []
         for m in reversed(all_messages):
-            if len(m.text) > 200:  # substantial message, not just a short ack
-                final_report = m.text
-                break
+            if len(m.text) > 100:
+                final_parts.append(m.text)
+                if len(final_parts) >= 3:
+                    break
+        final_parts.reverse()
+        final_report = "\n\n---\n\n".join(final_parts)
 
         # --- ANALYSIS ---
         full_lower = full_text.lower()
