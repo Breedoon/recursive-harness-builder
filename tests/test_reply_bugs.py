@@ -108,7 +108,7 @@ class TestBug2NeedsReplyStringCoercion:
     def test_string_false_is_not_truthy(self):
         """bool('false') is True in Python — must use _coerce_bool_arg."""
         # Read the source to verify _coerce_bool_arg is used for needs_reply
-        source = Path("/tmp/obs-reply-fix/src/obs_agent/tools.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / "src" / "obs_agent" / "tools.py").read_text()
 
         # Find the line that reads needs_reply/must_reply
         # It should use _coerce_bool_arg, NOT bare bool()
@@ -161,7 +161,7 @@ class TestBug3PollerIgnoresRepliedField:
         The function iterates inbox entries and skips those with read=true.
         It must ALSO skip entries with must_reply=true AND replied=true.
         """
-        source = Path("/tmp/obs-reply-fix/src/obs_agent/telegram.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / "src" / "obs_agent" / "telegram.py").read_text()
 
         # Extract JUST the function body (up to the next method definition)
         start = source.index("def _latest_unread_team_inbox_message(")
@@ -192,7 +192,7 @@ class TestBug3PollerIgnoresRepliedField:
         Without this, messages with must_reply:true, replied:true, read:false
         will trigger wake notifications indefinitely.
         """
-        source = Path("/tmp/obs-reply-fix/src/obs_agent/telegram.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / "src" / "obs_agent" / "telegram.py").read_text()
 
         # Find _latest_unread_team_inbox_message
         start = source.index("def _latest_unread_team_inbox_message(")
