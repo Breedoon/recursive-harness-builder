@@ -91,40 +91,27 @@ def _kill_existing_daemons_enabled() -> bool:
 
 
 def _kill_worktree_telegram_daemons(worktree_root: Path) -> None:
+    """Kill test bot processes (those launched with --test-instance).
+
+    Only targets processes that have the ``--test-instance`` flag in their
+    command line.  Production daemons (launched without the flag) are never
+    touched.
+    """
     pgrep = subprocess.run(
-        ["pgrep", "-f", "obs_agent\\.telegram_main"],
+        ["pgrep", "-f", "obs_agent\\.telegram_main.*--test-instance"],
         check=False,
         capture_output=True,
         text=True,
     )
     if pgrep.returncode not in (0, 1):
         return
-    root = str(worktree_root.resolve())
     for token in pgrep.stdout.split():
         if not token.isdigit():
             continue
         pid = int(token)
         if pid == os.getpid():
             continue
-        cwd_probe = subprocess.run(
-            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        cwd = ""
-        for line in cwd_probe.stdout.splitlines():
-            if line.startswith("n"):
-                cwd = line[1:].strip()
-                break
-        if not cwd:
-            continue
-        try:
-            resolved = str(Path(cwd).resolve())
-        except Exception:
-            continue
-        if resolved.startswith(root):
-            subprocess.run(["kill", str(pid)], check=False)
+        subprocess.run(["kill", str(pid)], check=False)
 
 
 def _start_bot(
@@ -166,7 +153,7 @@ def _start_bot(
     log_file = Path(tempfile.mktemp(prefix="obs_tg_forum_", suffix=".log"))
     log_fh = open(log_file, "w")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "obs_agent.telegram_main"],
+        [sys.executable, "-m", "obs_agent.telegram_main", "--test-instance"],
         env=env,
         stdout=log_fh,
         stderr=log_fh,
