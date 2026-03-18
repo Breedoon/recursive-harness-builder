@@ -150,9 +150,15 @@ def build_obs_bootstrap_xml(
     normalized = [normalize_lineage_name(n) for n in lineage]
     for idx, node_name in enumerate(normalized):
         attrs: dict[str, str] = {"display_name": node_name}
-        # Compute the agent_name for the sub-lineage up to and including this node
+        # Compute the agent_name for the sub-lineage up to and including this node.
+        # For the trunk (first node), use the passed agent_name (= team key in
+        # the Telegram runtime) instead of computing from lineage — the pure
+        # function can't know the team key.
         sub_lineage = tuple(normalized[: idx + 1])
-        attrs["agent_name"] = agent_name_for_lineage(sub_lineage)
+        if idx == 0 and resolved_agent_name:
+            attrs["agent_name"] = resolved_agent_name
+        else:
+            attrs["agent_name"] = agent_name_for_lineage(sub_lineage)
         ET.SubElement(lineage_el, "obs-node", attrs)
 
     fork_context = ET.SubElement(root, "fork_context")

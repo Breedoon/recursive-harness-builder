@@ -709,8 +709,12 @@ def create_obs_tools(
         sender = str(args.get("sender", "")).strip() or (
             bootstrap.native_agent_name if bootstrap is not None and bootstrap.native_agent_name else "obs-worker"
         )
-        # needs_reply is the canonical name; must_reply accepted for backward compat
-        must_reply = bool(args.get("needs_reply") or args.get("must_reply") or False)
+        # needs_reply is the canonical name; must_reply accepted for backward compat.
+        # Use _coerce_bool_arg to handle string "false" correctly (bool("false") is True).
+        try:
+            must_reply = _coerce_bool_arg(args.get("needs_reply") or args.get("must_reply") or False, name="needs_reply")
+        except ValueError:
+            must_reply = False
         if not team_name:
             return _error_result(
                 "Cannot use SendInboxMessage: team_name is required or must be inferable from current lineage"

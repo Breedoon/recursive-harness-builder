@@ -6401,6 +6401,10 @@ class TelegramBot:
                 continue
             if bool(item.get("read", False)):
                 continue
+            # Skip must_reply messages that have already been replied to —
+            # otherwise the poller keeps nagging for them indefinitely.
+            if item.get("must_reply") and item.get("replied"):
+                continue
             latest_unread = item
         if latest_unread is None:
             return None
