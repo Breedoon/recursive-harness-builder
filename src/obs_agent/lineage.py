@@ -23,7 +23,7 @@ from typing import Any, Iterable, Sequence
 from obs_agent.context_jsonl import find_session_jsonl
 
 _OBS_BOOTSTRAP_RE = re.compile(
-    r"(?s)^\s*(<obs-bootstrap\b[^>]*>.*?</obs-bootstrap>)"
+    r"(?s)(<obs-bootstrap\b[^>]*>.*?</obs-bootstrap>)"
 )
 _NON_ALNUM_RE = re.compile(r"[^A-Za-z0-9]+")
 
@@ -181,10 +181,10 @@ def build_obs_bootstrap_xml(
 
 
 def extract_obs_bootstrap_xml(text: str | None) -> str | None:
-    """Return the bootstrap block when the text begins with one."""
+    """Return the bootstrap block found anywhere in the text."""
     if not text:
         return None
-    match = _OBS_BOOTSTRAP_RE.match(text)
+    match = _OBS_BOOTSTRAP_RE.search(text)
     if match is None:
         return None
     return match.group(1)

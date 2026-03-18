@@ -6733,7 +6733,7 @@ class TelegramBot:
             if state is None:
                 return
             try:
-                await self._maybe_wake_route_inbox_target(
+                woken = await self._maybe_wake_route_inbox_target(
                     state=state,
                     team_name=team_name,
                     agent_name=recipient,
@@ -6741,6 +6741,16 @@ class TelegramBot:
                     summary=summary,
                     content=content,
                 )
+                if not woken:
+                    # Trunk was busy — clear the dedup key so the poller
+                    # retries on the next cycle instead of permanently
+                    # skipping this message.
+                    sender_norm = (sender or "").strip() or None
+                    summary_norm = (summary or "").strip() or None
+                    content_norm = (content or "").strip() or None
+                    fingerprint = f"{sender_norm}:{summary_norm}:{content_norm}"[:200]
+                    dedup_key = (team_name, recipient, fingerprint)
+                    self._notified_inbox_keys.discard(dedup_key)
             except Exception:
                 logger.warning(
                     "Failed waking lineage route from inbox notification route=%s team=%s agent=%s sender_route=%s",

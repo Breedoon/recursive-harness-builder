@@ -33,6 +33,7 @@ from obs_agent.lineage import (
     native_agent_name_for_lineage,
     normalize_lineage_name,
     parse_obs_bootstrap_xml,
+    slugify_projection_label,
 )
 
 if TYPE_CHECKING:
@@ -707,7 +708,7 @@ def create_obs_tools(
         content = str(args.get("content", "")).strip()
         summary = str(args.get("summary", "")).strip() or None
         sender = str(args.get("sender", "")).strip() or (
-            bootstrap.native_agent_name if bootstrap is not None and bootstrap.native_agent_name else "obs-worker"
+            bootstrap.agent_name if bootstrap is not None and bootstrap.agent_name else "obs-worker"
         )
         # needs_reply is the canonical name; must_reply accepted for backward compat.
         # Use _coerce_bool_arg to handle string "false" correctly (bool("false") is True).
@@ -754,8 +755,21 @@ def create_obs_tools(
             / "inboxes"
             / f"{recipient}.json"
         )
+        # Alias resolution: if exact name not found, try computing the
+        # child agent_name from the sender's lineage + alias.
+        # Child agent_name = {fingerprint(sender_lineage)}-{slugify(alias)}
+        if not inbox_path.exists() and bootstrap is not None and bootstrap.lineage:
+            child_hash = lineage_fingerprint(
+                tuple(normalize_lineage_name(n) for n in bootstrap.lineage)
+            )
+            child_slug = slugify_projection_label(recipient, fallback="")
+            if child_slug:
+                resolved = f"{child_hash}-{child_slug}"
+                resolved_path = inbox_path.parent / f"{resolved}.json"
+                if resolved_path.exists():
+                    recipient = resolved
+                    inbox_path = resolved_path
         # Validate recipient exists — inbox file must already exist.
-        # Inbox files are created when agents are launched, not on first message.
         if not inbox_path.exists():
             return {
                 "content": [{"type": "text", "text": f"recipient not found: no inbox exists for '{recipient}'"}],
@@ -881,7 +895,7 @@ def create_obs_tools(
             bootstrap.root_team_key if bootstrap is not None else ""
         )
         agent = str(args.get("agent", "")).strip() or (
-            bootstrap.native_agent_name if bootstrap is not None else ""
+            bootstrap.agent_name if bootstrap is not None else ""
         )
         if not team_name:
             return _error_result(
@@ -891,8 +905,8 @@ def create_obs_tools(
             return _error_result(
                 "Cannot use ReadInbox: agent is required or must be inferable from current lineage"
             )
-        include_read = bool(args.get("include_read", False))
-        mark_read = bool(args.get("mark_read", True))
+        include_read = _coerce_bool_arg(args.get("include_read", False), name="include_read")
+        mark_read = _coerce_bool_arg(args.get("mark_read", True), name="mark_read")
         try:
             limit = int(args.get("limit", 50))
         except (TypeError, ValueError):
@@ -1067,7 +1081,7 @@ def create_obs_tools(
         bootstrap = _current_obs_bootstrap()
         if bootstrap is None:
             return _error_result("Cannot use get_family: no OBS bootstrap found")
-        if not bootstrap.root_team_key or not bootstrap.native_agent_name:
+        if not bootstrap.root_team_key or not bootstrap.agent_name:
             return _error_result("Cannot use get_family: missing team key or agent name")
         if not bootstrap.lineage:
             return _error_result("Cannot use get_family: empty lineage")
@@ -1087,7 +1101,7 @@ def create_obs_tools(
                     all_agents.append(f.stem)
 
         my_lineage = bootstrap.lineage
-        my_agent_name = bootstrap.native_agent_name
+        my_agent_name = bootstrap.agent_name
         my_hash = lineage_fingerprint(tuple(normalize_lineage_name(n) for n in my_lineage))
 
         # Children: agents whose name starts with my lineage hash
