@@ -87,33 +87,8 @@ class TestIntegrationAudit:
             timeout=30.0,  # just send, don't wait for full completion
         )
 
-        # Wait for the agent to work — check periodically for the
-        # "final report" or timeout after 10 minutes
-        deadline = asyncio.get_running_loop().time() + 900  # 15 min
-        last_message_id = 0
-        stable_count = 0
-        final_messages: list[str] = []
-
-        while asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(45)  # check every 45s
-
-            recent = await live_tg_forum.platform.get_recent_messages(
-                thread_id=thread_id,
-                limit=60,
-            )
-
-            if not recent:
-                continue
-
-            current_last = recent[-1].message_id
-            if current_last == last_message_id:
-                stable_count += 1
-                # If no new messages for ~3 min (4 checks at 45s), agent is probably done
-                if stable_count >= 4:
-                    break
-            else:
-                stable_count = 0
-                last_message_id = current_last
+        # Wait 10 minutes — no early exit, let the agent work fully
+        await asyncio.sleep(600)
 
         # Collect ALL bot messages from the topic
         all_messages = await live_tg_forum.platform.get_recent_messages(
