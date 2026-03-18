@@ -35,14 +35,16 @@ Once they've all had time to work, wait 30 seconds without doing anything, then 
 
 Also try sending a message to one of your children using just their alias (e.g. just "Alpha" instead of the full hash-prefix name). Report whether alias-based messaging worked.
 
-After that, send each agent a message asking for their honest assessment. Ask them to reply.
+After that, wait for ALL your agents to complete their tasks. Once they've completed, send each of them a message asking for their honest assessment and asking them to reply. This is critical — completed agents MUST be woken up and respond. If a completed agent doesn't respond to your message, that's a bug.
 
 Then give me a final report. Specifically note:
-(a) Whether you and your agents received system notifications about unread messages
-(b) Whether alias-based messaging worked (sending to just the alias vs the full hash-prefix name)
-(c) Any tools that returned errors
-(d) Which messages were delivered and which weren't
-(e) Any surprising or broken behavior\
+(a) Whether you received system notifications about unread messages while actively running (not just after completing a turn)
+(b) Whether your agents reported receiving system notifications when messages arrived in their inbox
+(c) Whether COMPLETED agents were successfully woken up and responded to your assessment request
+(d) Whether alias-based messaging worked (sending to just the alias vs the full hash-prefix name)
+(e) Any tools that returned errors
+(f) Which messages were delivered and which weren't
+(g) Any surprising or broken behavior\
 """
 
 # Keywords that indicate broken functionality (not just preferences)

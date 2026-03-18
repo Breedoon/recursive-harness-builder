@@ -6461,9 +6461,9 @@ class TelegramBot:
             if record is None:
                 self._remove_team_worker_mappings_for_task(task_id)
                 continue
-            if record.status in {"failed", "stopped", "killed"} or record.terminal_request in {"failed", "stopped", "killed"}:
-                self._remove_team_worker_mappings_for_task(record.task_id)
-                continue
+            # Don't skip based on status — always try to deliver.
+            # If the agent is truly dead, _handle_inbox_message_notification
+            # will catch the error and send bounce-backs.
             team_name = (record.team_name or "").strip()
             agent_name = (record.agent_name or "").strip()
             if not team_name or not agent_name:
@@ -6532,13 +6532,19 @@ class TelegramBot:
         team_name = (record.team_name or "").strip()
         agent_name = (record.agent_name or "").strip()
         if not team_name or not agent_name:
-            return
+            raise RuntimeError(
+                f"Cannot wake team worker: missing team_name={team_name!r} or agent_name={agent_name!r}"
+            )
         child_state = self._get_state(record.child_route, create=False)
         if child_state is None:
-            return
-        bot = child_state.last_bot
+            raise RuntimeError(
+                f"Cannot wake team worker {agent_name}: child_state is None for route={record.child_route}"
+            )
+        bot = self._bot_for_state(child_state)
         if bot is None:
-            return
+            raise RuntimeError(
+                f"Cannot wake team worker {agent_name}: no bot available for route={record.child_route}"
+            )
 
         sender_norm = (sender or "").strip() or None
         summary_norm = (summary or "").strip() or None
@@ -6791,10 +6797,8 @@ class TelegramBot:
                     exc_info=True,
                 )
             return
-        if record.status in {"failed", "stopped", "killed"} or record.terminal_request in {"failed", "stopped", "killed"}:
-            self._remove_team_worker_mappings_for_task(record.task_id)
-            return
-
+        # If the agent task is actively running, queue the wake for when the
+        # turn completes — we can't start two fork tasks simultaneously.
         running = self._fork_task_tasks.get(record.task_id)
         if running is not None and not running.done():
             record.wake_requested = True
@@ -6803,12 +6807,10 @@ class TelegramBot:
             record.wake_source_content = content
             self._persist_task_handle_record(record)
             return
-        if record.status == "completed" and record.terminal_request is None:
-            record.idle_ready = True
-        if not record.idle_ready:
-            self._persist_task_handle_record(record)
-            return
 
+        # Always try to wake regardless of record status (completed, failed,
+        # stopped, etc.).  Over-deliver rather than under-deliver.
+        record.idle_ready = True
         try:
             await self._start_idle_team_worker_wake(
                 record=record,
@@ -6818,12 +6820,15 @@ class TelegramBot:
             )
         except Exception:
             logger.warning(
-                "Failed waking idle team worker from inbox notification route=%s task_id=%s sender_route=%s",
+                "Failed waking team worker from inbox notification route=%s task_id=%s status=%s sender_route=%s",
                 record.child_route,
                 record.task_id,
+                record.status,
                 sender_route,
                 exc_info=True,
             )
+            # Wake failed — send bounce-back so senders know.
+            await self._send_bounce_backs_for_dead_agent(record.child_route)
 
     async def _schedule_fork_task(
         self,
@@ -7283,14 +7288,12 @@ class TelegramBot:
         is_team_worker = bool((record.team_name or "").strip()) and bool(
             (record.agent_name or "").strip()
         )
-        if (
-            record.status == "completed"
-            and record.terminal_request is None
-            and is_team_worker
-        ):
+        # All team workers become idle_ready after their task finishes,
+        # regardless of outcome (completed, failed, stopped).  The inbox
+        # wake path will attempt to restart them; if that fails it sends
+        # bounce-backs.  Over-deliver rather than under-deliver.
+        if is_team_worker and record.terminal_request is None:
             record.idle_ready = True
-        elif record.status in {"failed", "stopped"}:
-            record.idle_ready = False
 
         if parent_state is not None:
             parent_state.active_fork_task_ids.discard(task_id)
@@ -7404,20 +7407,27 @@ class TelegramBot:
                 logger.debug("Failed to add parent backlink to child terminal message", exc_info=True)
 
         self._persist_task_handle_record(record)
-        if (
-            record.idle_ready
-            and record.terminal_request is None
-            and record.status == "completed"
-        ):
+        if record.idle_ready and record.terminal_request is None:
+            # Keep the team worker registered regardless of outcome status
+            # (completed, failed, stopped) so inbox wakes can reach it.
             self._fork_task_by_child_route[record.child_route] = record.task_id
             self._register_team_worker_record(record)
             if record.wake_requested:
-                await self._start_idle_team_worker_wake(
-                    record=record,
-                    sender=record.wake_source_sender,
-                    summary=record.wake_source_summary,
-                    content=record.wake_source_content,
-                )
+                try:
+                    await self._start_idle_team_worker_wake(
+                        record=record,
+                        sender=record.wake_source_sender,
+                        summary=record.wake_source_summary,
+                        content=record.wake_source_content,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed immediate wake for team worker task_id=%s status=%s",
+                        record.task_id,
+                        record.status,
+                        exc_info=True,
+                    )
+                    await self._send_bounce_backs_for_dead_agent(record.child_route)
             return
 
         self._fork_task_by_child_route.pop(record.child_route, None)
