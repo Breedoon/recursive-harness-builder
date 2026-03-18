@@ -235,6 +235,12 @@ class TelegramSessionState:
     active_fork_task_ids: set[str] = field(default_factory=set)
     agent_lineage: tuple[str, ...] | None = None
     pending_obs_bootstrap: str | None = None
+    # Inbox wake queueing: when a message arrives while the agent is busy,
+    # store the wake request so it fires when the turn completes.
+    inbox_wake_pending: bool = False
+    inbox_wake_sender: str | None = None
+    inbox_wake_summary: str | None = None
+    inbox_wake_content: str | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -5364,6 +5370,33 @@ class TelegramBot:
             deferred_bindings=deferred_bindings,
             session_id=state.session_id,
         )
+
+        # Check for queued inbox wake — fires after the turn completes
+        # (mirrors children's wake_requested flag on _ForkTaskRecord).
+        if state.inbox_wake_pending:
+            state.inbox_wake_pending = False
+            try:
+                team_name_for_wake = None
+                agent_name_for_wake = None
+                for (tn, an), r in self._route_inbox_targets.items():
+                    if r == state.route:
+                        team_name_for_wake, agent_name_for_wake = tn, an
+                        break
+                if team_name_for_wake and agent_name_for_wake:
+                    await self._start_idle_route_inbox_wake(
+                        state=state,
+                        team_name=team_name_for_wake,
+                        agent_name=agent_name_for_wake,
+                        sender=state.inbox_wake_sender,
+                        summary=state.inbox_wake_summary,
+                        content=state.inbox_wake_content,
+                    )
+            except Exception:
+                logger.debug("Failed queued inbox wake after turn", exc_info=True)
+            state.inbox_wake_sender = None
+            state.inbox_wake_summary = None
+            state.inbox_wake_content = None
+
         return _RunOutcome(
             assistant_text="\n".join(part for part in captured_text_parts if part).strip(),
             failed=failed,
@@ -6742,15 +6775,12 @@ class TelegramBot:
                     content=content,
                 )
                 if not woken:
-                    # Trunk was busy — clear the dedup key so the poller
-                    # retries on the next cycle instead of permanently
-                    # skipping this message.
-                    sender_norm = (sender or "").strip() or None
-                    summary_norm = (summary or "").strip() or None
-                    content_norm = (content or "").strip() or None
-                    fingerprint = f"{sender_norm}:{summary_norm}:{content_norm}"[:200]
-                    dedup_key = (team_name, recipient, fingerprint)
-                    self._notified_inbox_keys.discard(dedup_key)
+                    # Agent is busy — queue the wake for when the turn
+                    # completes (like children's wake_requested flag).
+                    state.inbox_wake_pending = True
+                    state.inbox_wake_sender = sender
+                    state.inbox_wake_summary = summary
+                    state.inbox_wake_content = content
             except Exception:
                 logger.warning(
                     "Failed waking lineage route from inbox notification route=%s team=%s agent=%s sender_route=%s",
