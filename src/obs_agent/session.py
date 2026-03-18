@@ -36,6 +36,16 @@ _DEFAULT_SDK_ENV: dict[str, str] = {
     # The skill_improvement_apply feature crashes headless SDK sessions.
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
 }
+def _on_cli_stderr(line: str) -> None:
+    """Capture stderr output from the Claude Code CLI subprocess.
+
+    Without this callback, stderr goes directly to the terminal (inherited
+    from the daemon process).  Routing it through the logger makes errors
+    visible in structured logs and prevents terminal noise.
+    """
+    logger.warning("CLI stderr: %s", line.rstrip())
+
+
 _CLIENT_CONNECT_MAX_ATTEMPTS = 3
 _CLIENT_CONNECT_RETRY_DELAY_SECONDS = 1.0
 
@@ -123,6 +133,7 @@ class SessionManager:
             setting_sources=["project"],
             env=effective_env,
             max_buffer_size=self.config.max_buffer_size,
+            stderr=_on_cli_stderr,
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
