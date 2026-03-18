@@ -95,7 +95,7 @@ class TestIntegrationAudit:
         final_messages: list[str] = []
 
         while asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(30)  # check every 30s
+            await asyncio.sleep(45)  # check every 45s
 
             recent = await live_tg_forum.platform.get_recent_messages(
                 thread_id=thread_id,
@@ -108,8 +108,8 @@ class TestIntegrationAudit:
             current_last = recent[-1].message_id
             if current_last == last_message_id:
                 stable_count += 1
-                # If no new messages for 90s (3 checks), agent is probably done
-                if stable_count >= 3:
+                # If no new messages for ~3 min (4 checks at 45s), agent is probably done
+                if stable_count >= 4:
                     break
             else:
                 stable_count = 0
