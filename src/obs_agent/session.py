@@ -126,6 +126,7 @@ class SessionManager:
         }
 
         options = ClaudeAgentOptions(
+            model=self.config.model,
             hooks=hook_matchers,
             mcp_servers={"obs-agent": tool_server},
             cwd=str(self.config.vault_path),

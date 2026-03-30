@@ -1,0 +1,99 @@
+"""Shared runtime environment bootstrap for CLI, daemon, and Telegram entrypoints."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+from typing import Iterable
+
+_DEFAULT_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    loaded: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, _, value = raw.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            loaded[key] = value
+    return loaded
+
+
+def _apply_env_defaults(values: dict[str, str]) -> None:
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
+
+
+def _resolve_profile(argv: Iterable[str]) -> tuple[str | None, list[str]]:
+    explicit_profile: str | None = None
+    filtered: list[str] = []
+    args = list(argv)
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if arg in {"--test", "--test-instance"}:
+            explicit_profile = "test"
+        elif arg == "--profile":
+            if idx + 1 >= len(args):
+                raise SystemExit("--profile requires a value")
+            explicit_profile = args[idx + 1].strip().lower()
+            idx += 1
+        elif arg.startswith("--profile="):
+            explicit_profile = arg.partition("=")[2].strip().lower()
+        else:
+            filtered.append(arg)
+        idx += 1
+    return explicit_profile, filtered
+
+
+def _apply_profile_prefix(profile: str) -> None:
+    prefix = f"OBS_{profile.upper()}_"
+    for key, value in list(os.environ.items()):
+        if not key.startswith(prefix):
+            continue
+        generic_key = "OBS_" + key[len(prefix):]
+        os.environ.setdefault(generic_key, value)
+
+
+def _apply_profile_defaults(profile: str) -> None:
+    if profile == "test":
+        os.environ.setdefault("OBS_AGENT_MODEL", "haiku")
+
+
+def bootstrap_runtime_env(
+    *,
+    argv: Iterable[str] | None = None,
+    env_path: Path | None = None,
+    mutate_argv: bool = True,
+) -> str:
+    """Load repo .env and resolve runtime profile into generic env vars.
+
+    The bootstrap is intentionally conservative:
+    - existing explicit environment variables win
+    - profile-specific values only fill generic vars when those are unset
+    - test profile defaults the model to Haiku; prod remains the config default
+    """
+
+    provided_args = list(sys.argv[1:] if argv is None else argv)
+    explicit_profile, filtered_args = _resolve_profile(provided_args)
+
+    _apply_env_defaults(_read_env_file(env_path or _DEFAULT_ENV_PATH))
+
+    profile = explicit_profile or (os.environ.get("OBS_PROFILE") or "").strip().lower() or "prod"
+    os.environ["OBS_PROFILE"] = profile
+
+    _apply_profile_prefix(profile)
+    _apply_profile_defaults(profile)
+
+    if argv is None and mutate_argv:
+        sys.argv[:] = [sys.argv[0], *filtered_args]
+
+    return profile

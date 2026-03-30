@@ -1,0 +1,28 @@
+[
+  {
+    "label": "sonnet[1m] \u2014 compaction ENABLED (find threshold)",
+    "model": "sonnet[1m]",
+    "session_id": "b95483b2-5096-427d-9d79-a7ecfe579f03",
+    "turns_completed": 1,
+    "last_total_tokens": 0,
+    "compact_events": 0,
+    "compacted": false,
+    "compacted_at_turn": null,
+    "compacted_at_tokens": null,
+    "error": "API Error: Rate limit reached",
+    "timestamp": "2026-03-16T01:52:46.131762"
+  },
+  {
+    "label": "sonnet[1m] \u2014 compaction DISABLED (settings file, push to 800K)",
+    "model": "sonnet[1m]",
+    "session_id": "8ef176cf-f16a-41aa-8322-8453f32016ae",
+    "turns_completed": 1,
+    "last_total_tokens": 0,
+    "compact_events": 0,
+    "compacted": false,
+    "compacted_at_turn": null,
+    "compacted_at_tokens": null,
+    "error": "API Error: Rate limit reached",
+    "timestamp": "2026-03-16T01:52:46.913413"
+  }
+]

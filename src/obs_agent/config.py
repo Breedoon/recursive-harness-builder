@@ -38,6 +38,7 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
+    model: str = "opus[1m]"
     claude_dir: str = ".claude"
     daemon_host: str = "127.0.0.1"
     daemon_port: int = 7832
@@ -45,7 +46,7 @@ class OBSConfig:
     max_queue_continuations: int = 3
     bg_fork_timeout: float = 600.0  # seconds to wait for background forks
     max_buffer_size: int = 10 * 1024 * 1024  # 10 MB SDK JSON buffer limit
-    context_window_estimate_tokens: int = 200_000
+    context_window_estimate_tokens: int = 1_000_000
     context_probe_claude_cli: bool = False
 
     # Telegram
@@ -73,6 +74,8 @@ class OBSConfig:
 
         if vault := os.environ.get("OBS_VAULT_PATH"):
             kwargs["vault_path"] = Path(vault)
+        if model := os.environ.get("OBS_AGENT_MODEL") or os.environ.get("OBS_MODEL"):
+            kwargs["model"] = model.strip()
         if host := os.environ.get("OBS_DAEMON_HOST"):
             kwargs["daemon_host"] = host
         if port := os.environ.get("OBS_DAEMON_PORT"):
@@ -89,25 +92,18 @@ class OBSConfig:
             kwargs["context_window_estimate_tokens"] = int(context_est)
         if probe_cli := os.environ.get("OBS_CONTEXT_PROBE_CLAUDE_CLI"):
             kwargs["context_probe_claude_cli"] = probe_cli.strip().lower() in {"1", "true", "yes", "on"}
-        raw_tokens = (
-            os.environ.get("OBS_TELEGRAM_BOT_TOKENS")
-            or os.environ.get("OBS_TELEGRAM_TEST_BOT_TOKENS")
-            or ""
-        ).strip()
+        raw_tokens = (os.environ.get("OBS_TELEGRAM_BOT_TOKENS") or "").strip()
         if raw_tokens:
             kwargs["telegram_bot_tokens"] = [
                 token.strip() for token in raw_tokens.split(",") if token.strip()
             ]
-        if tg_token := os.environ.get("OBS_TELEGRAM_BOT_TOKEN") or os.environ.get("OBS_TELEGRAM_PROD_BOT_TOKEN"):
+        if tg_token := os.environ.get("OBS_TELEGRAM_BOT_TOKEN"):
             kwargs["telegram_bot_token"] = tg_token.strip()
-        if tg_users := os.environ.get("OBS_TELEGRAM_ALLOWED_USERS") or os.environ.get("OBS_TELEGRAM_AUTHORIZED_USER_ID"):
+        if tg_users := os.environ.get("OBS_TELEGRAM_ALLOWED_USERS"):
             kwargs["telegram_allowed_user_ids"] = [
                 int(uid.strip()) for uid in tg_users.split(",") if uid.strip()
             ]
-        if tg_username := (
-            os.environ.get("OBS_TELEGRAM_NOTIFY_USERNAME")
-            or os.environ.get("OBS_TELEGRAM_TEST_NOTIFY_USERNAME")
-        ):
+        if tg_username := os.environ.get("OBS_TELEGRAM_NOTIFY_USERNAME"):
             kwargs["telegram_notify_username"] = tg_username.lstrip("@").strip() or None
         if tg_temp_root := os.environ.get("OBS_TELEGRAM_TEMP_ROOT"):
             kwargs["telegram_temp_root"] = Path(tg_temp_root)

@@ -19,11 +19,11 @@ from tests.evals.platform_telegram import TelegramPlatform
 
 
 _REQUIRED_ENV = [
-    "TELEGRAM_API_ID",
-    "TELEGRAM_API_HASH",
-    "TELEGRAM_SESSION",
-    "TELEGRAM_TEST_BOT_USERNAME",
-    "OBS_TELEGRAM_TEST_BOT_TOKEN",
+    "OBS_TEST_TELEGRAM_API_ID",
+    "OBS_TEST_TELEGRAM_API_HASH",
+    "OBS_TEST_TELEGRAM_SESSION",
+    "OBS_TEST_TELEGRAM_BOT_USERNAME",
+    "OBS_TEST_TELEGRAM_BOT_TOKEN",
 ]
 
 
@@ -53,14 +53,17 @@ def _read_log_tail(log_file: Path) -> str:
 def _start_bot(vault_path: Path, temp_root: Path) -> tuple[subprocess.Popen, Path]:
     env = os.environ.copy()
     env["OBS_VAULT_PATH"] = str(vault_path)
-    env["OBS_TELEGRAM_BOT_TOKEN"] = os.environ["OBS_TELEGRAM_TEST_BOT_TOKEN"]
-    env["OBS_TELEGRAM_ALLOWED_USERS"] = os.environ.get("TELEGRAM_TEST_USER_ID", "5129431382")
+    env["OBS_TELEGRAM_BOT_TOKEN"] = os.environ["OBS_TEST_TELEGRAM_BOT_TOKEN"]
+    env["OBS_TELEGRAM_ALLOWED_USERS"] = os.environ.get(
+        "OBS_TEST_TELEGRAM_ALLOWED_USERS",
+        "5129431382",
+    )
     env["OBS_TELEGRAM_TEMP_ROOT"] = str(temp_root)
 
     log_file = Path(tempfile.mktemp(prefix="obs_tg_media_", suffix=".log"))
     log_fh = open(log_file, "w")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "obs_agent.telegram_main"],
+        [sys.executable, "-m", "obs_agent.telegram_main", "--test"],
         env=env,
         stdout=log_fh,
         stderr=log_fh,

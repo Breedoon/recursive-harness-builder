@@ -105,8 +105,8 @@ class TelegramForumPlatform:
         idle_quiescence_timeout: float = _DEFAULT_IDLE_QUIESCENCE_TIMEOUT,
     ) -> None:
         self._chat_id = chat_id
-        self._bot_username = bot_username or os.environ["TELEGRAM_TEST_BOT_USERNAME"]
-        self._bot_token = bot_token or os.environ["OBS_TELEGRAM_TEST_BOT_TOKEN"]
+        self._bot_username = bot_username or os.environ["OBS_TEST_TELEGRAM_BOT_USERNAME"]
+        self._bot_token = bot_token or os.environ["OBS_TEST_TELEGRAM_BOT_TOKEN"]
         extra_tokens = os.environ.get("OBS_TELEGRAM_BOT_TOKENS", "").strip()
         self._sender_bot_tokens = [
             token.strip()
@@ -115,9 +115,9 @@ class TelegramForumPlatform:
         ]
         if self._bot_token not in self._sender_bot_tokens:
             self._sender_bot_tokens.insert(0, self._bot_token)
-        self._api_id = api_id or int(os.environ["TELEGRAM_API_ID"])
-        self._api_hash = api_hash or os.environ["TELEGRAM_API_HASH"]
-        self._session_string = session_string or os.environ["TELEGRAM_SESSION"]
+        self._api_id = api_id or int(os.environ["OBS_TEST_TELEGRAM_API_ID"])
+        self._api_hash = api_hash or os.environ["OBS_TEST_TELEGRAM_API_HASH"]
+        self._session_string = session_string or os.environ["OBS_TEST_TELEGRAM_SESSION"]
         self._timeout = timeout
         self._first_message_timeout = first_message_timeout
         self._done_timeout = done_timeout

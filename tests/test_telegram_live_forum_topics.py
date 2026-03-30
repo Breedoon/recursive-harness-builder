@@ -27,11 +27,11 @@ from tests.live_test_vault import ensure_live_test_vault
 
 
 _REQUIRED_ENV = [
-    "TELEGRAM_API_ID",
-    "TELEGRAM_API_HASH",
-    "TELEGRAM_SESSION",
-    "TELEGRAM_TEST_BOT_USERNAME",
-    "OBS_TELEGRAM_TEST_BOT_TOKEN",
+    "OBS_TEST_TELEGRAM_API_ID",
+    "OBS_TEST_TELEGRAM_API_HASH",
+    "OBS_TEST_TELEGRAM_SESSION",
+    "OBS_TEST_TELEGRAM_BOT_USERNAME",
+    "OBS_TEST_TELEGRAM_BOT_TOKEN",
 ]
 
 _SESSION_ID_RE = re.compile(
@@ -57,12 +57,7 @@ def _read_log_tail(log_file: Path) -> str:
 
 def _resolve_allowed_users() -> str:
     candidates: list[str] = []
-    for key in (
-        "OBS_TELEGRAM_ALLOWED_USERS",
-        "OBS_TELEGRAM_AUTHORIZED_USER_ID",
-        "TELEGRAM_TEST_USER_ID",
-        "TELEGRAM_USER_ID",
-    ):
+    for key in ("OBS_TEST_TELEGRAM_ALLOWED_USERS", "OBS_TELEGRAM_ALLOWED_USERS"):
         raw = (os.environ.get(key) or "").strip()
         if not raw:
             continue
@@ -76,9 +71,14 @@ def _resolve_allowed_users() -> str:
 
 
 def _resolve_sender_tokens() -> list[str]:
-    primary = os.environ["OBS_TELEGRAM_TEST_BOT_TOKEN"].strip()
+    primary = os.environ["OBS_TEST_TELEGRAM_BOT_TOKEN"].strip()
     tokens = [primary]
-    for key in ("OBS_TELEGRAM_TEST_BOT_TOKEN_2", "OBS_TELEGRAM_TEST_SECOND_BOT_TOKEN"):
+    extra_tokens = (os.environ.get("OBS_TEST_TELEGRAM_BOT_TOKENS") or "").strip()
+    for token in extra_tokens.split(","):
+        extra = token.strip()
+        if extra and extra not in tokens:
+            tokens.append(extra)
+    for key in ("OBS_TEST_TELEGRAM_BOT_TOKEN_2",):
         extra = (os.environ.get(key) or "").strip()
         if extra and extra not in tokens:
             tokens.append(extra)
@@ -86,7 +86,7 @@ def _resolve_sender_tokens() -> list[str]:
 
 
 def _kill_existing_daemons_enabled() -> bool:
-    raw = (os.environ.get("OBS_TELEGRAM_TEST_KILL_EXISTING_DAEMONS") or "").strip().lower()
+    raw = (os.environ.get("OBS_TEST_TELEGRAM_KILL_EXISTING_DAEMONS") or "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
@@ -467,7 +467,7 @@ async def _ensure_cached_forum_chat_id() -> int:
                 return _CACHED_FORUM_CHAT_ID
             _CACHED_FORUM_CHAT_ID = None
 
-        for key in ("OBS_TELEGRAM_TEST_FORUM_CHAT_ID", "TELEGRAM_TEST_FORUM_CHAT_ID"):
+        for key in ("OBS_TEST_TELEGRAM_FORUM_CHAT_ID",):
             raw = (os.environ.get(key) or "").strip()
             if not raw:
                 continue
@@ -509,7 +509,7 @@ async def live_tg_forum(tmp_path: Path) -> _LiveForumHarness:
         proc=proc,
         log_file=log_file,
         vault_path=vault_path,
-        bot_username=os.environ["TELEGRAM_TEST_BOT_USERNAME"],
+        bot_username=os.environ["OBS_TEST_TELEGRAM_BOT_USERNAME"],
         temp_root=temp_root,
         state_db_path=state_db_path,
     )

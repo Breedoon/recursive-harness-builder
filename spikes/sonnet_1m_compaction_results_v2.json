@@ -1,0 +1,44 @@
+[
+  {
+    "label": "haiku \u2014 compaction DISABLED (settings file, baseline verification)",
+    "model": "haiku",
+    "session_id": "6de77933-f400-419a-a426-64a090bf25dc",
+    "turns_completed": 9,
+    "last_total_tokens": 4065,
+    "compact_events": 1,
+    "compacted": true,
+    "compacted_at_turn": 9,
+    "compacted_at_tokens": 174096,
+    "cumulative_cost_estimate": 0.942,
+    "error": null,
+    "timestamp": "2026-03-16T01:54:17.232264"
+  },
+  {
+    "label": "opus[1m] \u2014 compaction ENABLED (find threshold)",
+    "model": "opus[1m]",
+    "session_id": "64071dce-61e5-4eb6-9751-04189f22a1c5",
+    "turns_completed": 1,
+    "last_total_tokens": 23931,
+    "compact_events": 0,
+    "compacted": false,
+    "compacted_at_turn": null,
+    "compacted_at_tokens": null,
+    "cumulative_cost_estimate": 0.09,
+    "error": "API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing the request or attempting a different approach. If you are seeing this refusal repeatedly, try running /model claude-sonnet-4-20250514 to switch models.",
+    "timestamp": "2026-03-16T01:54:20.727288"
+  },
+  {
+    "label": "opus[1m] \u2014 compaction DISABLED (push to 400K)",
+    "model": "opus[1m]",
+    "session_id": "2395472a-5c93-4cc2-a46e-20ba04a0003c",
+    "turns_completed": 1,
+    "last_total_tokens": 23931,
+    "compact_events": 0,
+    "compacted": false,
+    "compacted_at_turn": null,
+    "compacted_at_tokens": null,
+    "cumulative_cost_estimate": 0.007,
+    "error": "API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing the request or attempting a different approach. If you are seeing this refusal repeatedly, try running /model claude-sonnet-4-20250514 to switch models.",
+    "timestamp": "2026-03-16T01:54:23.388584"
+  }
+]

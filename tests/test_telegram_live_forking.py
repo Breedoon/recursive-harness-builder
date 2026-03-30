@@ -24,11 +24,11 @@ from tests.live_test_vault import ensure_live_test_vault
 
 
 _REQUIRED_ENV = [
-    "TELEGRAM_API_ID",
-    "TELEGRAM_API_HASH",
-    "TELEGRAM_SESSION",
-    "TELEGRAM_TEST_BOT_USERNAME",
-    "OBS_TELEGRAM_TEST_BOT_TOKEN",
+    "OBS_TEST_TELEGRAM_API_ID",
+    "OBS_TEST_TELEGRAM_API_HASH",
+    "OBS_TEST_TELEGRAM_SESSION",
+    "OBS_TEST_TELEGRAM_BOT_USERNAME",
+    "OBS_TEST_TELEGRAM_BOT_TOKEN",
 ]
 
 _SESSION_ID_RE = re.compile(
@@ -51,12 +51,7 @@ def _read_log_tail(log_file: Path) -> str:
 
 def _resolve_allowed_users() -> str:
     candidates: list[str] = []
-    for key in (
-        "OBS_TELEGRAM_ALLOWED_USERS",
-        "OBS_TELEGRAM_AUTHORIZED_USER_ID",
-        "TELEGRAM_TEST_USER_ID",
-        "TELEGRAM_USER_ID",
-    ):
+    for key in ("OBS_TEST_TELEGRAM_ALLOWED_USERS", "OBS_TELEGRAM_ALLOWED_USERS"):
         raw = (os.environ.get(key) or "").strip()
         if not raw:
             continue
@@ -86,10 +81,10 @@ def _start_bot(
 
     env = os.environ.copy()
     env["OBS_VAULT_PATH"] = str(vault_path)
-    env["OBS_TELEGRAM_BOT_TOKEN"] = os.environ["OBS_TELEGRAM_TEST_BOT_TOKEN"]
+    env["OBS_TELEGRAM_BOT_TOKEN"] = os.environ["OBS_TEST_TELEGRAM_BOT_TOKEN"]
     # Keep single-sender mode in DM-based tests: TelegramPlatform only listens
-    # to TELEGRAM_TEST_BOT_USERNAME responses.
-    env["OBS_TELEGRAM_BOT_TOKENS"] = os.environ["OBS_TELEGRAM_TEST_BOT_TOKEN"]
+    # to OBS_TEST_TELEGRAM_BOT_USERNAME responses.
+    env["OBS_TELEGRAM_BOT_TOKENS"] = os.environ["OBS_TEST_TELEGRAM_BOT_TOKEN"]
     env["OBS_TELEGRAM_ALLOWED_USERS"] = _resolve_allowed_users()
     env["OBS_TELEGRAM_TEMP_ROOT"] = str(temp_root)
     env["OBS_TELEGRAM_DROP_PENDING_UPDATES"] = "1"
@@ -99,7 +94,7 @@ def _start_bot(
     log_file = Path(tempfile.mktemp(prefix="obs_tg_fork_", suffix=".log"))
     log_fh = open(log_file, "w")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "obs_agent.telegram_main"],
+        [sys.executable, "-m", "obs_agent.telegram_main", "--test"],
         env=env,
         stdout=log_fh,
         stderr=log_fh,

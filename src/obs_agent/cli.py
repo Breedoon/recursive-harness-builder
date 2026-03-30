@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from obs_agent.config import OBSConfig
+from obs_agent.runtime_env import bootstrap_runtime_env
 
 if TYPE_CHECKING:
     from obs_agent.input import InputChannel
@@ -301,6 +302,7 @@ async def _consume_sse(
 
 async def async_main() -> None:
     """Async entry point for obs-agent CLI."""
+    bootstrap_runtime_env()
     config = OBSConfig.from_env()
     base_url = config.base_url
 
@@ -391,10 +393,11 @@ async def async_main() -> None:
 
 def main():
     """Entry point for obs-agent CLI."""
+    bootstrap_runtime_env()
     # Handle --help synchronously before starting the event loop
     if "--help" in sys.argv or "-h" in sys.argv:
         config = OBSConfig.from_env()
-        print("Usage: obs-agent [--help]")
+        print("Usage: obs-agent [--help] [--profile PROFILE] [--test]")
         print(f"Interactive CLI for OBS Agent (daemon at {config.base_url})")
         sys.exit(0)
 

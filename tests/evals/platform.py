@@ -55,6 +55,7 @@ class CLIPlatform:
         env["OBS_SIMPLE_INPUT"] = "1"
         env["OBS_DAEMON_PORT"] = str(daemon_port)
         env["OBS_EVAL_PROMPT"] = EVAL_PROMPT
+        env["OBS_PROFILE"] = "test"
 
         python = str(Path(sys.executable))
         self._child = pexpect.spawn(

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import os
 import re
 
 from claude_agent_sdk import (
@@ -256,6 +257,7 @@ async def _run_sdk_judge(prompt: str, use_mcp: bool = False, platform: Platform 
         )
 
     options_kwargs: dict = {
+        "model": (os.environ.get("OBS_EVAL_JUDGE_MODEL") or "haiku").strip() or "haiku",
         "permission_mode": "bypassPermissions",
         "max_turns": 30,
         "system_prompt": system_prompt,

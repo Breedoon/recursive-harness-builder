@@ -181,7 +181,7 @@ def build_obs_bootstrap_xml(
 
 
 def extract_obs_bootstrap_xml(text: str | None) -> str | None:
-    """Return the bootstrap block found anywhere in the text."""
+    """Return the first bootstrap block found anywhere in *text*."""
     if not text:
         return None
     match = _OBS_BOOTSTRAP_RE.search(text)

@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from obs_agent.commands import CommandRegistry
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
+from obs_agent.runtime_env import bootstrap_runtime_env
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent
 from obs_agent.session import SessionManager
 
@@ -47,6 +48,7 @@ def create_default_app() -> FastAPI:
     """
     from obs_agent.config import OBSConfig
 
+    bootstrap_runtime_env(mutate_argv=False)
     config = OBSConfig.from_env()
     config.validate()
     return create_app(config)

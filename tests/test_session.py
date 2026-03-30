@@ -121,6 +121,12 @@ class TestCreateOptions:
         assert options.mcp_servers is not None
         assert "obs-agent" in options.mcp_servers
 
+    def test_uses_configured_model(self, config):
+        config.model = "haiku"
+        mgr = SessionManager(config=config)
+        options = mgr.create_options()
+        assert options.model == "haiku"
+
     def test_passes_hook_state_to_obs_tools(self, config):
         state = HookState()
         mgr = SessionManager(config=config, hook_state=state)

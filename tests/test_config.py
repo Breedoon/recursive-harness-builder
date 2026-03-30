@@ -123,6 +123,17 @@ class TestDaemonSettings:
 class TestSessionSettings:
     """Config provides session management settings."""
 
+    def test_default_model(self):
+        """Default model remains the prod Opus config."""
+        cfg = OBSConfig()
+        assert cfg.model == "opus[1m]"
+
+    def test_model_from_env(self, monkeypatch):
+        """OBS_AGENT_MODEL overrides the default session model."""
+        monkeypatch.setenv("OBS_AGENT_MODEL", "haiku")
+        cfg = OBSConfig.from_env()
+        assert cfg.model == "haiku"
+
     def test_default_cache_window(self):
         """Default cache window is effectively non-expiring for now."""
         cfg = OBSConfig()

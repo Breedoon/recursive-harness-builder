@@ -9,10 +9,10 @@ arriving (no new message within a settling window) before returning the
 concatenated result.
 
 Requires environment variables:
-- TELEGRAM_API_ID: Telegram API ID (from https://my.telegram.org)
-- TELEGRAM_API_HASH: Telegram API hash
-- TELEGRAM_SESSION: Telethon StringSession (pre-authenticated)
-- TELEGRAM_TEST_BOT_USERNAME: bot username (without @)
+- OBS_TEST_TELEGRAM_API_ID: Telegram API ID (from https://my.telegram.org)
+- OBS_TEST_TELEGRAM_API_HASH: Telegram API hash
+- OBS_TEST_TELEGRAM_SESSION: Telethon StringSession (pre-authenticated)
+- OBS_TEST_TELEGRAM_BOT_USERNAME: bot username (without @)
 
 The Telethon session must be pre-authenticated (run spikes/generate_session.py).
 """
@@ -97,10 +97,10 @@ class TelegramPlatform:
         done_timeout: float = _DEFAULT_DONE_TIMEOUT,
         idle_quiescence_timeout: float = _DEFAULT_IDLE_QUIESCENCE_TIMEOUT,
     ) -> None:
-        self._api_id = api_id or int(os.environ["TELEGRAM_API_ID"])
-        self._api_hash = api_hash or os.environ["TELEGRAM_API_HASH"]
-        self._session_string = session_string or os.environ["TELEGRAM_SESSION"]
-        self._bot_username = bot_username or os.environ["TELEGRAM_TEST_BOT_USERNAME"]
+        self._api_id = api_id or int(os.environ["OBS_TEST_TELEGRAM_API_ID"])
+        self._api_hash = api_hash or os.environ["OBS_TEST_TELEGRAM_API_HASH"]
+        self._session_string = session_string or os.environ["OBS_TEST_TELEGRAM_SESSION"]
+        self._bot_username = bot_username or os.environ["OBS_TEST_TELEGRAM_BOT_USERNAME"]
         self._timeout = timeout
         self._first_message_timeout = first_message_timeout
         self._done_timeout = done_timeout

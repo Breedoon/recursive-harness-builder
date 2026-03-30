@@ -169,11 +169,11 @@ async def test_eval(scenario_name: str, eval_vault: Path, eval_config) -> None:
 def _has_telegram_credentials() -> bool:
     """Check if all required Telegram env vars are set."""
     required = [
-        "TELEGRAM_API_ID",
-        "TELEGRAM_API_HASH",
-        "TELEGRAM_SESSION",
-        "TELEGRAM_TEST_BOT_USERNAME",
-        "OBS_TELEGRAM_TEST_BOT_TOKEN",
+        "OBS_TEST_TELEGRAM_API_ID",
+        "OBS_TEST_TELEGRAM_API_HASH",
+        "OBS_TEST_TELEGRAM_SESSION",
+        "OBS_TEST_TELEGRAM_BOT_USERNAME",
+        "OBS_TEST_TELEGRAM_BOT_TOKEN",
     ]
     return all(os.environ.get(k) for k in required)
 
@@ -197,18 +197,17 @@ def _start_telegram_bot(vault_path: Path) -> tuple[subprocess.Popen, Path]:
     env = os.environ.copy()
     env["OBS_VAULT_PATH"] = str(vault_path)
     # Map the test bot token to what config.py reads
-    env["OBS_TELEGRAM_BOT_TOKEN"] = os.environ["OBS_TELEGRAM_TEST_BOT_TOKEN"]
+    env["OBS_TELEGRAM_BOT_TOKEN"] = os.environ["OBS_TEST_TELEGRAM_BOT_TOKEN"]
     # Set the allowed user to the Telethon test account so auth doesn't block evals.
-    # TELEGRAM_TEST_USER_ID is the user ID of the secondary Telethon account that
-    # sends messages during evals — NOT the primary account (OBS_TELEGRAM_AUTHORIZED_USER_ID).
-    test_user_id = os.environ.get("TELEGRAM_TEST_USER_ID", "5129431382")
+    # OBS_TEST_TELEGRAM_ALLOWED_USERS should be the Telethon account used during evals.
+    test_user_id = os.environ.get("OBS_TEST_TELEGRAM_ALLOWED_USERS", "5129431382")
     env["OBS_TELEGRAM_ALLOWED_USERS"] = test_user_id
 
     log_file = Path(tempfile.mktemp(prefix="obs_tg_bot_", suffix=".log"))
     log_fh = open(log_file, "w")
 
     proc = subprocess.Popen(
-        [sys.executable, "-m", "obs_agent.telegram_main"],
+        [sys.executable, "-m", "obs_agent.telegram_main", "--test"],
         env=env,
         stdout=log_fh,
         stderr=log_fh,
@@ -275,7 +274,7 @@ def _print_bot_logs(log_file: Path | None) -> None:
 @pytest.mark.timeout(1800)
 @pytest.mark.skipif(
     not _tg_creds_available,
-    reason="Telegram credentials not configured (need TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION, TELEGRAM_TEST_BOT_USERNAME, OBS_TELEGRAM_TEST_BOT_TOKEN)",
+    reason="Telegram credentials not configured (need OBS_TEST_TELEGRAM_API_ID, OBS_TEST_TELEGRAM_API_HASH, OBS_TEST_TELEGRAM_SESSION, OBS_TEST_TELEGRAM_BOT_USERNAME, OBS_TEST_TELEGRAM_BOT_TOKEN)",
 )
 async def test_eval_telegram_all(eval_vault: Path) -> None:
     """Run ALL Telegram eval scenarios sequentially in a single test.
