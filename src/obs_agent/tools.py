@@ -209,6 +209,11 @@ def create_obs_tools(
     """
 
     def _current_obs_bootstrap():
+        if hook_state is not None and hook_state.pending_obs_bootstrap_xml:
+            try:
+                return parse_obs_bootstrap_xml(hook_state.pending_obs_bootstrap_xml)
+            except Exception:
+                logger.warning("Failed parsing pending OBS bootstrap XML", exc_info=True)
         session_id = get_session_id()
         if not session_id and hook_state is not None:
             session_id = hook_state.session_id
@@ -216,10 +221,6 @@ def create_obs_tools(
             session_id=session_id,
             cwd=config.vault_path,
         )
-        # Fallback: if JSONL doesn't have bootstrap yet (first turn race),
-        # try the pending bootstrap from hook_state (set by telegram.py).
-        if result is None and hook_state is not None and hook_state.pending_obs_bootstrap_xml:
-            result = parse_obs_bootstrap_xml(hook_state.pending_obs_bootstrap_xml)
         return result
 
     async def _launch_task(
@@ -757,8 +758,12 @@ def create_obs_tools(
         )
         # needs_reply is the canonical name; must_reply accepted for backward compat.
         # Use _coerce_bool_arg to handle string "false" correctly (bool("false") is True).
+        if "needs_reply" in args:
+            needs_reply_raw = args.get("needs_reply")
+        else:
+            needs_reply_raw = args.get("must_reply", False)
         try:
-            must_reply = _coerce_bool_arg(args.get("needs_reply") or args.get("must_reply") or False, name="needs_reply")
+            must_reply = _coerce_bool_arg(needs_reply_raw, name="needs_reply")
         except ValueError:
             must_reply = False
         if not team_name:

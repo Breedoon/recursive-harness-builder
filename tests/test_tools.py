@@ -572,6 +572,156 @@ class TestForkTaskTool:
         assert payload["count"] == 1
 
     @pytest.mark.asyncio
+    async def test_session_lineage_prefers_pending_child_bootstrap_over_stale_fork_parent_bootstrap(
+        self,
+        monkeypatch,
+        skill_config,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        pending_child_bootstrap = (
+            "<obs-bootstrap version='2'>"
+            "<obs-lineage>"
+            "<obs-node display_name='Root' agent_name='2026-03-31-10-00-root' />"
+            "<obs-node display_name='Alpha' agent_name='aaaaaaaaaa-alpha' />"
+            "</obs-lineage>"
+            "<fork_context><origin>agent_task_fork</origin><is_fork>true</is_fork>"
+            "<session_id>sid-child</session_id><parent_session_id>sid-root</parent_session_id>"
+            "</fork_context>"
+            "<team_context>"
+            "<root_team_key>2026-03-31-10-00-root</root_team_key>"
+            "<agent_name>aaaaaaaaaa-alpha</agent_name>"
+            "<parent_agent_name>2026-03-31-10-00-root</parent_agent_name>"
+            "<parent_display_name>Root</parent_display_name>"
+            "</team_context>"
+            "</obs-bootstrap>"
+        )
+        monkeypatch.setattr(
+            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
+            lambda **_: ObsBootstrap(
+                raw_xml="<obs-bootstrap version='2'><obs-lineage><obs-node display_name='Root' agent_name='2026-03-31-10-00-root' /></obs-lineage><fork_context><origin>trunk_start</origin><is_fork>false</is_fork><session_id>sid-child</session_id></fork_context><team_context><root_team_key>2026-03-31-10-00-root</root_team_key><agent_name>2026-03-31-10-00-root</agent_name></team_context></obs-bootstrap>",
+                lineage=("Root",),
+                origin="trunk_start",
+                is_fork=False,
+                session_id="sid-child",
+                agent_id=None,
+                parent_session_id=None,
+                root_team_key="2026-03-31-10-00-root",
+                agent_name="2026-03-31-10-00-root",
+                parent_agent_name=None,
+                parent_display_name=None,
+            ),
+        )
+        hook_state = HookState()
+        hook_state.pending_obs_bootstrap_xml = pending_child_bootstrap
+        create_obs_tools(skill_config, lambda: "sid-child", hook_state=hook_state)
+        handler = _tool_handler(captured["tools"], "session_lineage")
+
+        result = await handler({})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["lineage"] == ["Root", "Alpha"]
+        assert payload["lineage_length"] == 2
+        assert payload["agent_name"] == "aaaaaaaaaa-alpha"
+        assert payload["parent_agent_name"] == "2026-03-31-10-00-root"
+
+    @pytest.mark.asyncio
+    async def test_send_inbox_message_uses_pending_child_bootstrap_for_default_sender(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        pending_child_bootstrap = (
+            "<obs-bootstrap version='2'>"
+            "<obs-lineage>"
+            "<obs-node display_name='Root' agent_name='2026-03-31-10-00-root' />"
+            "<obs-node display_name='Alpha' agent_name='aaaaaaaaaa-alpha' />"
+            "</obs-lineage>"
+            "<fork_context><origin>agent_task_fork</origin><is_fork>true</is_fork>"
+            "<session_id>sid-child</session_id><parent_session_id>sid-root</parent_session_id>"
+            "</fork_context>"
+            "<team_context>"
+            "<root_team_key>2026-03-31-10-00-root</root_team_key>"
+            "<agent_name>aaaaaaaaaa-alpha</agent_name>"
+            "<parent_agent_name>2026-03-31-10-00-root</parent_agent_name>"
+            "<parent_display_name>Root</parent_display_name>"
+            "</team_context>"
+            "</obs-bootstrap>"
+        )
+        monkeypatch.setattr(
+            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
+            lambda **_: ObsBootstrap(
+                raw_xml="<obs-bootstrap version='2'><obs-lineage><obs-node display_name='Root' agent_name='2026-03-31-10-00-root' /></obs-lineage><fork_context><origin>trunk_start</origin><is_fork>false</is_fork><session_id>sid-child</session_id></fork_context><team_context><root_team_key>2026-03-31-10-00-root</root_team_key><agent_name>2026-03-31-10-00-root</agent_name></team_context></obs-bootstrap>",
+                lineage=("Root",),
+                origin="trunk_start",
+                is_fork=False,
+                session_id="sid-child",
+                agent_id=None,
+                parent_session_id=None,
+                root_team_key="2026-03-31-10-00-root",
+                agent_name="2026-03-31-10-00-root",
+                parent_agent_name=None,
+                parent_display_name=None,
+            ),
+        )
+        hook_state = HookState()
+        hook_state.pending_obs_bootstrap_xml = pending_child_bootstrap
+        create_obs_tools(skill_config, lambda: "sid-child", hook_state=hook_state)
+        handler = _tool_handler(captured["tools"], "SendInboxMessage")
+
+        result = await handler({"recipient": "2026-03-31-10-00-root", "content": "hello parent"})
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["success"] is True
+
+        inbox_path = (
+            tmp_path
+            / ".claude"
+            / "teams"
+            / "2026-03-31-10-00-root"
+            / "inboxes"
+            / "2026-03-31-10-00-root.json"
+        )
+        persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
+        assert persisted[-1]["from"] == "aaaaaaaaaa-alpha"
+
+    @pytest.mark.asyncio
+    async def test_send_inbox_message_needs_reply_false_wins_over_legacy_must_reply_true(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
+        send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
+
+        result = await send_handler(
+            {
+                "team_name": "team-alpha",
+                "recipient": "worker-a",
+                "content": "hello team",
+                "sender": "lead",
+                "needs_reply": False,
+                "must_reply": True,
+            }
+        )
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["success"] is True
+
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
+        assert "must_reply" not in persisted[-1]
+        assert "replied" not in persisted[-1]
+
+    @pytest.mark.asyncio
     async def test_session_lineage_returns_current_bootstrap(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 

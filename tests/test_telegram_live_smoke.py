@@ -48,6 +48,11 @@ _LINEAGE_PAYLOAD_FACT_RE = re.compile(
     r"lineage=(?P<lineage>[^\n]+)"
 )
 
+_MESSAGE_FACT_RE = re.compile(
+    r"from=(?P<from>[^|\n]+)\|"
+    r"must_reply=(?P<must_reply>[^|\n]+)"
+)
+
 _FALLBACK_ROOT_TEAM_RE = re.compile(r"root_team_key\s*[:=]\s*[\"']?(?P<value>[^\"'\n<][^\"'\n]*)", re.IGNORECASE)
 _FALLBACK_AGENT_NAME_RE = re.compile(
     r"agent_name(?:\s*\([^)]*\))?\s*[:=]\s*[\"']?(?P<value>[^\"'\n<][^\"'\n]*)",
@@ -89,6 +94,47 @@ def _extract_lineage_fact_line(text: str) -> dict[str, str]:
 def _message_is_exact_token(message_text: str, token: str) -> bool:
     normalized = message_text.strip().replace("_", "").replace("*", "").strip()
     return normalized == token
+
+
+def _extract_message_fact_line(text: str) -> dict[str, str]:
+    match = _MESSAGE_FACT_RE.search(text)
+    assert match is not None, f"missing message fact line in:\n{text}"
+    facts = {
+        "from": match.group("from").strip().strip("_*`\"' "),
+        "must_reply": match.group("must_reply").strip().strip("_*`\"' "),
+    }
+    assert "<value>" not in facts["from"].lower(), f"placeholder sender in:\n{text}"
+    assert "<true-or-false>" not in facts["must_reply"].lower(), f"placeholder must_reply in:\n{text}"
+    return facts
+
+
+async def _wait_for_fact_message_after_containing(
+    harness: _LiveForumHarness,
+    *,
+    thread_id: int | None,
+    after_message_id: int,
+    token: str,
+    extractor,
+    timeout: float = 120.0,
+    limit: int = 40,
+) -> tuple[object, dict[str, str]]:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        recent = await harness.platform.get_recent_messages(thread_id=thread_id, limit=limit)
+        for message in recent:
+            if message.message_id <= after_message_id or token not in message.text:
+                continue
+            try:
+                facts = extractor(message.text)
+            except AssertionError:
+                continue
+            return message, facts
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for parseable fact reply {token!r} after message {after_message_id}\n"
+                + harness.failure_context()
+            )
+        await asyncio.sleep(1.0)
 
 
 def _extract_lineage_payload_fact_line(text: str) -> dict[str, object]:
@@ -1751,6 +1797,339 @@ class TestTelegramLiveSmoke:
             timeout=300.0,
         )
         assert f"ALPHA-GOT-PARENT-REPLY-{tag}" in parent_read.text, live_tg_forum.failure_context()
+
+    async def test_live_smoke_nested_tree_has_one_entry_per_real_agent(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        root_thread_id = await live_tg_forum.platform.create_topic(f"Smoke Tree Unique {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only TREE-UNIQUE-PRIME-{tag}.",
+            thread_id=root_thread_id,
+            token=f"TREE-UNIQUE-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        lineage_root = await _query_session_lineage(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            token=f"LINEAGE-ROOT-{tag}",
+            timeout=240.0,
+        )
+        thread_alpha, lineage_alpha = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=True,
+            alias="Alpha",
+            launch_token=f"ROOT-LAUNCHED-ALPHA-{tag}",
+            lineage_token=f"LINEAGE-ALPHA-{tag}",
+            timeout=240.0,
+        )
+        thread_charlie, lineage_charlie = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=True,
+            alias="Charlie",
+            launch_token=f"ROOT-LAUNCHED-CHARLIE-{tag}",
+            lineage_token=f"LINEAGE-CHARLIE-{tag}",
+            timeout=240.0,
+        )
+        thread_bravo, lineage_bravo = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=thread_alpha,
+            fork=True,
+            alias="Bravo",
+            launch_token=f"ALPHA-LAUNCHED-BRAVO-{tag}",
+            lineage_token=f"LINEAGE-BRAVO-{tag}",
+            timeout=260.0,
+        )
+        thread_delta, lineage_delta = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=thread_charlie,
+            fork=True,
+            alias="Delta",
+            launch_token=f"CHARLIE-LAUNCHED-DELTA-{tag}",
+            lineage_token=f"LINEAGE-DELTA-{tag}",
+            timeout=260.0,
+        )
+        thread_echo, lineage_echo = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=thread_delta,
+            fork=True,
+            alias="Echo",
+            launch_token=f"DELTA-LAUNCHED-ECHO-{tag}",
+            lineage_token=f"LINEAGE-ECHO-{tag}",
+            timeout=280.0,
+        )
+
+        for thread_id in (
+            root_thread_id,
+            thread_alpha,
+            thread_charlie,
+            thread_bravo,
+            thread_delta,
+            thread_echo,
+        ):
+            await _wait_for_thread_quiescence(
+                live_tg_forum,
+                thread_id=thread_id,
+                timeout=120.0,
+            )
+
+        root_tree = await _query_search_team_payload(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            mode="tree",
+            timeout=300.0,
+        )
+        expected_tree = sorted(
+            [
+                lineage_root["agent_name"],
+                lineage_alpha["agent_name"],
+                lineage_charlie["agent_name"],
+                lineage_bravo["agent_name"],
+                lineage_delta["agent_name"],
+                lineage_echo["agent_name"],
+            ]
+        )
+        actual_tree = sorted(str(name) for name in root_tree["tree"])
+        assert actual_tree == expected_tree, live_tg_forum.failure_context()
+        assert len(actual_tree) == len(set(actual_tree)) == 6, live_tg_forum.failure_context()
+
+        delta_family = await _query_search_team_payload(
+            live_tg_forum,
+            thread_id=thread_delta,
+            mode="family",
+            timeout=240.0,
+        )
+        assert delta_family["parent"] == lineage_charlie["agent_name"], live_tg_forum.failure_context()
+        assert delta_family["children"] == [lineage_echo["agent_name"]], live_tg_forum.failure_context()
+
+    async def test_live_smoke_fork_child_identity_and_sender_match_actual_child(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        root_thread_id = await live_tg_forum.platform.create_topic(f"Smoke Fork Identity {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only FORK-IDENTITY-PRIME-{tag}.",
+            thread_id=root_thread_id,
+            token=f"FORK-IDENTITY-PRIME-{tag}",
+            timeout=180.0,
+        )
+        root_lineage = await _query_session_lineage(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            token=f"FORK-ROOT-LIN-{tag}",
+            timeout=240.0,
+        )
+
+        child_thread_id, child_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=True,
+            alias=f"Alpha-{tag}",
+            launch_token=f"FORK-LAUNCHED-ALPHA-{tag}",
+            lineage_token=f"FORK-LINEAGE-ALPHA-{tag}",
+            timeout=300.0,
+        )
+        await _wait_for_thread_quiescence(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            seconds=5.0,
+            timeout=180.0,
+        )
+        await _wait_for_thread_quiescence(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            seconds=5.0,
+            timeout=180.0,
+        )
+
+        root_tree = await _query_search_team_payload(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            mode="tree",
+            timeout=240.0,
+        )
+        assert root_tree["mode"] == "tree", live_tg_forum.failure_context()
+        assert root_lineage["agent_name"] in root_tree["tree"], live_tg_forum.failure_context()
+        child_agents = sorted(
+            name for name in root_tree["tree"] if name != root_lineage["agent_name"]
+        )
+        assert len(child_agents) == 1, live_tg_forum.failure_context()
+        actual_child_agent = child_agents[0]
+        assert child_lineage["agent_name"] == actual_child_agent, live_tg_forum.failure_context()
+        assert int(child_lineage["lineage_length"]) == 2, live_tg_forum.failure_context()
+        await _wait_for_thread_quiescence(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            seconds=5.0,
+            timeout=180.0,
+        )
+        await _wait_for_thread_quiescence(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            seconds=5.0,
+            timeout=180.0,
+        )
+
+        baseline_child = await live_tg_forum.platform.latest_bot_message_id(thread_id=child_thread_id)
+        child_to_root_token = f"FORK-CHILD-TO-ROOT-{tag}"
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic fork identity smoke test. "
+                f"Use SendInboxMessage exactly once with recipient={root_lineage['agent_name']}, "
+                f"content={child_to_root_token!r}, summary='fork-identity', needs_reply=false, "
+                "and omit team_name and sender. "
+                f"Then reply with only FORK-CHILD-SENT-{tag}."
+            ),
+            thread_id=child_thread_id,
+            require_done=False,
+            timeout=240.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            after_message_id=baseline_child,
+            token=f"FORK-CHILD-SENT-{tag}",
+            timeout=360.0,
+        )
+
+        baseline_root = await live_tg_forum.platform.latest_bot_message_id(thread_id=root_thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic fork identity smoke test. "
+                "Call ReadInbox exactly once with include_read=true, mark_read=false, limit=20. "
+                f"Find the message whose exact text is {child_to_root_token!r}. "
+                f"Then reply with exactly FORK-INBOX-{tag}|from=<value>|must_reply=<true-or-false>. "
+                "If the field is missing, treat must_reply as false. "
+                "Replace the placeholders with the literal values from the inbox entry and do not add any other text."
+            ),
+            thread_id=root_thread_id,
+            require_done=False,
+            timeout=240.0,
+        )
+        inbox_message, inbox_facts = await _wait_for_fact_message_after_containing(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            after_message_id=baseline_root,
+            token=f"FORK-INBOX-{tag}|",
+            extractor=_extract_message_fact_line,
+            timeout=360.0,
+        )
+        assert inbox_facts["from"] == actual_child_agent, live_tg_forum.failure_context()
+        assert inbox_facts["must_reply"].lower() == "false", live_tg_forum.failure_context()
+
+    async def test_live_smoke_restart_preserves_fork_child_identity_and_sender(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        root_thread_id = await live_tg_forum.platform.create_topic(f"Smoke Restart Fork Identity {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only RESTART-FORK-PRIME-{tag}.",
+            thread_id=root_thread_id,
+            token=f"RESTART-FORK-PRIME-{tag}",
+            timeout=180.0,
+        )
+        root_lineage = await _query_session_lineage(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            token=f"RESTART-FORK-ROOT-LIN-{tag}",
+            timeout=240.0,
+        )
+
+        child_thread_id, child_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=True,
+            alias=f"Alpha-{tag}",
+            launch_token=f"RESTART-FORK-LAUNCHED-ALPHA-{tag}",
+            lineage_token=f"RESTART-FORK-LINEAGE-ALPHA-{tag}",
+            timeout=300.0,
+        )
+        expected_child_agent = child_lineage["agent_name"]
+        _restart_live_bot(live_tg_forum)
+
+        child_lineage_after = await _query_session_lineage(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            token=f"RESTART-FORK-LINEAGE-AFTER-{tag}",
+            timeout=300.0,
+        )
+        assert child_lineage_after["agent_name"] == expected_child_agent, live_tg_forum.failure_context()
+        assert child_lineage_after["root_team_key"] == root_lineage["root_team_key"], live_tg_forum.failure_context()
+        assert int(child_lineage_after["lineage_length"]) == 2, live_tg_forum.failure_context()
+        await _wait_for_thread_quiescence(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            seconds=5.0,
+            timeout=180.0,
+        )
+        await _wait_for_thread_quiescence(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            seconds=5.0,
+            timeout=180.0,
+        )
+
+        baseline_child = await live_tg_forum.platform.latest_bot_message_id(thread_id=child_thread_id)
+        child_to_root_token = f"RESTART-FORK-CHILD-TO-ROOT-{tag}"
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic restart fork identity smoke test. "
+                f"Use SendInboxMessage exactly once with recipient={root_lineage['agent_name']}, "
+                f"content={child_to_root_token!r}, summary='restart-fork-identity', needs_reply=false, "
+                "and omit team_name and sender. "
+                f"Then reply with only RESTART-FORK-CHILD-SENT-{tag}."
+            ),
+            thread_id=child_thread_id,
+            require_done=False,
+            timeout=240.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            after_message_id=baseline_child,
+            token=f"RESTART-FORK-CHILD-SENT-{tag}",
+            timeout=360.0,
+        )
+
+        baseline_root = await live_tg_forum.platform.latest_bot_message_id(thread_id=root_thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic restart fork identity smoke test. "
+                "Call ReadInbox exactly once with include_read=true, mark_read=false, limit=20. "
+                f"Find the message whose exact text is {child_to_root_token!r}. "
+                f"Then reply with exactly RESTART-FORK-INBOX-{tag}|from=<value>|must_reply=<true-or-false>. "
+                "If the field is missing, treat must_reply as false. "
+                "Replace the placeholders with the literal values from the inbox entry and do not add any other text."
+            ),
+            thread_id=root_thread_id,
+            require_done=False,
+            timeout=240.0,
+        )
+        _inbox_message, inbox_facts = await _wait_for_fact_message_after_containing(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            after_message_id=baseline_root,
+            token=f"RESTART-FORK-INBOX-{tag}|",
+            extractor=_extract_message_fact_line,
+            timeout=360.0,
+        )
+        assert inbox_facts["from"] == expected_child_agent, live_tg_forum.failure_context()
+        assert inbox_facts["must_reply"].lower() == "false", live_tg_forum.failure_context()
 
     async def test_live_smoke_restart_preserves_exact_team_key_and_parent_routing(
         self,

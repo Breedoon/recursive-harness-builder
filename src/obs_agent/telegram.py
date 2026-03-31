@@ -5768,7 +5768,19 @@ class TelegramBot:
                 )
             await state.session_manager.get_client()
             self._bind_state_session(state)
-            if state.pending_obs_bootstrap and not self._session_heads.get(state.session_id or ""):
+            latest_session_bootstrap = None
+            if state.pending_obs_bootstrap:
+                latest_session_bootstrap = find_latest_obs_bootstrap_for_session(
+                    session_id=state.session_id,
+                    cwd=self._config.vault_path,
+                )
+            if state.pending_obs_bootstrap and (
+                latest_session_bootstrap is None
+                or latest_session_bootstrap.raw_xml != state.pending_obs_bootstrap
+            ):
+                # Fresh child/fork topics may inherit a parent session head before
+                # their own bootstrap is written. Keep prepending the pending
+                # bootstrap until the child session JSONL actually contains it.
                 pending_bootstrap_active = state.pending_obs_bootstrap
                 run_user_text = f"{pending_bootstrap_active}\n\n{run_user_text}"
             # Prepend server timestamp + context stats to user messages
