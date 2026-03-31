@@ -304,7 +304,13 @@ async def _launch_lineage_worker(
             if message.message_id <= child_launch_message.message_id or f"{lineage_token}|" not in message.text:
                 continue
             try:
-                return child_thread_id, _extract_lineage_fact_line(message.text)
+                lineage = _extract_lineage_fact_line(message.text)
+                await _wait_for_thread_quiescence(
+                    harness,
+                    thread_id=child_thread_id,
+                    timeout=min(timeout + 120.0, 120.0),
+                )
+                return child_thread_id, lineage
             except AssertionError:
                 continue
         if asyncio.get_running_loop().time() >= deadline:
@@ -379,6 +385,102 @@ async def _send_inbox_message_and_expect_outcome(
         timeout=timeout + 120.0,
     )
     return _message_is_exact_token(result_message.text, delivered_token)
+
+
+async def _wait_for_thread_quiescence(
+    harness: _LiveForumHarness,
+    *,
+    thread_id: int,
+    seconds: float = 2.0,
+    timeout: float = 60.0,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            await harness.platform.wait_for_silence(thread_id=thread_id, seconds=seconds)
+            return
+        except AssertionError:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError(
+                    f"Timed out waiting for thread {thread_id} quiescence\n"
+                    + harness.failure_context()
+                )
+            await asyncio.sleep(0.5)
+
+
+def _restart_live_bot(harness: _LiveForumHarness) -> None:
+    _stop_bot(harness.proc)
+    assert harness.temp_root is not None
+    harness.proc, harness.log_file = _start_bot(
+        harness.vault_path,
+        harness.temp_root,
+        state_db_path=harness.state_db_path,
+    )
+
+
+async def _exercise_restart_roundtrip(
+    harness: _LiveForumHarness,
+    *,
+    root_thread_id: int,
+    recipient_thread_id: int,
+    recipient_agent_name: str,
+    root_agent_name: str,
+    token_prefix: str,
+    timeout: float = 420.0,
+) -> None:
+    recipient_baseline = await harness.platform.latest_bot_message_id(thread_id=recipient_thread_id)
+    root_baseline = await harness.platform.latest_bot_message_id(thread_id=root_thread_id)
+
+    recipient_reply_token = f"{token_prefix}-RECIPIENT-ACK"
+    recipient_fail_token = f"{token_prefix}-RECIPIENT-FAIL"
+    root_reply_token = f"{token_prefix}-ROOT-ACK"
+    root_reply_instruction = (
+        "This is a deterministic restart wake roundtrip smoke test. "
+        f"If you are reading this because a teammate message woke you while idle after daemon restart, "
+        f"reply in this topic with exactly {root_reply_token}."
+    )
+    wake_content = (
+        "This is a deterministic restart wake roundtrip smoke test. "
+        f"If you are reading this because a teammate message woke you while idle after daemon restart, "
+        f"use SendInboxMessage exactly once with recipient={root_agent_name!r}, "
+        f"content={root_reply_instruction!r}, summary='restart-roundtrip-reply', and omit team_name and sender. "
+        f"If the tool reports delivered=false or returns an error, reply with only {recipient_fail_token}. "
+        f"Otherwise reply with only {recipient_reply_token}."
+    )
+
+    await _send_inbox_message_and_wait_ack(
+        harness,
+        sender_thread_id=root_thread_id,
+        recipient=recipient_agent_name,
+        content=wake_content,
+        ack_token=f"{token_prefix}-ROOT-SENT",
+        summary="restart-roundtrip-wake",
+        timeout=240.0,
+    )
+
+    recipient_wake = await _wait_for_exact_message_after_any_token(
+        harness,
+        thread_id=recipient_thread_id,
+        after_message_id=recipient_baseline,
+        tokens=[recipient_reply_token, recipient_fail_token],
+        timeout=timeout,
+    )
+    assert _message_is_exact_token(
+        recipient_wake.text,
+        recipient_reply_token,
+    ), harness.failure_context()
+
+    root_roundtrip = await _wait_for_exact_message_after_any_token(
+        harness,
+        thread_id=root_thread_id,
+        after_message_id=root_baseline,
+        tokens=[root_reply_token],
+        timeout=timeout,
+    )
+    assert _message_is_exact_token(
+        root_roundtrip.text,
+        root_reply_token,
+    ), harness.failure_context()
 
 
 async def _wait_for_message_after_any_token(
@@ -3253,6 +3355,286 @@ class TestTelegramLiveSmoke:
             timeout=300.0,
         )
         assert f"RESTART-INBOX-SEEN-{tag}" in grandchild_post_restart.text, live_tg_forum.failure_context()
+
+    async def test_live_smoke_restart_grandchild_wakes_and_replies_back_to_trunk(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        root_thread_id = await live_tg_forum.platform.create_topic(f"Smoke Restart Wake {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only RESTART-WAKE-PRIME-{tag}.",
+            thread_id=root_thread_id,
+            token=f"RESTART-WAKE-PRIME-{tag}",
+            timeout=180.0,
+        )
+        root_lineage = await _query_session_lineage_payload(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            timeout=240.0,
+        )
+
+        child_thread_id, _ = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=False,
+            alias=f"RESTART-WAKE-CHILD-{tag}",
+            launch_token=f"RESTART-WAKE-LAUNCHED-CHILD-{tag}",
+            lineage_token=f"RESTART-WAKE-LINEAGE-CHILD-{tag}",
+            timeout=240.0,
+        )
+        grandchild_thread_id, grandchild_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=child_thread_id,
+            fork=False,
+            alias=f"RESTART-WAKE-GRAND-{tag}",
+            launch_token=f"RESTART-WAKE-LAUNCHED-GRAND-{tag}",
+            lineage_token=f"RESTART-WAKE-LINEAGE-GRAND-{tag}",
+            timeout=240.0,
+        )
+        await asyncio.sleep(2.0)
+
+        _stop_bot(live_tg_forum.proc)
+        assert live_tg_forum.temp_root is not None
+        live_tg_forum.proc, live_tg_forum.log_file = _start_bot(
+            live_tg_forum.vault_path,
+            live_tg_forum.temp_root,
+            state_db_path=live_tg_forum.state_db_path,
+        )
+        await asyncio.sleep(2.0)
+
+        grandchild_baseline = await live_tg_forum.platform.latest_bot_message_id(
+            thread_id=grandchild_thread_id
+        )
+        root_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=root_thread_id)
+
+        grandchild_reply_token = f"RESTART-WAKE-GRAND-ACK-{tag}"
+        grandchild_fail_token = f"RESTART-WAKE-GRAND-FAIL-{tag}"
+        root_reply_token = f"RESTART-WAKE-ROOT-ACK-{tag}"
+        root_reply_instruction = (
+            "This is a deterministic restart wake roundtrip smoke test. "
+            f"If you are reading this because a teammate message woke you while idle after daemon restart, "
+            f"reply in this topic with exactly {root_reply_token}."
+        )
+        wake_content = (
+            "This is a deterministic restart wake roundtrip smoke test. "
+            f"If you are reading this because a teammate message woke you while idle after daemon restart, "
+            f"use SendInboxMessage exactly once with recipient={root_lineage['agent_name']!r}, "
+            f"content={root_reply_instruction!r}, summary='restart-grandchild-reply', and omit team_name and sender. "
+            f"If the tool reports delivered=false or returns an error, reply with only {grandchild_fail_token}. "
+            f"Otherwise reply with only {grandchild_reply_token}."
+        )
+
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=root_thread_id,
+            recipient=grandchild_lineage["agent_name"],
+            content=wake_content,
+            ack_token=f"RESTART-WAKE-ROOT-SENT-{tag}",
+            summary="restart-grandchild-wake",
+            timeout=240.0,
+        )
+
+        grandchild_wake = await _wait_for_exact_message_after_any_token(
+            live_tg_forum,
+            thread_id=grandchild_thread_id,
+            after_message_id=grandchild_baseline,
+            tokens=[grandchild_reply_token, grandchild_fail_token],
+            timeout=420.0,
+        )
+        assert _message_is_exact_token(
+            grandchild_wake.text,
+            grandchild_reply_token,
+        ), live_tg_forum.failure_context()
+
+        root_roundtrip = await _wait_for_exact_message_after_any_token(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            after_message_id=root_baseline,
+            tokens=[root_reply_token],
+            timeout=420.0,
+        )
+        assert _message_is_exact_token(
+            root_roundtrip.text,
+            root_reply_token,
+        ), live_tg_forum.failure_context()
+
+    async def test_live_smoke_restart_roundtrip_survives_two_restarts(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        root_thread_id = await live_tg_forum.platform.create_topic(f"Smoke Restart Twice {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only RESTART-TWICE-PRIME-{tag}.",
+            thread_id=root_thread_id,
+            token=f"RESTART-TWICE-PRIME-{tag}",
+            timeout=180.0,
+        )
+        root_lineage = await _query_session_lineage_payload(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            timeout=240.0,
+        )
+
+        child_thread_id, _ = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=False,
+            alias=f"RESTART-TWICE-CHILD-{tag}",
+            launch_token=f"RESTART-TWICE-LAUNCHED-CHILD-{tag}",
+            lineage_token=f"RESTART-TWICE-LINEAGE-CHILD-{tag}",
+            timeout=240.0,
+        )
+        grandchild_thread_id, grandchild_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=child_thread_id,
+            fork=False,
+            alias=f"RESTART-TWICE-GRAND-{tag}",
+            launch_token=f"RESTART-TWICE-LAUNCHED-GRAND-{tag}",
+            lineage_token=f"RESTART-TWICE-LINEAGE-GRAND-{tag}",
+            timeout=240.0,
+        )
+        await asyncio.sleep(2.0)
+
+        for cycle in (1, 2):
+            _restart_live_bot(live_tg_forum)
+            await asyncio.sleep(2.0)
+            await _exercise_restart_roundtrip(
+                live_tg_forum,
+                root_thread_id=root_thread_id,
+                recipient_thread_id=grandchild_thread_id,
+                recipient_agent_name=grandchild_lineage["agent_name"],
+                root_agent_name=root_lineage["agent_name"],
+                token_prefix=f"RESTART-TWICE-{tag}-CYCLE-{cycle}",
+            )
+
+        lineage_after = await _query_session_lineage_payload(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            timeout=240.0,
+        )
+        assert lineage_after["root_team_key"] == root_lineage["root_team_key"], live_tg_forum.failure_context()
+        assert lineage_after["agent_name"] == root_lineage["agent_name"], live_tg_forum.failure_context()
+
+    async def test_live_smoke_restart_child_and_grandchild_both_reply_to_trunk(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        root_thread_id = await live_tg_forum.platform.create_topic(f"Smoke Restart Multi {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only RESTART-MULTI-PRIME-{tag}.",
+            thread_id=root_thread_id,
+            token=f"RESTART-MULTI-PRIME-{tag}",
+            timeout=180.0,
+        )
+        root_lineage = await _query_session_lineage_payload(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            timeout=240.0,
+        )
+
+        child_thread_id, child_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=False,
+            alias=f"RESTART-MULTI-CHILD-{tag}",
+            launch_token=f"RESTART-MULTI-LAUNCHED-CHILD-{tag}",
+            lineage_token=f"RESTART-MULTI-LINEAGE-CHILD-{tag}",
+            timeout=240.0,
+        )
+        grandchild_thread_id, grandchild_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=child_thread_id,
+            fork=False,
+            alias=f"RESTART-MULTI-GRAND-{tag}",
+            launch_token=f"RESTART-MULTI-LAUNCHED-GRAND-{tag}",
+            lineage_token=f"RESTART-MULTI-LINEAGE-GRAND-{tag}",
+            timeout=240.0,
+        )
+        await asyncio.sleep(2.0)
+
+        _restart_live_bot(live_tg_forum)
+        await asyncio.sleep(2.0)
+
+        child_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=child_thread_id)
+        grandchild_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=grandchild_thread_id)
+
+        child_reply_token = f"RESTART-MULTI-CHILD-REPLY-{tag}"
+        child_ack_token = f"RESTART-MULTI-CHILD-ACK-{tag}"
+        grandchild_reply_token = f"RESTART-MULTI-GRAND-REPLY-{tag}"
+        grandchild_ack_token = f"RESTART-MULTI-GRAND-ACK-{tag}"
+
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=root_thread_id,
+            recipient=child_lineage["agent_name"],
+            content=(
+                "This is a deterministic restart multi-reply smoke test. "
+                f"If you are reading this because a teammate message woke you while idle after daemon restart, "
+                f"use SendInboxMessage exactly once with recipient={root_lineage['agent_name']!r}, "
+                f"content={child_reply_token!r}, summary='restart-multi-child', and omit team_name and sender. "
+                f"Then reply with only {child_ack_token}."
+            ),
+            ack_token=f"RESTART-MULTI-SENT-CHILD-{tag}",
+            summary="restart-multi-child-wake",
+            timeout=240.0,
+        )
+        await _wait_for_exact_message_after_any_token(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            after_message_id=child_baseline,
+            tokens=[child_ack_token],
+            timeout=420.0,
+        )
+
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=root_thread_id,
+            recipient=grandchild_lineage["agent_name"],
+            content=(
+                "This is a deterministic restart multi-reply smoke test. "
+                f"If you are reading this because a teammate message woke you while idle after daemon restart, "
+                f"use SendInboxMessage exactly once with recipient={root_lineage['agent_name']!r}, "
+                f"content={grandchild_reply_token!r}, summary='restart-multi-grandchild', and omit team_name and sender. "
+                f"Then reply with only {grandchild_ack_token}."
+            ),
+            ack_token=f"RESTART-MULTI-SENT-GRAND-{tag}",
+            summary="restart-multi-grandchild-wake",
+            timeout=240.0,
+        )
+        await _wait_for_exact_message_after_any_token(
+            live_tg_forum,
+            thread_id=grandchild_thread_id,
+            after_message_id=grandchild_baseline,
+            tokens=[grandchild_ack_token],
+            timeout=420.0,
+        )
+
+        inbox_check = await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic restart multi-reply smoke test. "
+                "Call ReadInbox exactly once with include_read=true, mark_read=false, limit=20. "
+                f"If you find both {child_reply_token!r} and {grandchild_reply_token!r}, "
+                f"reply with only RESTART-MULTI-ROOT-GOT-BOTH-{tag}. "
+                f"Otherwise reply with only RESTART-MULTI-ROOT-MISS-{tag}."
+            ),
+            thread_id=root_thread_id,
+            token=f"RESTART-MULTI-ROOT-GOT-BOTH-{tag}",
+            timeout=360.0,
+        )
+        assert f"RESTART-MULTI-ROOT-GOT-BOTH-{tag}" in inbox_check.text, live_tg_forum.failure_context()
 
     async def test_live_smoke_rename_stop_resume_preserves_lineage_and_inbox(
         self,
