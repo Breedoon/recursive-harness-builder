@@ -188,6 +188,22 @@ class TestTelegramNotifyUsername:
         assert cfg.telegram_notify_username == "breedoon"
 
 
+class TestTelegramGroupFolderConfig:
+    def test_group_folder_title_default_none(self):
+        cfg = OBSConfig()
+        assert cfg.telegram_group_folder_title is None
+
+    def test_group_folder_title_from_env(self, monkeypatch):
+        monkeypatch.setenv("OBS_TELEGRAM_GROUP_FOLDER_TITLE", "Claudia")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_group_folder_title == "Claudia"
+
+    def test_group_addlist_url_from_env(self, monkeypatch):
+        monkeypatch.setenv("OBS_TELEGRAM_GROUP_ADDLIST_URL", "https://t.me/addlist/sPnRtk8389lhNjQ0")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_group_addlist_url == "https://t.me/addlist/sPnRtk8389lhNjQ0"
+
+
 # --- Immutable Paths ---
 
 

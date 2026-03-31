@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 try:  # pragma: no cover - optional import path exercised in integration
     from telethon import TelegramClient, events
     from telethon.sessions import StringSession
+    from telethon.tl.functions.chatlists import EditExportedInviteRequest, GetExportedInvitesRequest
     from telethon.tl.functions.channels import (
         CreateChannelRequest,
         EditAdminRequest,
@@ -29,19 +30,39 @@ try:  # pragma: no cover - optional import path exercised in integration
         LeaveChannelRequest,
         ToggleForumRequest,
     )
-    from telethon.tl.types import Channel, ChatAdminRights
+    from telethon.tl.functions.messages import GetDialogFiltersRequest, UpdateDialogFilterRequest
+    from telethon.tl.types import (
+        Channel,
+        ChatAdminRights,
+        DialogFilterChatlist,
+        InputChatlistDialogFilter,
+        InputPeerChannel,
+        InputPeerChat,
+        InputPeerUser,
+        TextWithEntities,
+    )
     from telethon.utils import get_peer_id
 except Exception:  # pragma: no cover - absence handled at runtime
     TelegramClient = None
     events = None
     StringSession = None
+    EditExportedInviteRequest = None
+    GetExportedInvitesRequest = None
     CreateChannelRequest = None
     EditAdminRequest = None
     InviteToChannelRequest = None
     LeaveChannelRequest = None
     ToggleForumRequest = None
+    GetDialogFiltersRequest = None
+    UpdateDialogFilterRequest = None
     Channel = None
     ChatAdminRights = None
+    DialogFilterChatlist = None
+    InputChatlistDialogFilter = None
+    InputPeerChannel = None
+    InputPeerChat = None
+    InputPeerUser = None
+    TextWithEntities = None
     get_peer_id = None
 
 
@@ -71,6 +92,10 @@ class ProvisionedGroup:
     added_bot_usernames: tuple[str, ...]
     creator_left: bool
     forum_tabs_enabled: bool
+    folder_title: str | None
+    addlist_url: str | None
+    added_to_folder: bool
+    added_to_addlist: bool
 
 
 def current_obs_profile() -> str:
@@ -221,6 +246,11 @@ class TelegramUserbotProvisioner:
             if forum_tabs_enabled:
                 raise RuntimeError("forum list layout requirement failed: forum_tabs is still enabled")
 
+            folder_title, addlist_url, added_to_folder, added_to_addlist = await self._maybe_add_group_to_chatlist(
+                client,
+                refreshed,
+            )
+
             creator_left = False
             if target_user_id is not None and target_user_id != getattr(me, "id", None):
                 await client(LeaveChannelRequest(channel=channel))
@@ -234,6 +264,10 @@ class TelegramUserbotProvisioner:
                 added_bot_usernames=tuple(bot_usernames),
                 creator_left=creator_left,
                 forum_tabs_enabled=forum_tabs_enabled,
+                folder_title=folder_title,
+                addlist_url=addlist_url,
+                added_to_folder=added_to_folder,
+                added_to_addlist=added_to_addlist,
             )
 
     async def create_bot(self, *, display_name: str = "Claudia") -> CreatedBot:
@@ -335,6 +369,86 @@ class TelegramUserbotProvisioner:
         if not self._config.telegram_userbot_session:
             raise RuntimeError("OBS_TELEGRAM_USERBOT_SESSION is required for userbot provisioning")
 
+    async def _maybe_add_group_to_chatlist(
+        self,
+        client: TelegramClient,
+        channel: Any,
+    ) -> tuple[str | None, str | None, bool, bool]:
+        folder_title = (self._config.telegram_group_folder_title or "").strip() or None
+        addlist_url = (self._config.telegram_group_addlist_url or "").strip() or None
+        if folder_title is None and addlist_url is None:
+            return None, None, False, False
+        if folder_title is None and addlist_url is not None:
+            raise RuntimeError("OBS_TELEGRAM_GROUP_FOLDER_TITLE is required when OBS_TELEGRAM_GROUP_ADDLIST_URL is set")
+
+        if GetDialogFiltersRequest is None or UpdateDialogFilterRequest is None:
+            raise RuntimeError("Telethon dialog filter APIs are unavailable")
+
+        filters_result = await client(GetDialogFiltersRequest())
+        filters = list(getattr(filters_result, "filters", []) or [])
+        target_filter = None
+        for dialog_filter in filters:
+            if DialogFilterChatlist is not None and not isinstance(dialog_filter, DialogFilterChatlist):
+                continue
+            if folder_title is not None and self._dialog_filter_title_text(dialog_filter) != folder_title:
+                continue
+            target_filter = dialog_filter
+            break
+        if target_filter is None:
+            raise RuntimeError(f"Telegram group folder not found: {folder_title or '<missing>'}")
+
+        channel_input = await client.get_input_entity(channel)
+        include_peers = list(getattr(target_filter, "include_peers", []) or [])
+        folder_changed = self._append_unique_input_peer(include_peers, channel_input)
+        if folder_changed:
+            await client(
+                UpdateDialogFilterRequest(
+                    id=int(target_filter.id),
+                    filter=DialogFilterChatlist(
+                        id=int(target_filter.id),
+                        title=self._ensure_text_with_entities(
+                            getattr(target_filter, "title", None),
+                            fallback=folder_title or "Claudia",
+                        ),
+                        pinned_peers=list(getattr(target_filter, "pinned_peers", []) or []),
+                        include_peers=include_peers,
+                        has_my_invites=bool(getattr(target_filter, "has_my_invites", False)),
+                        title_noanimate=bool(getattr(target_filter, "title_noanimate", False)),
+                        emoticon=getattr(target_filter, "emoticon", None),
+                        color=getattr(target_filter, "color", None),
+                    ),
+                )
+            )
+
+        addlist_changed = False
+        if addlist_url is not None:
+            if GetExportedInvitesRequest is None or EditExportedInviteRequest is None or InputChatlistDialogFilter is None:
+                raise RuntimeError("Telethon chatlist invite APIs are unavailable")
+            slug = self._extract_addlist_slug(addlist_url)
+            chatlist = InputChatlistDialogFilter(filter_id=int(target_filter.id))
+            exported = await client(GetExportedInvitesRequest(chatlist=chatlist))
+            invite = None
+            for existing in list(getattr(exported, "invites", []) or []):
+                url = str(getattr(existing, "url", "") or "")
+                if url.endswith(f"/{slug}"):
+                    invite = existing
+                    break
+            if invite is None:
+                raise RuntimeError(f"Telegram addlist invite not found for slug={slug}")
+            invite_peers = await self._resolve_exported_invite_input_peers(client, exported, slug=slug)
+            addlist_changed = self._append_unique_input_peer(invite_peers, channel_input)
+            if addlist_changed:
+                await client(
+                    EditExportedInviteRequest(
+                        chatlist=chatlist,
+                        slug=slug,
+                        title=getattr(invite, "title", None),
+                        peers=invite_peers,
+                    )
+                )
+
+        return folder_title, addlist_url, folder_changed, addlist_changed
+
     def _client(self):
         provisioner = self
 
@@ -403,6 +517,45 @@ class TelegramUserbotProvisioner:
             usernames.append(username.strip())
             seen_ids.add(user_id)
         return entities, usernames
+
+    async def _resolve_exported_invite_input_peers(
+        self,
+        client: TelegramClient,
+        exported: Any,
+        *,
+        slug: str,
+    ) -> list[Any]:
+        chats_by_id = {
+            int(getattr(chat, "id")): chat
+            for chat in list(getattr(exported, "chats", []) or [])
+            if isinstance(getattr(chat, "id", None), int)
+        }
+        users_by_id = {
+            int(getattr(user, "id")): user
+            for user in list(getattr(exported, "users", []) or [])
+            if isinstance(getattr(user, "id", None), int)
+        }
+        peers: list[Any] = []
+        for invite in list(getattr(exported, "invites", []) or []):
+            url = str(getattr(invite, "url", "") or "")
+            if not url.endswith(f"/{slug}"):
+                continue
+            for peer in list(getattr(invite, "peers", []) or []):
+                entity = None
+                peer_channel_id = getattr(peer, "channel_id", None)
+                peer_chat_id = getattr(peer, "chat_id", None)
+                peer_user_id = getattr(peer, "user_id", None)
+                if isinstance(peer_channel_id, int):
+                    entity = chats_by_id.get(peer_channel_id)
+                elif isinstance(peer_chat_id, int):
+                    entity = chats_by_id.get(peer_chat_id)
+                elif isinstance(peer_user_id, int):
+                    entity = users_by_id.get(peer_user_id)
+                if entity is None:
+                    continue
+                input_peer = await client.get_input_entity(entity)
+                self._append_unique_input_peer(peers, input_peer)
+        return peers
 
     async def _safe_invite(self, client: TelegramClient, channel: Any, entity: Any) -> None:
         try:
@@ -666,6 +819,54 @@ class TelegramUserbotProvisioner:
         if not match:
             return None
         return match.group(1)
+
+    def _dialog_filter_title_text(self, dialog_filter: Any) -> str | None:
+        title = getattr(dialog_filter, "title", None)
+        text = getattr(title, "text", title)
+        if not isinstance(text, str):
+            return None
+        normalized = text.strip()
+        return normalized or None
+
+    def _ensure_text_with_entities(self, value: Any, *, fallback: str) -> Any:
+        text = getattr(value, "text", value)
+        if TextWithEntities is None:
+            return text if isinstance(text, str) and text.strip() else fallback
+        if isinstance(text, str) and text.strip():
+            return TextWithEntities(text=text.strip(), entities=[])
+        return TextWithEntities(text=fallback, entities=[])
+
+    def _extract_addlist_slug(self, value: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            raise RuntimeError("Telegram addlist URL is required")
+        if "addlist/" in raw:
+            raw = raw.rsplit("addlist/", 1)[1]
+        normalized = raw.strip().strip("/")
+        if not normalized:
+            raise RuntimeError(f"Invalid Telegram addlist URL: {value}")
+        return normalized
+
+    def _append_unique_input_peer(self, peers: list[Any], peer: Any) -> bool:
+        peer_key = self._input_peer_key(peer)
+        for existing in peers:
+            if self._input_peer_key(existing) == peer_key:
+                return False
+        peers.append(peer)
+        return True
+
+    def _input_peer_key(self, peer: Any) -> tuple[str, int]:
+        if InputPeerChannel is not None and isinstance(peer, InputPeerChannel):
+            return ("channel", int(peer.channel_id))
+        if InputPeerChat is not None and isinstance(peer, InputPeerChat):
+            return ("chat", int(peer.chat_id))
+        if InputPeerUser is not None and isinstance(peer, InputPeerUser):
+            return ("user", int(peer.user_id))
+        for attr_name, kind in (("channel_id", "channel"), ("chat_id", "chat"), ("user_id", "user")):
+            value = getattr(peer, attr_name, None)
+            if isinstance(value, int):
+                return (kind, value)
+        raise RuntimeError(f"Unsupported input peer type: {type(peer).__name__}")
 
     def _text_matches_any(self, *needles: str) -> Callable[[str], bool]:
         normalized = tuple(needle.lower() for needle in needles if needle)

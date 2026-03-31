@@ -55,6 +55,8 @@ class OBSConfig:
     telegram_userbot_api_id: int | None = None
     telegram_userbot_api_hash: str | None = None
     telegram_userbot_session: str | None = None
+    telegram_group_folder_title: str | None = None
+    telegram_group_addlist_url: str | None = None
     telegram_allowed_user_ids: list[int] = field(default_factory=list)
     telegram_notify_username: str | None = None
     telegram_temp_root: Path = field(default_factory=lambda: _DEFAULT_TELEGRAM_TEMP_ROOT)
@@ -108,6 +110,10 @@ class OBSConfig:
             kwargs["telegram_userbot_api_hash"] = userbot_api_hash.strip()
         if userbot_session := os.environ.get("OBS_TELEGRAM_USERBOT_SESSION"):
             kwargs["telegram_userbot_session"] = userbot_session.strip()
+        if tg_folder_title := os.environ.get("OBS_TELEGRAM_GROUP_FOLDER_TITLE"):
+            kwargs["telegram_group_folder_title"] = tg_folder_title.strip() or None
+        if tg_addlist_url := os.environ.get("OBS_TELEGRAM_GROUP_ADDLIST_URL"):
+            kwargs["telegram_group_addlist_url"] = tg_addlist_url.strip() or None
         if tg_users := os.environ.get("OBS_TELEGRAM_ALLOWED_USERS"):
             kwargs["telegram_allowed_user_ids"] = [
                 int(uid.strip()) for uid in tg_users.split(",") if uid.strip()

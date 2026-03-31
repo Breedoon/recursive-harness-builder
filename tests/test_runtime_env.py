@@ -21,11 +21,15 @@ def _clear_runtime_env(monkeypatch) -> None:
         "OBS_TEST_TELEGRAM_BOT_TOKENS",
         "OBS_TEST_TELEGRAM_ALLOWED_USERS",
         "OBS_TEST_TELEGRAM_NOTIFY_USERNAME",
+        "OBS_TEST_TELEGRAM_GROUP_FOLDER_TITLE",
+        "OBS_TEST_TELEGRAM_GROUP_ADDLIST_URL",
         "OBS_TEST_TELEGRAM_USERBOT_API_ID",
         "OBS_TEST_TELEGRAM_USERBOT_API_HASH",
         "OBS_TEST_TELEGRAM_USERBOT_SESSION",
         "OBS_PROD_TELEGRAM_BOT_TOKEN",
         "OBS_PROD_TELEGRAM_ALLOWED_USERS",
+        "OBS_PROD_TELEGRAM_GROUP_FOLDER_TITLE",
+        "OBS_PROD_TELEGRAM_GROUP_ADDLIST_URL",
         "OBS_PROD_TELEGRAM_USERBOT_API_ID",
         "OBS_PROD_TELEGRAM_USERBOT_API_HASH",
         "OBS_PROD_TELEGRAM_USERBOT_SESSION",
@@ -33,6 +37,8 @@ def _clear_runtime_env(monkeypatch) -> None:
         "OBS_TELEGRAM_BOT_TOKENS",
         "OBS_TELEGRAM_ALLOWED_USERS",
         "OBS_TELEGRAM_NOTIFY_USERNAME",
+        "OBS_TELEGRAM_GROUP_FOLDER_TITLE",
+        "OBS_TELEGRAM_GROUP_ADDLIST_URL",
         "OBS_TELEGRAM_USERBOT_API_ID",
         "OBS_TELEGRAM_USERBOT_API_HASH",
         "OBS_TELEGRAM_USERBOT_SESSION",
@@ -57,6 +63,8 @@ def test_test_profile_maps_prefixed_env_and_sets_haiku(monkeypatch, tmp_path: Pa
                 "OBS_TEST_TELEGRAM_BOT_TOKENS=test-primary,test-secondary",
                 "OBS_TEST_TELEGRAM_ALLOWED_USERS=12345",
                 "OBS_TEST_TELEGRAM_NOTIFY_USERNAME=@notify_test",
+                "OBS_TEST_TELEGRAM_GROUP_FOLDER_TITLE=Claudia",
+                "OBS_TEST_TELEGRAM_GROUP_ADDLIST_URL=https://t.me/addlist/sPnRtk8389lhNjQ0",
                 "OBS_TEST_TELEGRAM_USERBOT_API_ID=111111",
                 "OBS_TEST_TELEGRAM_USERBOT_API_HASH=userbot-hash",
                 "OBS_TEST_TELEGRAM_USERBOT_SESSION=userbot-session",
@@ -82,6 +90,8 @@ def test_test_profile_maps_prefixed_env_and_sets_haiku(monkeypatch, tmp_path: Pa
     assert os.environ["OBS_TELEGRAM_BOT_TOKENS"] == "test-primary,test-secondary"
     assert os.environ["OBS_TELEGRAM_ALLOWED_USERS"] == "12345"
     assert os.environ["OBS_TELEGRAM_NOTIFY_USERNAME"] == "@notify_test"
+    assert os.environ["OBS_TELEGRAM_GROUP_FOLDER_TITLE"] == "Claudia"
+    assert os.environ["OBS_TELEGRAM_GROUP_ADDLIST_URL"] == "https://t.me/addlist/sPnRtk8389lhNjQ0"
     assert os.environ["OBS_TELEGRAM_USERBOT_API_ID"] == "111111"
     assert os.environ["OBS_TELEGRAM_USERBOT_API_HASH"] == "userbot-hash"
     assert os.environ["OBS_TELEGRAM_USERBOT_SESSION"] == "userbot-session"

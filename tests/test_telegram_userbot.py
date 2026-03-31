@@ -126,3 +126,24 @@ async def test_wait_for_bot_reply_surfaces_botfather_rate_limit(tmp_path: Path):
         assert "too many attempts" in str(exc).lower()
     else:
         raise AssertionError("Expected BotFather rate limit to raise RuntimeError")
+
+
+def test_extract_addlist_slug_accepts_full_url(tmp_path: Path):
+    provisioner = TelegramUserbotProvisioner(config=None, env_path=tmp_path / ".env")
+
+    assert provisioner._extract_addlist_slug("https://t.me/addlist/sPnRtk8389lhNjQ0") == "sPnRtk8389lhNjQ0"
+
+
+def test_append_unique_input_peer_dedupes_channel_ids(tmp_path: Path):
+    provisioner = TelegramUserbotProvisioner(config=None, env_path=tmp_path / ".env")
+
+    class _Peer:
+        def __init__(self, channel_id: int) -> None:
+            self.channel_id = channel_id
+
+    peers = [_Peer(123)]
+
+    changed = provisioner._append_unique_input_peer(peers, _Peer(123))
+
+    assert changed is False
+    assert len(peers) == 1

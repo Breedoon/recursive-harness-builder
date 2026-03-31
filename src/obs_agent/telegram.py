@@ -5197,9 +5197,16 @@ class TelegramBot:
         bot_label = ", ".join(f"@{username}" for username in result.added_bot_usernames) or "none"
         leave_label = "userbot left after setup" if result.creator_left else "userbot stayed as owner"
         layout_label = "list" if not result.forum_tabs_enabled else "tabs"
+        folder_label = "not configured"
+        if result.folder_title:
+            folder_label = f"{result.folder_title}:{'added' if result.added_to_folder else 'unchanged'}"
+        addlist_label = "not configured"
+        if result.addlist_url:
+            addlist_label = f"{result.addlist_url}:{'added' if result.added_to_addlist else 'unchanged'}"
         return (
             f"created group: {result.title} "
-            f"(chat_id={result.chat_id}; target={target_label}; bots={bot_label}; forum_layout={layout_label}; {leave_label})"
+            f"(chat_id={result.chat_id}; target={target_label}; bots={bot_label}; forum_layout={layout_label}; "
+            f"folder={folder_label}; addlist={addlist_label}; {leave_label})"
         )
 
     async def _provision_new_bot(
