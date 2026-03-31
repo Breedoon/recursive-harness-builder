@@ -25,7 +25,6 @@ import uuid
 
 import pytest
 
-from obs_agent.lineage import native_agent_name_for_lineage
 from tests.evals.platform_telegram_forum import TelegramForumPlatform
 from tests.test_telegram_live_forum_topics import (
     _append_unread_inbox_message,
@@ -104,8 +103,8 @@ class TestNamingRedesignSmoke:
         assert not root_lineage["root_team_key"].startswith("obs-tree-"), \
             f"Team key should be timestamp-based, got: {root_lineage['root_team_key']}"
         # Agent name should be just the slug (no obs-agent- prefix)
-        assert not root_lineage["native_agent_name"].startswith("obs-agent-"), \
-            f"Trunk agent name should be slug only, got: {root_lineage['native_agent_name']}"
+        assert not root_lineage["agent_name"].startswith("obs-agent-"), \
+            f"Trunk agent name should be slug only, got: {root_lineage['agent_name']}"
 
         # Phase 2: Launch children
         worker_a_thread, lineage_a = await _launch_lineage_worker(
@@ -131,18 +130,18 @@ class TestNamingRedesignSmoke:
         # Verify children share root_team_key but have unique agent names
         assert lineage_a["root_team_key"] == root_lineage["root_team_key"]
         assert lineage_b["root_team_key"] == root_lineage["root_team_key"]
-        assert lineage_a["native_agent_name"] != lineage_b["native_agent_name"]
+        assert lineage_a["agent_name"] != lineage_b["agent_name"]
         assert lineage_a["lineage_length"] == "2"
         assert lineage_b["lineage_length"] == "2"
 
         # Child agent names should have hash prefix (not obs-agent-)
-        assert not lineage_a["native_agent_name"].startswith("obs-agent-"), \
-            f"Child should not have obs-agent- prefix, got: {lineage_a['native_agent_name']}"
-        assert not lineage_b["native_agent_name"].startswith("obs-agent-"), \
-            f"Child should not have obs-agent- prefix, got: {lineage_b['native_agent_name']}"
+        assert not lineage_a["agent_name"].startswith("obs-agent-"), \
+            f"Child should not have obs-agent- prefix, got: {lineage_a['agent_name']}"
+        assert not lineage_b["agent_name"].startswith("obs-agent-"), \
+            f"Child should not have obs-agent- prefix, got: {lineage_b['agent_name']}"
         # Should contain a 10-char hex prefix followed by dash and slug
-        assert re.match(r"[0-9a-f]{10}-", lineage_a["native_agent_name"]), \
-            f"Child should have 10-char hash prefix, got: {lineage_a['native_agent_name']}. " \
+        assert re.match(r"[0-9a-f]{10}-", lineage_a["agent_name"]), \
+            f"Child should have 10-char hash prefix, got: {lineage_a['agent_name']}. " \
             f"Is the naming redesign applied at the launch path?"
 
         # Phase 3: Launch grandchild from Alpha
@@ -165,7 +164,7 @@ class TestNamingRedesignSmoke:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=worker_c_thread,
-            recipient=root_lineage["native_agent_name"],
+            recipient=root_lineage["agent_name"],
             content=token_c_to_root,
             ack_token=f"C-SENT-ROOT-{tag}",
             timeout=240.0,
@@ -196,7 +195,7 @@ class TestNamingRedesignSmoke:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=root_thread_id,
-            recipient=lineage_b["native_agent_name"],
+            recipient=lineage_b["agent_name"],
             content=token_root_to_b,
             ack_token=f"ROOT-SENT-B-{tag}",
             timeout=240.0,
@@ -262,7 +261,7 @@ class TestMustReplySmoke:
         await live_tg_forum.platform.send(
             (
                 "This is a deterministic must_reply test. "
-                f"Use SendInboxMessage with recipient={worker_lineage['native_agent_name']}, "
+                f"Use SendInboxMessage with recipient={worker_lineage['agent_name']}, "
                 f"content={token_must_reply!r}, summary='must_reply test', must_reply=true, "
                 "and omit team_name and sender. "
                 f"Reply with only ROOT-SENT-MUSTREPLY-{tag}."
@@ -286,7 +285,7 @@ class TestMustReplySmoke:
                 "This is a deterministic must_reply test. "
                 "Call ReadInbox exactly once. "
                 f"If you see a message containing {token_must_reply!r}, "
-                f"use SendInboxMessage to reply to {root_lineage['native_agent_name']} "
+                f"use SendInboxMessage to reply to {root_lineage['agent_name']} "
                 f"with content 'WORKER-REPLIED-{tag}' and summary='reply'. "
                 f"Then reply with exactly WORKER-DID-REPLY-{tag}."
             ),
@@ -362,8 +361,8 @@ class TestNamingFormatSmoke:
         )
 
         # Root: no obs-agent- prefix, no obs-tree- prefix
-        assert not root_lineage["native_agent_name"].startswith("obs-agent-"), \
-            f"Root should not have obs-agent- prefix, got: {root_lineage['native_agent_name']}"
+        assert not root_lineage["agent_name"].startswith("obs-agent-"), \
+            f"Root should not have obs-agent- prefix, got: {root_lineage['agent_name']}"
         assert not root_lineage["root_team_key"].startswith("obs-tree-"), \
             f"Root team key should be timestamp-based, got: {root_lineage['root_team_key']}"
 
@@ -379,7 +378,7 @@ class TestNamingFormatSmoke:
         )
 
         # Child: should have hash prefix
-        child_name = child_lineage["native_agent_name"]
+        child_name = child_lineage["agent_name"]
         assert not child_name.startswith("obs-agent-"), \
             f"Child should not have obs-agent- prefix, got: {child_name}"
         # Should contain a hex prefix

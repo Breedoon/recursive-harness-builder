@@ -28,9 +28,8 @@ from obs_agent.context_stats import (
 )
 from obs_agent.lineage import (
     find_latest_obs_bootstrap_for_session,
-    lineage_fingerprint,
     agent_name_for_lineage,
-    native_agent_name_for_lineage,
+    lineage_fingerprint,
     normalize_lineage_name,
     parse_obs_bootstrap_xml,
     slugify_projection_label,
@@ -116,6 +115,52 @@ def _transport_unavailable(tool_name: str) -> dict:
     return _error_result(
         f"Cannot use {tool_name}: this transport does not provide task orchestration"
     )
+
+
+def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
+    config_path = Path.home() / ".claude" / "teams" / team_name / "config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed reading team config JSON: %s", config_path, exc_info=True)
+        return {}
+    members = payload.get("members")
+    if not isinstance(members, list):
+        return {}
+    metadata: dict[str, dict[str, Any]] = {}
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        agent_name = str(member.get("name") or "").strip()
+        if not agent_name or agent_name == "team-lead":
+            continue
+        obs = member.get("obs")
+        if not isinstance(obs, dict):
+            continue
+        entry: dict[str, Any] = {"agent_name": agent_name}
+        display_name = obs.get("display_name")
+        if isinstance(display_name, str) and display_name.strip():
+            entry["display_name"] = display_name.strip()
+        parent_agent_name = obs.get("parent_agent_name")
+        if isinstance(parent_agent_name, str) and parent_agent_name.strip():
+            entry["parent_agent_name"] = parent_agent_name.strip()
+        parent_display_name = obs.get("parent_display_name")
+        if isinstance(parent_display_name, str) and parent_display_name.strip():
+            entry["parent_display_name"] = parent_display_name.strip()
+        lineage = obs.get("lineage")
+        if isinstance(lineage, list):
+            normalized_lineage = [
+                str(item).strip()
+                for item in lineage
+                if isinstance(item, str) and str(item).strip()
+            ]
+            if normalized_lineage:
+                entry["lineage"] = normalized_lineage
+                entry["lineage_length"] = len(normalized_lineage)
+        metadata[agent_name] = entry
+    return metadata
 
 
 def _coerce_bool_arg(value, *, name: str) -> bool:
@@ -292,7 +337,7 @@ def create_obs_tools(
             },
             "team_name": {
                 "type": "string",
-                "description": "Optional team/task-list name for native team env bootstrap.",
+                "description": "Optional team/task-list name for flat team env bootstrap.",
             },
         },
     )
@@ -337,7 +382,7 @@ def create_obs_tools(
             },
             "team_name": {
                 "type": "string",
-                "description": "Optional team/task-list name for native team env bootstrap.",
+                "description": "Optional team/task-list name for flat team env bootstrap.",
             },
         },
     )
@@ -398,7 +443,7 @@ def create_obs_tools(
 
     @tool(
         "AgentTaskOutput",
-        "Inspect a running or completed AgentTask using native TaskOutput-style "
+        "Inspect a running or completed AgentTask using TaskOutput-style "
         "parameters. Use task_id, block, and timeout.",
         {
             "task_id": {
@@ -442,7 +487,7 @@ def create_obs_tools(
             },
             "shell_id": {
                 "type": "string",
-                "description": "Deprecated alias for task_id, matching native TaskStop",
+                "description": "Deprecated alias for task_id, matching TaskStop.",
             },
         },
     )
@@ -451,7 +496,7 @@ def create_obs_tools(
 
     @tool(
         "AgentTaskStop",
-        "Stop a running AgentTask using native TaskStop-style task_id input.",
+        "Stop a running AgentTask using TaskStop-style task_id input.",
         {
             "task_id": {
                 "type": "string",
@@ -459,7 +504,7 @@ def create_obs_tools(
             },
             "shell_id": {
                 "type": "string",
-                "description": "Deprecated alias for task_id, matching native TaskStop",
+                "description": "Deprecated alias for task_id, matching TaskStop.",
             },
         },
     )
@@ -729,51 +774,65 @@ def create_obs_tools(
             return _error_result(
                 "Cannot send must_reply to yourself — this would cause an infinite wake loop."
             )
-        # Messages are ALWAYS delivered to the inbox file. The validator is
-        # advisory — it determines whether a wake attempt will be made, but
-        # never blocks delivery. The only definition of "dead" is: the user
-        # deleted the topic. We discover that lazily on wake failure.
-        _recipient_wakeable = True
-        if hook_state is not None and hook_state.inbox_recipient_validator is not None:
+
+        async def _validate_recipient(target: str) -> dict[str, Any] | None:
+            if hook_state is None or hook_state.inbox_recipient_validator is None:
+                return None
             try:
                 validation = await hook_state.inbox_recipient_validator(
                     {
                         "team_name": team_name,
-                        "recipient": recipient,
+                        "recipient": target,
                     }
                 )
             except Exception:
                 logger.warning("SendInboxMessage validator failed", exc_info=True)
-                validation = {"deliverable": True}
-            _recipient_wakeable = bool(validation.get("deliverable", True)) if isinstance(validation, dict) else bool(validation)
+                return {"deliverable": False, "reason": "recipient validation failed"}
+            if isinstance(validation, dict):
+                return validation
+            return {"deliverable": bool(validation)}
 
-        inbox_path = (
-            Path.home()
-            / ".claude"
-            / "teams"
-            / team_name
-            / "inboxes"
-            / f"{recipient}.json"
-        )
-        # Alias resolution: if exact name not found, try computing the
-        # child agent_name from the sender's lineage + alias.
-        # Child agent_name = {fingerprint(sender_lineage)}-{slugify(alias)}
-        if not inbox_path.exists() and bootstrap is not None and bootstrap.lineage:
+        def _is_deliverable(validation: dict[str, Any] | None) -> bool:
+            return bool(validation and validation.get("deliverable"))
+
+        inbox_dir = Path.home() / ".claude" / "teams" / team_name / "inboxes"
+        resolved_recipient = recipient
+        inbox_path = inbox_dir / f"{resolved_recipient}.json"
+        validation = await _validate_recipient(resolved_recipient)
+
+        # Alias resolution is intentionally limited to direct children:
+        # exact agent_name wins, otherwise try "{sender_lineage_hash}-{alias_slug}".
+        if (
+            not inbox_path.exists()
+            and not _is_deliverable(validation)
+            and bootstrap is not None
+            and bootstrap.lineage
+        ):
             child_hash = lineage_fingerprint(
                 tuple(normalize_lineage_name(n) for n in bootstrap.lineage)
             )
             child_slug = slugify_projection_label(recipient, fallback="")
             if child_slug:
-                resolved = f"{child_hash}-{child_slug}"
-                resolved_path = inbox_path.parent / f"{resolved}.json"
-                if resolved_path.exists():
-                    recipient = resolved
-                    inbox_path = resolved_path
-        # Validate recipient exists — inbox file must already exist.
-        if not inbox_path.exists():
+                candidate = f"{child_hash}-{child_slug}"
+                candidate_path = inbox_dir / f"{candidate}.json"
+                candidate_validation = await _validate_recipient(candidate)
+                if candidate_path.exists() or _is_deliverable(candidate_validation):
+                    resolved_recipient = candidate
+                    inbox_path = candidate_path
+                    validation = candidate_validation
+
+        if validation is not None and not _is_deliverable(validation):
+            reason = str(validation.get("reason") or validation.get("warning") or "recipient has no current route binding")
             return {
-                "content": [{"type": "text", "text": f"recipient not found: no inbox exists for '{recipient}'"}],
-                "tool_use_result": {"success": False, "delivered": False, "error": f"recipient not found: no inbox for '{recipient}'"},
+                "content": [{"type": "text", "text": f"message underdelivered: {reason}"}],
+                "tool_use_result": {
+                    "success": False,
+                    "delivered": False,
+                    "outcome": "underdelivered",
+                    "reason": reason,
+                    "recipient": resolved_recipient,
+                    "team_name": team_name,
+                },
                 "is_error": True,
             }
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
@@ -800,12 +859,86 @@ def create_obs_tools(
             entries.append(message)
             inbox_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
 
+        async def _rollback_written_message() -> None:
+            async with lock:
+                if not inbox_path.exists():
+                    return
+                try:
+                    loaded = json.loads(inbox_path.read_text(encoding="utf-8"))
+                except Exception:
+                    logger.warning("Failed reading inbox JSON during rollback: %s", inbox_path, exc_info=True)
+                    return
+                if not isinstance(loaded, list):
+                    return
+                remaining = [item for item in loaded if isinstance(item, dict)]
+                removed = False
+                for index in range(len(remaining) - 1, -1, -1):
+                    item = remaining[index]
+                    if (
+                        item.get("timestamp") == message["timestamp"]
+                        and item.get("from") == sender
+                        and item.get("text") == content
+                        and item.get("summary", "") == (summary or "")
+                    ):
+                        del remaining[index]
+                        removed = True
+                        break
+                if not removed:
+                    return
+                if remaining:
+                    inbox_path.write_text(json.dumps(remaining, ensure_ascii=True), encoding="utf-8")
+                else:
+                    inbox_path.unlink(missing_ok=True)
+
+        response = {
+            "success": True,
+            "delivered": True,
+            "outcome": "reached",
+            "team_name": team_name,
+            "recipient": resolved_recipient,
+            "message_count": len(entries),
+        }
+        if validation is not None and validation.get("warning"):
+            response["warning"] = str(validation["warning"])
+        notifier_result: dict[str, Any] | None = None
+        if hook_state is not None and hook_state.inbox_message_notifier is not None:
+            try:
+                notification_payload: dict[str, Any] = {
+                    "team_name": team_name,
+                    "recipient": resolved_recipient,
+                    "sender": sender,
+                    "content": content,
+                    "summary": summary,
+                    "_direct_send": True,
+                }
+                if must_reply:
+                    notification_payload["_must_reply"] = True
+                raw_notifier_result = await hook_state.inbox_message_notifier(notification_payload)
+                if isinstance(raw_notifier_result, dict):
+                    notifier_result = raw_notifier_result
+            except Exception:
+                logger.warning("SendInboxMessage notifier failed", exc_info=True)
+        if notifier_result is not None and notifier_result.get("delivered") is False:
+            await _rollback_written_message()
+            reason = str(notifier_result.get("reason") or "recipient wake failed")
+            return {
+                "content": [{"type": "text", "text": f"message underdelivered: {reason}"}],
+                "tool_use_result": {
+                    "success": False,
+                    "delivered": False,
+                    "outcome": "underdelivered",
+                    "reason": reason,
+                    "recipient": resolved_recipient,
+                    "team_name": team_name,
+                },
+                "is_error": True,
+            }
+
         # Reply detection: if we just sent a message to `recipient`, check our OWN
         # inbox for must_reply messages FROM that recipient that are unreplied.
         # If found, mark them replied.  When ALL must_reply messages are replied,
         # delete the reply_wake schedule.
-        # Reply detection: mark must_reply messages from `recipient` in our inbox as replied
-        if sender and sender != recipient:
+        if sender and sender != resolved_recipient:
             sender_inbox_path = (
                 Path.home()
                 / ".claude"
@@ -821,32 +954,26 @@ def create_obs_tools(
                         sender_entries = json.loads(sender_inbox_path.read_text(encoding="utf-8"))
                         if isinstance(sender_entries, list):
                             updated, all_replied = detect_must_reply_completions(
-                                sender_entries, recipient
+                                sender_entries, resolved_recipient
                             )
-                            # Only write if something changed
                             replied_something = any(
                                 e.get("replied") is True
                                 for e in updated
-                                if e.get("must_reply") is True and e.get("from") == recipient
+                                if e.get("must_reply") is True and e.get("from") == resolved_recipient
                             )
                             if replied_something:
                                 sender_inbox_path.write_text(
                                     json.dumps(updated, ensure_ascii=True),
                                     encoding="utf-8",
                                 )
-                                # This message IS a reply to a must_reply.
-                                # Let the agent decide whether to set must_reply
-                                # on its reply — don't override.
                             if all_replied and hook_state is not None:
-                                # All must_reply messages are replied — signal
-                                # schedule cleanup (handled by telegram.py)
                                 if hook_state.inbox_message_notifier is not None:
                                     try:
                                         await hook_state.inbox_message_notifier(
                                             {
                                                 "team_name": team_name,
                                                 "recipient": sender,
-                                                "sender": recipient,
+                                                "sender": resolved_recipient,
                                                 "content": "__reply_wake_clear__",
                                                 "summary": "all must_reply messages replied",
                                                 "_reply_wake_clear": True,
@@ -857,33 +984,6 @@ def create_obs_tools(
                                         logger.warning("Reply wake clear notification failed", exc_info=True)
                     except Exception:
                         logger.warning("Reply detection: failed reading sender inbox %s", sender_inbox_path, exc_info=True)
-
-        response = {
-            "success": True,
-            "team_name": team_name,
-            "recipient": recipient,
-            "message_count": len(entries),
-        }
-        if not _recipient_wakeable:
-            response["warning"] = (
-                "Message delivered to inbox but recipient may not be active. "
-                "The agent may read it when next woken."
-            )
-        if hook_state is not None and hook_state.inbox_message_notifier is not None and _recipient_wakeable:
-            try:
-                notification_payload: dict[str, Any] = {
-                    "team_name": team_name,
-                    "recipient": recipient,
-                    "sender": sender,
-                    "content": content,
-                    "summary": summary,
-                    "_direct_send": True,
-                }
-                if must_reply:
-                    notification_payload["_must_reply"] = True
-                await hook_state.inbox_message_notifier(notification_payload)
-            except Exception:
-                logger.warning("SendInboxMessage notifier failed", exc_info=True)
         return {
             "content": [{"type": "text", "text": json.dumps(response, ensure_ascii=True)}],
             "tool_use_result": response,
@@ -941,7 +1041,7 @@ def create_obs_tools(
                 selected = selected[-limit:]
             if mark_read and entries:
                 changed = False
-                for item in entries:
+                for item in selected:
                     if not bool(item.get("read", False)):
                         item["read"] = True
                         changed = True
@@ -962,14 +1062,41 @@ def create_obs_tools(
 
     @tool(
         "SendInboxMessage",
-        "Write a message to a native-compatible team inbox JSON file.",
+        "Write a message to a team inbox JSON file.",
         {
-            "team_name": {"type": "string", "description": "Optional team name; defaults to current tree root team"},
-            "recipient": {"type": "string", "description": "Recipient agent name"},
-            "content": {"type": "string", "description": "Message body"},
-            "summary": {"type": "string", "description": "Optional short summary"},
-            "sender": {"type": "string", "description": "Optional sender label"},
-            "needs_reply": {"type": "boolean", "description": "Set true when asking a question or sending a request that requires a response from the recipient. Default false."},
+            "type": "object",
+            "properties": {
+                "team_name": {
+                    "type": "string",
+                    "description": "Optional team name; defaults to the current root team.",
+                },
+                "recipient": {
+                    "type": "string",
+                    "description": "Recipient agent name.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Message body.",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Optional short summary.",
+                },
+                "sender": {
+                    "type": "string",
+                    "description": "Optional sender label; defaults to the current agent name.",
+                },
+                "needs_reply": {
+                    "type": "boolean",
+                    "description": "Set true when this is a question or request that needs a reply. Defaults to false.",
+                },
+                "must_reply": {
+                    "type": "boolean",
+                    "description": "Deprecated alias for needs_reply.",
+                },
+            },
+            "required": ["recipient", "content"],
+            "additionalProperties": False,
         },
     )
     async def send_inbox_message(args: dict) -> dict:
@@ -977,13 +1104,33 @@ def create_obs_tools(
 
     @tool(
         "ReadInbox",
-        "Read messages from a native-compatible team inbox JSON file.",
+        "Read messages from a team inbox JSON file.",
         {
-            "team_name": {"type": "string", "description": "Optional team name; defaults to current tree root team"},
-            "agent": {"type": "string", "description": "Optional agent inbox name; defaults to current native agent projection"},
-            "include_read": {"type": "boolean", "description": "Include already-read messages"},
-            "mark_read": {"type": "boolean", "description": "Mark unread messages as read"},
-            "limit": {"type": "integer", "description": "Maximum number of messages to return"},
+            "type": "object",
+            "properties": {
+                "team_name": {
+                    "type": "string",
+                    "description": "Optional team name; defaults to the current root team.",
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Optional agent inbox name; defaults to the current agent name.",
+                },
+                "include_read": {
+                    "type": "boolean",
+                    "description": "Include already-read messages.",
+                },
+                "mark_read": {
+                    "type": "boolean",
+                    "description": "Mark returned unread messages as read.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of messages to return.",
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
         },
     )
     async def read_inbox(args: dict) -> dict:
@@ -1049,13 +1196,20 @@ def create_obs_tools(
             "parent_session_id": bootstrap.parent_session_id,
             "root_team_key": bootstrap.root_team_key,
             "agent_name": bootstrap.agent_name,
+            "parent_agent_name": bootstrap.parent_agent_name,
+            "parent_display_name": bootstrap.parent_display_name,
             "path": "/".join(bootstrap.lineage),
         }
         # Compute agent_names for each node in the lineage
         agent_names = []
         for i in range(len(bootstrap.lineage)):
             sub = bootstrap.lineage[: i + 1]
-            agent_names.append(native_agent_name_for_lineage(sub))
+            agent_names.append(
+                agent_name_for_lineage(
+                    sub,
+                    team_key=bootstrap.root_team_key,
+                )
+            )
         payload["agent_names"] = agent_names
         if include_xml:
             payload["xml"] = bootstrap.raw_xml
@@ -1065,26 +1219,30 @@ def create_obs_tools(
         }
 
     @tool(
-        "get_family",
-        "Find relatives in the team tree — children, siblings, or parent — by scanning inbox files.",
+        "search_team",
+        "Discover teammates in the current lineage tree by scanning team inboxes.",
         {
-            "who": {
+            "mode": {
                 "type": "string",
-                "description": "One of: children, siblings, parent, all",
+                "description": "One of: parent, children, siblings, ancestors, descendants, family, tree",
             },
         },
     )
-    async def get_family(args: dict) -> dict:
-        who = str(args.get("who", "all")).strip().lower()
-        if who not in {"children", "siblings", "parent", "all"}:
-            return _error_result("get_family: 'who' must be one of: children, siblings, parent, all")
+    async def search_team(args: dict) -> dict:
+        mode = str(args.get("mode") or args.get("who") or "family").strip().lower()
+        if mode == "all":
+            mode = "family"
+        if mode not in {"children", "siblings", "parent", "ancestors", "descendants", "family", "tree"}:
+            return _error_result(
+                "search_team: 'mode' must be one of: parent, children, siblings, ancestors, descendants, family, tree"
+            )
         bootstrap = _current_obs_bootstrap()
         if bootstrap is None:
-            return _error_result("Cannot use get_family: no OBS bootstrap found")
+            return _error_result("Cannot use search_team: no OBS bootstrap found")
         if not bootstrap.root_team_key or not bootstrap.agent_name:
-            return _error_result("Cannot use get_family: missing team key or agent name")
+            return _error_result("Cannot use search_team: missing team key or agent name")
         if not bootstrap.lineage:
-            return _error_result("Cannot use get_family: empty lineage")
+            return _error_result("Cannot use search_team: empty lineage")
 
         inboxes_dir = (
             Path.home()
@@ -1093,50 +1251,116 @@ def create_obs_tools(
             / bootstrap.root_team_key
             / "inboxes"
         )
-        result: dict[str, list[str]] = {}
+        team_projection_metadata = _load_team_projection_metadata(bootstrap.root_team_key)
+        result: dict[str, Any] = {
+            "mode": mode,
+            "team_name": bootstrap.root_team_key,
+            "current_agent": bootstrap.agent_name,
+        }
         all_agents = []
         if inboxes_dir.is_dir():
             for f in inboxes_dir.iterdir():
                 if f.suffix == ".json" and f.stem:
                     all_agents.append(f.stem)
+        all_agents = sorted(set(all_agents))
 
         my_lineage = bootstrap.lineage
         my_agent_name = bootstrap.agent_name
         my_hash = lineage_fingerprint(tuple(normalize_lineage_name(n) for n in my_lineage))
 
-        # Children: agents whose name starts with my lineage hash
-        if who in {"children", "all"}:
-            children = [
-                name for name in all_agents
-                if name.startswith(f"{my_hash}-") and name != my_agent_name
-            ]
+        children = sorted(
+            name for name in all_agents
+            if name.startswith(f"{my_hash}-") and name != my_agent_name
+        )
+        if mode in {"children", "family"}:
             result["children"] = children
 
-        # Parent: derive from my agent_name's hash prefix
-        if who in {"parent", "all"}:
+        parent: str | None = None
+        if mode in {"parent", "family"}:
             if len(my_lineage) > 1:
-                parent_lineage = my_lineage[:-1]
-                if len(parent_lineage) == 1:
-                    # Parent is trunk — trunk agent_name = team key
-                    parent_name = bootstrap.root_team_key or ""
-                else:
-                    parent_name = native_agent_name_for_lineage(parent_lineage)
-                result["parent"] = [parent_name] if parent_name in all_agents else []
-            else:
-                result["parent"] = []  # trunk has no parent
+                parent_name = bootstrap.parent_agent_name
+                if not parent_name:
+                    parent_lineage = my_lineage[:-1]
+                    parent_name = agent_name_for_lineage(
+                        parent_lineage,
+                        team_key=bootstrap.root_team_key,
+                    )
+                if parent_name in all_agents:
+                    parent = parent_name
+            result["parent"] = parent
 
-        # Siblings: agents with same parent hash prefix as me
-        if who in {"siblings", "all"}:
-            if len(my_lineage) > 1:
-                parent_lineage = tuple(normalize_lineage_name(n) for n in my_lineage[:-1])
-                parent_hash = lineage_fingerprint(parent_lineage)
-                siblings = [
-                    name for name in all_agents
-                    if name.startswith(f"{parent_hash}-") and name != my_agent_name
-                ]
-                result["siblings"] = siblings
-            else:
-                result["siblings"] = []  # trunk has no siblings
+        siblings: list[str] = []
+        if len(my_lineage) > 1:
+            parent_lineage = tuple(normalize_lineage_name(n) for n in my_lineage[:-1])
+            parent_hash = lineage_fingerprint(parent_lineage)
+            siblings = sorted(
+                name for name in all_agents
+                if name.startswith(f"{parent_hash}-") and name != my_agent_name
+            )
+        if mode in {"siblings", "family"}:
+            result["siblings"] = siblings
+
+        if mode == "ancestors":
+            ancestors = [
+                agent_name_for_lineage(
+                    my_lineage[: idx + 1],
+                    team_key=bootstrap.root_team_key,
+                )
+                for idx in range(len(my_lineage) - 1)
+            ]
+            result["ancestors"] = ancestors
+
+        if mode == "descendants":
+            descendants: list[str] = []
+            for agent_name, details in team_projection_metadata.items():
+                lineage = details.get("lineage")
+                if not isinstance(lineage, list):
+                    continue
+                normalized_lineage = tuple(
+                    str(item).strip()
+                    for item in lineage
+                    if isinstance(item, str) and str(item).strip()
+                )
+                if len(normalized_lineage) <= len(my_lineage):
+                    continue
+                if normalized_lineage[: len(my_lineage)] == my_lineage:
+                    descendants.append(agent_name)
+            result["descendants"] = sorted(
+                set(descendants),
+                key=lambda name: (
+                    int((team_projection_metadata.get(name) or {}).get("lineage_length") or 9999),
+                    "/".join((team_projection_metadata.get(name) or {}).get("lineage") or []),
+                    name,
+                ),
+            )
+
+        if mode == "tree":
+            result["tree"] = all_agents
+            child_set = set(children)
+            sibling_set = set(siblings)
+            tree_members: list[dict[str, Any]] = []
+            for agent_name in all_agents:
+                details = dict(team_projection_metadata.get(agent_name) or {})
+                details["agent_name"] = agent_name
+                if agent_name == my_agent_name:
+                    details["relation"] = "self"
+                elif parent is not None and agent_name == parent:
+                    details["relation"] = "parent"
+                elif agent_name in child_set:
+                    details["relation"] = "child"
+                elif agent_name in sibling_set:
+                    details["relation"] = "sibling"
+                else:
+                    details["relation"] = "tree"
+                tree_members.append(details)
+            tree_members.sort(
+                key=lambda item: (
+                    int(item.get("lineage_length") or 9999),
+                    "/".join(item.get("lineage") or []),
+                    str(item.get("agent_name") or ""),
+                )
+            )
+            result["tree_members"] = tree_members
 
         return {
             "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=True)}],
@@ -1160,7 +1384,7 @@ def create_obs_tools(
             session_info,
             context_info,
             session_lineage,
-            get_family,
+            search_team,
         ],
     )
     return server

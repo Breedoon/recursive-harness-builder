@@ -7,9 +7,9 @@ Terminology spec:
   Used for: topic titles, lineage XML, user-facing text
 
 Changes being tested:
-- native_agent_name → agent_name everywhere
+- legacy native_agent_name → agent_name everywhere
 - obs-node name= → obs-node display_name= in XML
-- <native_agent_name> → <agent_name> in team_context XML
+- legacy <native_agent_name> → <agent_name> in team_context XML
 - Bootstrap version 1 → 2
 - MCP params: alias/description/name → display_name (with fallbacks)
 - session_lineage output field rename
@@ -26,9 +26,9 @@ import pytest
 
 from obs_agent.lineage import (
     ObsBootstrap,
+    agent_name_for_lineage,
     build_obs_bootstrap_xml,
     lineage_fingerprint,
-    native_agent_name_for_lineage,
     normalize_lineage_name,
     parse_obs_bootstrap_xml,
     slugify_projection_label,
@@ -50,7 +50,7 @@ class TestV2XMLRoundTrip:
             is_fork=False,
             session_id="sid-1",
             root_team_key="team-1",
-            native_agent_name="hash-child",
+            agent_name="hash-child",
         )
         root = ET.fromstring(xml)
 
@@ -76,7 +76,7 @@ class TestV2XMLRoundTrip:
             is_fork=False,
             session_id="sid-1",
             root_team_key="team-1",
-            native_agent_name="my-agent",
+            agent_name="my-agent",
         )
         root = ET.fromstring(xml)
         team_ctx = root.find("team_context")
@@ -101,7 +101,7 @@ class TestV2XMLRoundTrip:
             session_id="sid-2",
             parent_session_id="sid-1",
             root_team_key="team-2",
-            native_agent_name="hash-worker",
+            agent_name="hash-worker",
         )
         parsed = parse_obs_bootstrap_xml(xml)
 
@@ -144,8 +144,8 @@ class TestV1BackwardCompat:
         parsed = parse_obs_bootstrap_xml(v1_xml)
         assert parsed.lineage == ("Root", "Child")
         assert parsed.root_team_key == "team-key"
-        # Should work with old field name
-        assert parsed.native_agent_name == "hash-child"
+        # Legacy v1 XML should still populate the canonical field.
+        assert parsed.agent_name == "hash-child"
 
     def test_v1_parsed_exposes_agent_name_field(self):
         """After refactor, the parsed result should have agent_name even for v1 input."""
@@ -200,7 +200,7 @@ class TestNoVersionField:
         )
         parsed = parse_obs_bootstrap_xml(xml)
         assert parsed.lineage == ("Root",)
-        assert parsed.native_agent_name == "root"
+        assert parsed.agent_name == "root"
 
 
 # ---------------------------------------------------------------------------
@@ -210,11 +210,9 @@ class TestNoVersionField:
 class TestAgentNameFunction:
 
     def test_agent_name_for_lineage_exists(self):
-        from obs_agent.lineage import agent_name_for_lineage
-        # Should produce same results as native_agent_name_for_lineage
-        assert agent_name_for_lineage(("Root",)) == native_agent_name_for_lineage(("Root",))
-        assert agent_name_for_lineage(("Root", "Child")) == native_agent_name_for_lineage(("Root", "Child"))
-        assert agent_name_for_lineage(("A", "B", "C")) == native_agent_name_for_lineage(("A", "B", "C"))
+        assert agent_name_for_lineage(("Root",)) == "root"
+        assert agent_name_for_lineage(("Root", "Child")).endswith("-child")
+        assert agent_name_for_lineage(("A", "B", "C")).endswith("-c")
 
     def test_agent_name_for_lineage_importable(self):
         """The new name should be importable from lineage module."""
@@ -324,7 +322,7 @@ class TestTerminologyComment:
 class TestBuildXMLNewParamName:
 
     def test_build_accepts_agent_name_param(self):
-        """build_obs_bootstrap_xml should accept agent_name= (not just native_agent_name=)."""
+        """build_obs_bootstrap_xml should accept the canonical agent_name= kwarg."""
         xml = build_obs_bootstrap_xml(
             lineage=("Root",),
             origin="test",
@@ -335,3 +333,15 @@ class TestBuildXMLNewParamName:
         parsed = parse_obs_bootstrap_xml(xml)
         # Should store it correctly
         assert hasattr(parsed, "agent_name")
+
+    def test_build_accepts_legacy_agent_name_kwarg(self):
+        """Legacy native_agent_name= should still be accepted for old callers."""
+        xml = build_obs_bootstrap_xml(
+            lineage=("Root",),
+            origin="test",
+            is_fork=False,
+            session_id="sid",
+            native_agent_name="my-agent",
+        )
+        parsed = parse_obs_bootstrap_xml(xml)
+        assert parsed.agent_name == "my-agent"

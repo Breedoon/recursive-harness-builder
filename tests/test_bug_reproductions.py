@@ -108,7 +108,7 @@ class TestBug1PhantomNotificationLoop:
             lineage_token=f"PHANTOM-LIN-{tag}",
             timeout=240.0,
         )
-        child_agent = _extract_lineage_fact_line(child_lineage, "native_agent_name")
+        child_agent = _extract_lineage_fact_line(child_lineage, "agent_name")
         assert child_agent, "Could not extract child agent_name"
 
         # Wait for child to finish initial turn and go idle
@@ -278,7 +278,7 @@ class TestBug3DeletedTopicRedirectsToGeneral:
             lineage_token=f"REDIRECT-LIN-{tag}",
             timeout=240.0,
         )
-        child_agent = _extract_lineage_fact_line(child_lineage, "native_agent_name")
+        child_agent = _extract_lineage_fact_line(child_lineage, "agent_name")
         assert child_agent, "Could not extract child agent_name"
 
         # Wait for child to be active
@@ -390,7 +390,7 @@ class TestBug3bBounceBackForDeadAgent:
             lineage_token=f"BOUNCE-LIN-CHILD-{tag}",
             timeout=240.0,
         )
-        child_agent = _extract_lineage_fact_line(child_lineage, "native_agent_name")
+        child_agent = _extract_lineage_fact_line(child_lineage, "agent_name")
         assert child_agent, "Could not extract child agent_name"
 
         sibling_thread, sibling_lineage = await _launch_lineage_worker(
@@ -514,7 +514,7 @@ class TestBug4TrunkNameEqualsTeamName:
             timeout=240.0,
         )
 
-        agent_name = _extract_lineage_fact_line(lineage, "native_agent_name")
+        agent_name = _extract_lineage_fact_line(lineage, "agent_name")
         team_name = _extract_lineage_fact_line(lineage, "root_team_key")
         assert agent_name, "Could not extract agent_name"
         assert team_name, "Could not extract team_name"
@@ -574,7 +574,7 @@ class TestBug5RestartChangesTeam:
             timeout=240.0,
         )
         team_before = _extract_lineage_fact_line(lineage_before, "root_team_key")
-        agent_before = _extract_lineage_fact_line(lineage_before, "native_agent_name")
+        agent_before = _extract_lineage_fact_line(lineage_before, "agent_name")
         assert team_before, "Could not extract team key before restart"
         assert agent_before, "Could not extract agent name before restart"
 
@@ -606,7 +606,7 @@ class TestBug5RestartChangesTeam:
             timeout=240.0,
         )
         team_after = _extract_lineage_fact_line(lineage_after, "root_team_key")
-        agent_after = _extract_lineage_fact_line(lineage_after, "native_agent_name")
+        agent_after = _extract_lineage_fact_line(lineage_after, "agent_name")
 
         assert team_after == team_before, (
             f"RESTART TEAM BUG: team key changed after restart! "

@@ -1,12 +1,12 @@
 # Telegram Lineage-First Multi-Level Teams
 
 **Status**: In progress  
-**Date**: 2026-03-13
+**Date**: 2026-03-30
 
 ## Executive Summary
 
 This change makes multi-level teams a core platform feature by making
-`lineage` the canonical agent identity and projecting Claude's flat native team
+`lineage` the canonical agent identity and projecting Claude's flat team
 model onto the root of each lineage tree.
 
 The platform, not Claude Code, owns the real hierarchy.
@@ -40,6 +40,16 @@ The user requirements that remain in scope after research and design review are:
 11. Testing must be live, overlapping, and intentionally fragile: long chains,
     concurrency, messaging, forks, schedules, restart, and edge conditions in
     the same scenario.
+12. Messaging should stay simple and explainable:
+    - address resolution should be deterministic
+    - delivery outcomes should be explicit
+    - activity should be derived from the running process, not persisted as a
+      second truth
+13. The durable identity truth lives in the agent transcript bootstrap XML and
+    the inbox JSON files, not in a centralized liveness registry.
+14. Root team keys are generated once at trunk creation time and must never be
+    regenerated from a later wall-clock timestamp during restart, wake, clear,
+    or resume flows.
 
 ## Definitions
 
@@ -70,19 +80,19 @@ lineage.
 The trunk is the root agent for a tree. In a forum group, this is typically the
 topic where the user started the work.
 
-### Native Team Projection
+### Flat Team Projection
 
-Claude's native team model is treated as a flat projection:
+Claude's flat team model is treated as a flat projection:
 
-1. one native team per trunk tree
-2. one native agent member per lineage
+1. one flat team per trunk tree
+2. one agent member per lineage
 3. the real hierarchy stays in OBS lineage data
 
 ## Non-Goals
 
 1. Native Claude task tool parity
-2. Nested native teams
-3. Multiple native inboxes per lineage
+2. Nested flat teams
+3. Multiple inboxes per lineage
 4. Replacing inline forking semantics
 5. Solving every future summarization detail in this change
 
@@ -98,7 +108,22 @@ OBS owns:
 4. lineage-aware naming
 5. lineage-aware messaging and future notifications
 
-Claude native teams are used only as a helpful flat substrate.
+Claude team projection is used only as a helpful flat substrate.
+
+### No centralized liveness registry
+
+OBS should not persist `active`, `idle`, or `dead` as canonical global states.
+
+Instead:
+
+1. identity comes from the latest valid bootstrap for the current head
+2. current route or worker binding may be persisted for recovery
+3. active vs idle is derived from the running daemon process
+4. `underdelivered` is a send outcome, not a durable agent state
+5. "dead" is only operational shorthand for:
+   - the topic was deleted
+   - `/new` replaced the identity
+   - or a wake attempt proved the old binding no longer exists
 
 ### One canonical bootstrap envelope
 
@@ -108,11 +133,11 @@ function.
 The settled envelope root is:
 
 ```xml
-<obs-bootstrap version="1">
+<obs-bootstrap version="2">
   <obs-lineage>
-    <obs-node name="Root Topic" />
-    <obs-node name="Research Fork" />
-    <obs-node name="task-researcher" />
+    <obs-node display_name="Root Topic" agent_name="2026-03-30-17-20-root-topic" />
+    <obs-node display_name="Research Fork" agent_name="0a1b2c3d4e-research-fork" />
+    <obs-node display_name="task-researcher" agent_name="9f8e7d6c5b-task-researcher" />
   </obs-lineage>
   <fork_context>
     <origin>agent_task_fork</origin>
@@ -123,7 +148,9 @@ The settled envelope root is:
   </fork_context>
   <team_context>
     <root_team_key>...</root_team_key>
-    <native_agent_name>...</native_agent_name>
+    <agent_name>...</agent_name>
+    <parent_agent_name>...</parent_agent_name>
+    <parent_display_name>Research Fork</parent_display_name>
   </team_context>
 </obs-bootstrap>
 ```
@@ -131,11 +158,14 @@ The settled envelope root is:
 Notes:
 
 1. The root tag uses `obs-`, not `obs-agent`.
-2. Existing `fork_context` and `team_context` concepts are retained inside the
-   new envelope so current model behavior stays intuitive.
+2. Existing `fork_context` and `team_context` concepts are retained so the
+   model-visible shape stays intuitive.
 3. `agent_id` remains as the short runtime handle. It is not the canonical
    identity.
 4. `lineage` remains the canonical identity.
+5. `parent_agent_name` and `parent_display_name` are optional for the trunk and
+   required for descendants. They exist purely to make parent messaging and
+   parent discoverability obvious to the model.
 
 ## Why Prompt Injection Wins
 
@@ -190,8 +220,26 @@ Parser rules:
 
 1. the bootstrap block must be injected at the start of the first outbound
    prompt for that head
-2. the parser only trusts well-formed `<obs-bootstrap version="1">...</obs-bootstrap>`
+2. the parser only trusts well-formed `<obs-bootstrap version="2">...</obs-bootstrap>`
 3. latest valid bootstrap wins
+4. once a trunk's `root_team_key` exists, later recovery must reuse it rather
+   than recomputing from current time
+
+### Root-team key stability
+
+`root_team_key` is generated exactly once for a trunk.
+
+Rules:
+
+1. a brand-new trunk may generate a timestamp-based `root_team_key`
+2. every descendant must inherit that exact `root_team_key`
+3. `/clear`, wake, inline fork, daemon restart, and child recovery must reuse
+   the existing `root_team_key`
+4. the latest valid bootstrap in the JSONL is the first recovery source
+5. persisted session env or route state may help recovery, but must never
+   override a newer transcript bootstrap
+6. recomputing a new `root_team_key` from the current clock after creation is a
+   bug
 
 ## Creation Flows
 
@@ -372,21 +420,26 @@ Topic titles are display-oriented and may include the parent prefix:
 1. agent task child topic: `"<parent> - <alias>"`
 2. `/fork` child topic: `"<parent> - <title-or-Fn>"`
 
-### Native team projection names
+### Team projection names
 
-Native Claude team and agent names must be filesystem-safe because current inbox
+Flat team and agent names must be filesystem-safe because current inbox
 compat paths use them directly.
 
 Therefore:
 
 1. raw human lineage names stay in bootstrap XML and user-visible topic names
-2. native team/agent projection uses sanitized stable keys
-3. slashes are not used in native projection names
+2. flat team/agent projection uses sanitized stable keys
+3. slashes are not used in projection names
 
 Projection:
 
 1. `root_team_key` is derived from the trunk lineage only
-2. `native_agent_name` is derived from the full lineage
+2. `agent_name` is derived from the full lineage
+3. the canonical trunk `agent_name` in runtime/bootstrap is the full
+   `root_team_key`
+4. helper code that only has a lineage tuple and no team key may still produce
+   a slug fallback for a trunk, but that fallback is not the canonical routable
+   identity once the trunk exists
 
 This preserves one inbox per lineage and avoids multi-inbox explosion.
 
@@ -398,8 +451,8 @@ Every subagent is a team member by default.
 
 The flat projection is:
 
-1. native team = root team for the trunk tree
-2. native agent = the current lineage member handle
+1. flat team = root team for the trunk tree
+2. agent_name = the current lineage member handle
 
 This means a deep descendant is:
 
@@ -409,14 +462,18 @@ This means a deep descendant is:
 Claude sees both:
 
 1. `team_context` from the bootstrap
-2. native team env variables when applicable
+2. team env variables when applicable
 
 Implementation note:
 
-1. The canonical bootstrap path also materializes the projected native team
+1. The canonical bootstrap path also materializes the projected flat team
    config and inbox files before the first routed query for that head.
-2. This makes the flat native team substrate available to trunks and
+2. This makes the flat team substrate available to trunks and
    descendants by default, not only explicit worker launches.
+3. The per-team `config.json` member entries may also cache OBS bootstrap
+   metadata such as display name, lineage, and parent agent name so discovery
+   tools can render a useful tree without inventing a centralized liveness
+   registry.
 
 ## Messaging Model
 
@@ -437,19 +494,66 @@ Implications:
 4. every lineage-backed route is a valid inbox target, not only task-backed
    workers
 
-### Dead-recipient contract
+### Delivery outcome model
 
-If a sender targets an agent identity that no longer exists because that topic
-was deleted or replaced via `/new`, the sender must be told that the message was
-not delivered.
+Message sending has two separate questions:
+
+1. was the message stored in the inbox file?
+2. was the recipient actually reached or woken?
+
+The sender-facing outcome must distinguish these.
+
+Required outcomes:
+
+1. `reached`
+   - inbox write succeeded
+   - runtime confirmed direct notify or wake start
+2. `wake_queued`
+   - inbox write succeeded
+   - recipient is currently active, so delivery will be surfaced at the next
+     allowed runtime checkpoint
+3. `stored_only`
+   - inbox write succeeded
+   - no current binding could be confirmed, so delivery is not claimed
+4. `underdelivered`
+   - the runtime proved the recipient binding no longer exists or the wake
+     attempt definitively failed
+
+### Child alias resolution
+
+Alias messaging is allowed only from a parent to its direct children.
+
+Resolution order:
+
+1. try the exact recipient string as a full agent name
+2. if no inbox exists, derive the direct-child projection as:
+   - `lineage_fingerprint(sender_lineage) + "-" + slug(alias)`
+3. if that derived child inbox exists, use it
+4. otherwise fail the send
+
+Non-goals for alias resolution:
+
+1. alias lookup for siblings
+2. alias lookup for cousins
+3. alias lookup for ancestors
+4. fuzzy tree search during `SendInboxMessage`
+
+### Unbound-recipient contract
+
+If a sender targets an identity whose current topic binding no longer exists
+because that topic was deleted or replaced via `/new`, the sender must be told
+that the message was underdelivered.
 
 Rules:
 
-1. dead recipients must not silently accept inbox writes
-2. `SendInboxMessage` should fail with an explicit undelivered result
-3. the sender-facing error should mention that the recipient may have been
-   replaced or deleted
-4. the runtime must not wake any route for that undelivered send
+1. OBS does not need a persisted `dead` flag to enforce this contract
+2. the sender-facing result must not falsely claim full delivery when only the
+   mailbox write succeeded
+3. when a wake attempt proves the topic is gone, the result should become
+   `underdelivered`
+4. the sender-facing text should mention replacement, deletion, or missing
+   binding, not pretend to know the message was read
+5. the runtime must not wake any route for that underdelivered send
 
 ### Replacement with the same lineage name
 
@@ -480,7 +584,7 @@ Operational requirement:
 Future-friendly rule:
 
 1. the platform should eventually accept lineage-based recipients directly
-2. the flat native projection stays an internal transport detail
+2. the flat team projection stays an internal transport detail
 
 ## Tool Changes
 
@@ -504,10 +608,59 @@ Add a lightweight tool that returns the current resolved bootstrap metadata:
 2. lineage length
 3. current session id
 4. current root team key
-5. current native agent name
+5. current agent name
 6. optional raw bootstrap XML only when explicitly requested
 
 This is both a debugging tool and a future messaging helper.
+
+### `search_team`
+
+The existing family-discovery tool should be renamed to something a model would
+use naturally.
+
+Public schema:
+
+1. primary tool name: `search_team`
+2. modes: `parent`, `children`, `siblings`, `ancestors`, `descendants`, `family`, `tree`
+3. replace `all` with `family`
+4. add `tree`
+5. keep `all` as a deprecated alias for `family`
+
+Query modes:
+
+1. `parent` — immediate parent only
+2. `children` — immediate children only
+3. `siblings` — immediate siblings only
+4. `ancestors` — the chain from trunk down to the immediate parent
+5. `descendants` — every known descendant below the current lineage
+6. `family` — parent + children + siblings
+7. `tree` — every mailbox projection in the same root team, whether currently
+   bound or not
+
+Output expectations:
+
+1. always return routable `agent_name` values
+2. when available, include display names or aliases alongside them
+3. `parent` should prefer `parent_agent_name` from bootstrap when present
+4. `tree` is explicitly a mailbox inventory view, not a liveness view
+5. `tree` may also include richer per-member objects carrying
+   `display_name`, `lineage`, `lineage_length`, `parent_agent_name`,
+   `parent_display_name`, and relation-to-current-agent when that metadata is
+   available from the projected team config
+
+### Telegram `/tree` commands
+
+User-facing Telegram commands should expose the same projected hierarchy in a
+human-readable form:
+
+1. `/tree` — render the full tree
+2. `/tree-` or `/tree-descendants` — render the current agent and descendants
+3. `/tree-ancestors` — render the current agent and ancestors
+4. display labels should prefer lineage `display_name`, not hashed `agent_name`
+5. when a last-known topic route is available, the rendered display label may
+   be hyperlinked to that Telegram topic
+6. deleted or replaced topics may still appear; `/tree` is a hierarchy view,
+   not a liveness guarantee
 
 ## Accepted Edge Cases
 
@@ -529,7 +682,7 @@ Two siblings can resolve to the same alias.
 Accepted for now:
 
 1. lineage remains the logical identity
-2. native projection keys add a stable hash suffix
+2. projection keys add a stable hash suffix
 3. janitor or future repair tooling can surface collisions
 
 ### Topic rename after creation
@@ -576,6 +729,8 @@ Every major scenario should combine several of:
 7. assert every receiver wakes and processes the message
 8. assert root team projection is identical across all members
 9. assert lineage differs correctly across all topics
+10. require each level to create the next level itself so the scenario actually
+    exercises real hierarchy rather than one root launching all workers
 
 #### Scenario B: Deep lineage plus inline fork race
 
@@ -607,6 +762,8 @@ Every major scenario should combine several of:
 5. restart the daemon under test
 6. verify lineage recovery, schedule recovery, and inbox wake recovery
 7. verify that post-restart children still resolve to the same root team
+8. require a descendant to message its parent after restart using the recovered
+   parent agent name from bootstrap or teammate discovery
 
 #### Scenario E: Rename, stop, resume, and continued messaging
 
@@ -627,7 +784,7 @@ Every major scenario should combine several of:
 5. verify the deepest descendant still resolves:
    - correct lineage depth
    - same root team key
-   - stable native agent projection
+   - stable agent projection
 
 #### Scenario G: Many-to-one fan-in delivery
 
@@ -656,7 +813,7 @@ Every major scenario should combine several of:
 2. record the target agent's lineage facts
 3. issue `/clear` in that target topic
 4. verify the next session forgets earlier conversational facts
-5. verify the target still resolves to the same root team key and native agent
+5. verify the target still resolves to the same root team key and agent
    name
 6. send an inbox message from another agent after `/clear`
 7. require the cleared target to wake and process the message
@@ -669,7 +826,7 @@ Every major scenario should combine several of:
 4. verify the topic becomes a fresh trunk with a different lineage and different
    root team projection
 5. from another agent, try to send to the old child projection
-6. require an explicit undelivered result
+6. require an explicit underdelivered result
 7. verify the new trunk does not receive that dead-period message
 
 #### Scenario K: Delete or replace during traffic, then respawn same alias
@@ -710,8 +867,13 @@ Every major scenario should combine several of:
 12. restored lineage route wake after restart
 13. `/clear` preserves lineage and route inbox projection
 14. `/new` reseeds the topic as a new trunk identity
-15. dead recipients return explicit undelivered results
-16. a respawned same-lineage replacement becomes deliverable again
+15. child-only alias resolution from sender lineage hash
+16. `search_team` supports `parent`, `children`, `siblings`, `ancestors`,
+    `descendants`, `family`, and `tree`
+17. bootstrap includes parent agent metadata for descendants
+18. root team key is never regenerated after initial creation
+19. replaced or deleted recipients return explicit underdelivered results
+20. a respawned same-lineage replacement becomes deliverable again
 
 ## Implementation Phasing
 
@@ -727,7 +889,11 @@ Every major scenario should combine several of:
 8. deterministic unit tests
 9. first overlapping live forum smoke scenario additions
 10. `/clear` and `/new` lifecycle semantics
-11. dead-recipient undelivered messaging
+11. unbound-recipient underdelivered messaging
+12. child-only alias resolution
+13. teammate discovery rename and `tree` mode
+14. parent metadata in bootstrap
+15. no-regeneration enforcement for root team keys
 
 ### Later phases
 
@@ -745,12 +911,14 @@ Every major scenario should combine several of:
 ## Current Risks
 
 1. Prompt bootstrap size adds some context overhead on every new head.
-2. The current team-worker state store is still keyed by native team and native
+2. The current team-worker state store is still keyed by flat team and
    agent names, not lineage.
 3. Existing live tests assume explicit `description` and explicit team fields in
    several places and will need migration.
 4. Queue-operation transcript shape is currently the easiest prompt-search
    target, but parser logic should also support ordinary user-message content.
+5. Open-ended audits can confuse prompt-planning failures with transport bugs, so
+   the deepest hierarchy scenarios must force nested launches deterministically.
 
 ## Decision Log
 
@@ -758,13 +926,15 @@ Every major scenario should combine several of:
 
 1. `lineage` is canonical identity.
 2. Prompt-injected `<obs-bootstrap>` is the canonical durable bootstrap.
-3. Native teams are a flat root-team projection.
+3. Team projection is a flat root-team projection.
 4. `/fork` appends to topic names.
 5. `alias` replaces `description` at the tool schema.
+6. activity is derived at runtime, not persisted as a global registry
+7. send results distinguish `stored_only` from `reached`
 
 ### Rejected
 
-1. Using multiple native teams to represent the real hierarchy
+1. Using multiple flat teams to represent the real hierarchy
 2. Making `SessionStart additionalContext` the canonical parse source
 3. Relying on transcript-only custom system records as the main model-awareness
    mechanism

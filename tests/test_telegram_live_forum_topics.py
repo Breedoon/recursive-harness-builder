@@ -2398,6 +2398,7 @@ class TestTelegramLiveForumTopics:
             timeout=240.0,
         )
         worker_thread_id, _ = _extract_topic_link(launch_message.text)
+        await asyncio.sleep(2.0)
         await _wait_for_message_containing(
             live_tg_forum,
             thread_id=worker_thread_id,
@@ -2501,4 +2502,78 @@ class TestTelegramLiveForumTopics:
         assert "agent task wake: teammate message received" in wake_message.text.lower(), (
             live_tg_forum.failure_context()
         )
+        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
+
+    async def test_live_running_team_worker_reports_active_inbox_notification(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        team_name = f"live-active-team-{tag}"
+        worker_name = f"live-active-worker-{tag[:4]}"
+        inbox_token = f"ACTIVE-NOTIFY-MSG-{tag}"
+        result_token = f"ACTIVE-NOTIFY-OK-{tag}"
+        parent_thread_id = await live_tg_forum.platform.create_topic(f"Team Active Notice {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic integration test. Reply with only ACTIVE-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"ACTIVE-PRIME-{tag}",
+            timeout=240.0,
+        )
+
+        launch_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic integration test for active inbox notifications. "
+                "Use AgentTask exactly once with fork=false, "
+                f"team_name={team_name}, name={worker_name}, description ACTIVE-WORKER-{tag}, and prompt "
+                "'Call TeamCreate with team_name="
+                f"{team_name}. "
+                "Then use Bash exactly once to run sleep 20. "
+                "If, while you are still in that same active turn, you receive a system notification saying "
+                "\"New teammate messages arrived while you were still running\", remember that it happened. "
+                f"After sleep finishes, call ReadInbox exactly once with team_name={team_name}, agent={worker_name}, "
+                f"include_read=true, mark_read=false, limit=20. If the inbox contains {inbox_token!r} and you did receive "
+                f"that active-turn system notification, reply with only {result_token}. Otherwise reply with only ACTIVE-NOTIFY-FAIL-{tag}.' "
+                f"After launch, reply with only ACTIVE-LAUNCHED-{tag}."
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=240.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=launch_baseline,
+            token=f"ACTIVE-LAUNCHED-{tag}",
+            timeout=240.0,
+        )
+        launch_message = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=launch_baseline,
+            token="agent task launched",
+            timeout=240.0,
+        )
+        worker_thread_id, _ = _extract_topic_link(launch_message.text)
+
+        await asyncio.sleep(4.0)
+        _append_unread_inbox_message(
+            team_name=team_name,
+            recipient=worker_name,
+            content=inbox_token,
+            summary="active notification",
+            sender="external-live-test",
+        )
+
+        worker_done = await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+            token=result_token,
+            timeout=420.0,
+        )
+        assert result_token in worker_done.text, live_tg_forum.failure_context()
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()

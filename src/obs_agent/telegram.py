@@ -47,9 +47,9 @@ from obs_agent.hooks import HookState
 from obs_agent.context_jsonl import find_session_jsonl
 from obs_agent.jsonl_fork import fork_session_jsonl
 from obs_agent.lineage import (
+    agent_name_for_lineage,
     build_obs_bootstrap_xml,
     find_latest_obs_bootstrap_for_session,
-    native_agent_name_for_lineage,
     normalize_lineage_name,
     parse_obs_bootstrap_xml,
     root_team_key_for_lineage,
@@ -350,6 +350,10 @@ def create_reply_wake_schedule(route: TelegramRoute) -> _TopicScheduleRecord:
         max_runs=3,
         run_count=0,
     )
+
+
+def is_reply_wake_schedule(record: _TopicScheduleRecord) -> bool:
+    return record.schedule_id.startswith("reply-wake-")
 
 
 @dataclass(frozen=True)
@@ -1501,7 +1505,7 @@ class TelegramBot:
                     restored_bootstrap = None
             if restored_bootstrap is not None:
                 team_name = restored_bootstrap.root_team_key
-                agent_name = restored_bootstrap.native_agent_name
+                agent_name = restored_bootstrap.agent_name
                 if not team_name or not agent_name:
                     default_team_name, default_agent_name = self._default_team_projection(
                         restored_bootstrap.lineage
@@ -1526,7 +1530,10 @@ class TelegramBot:
                     pass
                 elif persisted_team:
                     # Have team but no agent name — derive it
-                    default_agent_name = native_agent_name_for_lineage(state.agent_lineage)
+                    default_agent_name = agent_name_for_lineage(
+                        state.agent_lineage,
+                        team_key=persisted_team,
+                    )
                     state.session_manager.set_sdk_env_overrides(
                         self._build_team_worker_env(
                             team_name=persisted_team,
@@ -1860,13 +1867,22 @@ class TelegramBot:
         return _delete
 
     def _make_inbox_message_notifier(self, route: TelegramRoute):
-        async def _notify(payload: dict[str, Any]) -> None:
-            await self._handle_inbox_message_notification(
+        async def _notify(payload: dict[str, Any]) -> dict[str, Any] | None:
+            return await self._handle_inbox_message_notification(
                 sender_route=route,
                 payload=payload,
             )
 
         return _notify
+
+    @staticmethod
+    def _notification_failure_reason(exc: Exception) -> str:
+        if isinstance(exc, _TopicDeletedError):
+            return "recipient topic was deleted"
+        message = str(exc).strip()
+        if "child_state is none" in message.lower():
+            return "recipient has no current route binding"
+        return message or "recipient wake failed"
 
     def _make_inbox_recipient_validator(self, route: TelegramRoute):
         async def _validate(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1971,7 +1987,7 @@ class TelegramBot:
         if len(lineage) <= 1:
             # Trunk: agent_name = team_key (they must be identical)
             return team_key, team_key
-        return team_key, native_agent_name_for_lineage(lineage)
+        return team_key, agent_name_for_lineage(lineage)
 
     def _get_parent_team_key(self, state: TelegramSessionState) -> str | None:
         """Extract the root_team_key from a state's SDK env overrides or bootstrap."""
@@ -2010,8 +2026,8 @@ class TelegramBot:
             else None
         )
         agent_name = (
-            bootstrap.native_agent_name
-            if bootstrap is not None and bootstrap.native_agent_name
+            bootstrap.agent_name
+            if bootstrap is not None and bootstrap.agent_name
             else None
         )
         if not team_name or not agent_name:
@@ -2036,13 +2052,31 @@ class TelegramBot:
         if key is None:
             self._remove_route_inbox_target(state.route)
             return
+        bootstrap = None
+        if state.pending_obs_bootstrap:
+            try:
+                bootstrap = parse_obs_bootstrap_xml(state.pending_obs_bootstrap)
+            except Exception:
+                bootstrap = None
+        lineage = state.agent_lineage
+        if (not lineage) and bootstrap is not None and bootstrap.lineage:
+            lineage = bootstrap.lineage
+        obs_metadata = self._build_team_projection_obs_metadata(
+            lineage=lineage,
+            team_name=key[0],
+            agent_name=key[1],
+            route=state.route,
+            parent_agent_name=bootstrap.parent_agent_name if bootstrap is not None else None,
+            parent_display_name=bootstrap.parent_display_name if bootstrap is not None else None,
+        )
         self._remove_route_inbox_target(state.route)
         self._route_inbox_targets[key] = state.route
         self._route_inbox_target_keys_by_route[state.route] = key
-        self._upsert_native_team_member_config(
+        self._upsert_team_projection_config(
             team_name=key[0],
             agent_name=key[1],
             child_session_id=state.session_id,
+            obs_metadata=obs_metadata,
         )
 
     def _prime_obs_bootstrap(
@@ -2070,6 +2104,15 @@ class TelegramBot:
             default_team_name, default_agent_name = self._default_team_projection(normalized_lineage)
             resolved_team_name = resolved_team_name or default_team_name
             resolved_agent_name = resolved_agent_name or default_agent_name
+        parent_agent_name: str | None = None
+        parent_display_name: str | None = None
+        if len(normalized_lineage) > 1:
+            parent_lineage = normalized_lineage[:-1]
+            parent_display_name = parent_lineage[-1]
+            parent_agent_name = agent_name_for_lineage(
+                parent_lineage,
+                team_key=resolved_team_name,
+            )
         bootstrap_xml = build_obs_bootstrap_xml(
             lineage=normalized_lineage,
             origin=origin,
@@ -2078,7 +2121,9 @@ class TelegramBot:
             agent_id=agent_id,
             parent_session_id=parent_session_id,
             root_team_key=resolved_team_name,
-            native_agent_name=resolved_agent_name,
+            agent_name=resolved_agent_name,
+            parent_agent_name=parent_agent_name,
+            parent_display_name=parent_display_name,
         )
         state.session_manager.set_sdk_env_overrides(
             self._build_team_worker_env(
@@ -2086,10 +2131,18 @@ class TelegramBot:
                 agent_name=resolved_agent_name,
             )
         )
-        self._upsert_native_team_member_config(
+        self._upsert_team_projection_config(
             team_name=resolved_team_name,
             agent_name=resolved_agent_name,
             child_session_id=session_id or state.session_id,
+            obs_metadata=self._build_team_projection_obs_metadata(
+                lineage=normalized_lineage,
+                team_name=resolved_team_name,
+                agent_name=resolved_agent_name,
+                route=state.route,
+                parent_agent_name=parent_agent_name,
+                parent_display_name=parent_display_name,
+            ),
         )
         state.pending_obs_bootstrap = bootstrap_xml
         # Also store in hook_state so session_lineage can find it on first turn
@@ -2633,12 +2686,33 @@ class TelegramBot:
 
         state = self._get_state(record.route, create=False)
         if state is None:
+            if is_reply_wake_schedule(record):
+                record.enabled = False
+                record.next_run_at = None
+                self._register_topic_schedule(record)
             return False
         bot = self._bot_for_state(state)
         if bot is None:
+            if is_reply_wake_schedule(record):
+                record.enabled = False
+                record.next_run_at = None
+                self._register_topic_schedule(record)
             return False
         lock = self._get_route_lock(record.route)
         if lock.locked() or state.busy or record.route in self._schedule_running_by_route:
+            if is_reply_wake_schedule(record):
+                record.run_count += 1
+                if self._schedule_is_exhausted(record, now):
+                    record.enabled = False
+                    record.next_run_at = None
+                else:
+                    try:
+                        record.next_run_at = self._next_timed_run_at(record, base_ts=now)
+                    except ValueError as exc:
+                        record.enabled = False
+                        record.last_error = f"schedule config error: {exc}"
+                        record.next_run_at = None
+                self._register_topic_schedule(record)
             return False
 
         now_after = now
@@ -2926,12 +3000,111 @@ class TelegramBot:
             env["CLAUDE_CODE_AGENT_NAME"] = normalized_agent
         return env
 
-    def _upsert_native_team_member_config(
+    def _build_team_projection_obs_metadata(
+        self,
+        *,
+        lineage: tuple[str, ...] | None,
+        team_name: str | None,
+        agent_name: str | None,
+        route: TelegramRoute | None = None,
+        parent_agent_name: str | None = None,
+        parent_display_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        normalized_lineage = tuple(
+            item
+            for item in (normalize_lineage_name(value) for value in (lineage or ()))
+            if item
+        )
+        normalized_team = (team_name or "").strip()
+        normalized_agent = (agent_name or "").strip()
+        if not normalized_lineage or not normalized_team or not normalized_agent:
+            return None
+        resolved_parent_display = (parent_display_name or "").strip() or None
+        resolved_parent_agent = (parent_agent_name or "").strip() or None
+        if len(normalized_lineage) > 1:
+            if resolved_parent_display is None:
+                resolved_parent_display = normalized_lineage[-2]
+            if resolved_parent_agent is None:
+                resolved_parent_agent = agent_name_for_lineage(
+                    normalized_lineage[:-1],
+                    team_key=normalized_team,
+                )
+        payload = {
+            "root_team_key": normalized_team,
+            "agent_name": normalized_agent,
+            "display_name": normalized_lineage[-1],
+            "parent_agent_name": resolved_parent_agent,
+            "parent_display_name": resolved_parent_display,
+            "lineage": list(normalized_lineage),
+            "lineage_length": len(normalized_lineage),
+            "updated_at": int(time.time() * 1000),
+        }
+        if route is not None:
+            payload["topic_chat_id"] = route.chat_id
+            payload["topic_thread_id"] = route.thread_id
+        return payload
+
+    def _load_team_projection_metadata(
+        self,
+        team_name: str,
+    ) -> dict[str, dict[str, Any]]:
+        config_path = Path.home() / ".claude" / "teams" / team_name / "config.json"
+        if not config_path.exists():
+            return {}
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug("Failed to parse team config %s", config_path, exc_info=True)
+            return {}
+        members = payload.get("members")
+        if not isinstance(members, list):
+            return {}
+        metadata: dict[str, dict[str, Any]] = {}
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            agent_name = str(member.get("name") or "").strip()
+            if not agent_name or agent_name == "team-lead":
+                continue
+            obs = member.get("obs")
+            if not isinstance(obs, dict):
+                continue
+            entry: dict[str, Any] = {"agent_name": agent_name}
+            for text_key in (
+                "display_name",
+                "parent_agent_name",
+                "parent_display_name",
+                "root_team_key",
+            ):
+                value = obs.get(text_key)
+                if isinstance(value, str) and value.strip():
+                    entry[text_key] = value.strip()
+            lineage = obs.get("lineage")
+            if isinstance(lineage, list):
+                normalized_lineage = [
+                    str(item).strip()
+                    for item in lineage
+                    if isinstance(item, str) and str(item).strip()
+                ]
+                if normalized_lineage:
+                    entry["lineage"] = normalized_lineage
+                    entry["lineage_length"] = len(normalized_lineage)
+            if isinstance(obs.get("lineage_length"), int):
+                entry["lineage_length"] = int(obs["lineage_length"])
+            for int_key in ("topic_chat_id", "topic_thread_id", "updated_at"):
+                value = obs.get(int_key)
+                if isinstance(value, int):
+                    entry[int_key] = value
+            metadata[agent_name] = entry
+        return metadata
+
+    def _upsert_team_projection_config(
         self,
         *,
         team_name: str | None,
         agent_name: str | None,
         child_session_id: str | None,
+        obs_metadata: dict[str, Any] | None = None,
     ) -> None:
         normalized_team = (team_name or "").strip()
         normalized_agent = (agent_name or "").strip()
@@ -3004,6 +3177,7 @@ class TelegramBot:
                 "cwd": str(self._config.vault_path),
                 "subscriptions": [],
                 "backendType": "in-process",
+                **({"obs": obs_metadata} if obs_metadata else {}),
             }
         )
 
@@ -3093,6 +3267,34 @@ class TelegramBot:
             self._team_worker_records.pop(key, None)
         self._state_store.delete_team_worker_state_by_task_id(task_id=task_id)
 
+    def _sweep_route_team_worker_mappings(
+        self,
+        route: TelegramRoute,
+        *,
+        terminal_status: str | None = None,
+    ) -> None:
+        """Hard-unbind any worker projection that still points at a dropped route.
+
+        Live topic deletion can bypass the normal task-cancel path when the
+        route disappears under the transport. In that case the route_state can
+        be gone while the team_worker binding still survives, which then blocks
+        same-alias respawn. This sweep makes route teardown authoritative.
+        """
+        for task_id, record in list(self._fork_tasks_by_id.items()):
+            if record.child_route != route:
+                continue
+            if terminal_status and record.terminal_request is None:
+                record.terminal_request = terminal_status
+            if terminal_status and record.status not in {"completed", "failed", "stopped"}:
+                record.status = terminal_status
+            record.idle_ready = False
+            record.wake_requested = False
+            if terminal_status and record.completed_at is None:
+                record.completed_at = time.time()
+            self._fork_task_by_child_route.pop(record.child_route, None)
+            self._remove_team_worker_mappings_for_task(task_id)
+            self._persist_task_handle_record(record)
+
     def _persist_team_worker_record(self, record: _ForkTaskRecord) -> None:
         team = (record.team_name or "").strip()
         agent = (record.agent_name or "").strip()
@@ -3147,7 +3349,7 @@ class TelegramBot:
         key = self._team_worker_key(record.team_name, record.agent_name)
         if key is not None:
             self._team_worker_records[key] = record.task_id
-            self._upsert_native_team_member_config(
+            self._upsert_team_projection_config(
                 team_name=record.team_name,
                 agent_name=record.agent_name,
                 child_session_id=record.child_session_id,
@@ -3196,47 +3398,32 @@ class TelegramBot:
         team_name: str | None,
         agent_name: str | None,
     ) -> dict[str, Any]:
-        """Check if recipient can be woken. This is advisory only — messages
-        are ALWAYS delivered to the inbox file regardless of this result.
-        This function MUST NOT have side effects (no mapping removal).
-        The only definition of "dead" is: the user deleted the topic."""
+        """Check whether a recipient currently has a live route binding.
+
+        This function MUST NOT have side effects. It answers one question only:
+        can the runtime currently route a message to this agent identity?
+        """
         record = self._resolve_team_worker_record(
             team_name=team_name,
             agent_name=agent_name,
         )
         if record is not None:
-            # Completed/stopped/failed agents are still messageable —
-            # they can be woken from idle. Only truly dead (topic deleted)
-            # agents are unwakeable, and we discover that lazily.
             child_state = self._get_state(record.child_route, create=False)
             if child_state is not None:
                 return {"deliverable": True}
-            # State is gone but record exists — agent may have been
-            # cleaned up but inbox file persists. Still deliverable
-            # (message goes to inbox, wake is best-effort).
-            return {"deliverable": True, "warning": "agent state not in memory, wake may fail"}
+            return {
+                "deliverable": False,
+                "reason": "recipient has no current route binding",
+            }
         state = self._resolve_route_inbox_target(
             team_name=team_name,
             agent_name=agent_name,
         )
         if state is not None:
             return {"deliverable": True}
-        # No record and no route target — but inbox file may still exist.
-        # Since messages always deliver to inbox, return deliverable=True
-        # but note the agent may not be wakeable.
-        inbox_path = (
-            Path.home()
-            / ".claude"
-            / "teams"
-            / (team_name or "")
-            / "inboxes"
-            / f"{agent_name or ''}.json"
-        )
-        if inbox_path.exists():
-            return {"deliverable": True, "warning": "agent not tracked in memory, message will be in inbox but wake may fail"}
         return {
             "deliverable": False,
-            "reason": "no inbox found for recipient — agent may not exist in this tree",
+            "reason": "recipient has no current route binding",
         }
 
     def _mark_task_terminal_request(self, route: TelegramRoute, status: str) -> None:
@@ -4344,6 +4531,286 @@ class TelegramBot:
             )
         snapshot = apply_context_probe(snapshot, probe)
         return format_context_snapshot_lines(snapshot)
+
+    def _current_tree_context(
+        self,
+        state: TelegramSessionState,
+    ) -> tuple[str, str, tuple[str, ...]] | None:
+        bootstrap = None
+        if state.pending_obs_bootstrap:
+            try:
+                bootstrap = parse_obs_bootstrap_xml(state.pending_obs_bootstrap)
+            except Exception:
+                bootstrap = None
+        if bootstrap is None:
+            bootstrap = find_latest_obs_bootstrap_for_session(
+                session_id=state.session_id,
+                cwd=self._config.vault_path,
+            )
+        lineage = state.agent_lineage
+        if (not lineage) and bootstrap is not None and bootstrap.lineage:
+            lineage = bootstrap.lineage
+        if not lineage:
+            lineage = self._ensure_state_lineage(state, session_id=state.session_id)
+        if not lineage:
+            return None
+        env = state.session_manager.sdk_env_overrides
+        team_name = (
+            (bootstrap.root_team_key if bootstrap is not None else None)
+            or env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
+        )
+        agent_name = (
+            (bootstrap.agent_name if bootstrap is not None else None)
+            or env.get("CLAUDE_CODE_AGENT_NAME", "").strip()
+        )
+        if not team_name or not agent_name:
+            default_team_name, default_agent_name = self._default_team_projection(lineage)
+            team_name = team_name or default_team_name
+            agent_name = agent_name or default_agent_name
+        return team_name, agent_name, tuple(lineage)
+
+    @staticmethod
+    def _fallback_tree_display_name(agent_name: str) -> str:
+        normalized = agent_name.strip()
+        if not normalized:
+            return "unknown"
+        match = re.match(r"^[0-9a-f]{10}-(.+)$", normalized)
+        if match:
+            normalized = match.group(1)
+        else:
+            match = re.match(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-(.+)$", normalized)
+            if match:
+                normalized = match.group(1)
+        return normalized.replace("-", " ")
+
+    def _tree_link_for_member(self, member: dict[str, Any], team_name: str) -> str | None:
+        agent_name = str(member.get("agent_name") or "").strip()
+        if not agent_name:
+            return None
+        state = self._resolve_route_inbox_target(team_name=team_name, agent_name=agent_name)
+        if state is not None and state.route.thread_id is not None:
+            return self._build_message_link(state.route, state.route.thread_id)
+        topic_chat_id = member.get("topic_chat_id")
+        topic_thread_id = member.get("topic_thread_id")
+        if not isinstance(topic_chat_id, int) or not isinstance(topic_thread_id, int):
+            return None
+        return self._build_message_link(
+            TelegramRoute(chat_id=topic_chat_id, thread_id=topic_thread_id),
+            topic_thread_id,
+        )
+
+    def _load_tree_members(
+        self,
+        *,
+        team_name: str,
+        current_agent_name: str,
+        current_lineage: tuple[str, ...],
+        current_route: TelegramRoute,
+    ) -> dict[str, dict[str, Any]]:
+        metadata = self._load_team_projection_metadata(team_name)
+        inbox_dir = Path.home() / ".claude" / "teams" / team_name / "inboxes"
+        all_agents: set[str] = set(metadata)
+        if inbox_dir.is_dir():
+            for path in inbox_dir.iterdir():
+                if path.suffix == ".json" and path.stem:
+                    all_agents.add(path.stem)
+        if current_agent_name:
+            all_agents.add(current_agent_name)
+
+        members: dict[str, dict[str, Any]] = {}
+        for agent_name in sorted(all_agents):
+            entry = dict(metadata.get(agent_name) or {})
+            entry["agent_name"] = agent_name
+            members[agent_name] = entry
+
+        for idx, display_name in enumerate(current_lineage):
+            lineage = current_lineage[: idx + 1]
+            agent_name = agent_name_for_lineage(lineage, team_key=team_name)
+            entry = members.setdefault(agent_name, {"agent_name": agent_name})
+            entry.setdefault("display_name", display_name)
+            entry.setdefault("lineage", list(lineage))
+            entry.setdefault("lineage_length", len(lineage))
+            entry.setdefault("root_team_key", team_name)
+            if idx > 0:
+                entry.setdefault(
+                    "parent_agent_name",
+                    agent_name_for_lineage(lineage[:-1], team_key=team_name),
+                )
+                entry.setdefault("parent_display_name", current_lineage[idx - 1])
+            if agent_name == current_agent_name:
+                entry["topic_chat_id"] = current_route.chat_id
+                entry["topic_thread_id"] = current_route.thread_id
+
+        for agent_name, entry in members.items():
+            entry.setdefault("display_name", self._fallback_tree_display_name(agent_name))
+            if not isinstance(entry.get("lineage_length"), int):
+                lineage = entry.get("lineage")
+                if isinstance(lineage, list):
+                    entry["lineage_length"] = len(lineage)
+        return members
+
+    def _render_tree_html(
+        self,
+        *,
+        team_name: str,
+        current_agent_name: str,
+        current_lineage: tuple[str, ...],
+        members: dict[str, dict[str, Any]],
+        mode: str,
+    ) -> str:
+        if mode == "ancestors":
+            allowed = {
+                agent_name_for_lineage(current_lineage[: idx + 1], team_key=team_name)
+                for idx in range(len(current_lineage))
+            }
+        elif mode == "descendants":
+            allowed = {
+                agent_name
+                for agent_name, member in members.items()
+                if isinstance(member.get("lineage"), list)
+                and tuple(member["lineage"][: len(current_lineage)]) == current_lineage
+            }
+            allowed.add(current_agent_name)
+        else:
+            allowed = set(members)
+
+        children_by_parent: dict[str, list[str]] = {}
+        root_names: list[str] = []
+        for agent_name, member in members.items():
+            if agent_name not in allowed:
+                continue
+            parent_agent_name = str(member.get("parent_agent_name") or "").strip()
+            if parent_agent_name and parent_agent_name in allowed and parent_agent_name != agent_name:
+                children_by_parent.setdefault(parent_agent_name, []).append(agent_name)
+            else:
+                root_names.append(agent_name)
+
+        def _sort_key(agent_name: str) -> tuple[int, str, str]:
+            member = members[agent_name]
+            lineage = member.get("lineage")
+            lineage_key = "/".join(lineage) if isinstance(lineage, list) else ""
+            return (
+                int(member.get("lineage_length") or 9999),
+                lineage_key.casefold(),
+                str(member.get("display_name") or agent_name).casefold(),
+            )
+
+        for child_names in children_by_parent.values():
+            child_names.sort(key=_sort_key)
+        root_names = sorted(set(root_names), key=_sort_key)
+
+        if mode == "descendants" and current_agent_name in allowed:
+            root_names = [current_agent_name]
+        elif mode == "ancestors":
+            root_agent = agent_name_for_lineage(current_lineage[:1], team_key=team_name)
+            root_names = [root_agent] if root_agent in allowed else root_names
+        elif team_name in allowed:
+            root_names = [team_name] + [name for name in root_names if name != team_name]
+
+        lines: list[str] = []
+
+        def _walk(agent_name: str, depth: int) -> None:
+            member = members[agent_name]
+            display_name = str(member.get("display_name") or agent_name)
+            link = self._tree_link_for_member(member, team_name)
+            label = html.escape(display_name)
+            if link:
+                label = f'<a href="{html.escape(link, quote=True)}">{label}</a>'
+            if agent_name == current_agent_name:
+                label = f"{label} (current)"
+            indent = "&nbsp;&nbsp;" * depth
+            lines.append(f"{indent}- {label}")
+            for child_name in children_by_parent.get(agent_name, []):
+                _walk(child_name, depth + 1)
+
+        for root_name in root_names:
+            _walk(root_name, 0)
+
+        return "<br/>".join(lines)
+
+    async def _handle_tree_view(
+        self,
+        *,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        mode: str,
+    ) -> None:
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+
+        route = self._route_for_message(update.effective_message)
+        state = self._get_state(route)
+        if state is None:
+            return
+        state.last_bot = context.bot
+        context_tuple = self._current_tree_context(state)
+        if context_tuple is None:
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text="tree unavailable: no OBS lineage/bootstrap found for this topic",
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
+        team_name, current_agent_name, current_lineage = context_tuple
+        members = self._load_tree_members(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=current_lineage,
+            current_route=route,
+        )
+        html_text = self._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=current_lineage,
+            members=members,
+            mode=mode,
+        )
+        if not html_text:
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text="tree unavailable: no team members found",
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
+        await self._send_html(
+            route=route,
+            bot=context.bot,
+            html_text=html_text,
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
+
+    async def handle_tree(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        await self._handle_tree_view(update=update, context=context, mode="tree")
+
+    async def handle_tree_descendants(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        await self._handle_tree_view(update=update, context=context, mode="descendants")
+
+    async def handle_tree_ancestors(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        await self._handle_tree_view(update=update, context=context, mode="ancestors")
+
+    async def handle_tree_alias_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        text = (update.effective_message.text or "").strip().lower() if update.effective_message is not None else ""
+        mode = "tree"
+        if text.startswith("/tree-ancestors"):
+            mode = "ancestors"
+        elif text.startswith("/tree-") or text.startswith("/tree-descendants"):
+            mode = "descendants"
+        await self._handle_tree_view(update=update, context=context, mode=mode)
 
     async def handle_clear(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -5860,6 +6327,10 @@ class TelegramBot:
         if terminal_status:
             self._mark_task_terminal_request(route, terminal_status)
             await self._cancel_route_fork_tasks(route, status=terminal_status)
+            self._sweep_route_team_worker_mappings(
+                route,
+                terminal_status=terminal_status,
+            )
         stale_session_ids = [
             session_id
             for session_id, mapped_route in self._route_by_session_id.items()
@@ -5973,14 +6444,14 @@ class TelegramBot:
             child_lineage = parent_lineage + (normalized_lineage_name,)
             # Children inherit the parent's root_team_key — only trunk generates
             # a new timestamp-based key. The agent_name is always computed fresh.
-            default_agent_name = native_agent_name_for_lineage(child_lineage)
+            default_agent_name = agent_name_for_lineage(child_lineage)
             parent_team_key = self._get_parent_team_key(parent_state)
             team_name = (team_name or "").strip() or parent_team_key or root_team_key_for_lineage(child_lineage)
             agent_name = (agent_name or "").strip() or default_agent_name
-            # Collision detection: aggressive filesystem-based check.
-            # If an inbox file exists for this agent_name → name is taken.
-            # For auto-generated names (F1, F2...): auto-increment past taken names.
-            # For user-specified names: error on collision.
+            # Collision detection is based on current bindings, not merely on
+            # inbox-file existence. Deleted topics intentionally leave inbox
+            # files behind so backlog can survive until the same identity is
+            # respawned.
             is_auto_generated = bool(
                 re.match(r"^F\d+$", normalized_lineage_name, re.IGNORECASE)
             )
@@ -5990,7 +6461,19 @@ class TelegramBot:
                     / "inboxes" / f"{agent_name}.json"
                 )
                 agent_key = self._team_worker_key(team_name, agent_name)
-                if inbox_path.exists():
+                projection_is_bound = False
+                if agent_key is not None:
+                    projection_is_bound = (
+                        self._resolve_route_inbox_target(
+                            team_name=team_name,
+                            agent_name=agent_name,
+                        ) is not None
+                        or self._resolve_team_worker_record(
+                            team_name=team_name,
+                            agent_name=agent_name,
+                        ) is not None
+                    )
+                if inbox_path.exists() and projection_is_bound:
                     if is_auto_generated:
                         # Auto-increment: try F2, F3, ... until we find a free name
                         counter = int(normalized_lineage_name[1:])
@@ -6003,7 +6486,17 @@ class TelegramBot:
                                 Path.home() / ".claude" / "teams" / team_name
                                 / "inboxes" / f"{candidate_agent}.json"
                             )
-                            if not candidate_inbox.exists():
+                            candidate_bound = (
+                                self._resolve_route_inbox_target(
+                                    team_name=team_name,
+                                    agent_name=candidate_agent,
+                                ) is not None
+                                or self._resolve_team_worker_record(
+                                    team_name=team_name,
+                                    agent_name=candidate_agent,
+                                ) is not None
+                            )
+                            if not candidate_inbox.exists() or not candidate_bound:
                                 # Found a free name — update everything
                                 normalized_lineage_name = candidate_name
                                 child_lineage = candidate_lineage
@@ -6151,15 +6644,15 @@ class TelegramBot:
         output_file: str | None,
         topic_link: str | None,
         task_label: str,
-        native_agent_name: str | None = None,
+        agent_name: str | None = None,
         team_name: str | None = None,
     ) -> str:
         lines = [
             f"{task_label} launched successfully.",
             f"agentId: {task_id}",
         ]
-        if native_agent_name:
-            lines.append(f"native_agent_name: {native_agent_name}")
+        if agent_name:
+            lines.append(f"agent_name: {agent_name}")
         if team_name:
             lines.append(f"team_name: {team_name}")
         lines.append(
@@ -6307,6 +6800,55 @@ class TelegramBot:
             preview = content_norm if len(content_norm) <= 240 else f"{content_norm[:240]}..."
             lines.append(f"Latest content preview: {preview}")
         return "\n".join(lines)
+
+    def _build_running_team_worker_prompt(
+        self,
+        *,
+        team_name: str,
+        agent_name: str,
+        sender: str | None,
+        summary: str | None,
+        content: str | None,
+    ) -> str:
+        lines = [
+            "(System notification: New teammate messages arrived while you were still running.)",
+            f"At the next convenient opportunity, call ReadInbox with team_name={team_name}, agent={agent_name}, include_read=false, mark_read=true, limit=50.",
+            "Process all unread teammate messages before you finish the current task if practical.",
+            "If needed, reply to teammates with SendInboxMessage.",
+        ]
+        sender_norm = (sender or "").strip()
+        summary_norm = (summary or "").strip()
+        content_norm = (content or "").strip()
+        if sender_norm:
+            lines.append(f"Latest sender: {sender_norm}.")
+        if summary_norm:
+            lines.append(f"Latest summary: {summary_norm}.")
+        if content_norm:
+            preview = content_norm if len(content_norm) <= 240 else f"{content_norm[:240]}..."
+            lines.append(f"Latest content preview: {preview}")
+        return "\n".join(lines)
+
+    def _queue_running_team_worker_notice(
+        self,
+        *,
+        state: TelegramSessionState,
+        team_name: str,
+        agent_name: str,
+        sender: str | None,
+        summary: str | None,
+        content: str | None,
+    ) -> None:
+        state.hook_state.message_queue.put_nowait(
+            QueuedMessage(
+                text=self._build_running_team_worker_prompt(
+                    team_name=team_name,
+                    agent_name=agent_name,
+                    sender=sender,
+                    summary=summary,
+                    content=content,
+                )
+            )
+        )
 
     @staticmethod
     def _team_inbox_path(team_name: str, agent_name: str) -> Path:
@@ -6696,11 +7238,11 @@ class TelegramBot:
         *,
         sender_route: TelegramRoute,
         payload: dict[str, Any],
-    ) -> None:
+    ) -> dict[str, Any] | None:
         team_name = str(payload.get("team_name") or "").strip()
         recipient = str(payload.get("recipient") or "").strip()
         if not team_name or not recipient:
-            return
+            return {"delivered": False, "reason": "recipient has no current route binding"}
 
         # Clear dedup keys for this agent so a genuinely NEW message triggers
         # a wake.  Only do this when called from the DIRECT path (SendInboxMessage)
@@ -6727,7 +7269,7 @@ class TelegramBot:
                         "Deleted reply_wake schedule %s: all must_reply messages replied",
                         wake_id,
                     )
-            return
+            return {"delivered": True}
 
         # Create reply_wake schedule if this is a must_reply message
         if payload.get("_must_reply"):
@@ -6770,7 +7312,7 @@ class TelegramBot:
                 agent_name=recipient,
             )
             if state is None:
-                return
+                return {"delivered": False, "reason": "recipient has no current route binding"}
             try:
                 woken = await self._maybe_wake_route_inbox_target(
                     state=state,
@@ -6781,13 +7323,16 @@ class TelegramBot:
                     content=content,
                 )
                 if not woken:
-                    # Agent is busy — queue the wake for when the turn
-                    # completes (like children's wake_requested flag).
-                    state.inbox_wake_pending = True
-                    state.inbox_wake_sender = sender
-                    state.inbox_wake_summary = summary
-                    state.inbox_wake_content = content
-            except Exception:
+                    self._queue_running_team_worker_notice(
+                        state=state,
+                        team_name=team_name,
+                        agent_name=recipient,
+                        sender=sender,
+                        summary=summary,
+                        content=content,
+                    )
+                return {"delivered": True}
+            except Exception as exc:
                 logger.warning(
                     "Failed waking lineage route from inbox notification route=%s team=%s agent=%s sender_route=%s",
                     state.route,
@@ -6796,17 +7341,31 @@ class TelegramBot:
                     sender_route,
                     exc_info=True,
                 )
-            return
+                return {
+                    "delivered": False,
+                    "reason": self._notification_failure_reason(exc),
+                }
         # If the agent task is actively running, queue the wake for when the
         # turn completes — we can't start two fork tasks simultaneously.
         running = self._fork_task_tasks.get(record.task_id)
         if running is not None and not running.done():
-            record.wake_requested = True
-            record.wake_source_sender = sender
-            record.wake_source_summary = summary
-            record.wake_source_content = content
-            self._persist_task_handle_record(record)
-            return
+            child_state = self._get_state(record.child_route, create=False)
+            if child_state is not None:
+                self._queue_running_team_worker_notice(
+                    state=child_state,
+                    team_name=team_name,
+                    agent_name=recipient,
+                    sender=sender,
+                    summary=summary,
+                    content=content,
+                )
+            else:
+                record.wake_requested = True
+                record.wake_source_sender = sender
+                record.wake_source_summary = summary
+                record.wake_source_content = content
+                self._persist_task_handle_record(record)
+            return {"delivered": True}
 
         # Always try to wake regardless of record status (completed, failed,
         # stopped, etc.).  Over-deliver rather than under-deliver.
@@ -6818,7 +7377,8 @@ class TelegramBot:
                 summary=summary,
                 content=content,
             )
-        except Exception:
+            return {"delivered": True}
+        except Exception as exc:
             logger.warning(
                 "Failed waking team worker from inbox notification route=%s task_id=%s status=%s sender_route=%s",
                 record.child_route,
@@ -6829,6 +7389,10 @@ class TelegramBot:
             )
             # Wake failed — send bounce-back so senders know.
             await self._send_bounce_backs_for_dead_agent(record.child_route)
+            return {
+                "delivered": False,
+                "reason": self._notification_failure_reason(exc),
+            }
 
     async def _schedule_fork_task(
         self,
@@ -6871,7 +7435,13 @@ class TelegramBot:
 
         prompt = str(args["prompt"])
         description = (
-            str(args.get("alias") or args.get("description") or "").strip()
+            str(
+                args.get("display_name")
+                or args.get("alias")
+                or args.get("description")
+                or args.get("name")
+                or ""
+            ).strip()
             or record.description
         )
         team_name = str(args.get("team_name") or "").strip() or record.team_name
@@ -6985,7 +7555,7 @@ class TelegramBot:
                         output_file=self._record_output_file(record),
                         topic_link=child_link,
                         task_label=record.launch_tool_name,
-                        native_agent_name=record.agent_name,
+                        agent_name=record.agent_name,
                         team_name=record.team_name,
                     ),
                 }
@@ -7018,7 +7588,7 @@ class TelegramBot:
         team_name = str(args.get("team_name") or "").strip() or None
         # With two-tier naming, the 'name' parameter is a display name (alias),
         # NOT the machine agent_name. The agent_name is computed from the lineage
-        # by _create_child_fork_topic via native_agent_name_for_lineage.
+        # by _create_child_fork_topic via agent_name_for_lineage.
         # Only use an explicit 'agent_name' if it's provided separately.
         agent_name = str(args.get("agent_name") or "").strip() or None
         source_session_id: str | None = None
@@ -7055,7 +7625,13 @@ class TelegramBot:
                 raise RuntimeError("Cannot launch ForkTask yet: no mapped head in this topic")
 
         task_id = str(uuid.uuid4())
-        description = str(args.get("alias") or args.get("description") or "").strip() or None
+        description = str(
+            args.get("display_name")
+            or args.get("alias")
+            or args.get("description")
+            or args.get("name")
+            or ""
+        ).strip() or None
         prompt = str(args["prompt"])
         # timeout_ms and max_turns disabled — all agents run without limits.
         timeout_ms = None
@@ -7156,7 +7732,7 @@ class TelegramBot:
                         output_file=self._record_output_file(record),
                         topic_link=child_link,
                         task_label=launch_tool_name,
-                        native_agent_name=record.agent_name,
+                        agent_name=record.agent_name,
                         team_name=record.team_name,
                     ),
                 }
@@ -7757,12 +8333,21 @@ def create_telegram_app(config: OBSConfig) -> Application:
         .build()
     )
     app.bot_data["obs_telegram_bot"] = bot
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"^/(?:tree-|tree-(?:ancestors|descendants))(?:@[A-Za-z0-9_]+)?(?:\s|$)"),
+            bot.handle_tree_alias_command,
+        )
+    )
     app.add_handler(CommandHandler("clear", bot.handle_clear))
     app.add_handler(CommandHandler("new", bot.handle_new))
     app.add_handler(CommandHandler("unschedule", bot.handle_unschedule))
     app.add_handler(CommandHandler("stop", bot.handle_stop))
     app.add_handler(CommandHandler("context", bot.handle_context))
     app.add_handler(CommandHandler("report", bot.handle_report))
+    app.add_handler(CommandHandler("tree", bot.handle_tree))
+    app.add_handler(CommandHandler("tree_descendants", bot.handle_tree_descendants))
+    app.add_handler(CommandHandler("tree_ancestors", bot.handle_tree_ancestors))
     app.add_handler(CommandHandler("fork", bot.handle_fork))
     app.add_handler(CommandHandler("delete", bot.handle_delete))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, bot.handle_forum_topic_created))
@@ -7794,6 +8379,9 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
         BotCommand("context", "Show session and context window info"),
         BotCommand("report", "Save a debug case file for this message/topic"),
+        BotCommand("tree", "Render the full agent tree for this team"),
+        BotCommand("tree_descendants", "Render this agent and all descendants"),
+        BotCommand("tree_ancestors", "Render this agent and all ancestors"),
         BotCommand("fork", "Create a new topic from this head or replied message"),
         BotCommand("delete", "Delete this topic; use '/delete all' to remove all non-General topics"),
     ])

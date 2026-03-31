@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import xml.etree.ElementTree as ET
 
 from obs_agent.lineage import (
+    agent_name_for_lineage,
     build_obs_bootstrap_xml,
     extract_obs_bootstrap_xml,
     find_latest_obs_bootstrap_in_jsonl,
-    native_agent_name_for_lineage,
     parse_obs_bootstrap_xml,
     root_team_key_for_lineage,
 )
@@ -22,7 +23,9 @@ def test_bootstrap_round_trip_and_projection(tmp_path):
         agent_id="task-123",
         parent_session_id="sid-parent",
         root_team_key=root_team_key_for_lineage(lineage),
-        native_agent_name=native_agent_name_for_lineage(lineage),
+        agent_name=agent_name_for_lineage(lineage),
+        parent_agent_name=agent_name_for_lineage(lineage[:-1], team_key=root_team_key_for_lineage(lineage)),
+        parent_display_name="Child Topic",
     )
 
     parsed = parse_obs_bootstrap_xml(xml)
@@ -34,7 +37,12 @@ def test_bootstrap_round_trip_and_projection(tmp_path):
     assert parsed.agent_id == "task-123"
     assert parsed.parent_session_id == "sid-parent"
     assert parsed.root_team_key == root_team_key_for_lineage(lineage)
-    assert parsed.native_agent_name == native_agent_name_for_lineage(lineage)
+    assert parsed.agent_name == agent_name_for_lineage(lineage)
+    assert parsed.parent_agent_name == agent_name_for_lineage(
+        lineage[:-1],
+        team_key=root_team_key_for_lineage(lineage),
+    )
+    assert parsed.parent_display_name == "Child Topic"
 
 
 def test_latest_bootstrap_wins_when_scanning_jsonl(tmp_path):
@@ -45,7 +53,7 @@ def test_latest_bootstrap_wins_when_scanning_jsonl(tmp_path):
         is_fork=False,
         session_id="sid-1",
         root_team_key="team-root",
-        native_agent_name="agent-root",
+        agent_name="agent-root",
     )
     second = build_obs_bootstrap_xml(
         lineage=("Root", "Forked"),
@@ -54,7 +62,7 @@ def test_latest_bootstrap_wins_when_scanning_jsonl(tmp_path):
         session_id="sid-2",
         parent_session_id="sid-1",
         root_team_key="team-root",
-        native_agent_name="agent-forked",
+        agent_name="agent-forked",
     )
     lines = [
         json.dumps(
@@ -83,6 +91,27 @@ def test_latest_bootstrap_wins_when_scanning_jsonl(tmp_path):
     assert parsed.session_id == "sid-2"
 
 
+def test_descendant_bootstrap_keeps_parent_node_agent_names() -> None:
+    lineage = ("Root Topic", "Child Topic", "worker-a")
+    team_key = root_team_key_for_lineage(lineage, timestamp=1710561600.0)
+    xml = build_obs_bootstrap_xml(
+        lineage=lineage,
+        origin="agent_task_fork",
+        is_fork=True,
+        session_id="sid-child",
+        root_team_key=team_key,
+        agent_name=agent_name_for_lineage(lineage),
+    )
+
+    root = ET.fromstring(xml)
+    nodes = root.findall(".//obs-node")
+    assert [node.attrib["agent_name"] for node in nodes] == [
+        team_key,
+        agent_name_for_lineage(lineage[:-1]),
+        agent_name_for_lineage(lineage),
+    ]
+
+
 def test_extract_bootstrap_with_system_note_prefix():
     """Regression: bootstrap prefixed by <system-note> must still be found.
 
@@ -95,7 +124,7 @@ def test_extract_bootstrap_with_system_note_prefix():
         is_fork=False,
         session_id="sid-trunk",
         root_team_key="2026-03-18-02-20-test",
-        native_agent_name="2026-03-18-02-20-test",
+        agent_name="2026-03-18-02-20-test",
     )
     # Simulate what telegram.py:4970-4987 produces
     text = (
@@ -123,7 +152,7 @@ def test_find_bootstrap_in_jsonl_with_system_note_prefix(tmp_path):
         is_fork=False,
         session_id="sid-trunk",
         root_team_key="2026-03-18-02-20-test",
-        native_agent_name="2026-03-18-02-20-test",
+        agent_name="2026-03-18-02-20-test",
     )
     prefixed_content = (
         "<system-note>\n"
@@ -146,4 +175,3 @@ def test_find_bootstrap_in_jsonl_with_system_note_prefix(tmp_path):
     assert parsed is not None
     assert parsed.lineage == ("test",)
     assert parsed.session_id == "sid-trunk"
-

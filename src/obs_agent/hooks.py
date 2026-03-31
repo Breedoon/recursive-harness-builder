@@ -125,10 +125,10 @@ def on_pre_tool_use(
 
     if normalized_tool_name in _BLOCKED_NATIVE_INBOX_TOOLS:
         return _deny(
-            "Blocked by platform policy: native team messaging tools are disabled in Telegram runtime. "
+            "Blocked by platform policy: flat team messaging tools are disabled in Telegram runtime. "
             "Use SendInboxMessage and ReadInbox instead.",
             additional_context=(
-                "System: Native team messaging tools are disabled by platform policy in Telegram runtime. "
+                "System: Flat team messaging tools are disabled by platform policy in Telegram runtime. "
                 "Use SendInboxMessage and ReadInbox."
             ),
             show_system_message=True,
@@ -227,7 +227,7 @@ class HookState:
     cron_lister: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     cron_deleter: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     inbox_recipient_validator: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
-    inbox_message_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    inbox_message_notifier: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None
     stop_event_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     current_tool_use_id: str | None = None
     schedule_run_active: bool = False

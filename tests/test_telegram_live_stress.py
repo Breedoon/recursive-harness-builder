@@ -8,7 +8,7 @@ Comprehensive adversarial tests that exercise the messaging system under stress:
 - Completed agents remain messageable
 - Topic deletion behavior (graceful failure, no redirect to General)
 - session_lineage include_xml=false
-- AgentTask returns native_agent_name
+- AgentTask returns agent_name
 
 These tests reproduce real production bugs found during the naming redesign rollout.
 Each test is long, comprehensive, and designed to catch regressions.
@@ -236,7 +236,7 @@ class TestMessagingStress:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=thread_b,
-            recipient=root_lineage["native_agent_name"],
+            recipient=root_lineage["agent_name"],
             content=msg_b_to_root,
             ack_token=f"B-SENT-ROOT-{tag}",
             timeout=240.0,
@@ -258,7 +258,7 @@ class TestMessagingStress:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=root_thread,
-            recipient=lineage_b["native_agent_name"],
+            recipient=lineage_b["agent_name"],
             content=msg_root_to_b,
             ack_token=f"ROOT-SENT-B-{tag}",
             timeout=240.0,
@@ -269,7 +269,7 @@ class TestMessagingStress:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=thread_b,
-            recipient=lineage_c["native_agent_name"],
+            recipient=lineage_c["agent_name"],
             content=msg_b_to_c,
             ack_token=f"B-SENT-C-{tag}",
             timeout=240.0,
@@ -291,7 +291,7 @@ class TestMessagingStress:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=thread_c,
-            recipient=lineage_a["native_agent_name"],
+            recipient=lineage_a["agent_name"],
             content=msg_c_to_a,
             ack_token=f"C-SENT-A-{tag}",
             timeout=240.0,
@@ -349,7 +349,7 @@ class TestMustReplyProperCycle:
         await _send_must_reply_message(
             live_tg_forum,
             sender_thread_id=root_thread,
-            recipient=worker_lineage["native_agent_name"],
+            recipient=worker_lineage["agent_name"],
             content=must_reply_content,
             ack_token=f"ROOT-SENT-MR-{tag}",
             timeout=240.0,
@@ -360,7 +360,7 @@ class TestMustReplyProperCycle:
             live_tg_forum,
             thread_id=worker_thread,
             look_for=must_reply_content,
-            reply_to=root_lineage["native_agent_name"],
+            reply_to=root_lineage["agent_name"],
             reply_content=f"WORKER-DONE-{tag}",
             ack_token=f"WORKER-REPLIED-{tag}",
             timeout=240.0,
@@ -461,7 +461,7 @@ class TestMustReplyExhaustion:
         await _send_must_reply_message(
             live_tg_forum,
             sender_thread_id=root_thread,
-            recipient=worker_lineage["native_agent_name"],
+            recipient=worker_lineage["agent_name"],
             content=f"REPLY-TO-ME-{tag}",
             ack_token=f"ROOT-SENT-MR-EX-{tag}",
             timeout=240.0,
@@ -548,7 +548,7 @@ class TestMustReplyNoLoop:
         await _send_must_reply_message(
             live_tg_forum,
             sender_thread_id=thread_a,
-            recipient=lineage_b["native_agent_name"],
+            recipient=lineage_b["agent_name"],
             content=f"PING-{tag}",
             ack_token=f"A-SENT-PING-{tag}",
             timeout=240.0,
@@ -559,7 +559,7 @@ class TestMustReplyNoLoop:
             live_tg_forum,
             thread_id=thread_b,
             look_for=f"PING-{tag}",
-            reply_to=lineage_a["native_agent_name"],
+            reply_to=lineage_a["agent_name"],
             reply_content=f"PONG-{tag}",
             ack_token=f"B-REPLIED-PONG-{tag}",
             timeout=240.0,
@@ -662,7 +662,7 @@ class TestCompletedAgentMessageable:
         delivered = await _send_inbox_message_and_expect_outcome(
             live_tg_forum,
             sender_thread_id=root_thread,
-            recipient=worker_lineage["native_agent_name"],
+            recipient=worker_lineage["agent_name"],
             content=msg_to_completed,
             delivered_token=f"DELIVERED-TO-COMPLETED-{tag}",
             undelivered_token=f"UNDELIVERED-COMPLETED-{tag}",
@@ -675,7 +675,113 @@ class TestCompletedAgentMessageable:
 
 
 # ---------------------------------------------------------------------------
-# TEST 6: Topic deletion behavior
+# TEST 6: Idle agent wake without sleep
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+@pytest.mark.timeout(600)  # 10 minutes
+class TestIdleWakeWithoutSleep:
+    """Verify an idle agent wakes from a direct inbox message without sleep as the mechanism."""
+
+    async def test_live_idle_agent_wakes_on_direct_message_without_sleep(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+
+        root_thread = await live_tg_forum.platform.create_topic(f"IdleWake {tag}")
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"Deterministic idle-wake test. Reply with only IDLEWAKE-PRIME-{tag}.",
+            thread_id=root_thread,
+            token=f"IDLEWAKE-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        root_lineage = await _query_session_lineage_payload(
+            live_tg_forum,
+            thread_id=root_thread,
+            timeout=240.0,
+        )
+
+        child_thread, child_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread,
+            fork=False,
+            alias=f"IdleChild-{tag}",
+            launch_token=f"IDLE-LAUNCH-{tag}",
+            lineage_token=f"IDLE-LIN-{tag}",
+            timeout=240.0,
+        )
+
+        # Force a clean finished turn so the child is genuinely idle between turns.
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"Reply with only IDLE-READY-{tag}.",
+            thread_id=child_thread,
+            token=f"IDLE-READY-{tag}",
+            timeout=180.0,
+        )
+
+        child_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=child_thread)
+        root_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=root_thread)
+        wake_reply_token = f"IDLE-WAKE-PONG-{tag}"
+        wake_ack_token = f"IDLE-CHILD-WOKE-{tag}"
+        wake_message = (
+            f"IDLE-WAKE-PING-{tag}. "
+            f"If you are reading this after being woken while idle, use SendInboxMessage exactly once "
+            f"with recipient={root_lineage['agent_name']}, content={wake_reply_token!r}, "
+            "summary='idle-wake-reply', and omit team_name and sender. "
+            f"Then reply in this topic with exactly {wake_ack_token}."
+        )
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic idle-wake test. "
+                f"Use SendInboxMessage exactly once with recipient={child_lineage['agent_name']}, "
+                f"content={wake_message!r}, summary='idle-wake-root', and omit team_name and sender. "
+                f"Reply with only ROOT-SENT-IDLE-WAKE-{tag}."
+            ),
+            thread_id=root_thread,
+            require_done=False,
+            timeout=240.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=root_thread,
+            after_message_id=root_baseline,
+            token=f"ROOT-SENT-IDLE-WAKE-{tag}",
+            timeout=300.0,
+        )
+
+        # The proof is that the idle child wakes and emits a fresh reply in its own topic.
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=child_thread,
+            after_message_id=child_baseline,
+            token=wake_ack_token,
+            timeout=300.0,
+        )
+
+        root_inbox_result = await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "Call ReadInbox exactly once with include_read=true, mark_read=false, limit=20. "
+                f"If you find a message whose exact text is {wake_reply_token!r}, "
+                f"reply with only ROOT-GOT-IDLE-WAKE-{tag}. "
+                f"Otherwise reply with only ROOT-MISSED-IDLE-WAKE-{tag}."
+            ),
+            thread_id=root_thread,
+            token=f"ROOT-GOT-IDLE-WAKE-{tag}",
+            timeout=300.0,
+        )
+        assert f"ROOT-GOT-IDLE-WAKE-{tag}" in root_inbox_result.text, live_tg_forum.failure_context()
+
+
+# ---------------------------------------------------------------------------
+# TEST 7: Topic deletion behavior
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
@@ -726,21 +832,28 @@ class TestTopicDeletion:
 
         # Record General baseline BEFORE sending the message
         general_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
+        sender_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=root_thread)
 
         # Send message from root to deleted worker
         msg_to_deleted = f"HELLO-DOOMED-{tag}"
         delivered = await _send_inbox_message_and_expect_outcome(
             live_tg_forum,
             sender_thread_id=root_thread,
-            recipient=worker_lineage["native_agent_name"],
+            recipient=worker_lineage["agent_name"],
             content=msg_to_deleted,
             delivered_token=f"DELIVERED-TO-DOOMED-{tag}",
             undelivered_token=f"UNDELIVERED-DOOMED-{tag}",
             timeout=240.0,
         )
-
-        # The message should still be "delivered" to inbox file (always-deliver)
-        # But the wake attempt should fail gracefully
+        if delivered:
+            bounce = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=root_thread,
+                after_message_id=sender_baseline,
+                token="topic was deleted",
+                timeout=240.0,
+            )
+            assert "topic was deleted" in bounce.text.lower(), live_tg_forum.failure_context()
 
         # CRITICAL: Check that the message did NOT appear in General topic
         await asyncio.sleep(10)
@@ -812,7 +925,7 @@ class TestSessionLineageNoXML:
 
 
 # ---------------------------------------------------------------------------
-# TEST 8: AgentTask returns native_agent_name
+# TEST 8: AgentTask returns agent_name
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration
@@ -820,13 +933,13 @@ class TestSessionLineageNoXML:
 @pytest.mark.telegram_smoke
 @pytest.mark.timeout(600)  # 10 minutes
 class TestAgentTaskReturnsName:
-    """AgentTask confirmation should include the native_agent_name."""
+    """AgentTask confirmation should include the agent_name."""
 
-    async def test_live_agent_task_returns_native_name(
+    async def test_live_agent_task_returns_agent_name(
         self,
         live_tg_forum: _LiveForumHarness,
     ) -> None:
-        """Launch a child via AgentTask and verify the confirmation includes native_agent_name."""
+        """Launch a child via AgentTask and verify the confirmation includes agent_name."""
         await _reset_general(live_tg_forum)
         tag = uuid.uuid4().hex[:8]
 
@@ -847,7 +960,7 @@ class TestAgentTaskReturnsName:
                 f"alias='NameCheck-{tag}', "
                 "prompt='Reply with DONE and stop.'. "
                 "After launching, check the launch confirmation text. "
-                "If it contains 'native_agent_name' or 'agent_name', "
+                "If it contains 'agent_name' or 'agent_name', "
                 f"reply with exactly NAME-IN-CONFIRM-{tag}. "
                 f"Otherwise reply with NAME-MISSING-{tag}."
             ),
@@ -863,7 +976,7 @@ class TestAgentTaskReturnsName:
             timeout=360.0,
         )
         assert f"NAME-IN-CONFIRM-{tag}" in result.text, (
-            "AgentTask confirmation does not include native_agent_name! "
+            "AgentTask confirmation does not include agent_name! "
             "Parents need to know how to message their children."
         )
 
@@ -922,7 +1035,7 @@ class TestPhantomNotificationDedup:
         )
 
         # Extract child's agent_name
-        child_agent = _extract_lineage_fact_line(child_lineage, "native_agent_name")
+        child_agent = _extract_lineage_fact_line(child_lineage, "agent_name")
         assert child_agent, "Failed to extract child agent_name"
 
         # Wait for child to finish initial turn and go idle
@@ -1003,7 +1116,7 @@ class TestPhantomNotificationDedup:
             lineage_token=f"PHANTOM-CHILD-{tag}",
             timeout=240.0,
         )
-        child_agent = _extract_lineage_fact_line(child_lineage, "native_agent_name")
+        child_agent = _extract_lineage_fact_line(child_lineage, "agent_name")
         assert child_agent, "Failed to extract child agent_name"
 
         # Wait for child to finish initial turn and go idle
@@ -1031,7 +1144,7 @@ class TestPhantomNotificationDedup:
                     token=f"PHANTOM-ROOT-AGENT-{tag}",
                     timeout=120.0,
                 ),
-                "native_agent_name",
+                "agent_name",
             ) or "unknown",
             reply_content=f"PHANTOM-REPLY-{tag}",
             ack_token=f"PHANTOM-REPLIED-{tag}",

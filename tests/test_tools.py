@@ -74,8 +74,41 @@ class TestForkTaskTool:
             "session_info",
             "context_info",
             "session_lineage",
-            "get_family",
+            "search_team",
         ]
+
+    def test_send_inbox_message_schema_marks_only_recipient_and_content_required(
+        self,
+        monkeypatch,
+        skill_config,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        create_obs_tools(skill_config, lambda: "sid-123")
+
+        tool = next(tool for tool in captured["tools"] if tool.name == "SendInboxMessage")
+        schema = tool.input_schema
+        assert schema["type"] == "object"
+        assert schema["required"] == ["recipient", "content"]
+        assert "team_name" in schema["properties"]
+        assert "sender" in schema["properties"]
+        assert "needs_reply" in schema["properties"]
+        assert "must_reply" in schema["properties"]
+
+    def test_read_inbox_schema_has_no_required_fields(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        create_obs_tools(skill_config, lambda: "sid-123")
+
+        tool = next(tool for tool in captured["tools"] if tool.name == "ReadInbox")
+        schema = tool.input_schema
+        assert schema["type"] == "object"
+        assert schema["required"] == []
+        assert "team_name" in schema["properties"]
+        assert "agent" in schema["properties"]
+        assert "limit" in schema["properties"]
 
     @pytest.mark.asyncio
     async def test_fork_task_requires_prompt(self, monkeypatch, skill_config):
@@ -481,7 +514,9 @@ class TestForkTaskTool:
                 agent_id="task-123",
                 parent_session_id="sid-parent",
                 root_team_key="obs-tree-root-123",
-                native_agent_name="obs-agent-child-123",
+                agent_name="obs-agent-child-123",
+                parent_agent_name="obs-tree-root-123",
+                parent_display_name="Root",
             ),
         )
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
@@ -552,7 +587,9 @@ class TestForkTaskTool:
                 agent_id=None,
                 parent_session_id=None,
                 root_team_key="obs-tree-root-123",
-                native_agent_name="obs-agent-root-123",
+                agent_name="obs-agent-root-123",
+                parent_agent_name=None,
+                parent_display_name=None,
             ),
         )
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
@@ -565,6 +602,7 @@ class TestForkTaskTool:
         assert payload["origin"] == "trunk_start"
         assert payload["root_team_key"] == "obs-tree-root-123"
         assert "xml" not in payload
+        assert payload["agent_names"] == ["obs-tree-root-123"]
 
         result_with_xml = await handler({"include_xml": True})
         payload_with_xml = json.loads(result_with_xml["content"][0]["text"])
@@ -590,7 +628,9 @@ class TestForkTaskTool:
                 agent_id=None,
                 parent_session_id=None,
                 root_team_key="obs-tree-root-123",
-                native_agent_name="obs-agent-root-123",
+                agent_name="obs-agent-root-123",
+                parent_agent_name=None,
+                parent_display_name=None,
             ),
         )
         create_obs_tools(skill_config, lambda: "sid-live", hook_state=HookState())
@@ -634,7 +674,7 @@ class TestForkTaskTool:
         )
 
     @pytest.mark.asyncio
-    async def test_send_inbox_message_reports_undelivered_when_recipient_is_dead(
+    async def test_send_inbox_message_reports_underdelivered_when_recipient_is_unbound(
         self,
         monkeypatch,
         skill_config,
@@ -665,10 +705,395 @@ class TestForkTaskTool:
             }
         )
 
-        # Per always-deliver design: messages always go to inbox even if validator says not deliverable
-        assert "is_error" not in result  # Not an error — delivered to inbox
+        assert result["is_error"] is True
+        assert "underdelivered" in result["content"][0]["text"]
         inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
-        assert inbox_path.exists()  # Message was written to inbox file
+        assert not inbox_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_send_inbox_message_creates_inbox_when_transport_confirms_binding(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        state = HookState()
+        state.inbox_recipient_validator = AsyncMock(return_value={"deliverable": True})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
+
+        result = await send_handler(
+            {
+                "team_name": "team-alpha",
+                "recipient": "worker-a",
+                "content": "hello team",
+                "summary": "greeting",
+                "sender": "lead",
+            }
+        )
+
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["success"] is True
+        assert payload["delivered"] is True
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        assert inbox_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_send_inbox_message_rolls_back_when_notifier_reports_underdelivery(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        state = HookState()
+        state.inbox_recipient_validator = AsyncMock(return_value={"deliverable": True})
+        state.inbox_message_notifier = AsyncMock(
+            return_value={"delivered": False, "reason": "recipient topic was deleted"}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
+
+        result = await send_handler(
+            {
+                "team_name": "team-alpha",
+                "recipient": "worker-a",
+                "content": "hello team",
+                "summary": "greeting",
+                "sender": "lead",
+            }
+        )
+
+        assert result["is_error"] is True
+        assert "underdelivered" in result["content"][0]["text"]
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        assert not inbox_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_send_inbox_message_resolves_direct_child_alias_only(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
+            lambda **_: ObsBootstrap(
+                raw_xml="<obs-bootstrap version='2' />",
+                lineage=("Root",),
+                origin="trunk_start",
+                is_fork=False,
+                session_id="sid-root",
+                agent_id=None,
+                parent_session_id=None,
+                root_team_key="2026-03-30-10-10-root",
+                agent_name="2026-03-30-10-10-root",
+                parent_agent_name=None,
+                parent_display_name=None,
+            ),
+        )
+        create_obs_tools(skill_config, lambda: "sid-root", hook_state=HookState())
+        send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
+
+        child_name = "e96857c58f-alpha-child"
+        child_path = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "inboxes" / f"{child_name}.json"
+        child_path.parent.mkdir(parents=True, exist_ok=True)
+        child_path.write_text("[]", encoding="utf-8")
+
+        result = await send_handler(
+            {
+                "recipient": "Alpha Child",
+                "content": "ping",
+            }
+        )
+
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["success"] is True
+        assert payload["recipient"] == child_name
+        persisted = json.loads(child_path.read_text(encoding="utf-8"))
+        assert persisted[-1]["text"] == "ping"
+
+    @pytest.mark.asyncio
+    async def test_send_inbox_message_does_not_resolve_parent_alias(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
+            lambda **_: ObsBootstrap(
+                raw_xml="<obs-bootstrap version='2' />",
+                lineage=("Root", "Child"),
+                origin="agent_task_fresh",
+                is_fork=False,
+                session_id="sid-child",
+                agent_id=None,
+                parent_session_id="sid-root",
+                root_team_key="2026-03-30-10-10-root",
+                agent_name="e96857c58f-child",
+                parent_agent_name="2026-03-30-10-10-root",
+                parent_display_name="Root",
+            ),
+        )
+        state = HookState()
+        state.inbox_recipient_validator = AsyncMock(
+            return_value={
+                "deliverable": False,
+                "reason": "recipient has no current route binding",
+            }
+        )
+        create_obs_tools(skill_config, lambda: "sid-child", hook_state=state)
+        send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
+
+        root_path = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "inboxes" / "2026-03-30-10-10-root.json"
+        root_path.parent.mkdir(parents=True, exist_ok=True)
+        root_path.write_text("[]", encoding="utf-8")
+
+        result = await send_handler(
+            {
+                "recipient": "Root",
+                "content": "ping-parent",
+            }
+        )
+
+        assert result["is_error"] is True
+        assert "underdelivered" in result["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_read_inbox_marks_only_returned_messages_as_read(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
+        read_handler = _tool_handler(captured["tools"], "ReadInbox")
+
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {"from": "s-1", "text": "m-1", "summary": "", "timestamp": "2026-03-30T00:00:00Z", "read": False},
+                    {"from": "s-2", "text": "m-2", "summary": "", "timestamp": "2026-03-30T00:00:01Z", "read": False},
+                    {"from": "s-3", "text": "m-3", "summary": "", "timestamp": "2026-03-30T00:00:02Z", "read": False},
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = await read_handler(
+            {
+                "team_name": "team-alpha",
+                "agent": "worker-a",
+                "mark_read": True,
+                "limit": 1,
+            }
+        )
+
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["count"] == 1
+        assert payload["messages"][0]["text"] == "m-3"
+        persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
+        assert [item["read"] for item in persisted] == [False, False, True]
+
+    @pytest.mark.asyncio
+    async def test_search_team_reports_family_and_tree(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
+            lambda **_: ObsBootstrap(
+                raw_xml="<obs-bootstrap version='2' />",
+                lineage=("Root", "Branch", "Leaf"),
+                origin="agent_task_fresh",
+                is_fork=False,
+                session_id="sid-leaf",
+                agent_id=None,
+                parent_session_id="sid-branch",
+                root_team_key="2026-03-30-10-10-root",
+                agent_name="8fb0d4bb4f-leaf",
+                parent_agent_name="e96857c58f-branch",
+                parent_display_name="Branch",
+            ),
+        )
+        create_obs_tools(skill_config, lambda: "sid-leaf", hook_state=HookState())
+        handler = _tool_handler(captured["tools"], "search_team")
+
+        inboxes = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "inboxes"
+        inboxes.mkdir(parents=True, exist_ok=True)
+        for name in [
+            "2026-03-30-10-10-root",
+            "e96857c58f-branch",
+            "8fb0d4bb4f-leaf",
+            "8fb0d4bb4f-sibling",
+            "83a3e652c4-child-a",
+            "83a3e652c4-child-b",
+            "aaaaaaaaaa-cousin",
+        ]:
+            (inboxes / f"{name}.json").write_text("[]", encoding="utf-8")
+        team_config = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "config.json"
+        team_config.write_text(
+            json.dumps(
+                {
+                    "members": [
+                        {
+                            "agentId": "2026-03-30-10-10-root@2026-03-30-10-10-root",
+                            "name": "2026-03-30-10-10-root",
+                            "obs": {
+                                "lineage": ["Root"],
+                                "display_name": "Root",
+                                "lineage_length": 1,
+                            },
+                        },
+                        {
+                            "agentId": "e96857c58f-branch@2026-03-30-10-10-root",
+                            "name": "e96857c58f-branch",
+                            "obs": {
+                                "lineage": ["Root", "Branch"],
+                                "display_name": "Branch",
+                                "parent_agent_name": "2026-03-30-10-10-root",
+                                "parent_display_name": "Root",
+                                "lineage_length": 2,
+                            },
+                        },
+                        {
+                            "agentId": "8fb0d4bb4f-leaf@2026-03-30-10-10-root",
+                            "name": "8fb0d4bb4f-leaf",
+                            "obs": {
+                                "lineage": ["Root", "Branch", "Leaf"],
+                                "display_name": "Leaf",
+                                "parent_agent_name": "e96857c58f-branch",
+                                "parent_display_name": "Branch",
+                                "lineage_length": 3,
+                            },
+                        },
+                        {
+                            "agentId": "8fb0d4bb4f-sibling@2026-03-30-10-10-root",
+                            "name": "8fb0d4bb4f-sibling",
+                            "obs": {
+                                "lineage": ["Root", "Branch", "Sibling"],
+                                "display_name": "Sibling",
+                                "parent_agent_name": "e96857c58f-branch",
+                                "parent_display_name": "Branch",
+                                "lineage_length": 3,
+                            },
+                        },
+                        {
+                            "agentId": "83a3e652c4-child-a@2026-03-30-10-10-root",
+                            "name": "83a3e652c4-child-a",
+                            "obs": {
+                                "lineage": ["Root", "Branch", "Leaf", "Child A"],
+                                "display_name": "Child A",
+                                "parent_agent_name": "8fb0d4bb4f-leaf",
+                                "parent_display_name": "Leaf",
+                                "lineage_length": 4,
+                            },
+                        },
+                        {
+                            "agentId": "83a3e652c4-child-b@2026-03-30-10-10-root",
+                            "name": "83a3e652c4-child-b",
+                            "obs": {
+                                "lineage": ["Root", "Branch", "Leaf", "Child B"],
+                                "display_name": "Child B",
+                                "parent_agent_name": "8fb0d4bb4f-leaf",
+                                "parent_display_name": "Leaf",
+                                "lineage_length": 4,
+                            },
+                        },
+                        {
+                            "agentId": "aaaaaaaaaa-cousin@2026-03-30-10-10-root",
+                            "name": "aaaaaaaaaa-cousin",
+                            "obs": {
+                                "lineage": ["Root", "Other Branch", "Cousin"],
+                                "display_name": "Cousin",
+                                "parent_agent_name": "bbbbbbbbbb-other-branch",
+                                "parent_display_name": "Other Branch",
+                                "lineage_length": 3,
+                            },
+                        },
+                    ]
+                },
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        family = await handler({"mode": "family"})
+        family_payload = json.loads(family["content"][0]["text"])
+        assert family_payload["parent"] == "e96857c58f-branch"
+        assert family_payload["siblings"] == ["8fb0d4bb4f-sibling"]
+        assert family_payload["children"] == ["83a3e652c4-child-a", "83a3e652c4-child-b"]
+
+        ancestors = await handler({"mode": "ancestors"})
+        ancestors_payload = json.loads(ancestors["content"][0]["text"])
+        assert ancestors_payload["ancestors"] == [
+            "2026-03-30-10-10-root",
+            "e96857c58f-branch",
+        ]
+
+        descendants = await handler({"mode": "descendants"})
+        descendants_payload = json.loads(descendants["content"][0]["text"])
+        assert descendants_payload["descendants"] == [
+            "83a3e652c4-child-a",
+            "83a3e652c4-child-b",
+        ]
+
+        tree = await handler({"mode": "tree"})
+        tree_payload = json.loads(tree["content"][0]["text"])
+        assert tree_payload["tree"] == sorted(
+            [
+                "2026-03-30-10-10-root",
+                "e96857c58f-branch",
+                "8fb0d4bb4f-leaf",
+                "8fb0d4bb4f-sibling",
+                "83a3e652c4-child-a",
+                "83a3e652c4-child-b",
+                "aaaaaaaaaa-cousin",
+            ]
+        )
+        tree_members = tree_payload["tree_members"]
+        root_member = next(item for item in tree_members if item["agent_name"] == "2026-03-30-10-10-root")
+        assert root_member["display_name"] == "Root"
+        assert root_member["lineage"] == ["Root"]
+        leaf_member = next(item for item in tree_members if item["agent_name"] == "8fb0d4bb4f-leaf")
+        assert leaf_member["relation"] == "self"
+        assert leaf_member["display_name"] == "Leaf"
+        assert leaf_member["parent_agent_name"] == "e96857c58f-branch"
+        assert leaf_member["parent_display_name"] == "Branch"
+        sibling_member = next(item for item in tree_members if item["agent_name"] == "8fb0d4bb4f-sibling")
+        assert sibling_member["relation"] == "sibling"
+        child_member = next(item for item in tree_members if item["agent_name"] == "83a3e652c4-child-a")
+        assert child_member["relation"] == "child"
+        cousin_member = next(item for item in tree_members if item["agent_name"] == "aaaaaaaaaa-cousin")
+        assert cousin_member["relation"] == "tree"
 
     @pytest.mark.asyncio
     async def test_send_inbox_message_concurrent_writes_are_not_lost(self, monkeypatch, skill_config, tmp_path):

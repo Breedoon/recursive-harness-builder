@@ -16,39 +16,34 @@ from unittest.mock import MagicMock
 import pytest
 
 from obs_agent.lineage import (
+    agent_name_for_lineage,
     lineage_fingerprint,
     normalize_lineage_name,
     build_obs_bootstrap_xml,
     parse_obs_bootstrap_xml,
 )
 
-# Try both old and new function names
-try:
-    from obs_agent.lineage import agent_name_for_lineage
-except ImportError:
-    from obs_agent.lineage import native_agent_name_for_lineage as agent_name_for_lineage
-
 
 # ---------------------------------------------------------------------------
 # BUG: get_family(parent) broken at depth 1
 # Children of trunk can't find their parent because the trunk's agent_name
-# is the full team key, but native_agent_name_for_lineage returns just slug.
+# is the full team key, but agent_name_for_lineage returns just the slug.
 # ---------------------------------------------------------------------------
 
 class TestGetFamilyTrunkParent:
-    """get_family(parent) must work at every depth, including depth 1."""
+    """search_team(parent) must work at every depth, including depth 1."""
 
     def test_depth_1_child_finds_trunk_parent(self):
-        """The get_family tool should find trunk as parent at depth 1.
+        """The search_team tool should find trunk as parent at depth 1.
 
-        The fix is in the get_family tool itself (uses bootstrap.root_team_key
+        The fix is in the search_team tool itself (uses bootstrap.root_team_key
         for trunk parent), not in agent_name_for_lineage (pure function).
         Verify the tool source has the trunk special case.
         """
         source = (Path(__file__).resolve().parents[1] / "src" / "obs_agent" / "tools.py").read_text()
-        # The get_family tool should use root_team_key for trunk parent lookup
-        assert "root_team_key" in source[source.index("get_family"):], (
-            "get_family tool should use bootstrap.root_team_key for trunk parent lookup"
+        # The search_team tool should use root_team_key for trunk parent lookup
+        assert "root_team_key" in source[source.index("search_team"):], (
+            "search_team tool should use bootstrap.root_team_key for trunk parent lookup"
         )
 
     def test_depth_2_child_finds_parent(self, tmp_path):

@@ -17,9 +17,9 @@ import re
 import pytest
 
 from obs_agent.lineage import (
+    agent_name_for_lineage,
     build_obs_bootstrap_xml,
     lineage_fingerprint,
-    native_agent_name_for_lineage,
     normalize_lineage_name,
     parse_obs_bootstrap_xml,
     root_team_key_for_lineage,
@@ -144,7 +144,7 @@ class TestProjectionFormat:
     """Tests for the REDESIGNED naming format.
 
     - root_team_key: YYYY-MM-DD-HH-MM-{slug} (timestamp-based)
-    - native_agent_name: trunk = {slug}, child = {parent_hash}-{slug}
+    - agent_name: trunk = {slug}, child = {parent_hash}-{slug}
     """
 
     def test_n9_root_team_key_timestamp_format(self):
@@ -161,29 +161,29 @@ class TestProjectionFormat:
         key = root_team_key_for_lineage(())
         assert key == "0000-00-00-00-00-root"
 
-    def test_n11_native_agent_name_child_format(self):
+    def test_n11_agent_name_child_format(self):
         """Child agent name has {parent_hash}-{slug} format."""
-        name = native_agent_name_for_lineage(("Root Topic", "Child Topic", "worker-a"))
+        name = agent_name_for_lineage(("Root Topic", "Child Topic", "worker-a"))
         # Should NOT have obs-agent- prefix
         assert not name.startswith("obs-agent-")
         assert "worker-a" in name
         # Should have a hash prefix (10 hex chars + dash)
         assert re.match(r"[0-9a-f]{10}-worker-a$", name)
 
-    def test_n11b_native_agent_name_trunk_format(self):
+    def test_n11b_agent_name_trunk_format(self):
         """Trunk agent name is just the slug — no prefix, no hash."""
-        name = native_agent_name_for_lineage(("My Topic",))
+        name = agent_name_for_lineage(("My Topic",))
         assert name == "my-topic"
 
-    def test_n12_native_agent_name_empty_lineage(self):
+    def test_n12_agent_name_empty_lineage(self):
         """Empty lineage returns 'root'."""
-        name = native_agent_name_for_lineage(())
+        name = agent_name_for_lineage(())
         assert name == "root"
 
     def test_n13_same_leaf_different_path_different_name(self):
         """Same leaf name under different parents produces different agent names."""
-        name_a = native_agent_name_for_lineage(("A", "worker"))
-        name_b = native_agent_name_for_lineage(("B", "worker"))
+        name_a = agent_name_for_lineage(("A", "worker"))
+        name_b = agent_name_for_lineage(("B", "worker"))
         assert name_a != name_b
         # Both contain "worker" in the slug
         assert "worker" in name_a
@@ -211,15 +211,15 @@ class TestCollisionAndEdgeCases:
 
     def test_n15_sibling_same_name_different_hash(self):
         """Same display name under different parents → different agent names."""
-        name_a = native_agent_name_for_lineage(("Root", "Branch-A", "research"))
-        name_b = native_agent_name_for_lineage(("Root", "Branch-B", "research"))
+        name_a = agent_name_for_lineage(("Root", "Branch-A", "research"))
+        name_b = agent_name_for_lineage(("Root", "Branch-B", "research"))
         assert name_a != name_b
 
     def test_n16_deep_lineage_10_levels(self):
         """10-level lineage produces valid, non-empty names."""
         lineage = tuple(f"Level-{i}" for i in range(10))
         key = root_team_key_for_lineage(lineage)
-        name = native_agent_name_for_lineage(lineage)
+        name = agent_name_for_lineage(lineage)
         assert key  # non-empty
         assert name  # non-empty
         assert "level-9" in name  # leaf is Level-9
@@ -243,8 +243,8 @@ class TestCollisionAndEdgeCases:
         The naming function itself doesn't prevent this — it's the TelegramBot
         that checks _team_worker_records before launching.
         """
-        name_1 = native_agent_name_for_lineage(("Root", "worker"))
-        name_2 = native_agent_name_for_lineage(("Root", "worker"))
+        name_1 = agent_name_for_lineage(("Root", "worker"))
+        name_2 = agent_name_for_lineage(("Root", "worker"))
         assert name_1 == name_2  # Same input → same output (deterministic)
 
     def test_n18_same_name_different_parent_produces_different_agent_name(self):
@@ -252,8 +252,8 @@ class TestCollisionAndEdgeCases:
 
         This is NOT a collision — it's fine. Different parents = different hash prefixes.
         """
-        name_a = native_agent_name_for_lineage(("Root", "Branch-A", "worker"))
-        name_b = native_agent_name_for_lineage(("Root", "Branch-B", "worker"))
+        name_a = agent_name_for_lineage(("Root", "Branch-A", "worker"))
+        name_b = agent_name_for_lineage(("Root", "Branch-B", "worker"))
         assert name_a != name_b
         # Both end with -worker
         assert name_a.endswith("-worker")
@@ -270,18 +270,18 @@ class TestRedesignedNamingFormat:
 
     def test_trunk_agent_name_no_prefix(self):
         """Trunk agent has no hash prefix — just the slug."""
-        name = native_agent_name_for_lineage(("My Topic",))
+        name = agent_name_for_lineage(("My Topic",))
         assert name == "my-topic"
 
     def test_child_agent_name_has_parent_hash(self):
         """Child agent has {parent_hash}-{slug} format."""
-        name = native_agent_name_for_lineage(("Root", "Worker"))
+        name = agent_name_for_lineage(("Root", "Worker"))
         parent_hash = lineage_fingerprint(("Root",))
         assert name == f"{parent_hash}-worker"
 
     def test_deep_child_agent_name(self):
         """Deep child uses hash of parent lineage (not full lineage)."""
-        name = native_agent_name_for_lineage(("Root", "A", "B", "C"))
+        name = agent_name_for_lineage(("Root", "A", "B", "C"))
         parent_hash = lineage_fingerprint(("Root", "A", "B"))
         assert name == f"{parent_hash}-c"
 
@@ -317,7 +317,7 @@ class TestXMLEnrichment:
             is_fork=False,
             session_id="test-sid",
             root_team_key="test-team",
-            native_agent_name="test-agent",
+            agent_name="test-agent",
         )
         import xml.etree.ElementTree as ET
 
@@ -336,7 +336,7 @@ class TestXMLEnrichment:
             is_fork=False,
             session_id="test-sid",
             root_team_key="test-team",
-            native_agent_name="test-agent",
+            agent_name="test-agent",
         )
         parsed = parse_obs_bootstrap_xml(xml)
         assert parsed.lineage == lineage
@@ -356,15 +356,14 @@ class TestXMLEnrichment:
             is_fork=False,
             session_id="test-sid",
             root_team_key="test-team",
-            native_agent_name="test-agent",
+            agent_name="test-agent",
         )
         import xml.etree.ElementTree as ET
 
         root = ET.fromstring(xml)
         nodes = root.findall(".//obs-node")
 
-        # First node (trunk): uses the passed agent_name (= team key in production)
-        assert nodes[0].attrib["agent_name"] == "test-agent"
-        # Second node (child): {parent_hash}-{slug}
-        expected_child = native_agent_name_for_lineage(("Root Topic", "Worker Agent"))
-        assert nodes[1].attrib["agent_name"] == expected_child
+        # First node (trunk): uses the root team key, not the leaf agent_name.
+        assert nodes[0].attrib["agent_name"] == "test-team"
+        # Leaf node: uses the explicit resolved agent_name passed to the builder.
+        assert nodes[1].attrib["agent_name"] == "test-agent"

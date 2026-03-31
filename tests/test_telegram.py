@@ -20,7 +20,7 @@ import pytest
 from telegram.error import BadRequest, TelegramError
 
 from obs_agent.events import StatusEvent
-from obs_agent.lineage import native_agent_name_for_lineage, root_team_key_for_lineage
+from obs_agent.lineage import agent_name_for_lineage, root_team_key_for_lineage
 from obs_agent.queueing import QueuedMessage
 from obs_agent.runner import DoneEvent, TextEvent, TurnEndEvent
 from obs_agent.telegram import (
@@ -32,6 +32,7 @@ from obs_agent.telegram import (
     _TopicScheduleRecord,
     _RunOutcome,
     _TelegramMessageBinding,
+    create_reply_wake_schedule,
     create_telegram_app,
     run_telegram_bot,
 )
@@ -1494,6 +1495,42 @@ class TestTopicScheduling:
         assert f"from={from_local}" in summary
         assert f"until={until_local}" in summary
 
+    async def test_reply_wake_schedule_consumes_attempts_while_route_is_busy(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=79131)
+        state = bot._get_state(route)
+        assert state is not None
+        state.busy = True
+        state.last_bot = MagicMock()
+        state.last_bot.send_message = AsyncMock()
+
+        record = create_reply_wake_schedule(route)
+        record.next_run_at = 0.0
+        bot._register_topic_schedule(record)
+
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
+            assert await bot._execute_topic_schedule(record=record, trigger_kind="interval") is False
+            first = bot._topic_schedules_by_id[record.schedule_id]
+            assert first.run_count == 1
+            assert first.enabled is True
+            assert first.next_run_at == 1001.0
+
+        with patch("obs_agent.telegram.time.time", return_value=1001.0):
+            assert await bot._execute_topic_schedule(record=first, trigger_kind="interval") is False
+            second = bot._topic_schedules_by_id[record.schedule_id]
+            assert second.run_count == 2
+            assert second.enabled is True
+            assert second.next_run_at == 1002.0
+
+        with patch("obs_agent.telegram.time.time", return_value=1002.0):
+            assert await bot._execute_topic_schedule(record=second, trigger_kind="interval") is False
+
+        final = bot._topic_schedules_by_id[record.schedule_id]
+        assert final.run_count == 3
+        assert final.enabled is False
+        assert final.next_run_at is None
+        state.last_bot.send_message.assert_not_awaited()
+
     async def test_overlap_validation_removed_allows_free_coexistence(self, config):
         """Overlap validation was removed — schedules freely coexist.
 
@@ -2294,7 +2331,7 @@ class TestCommands:
             is_fork=False,
         )
         team_name = root_team_key_for_lineage(("Root", "Worker"))
-        agent_name = native_agent_name_for_lineage(("Root", "Worker"))
+        agent_name = agent_name_for_lineage(("Root", "Worker"))
 
         update = _make_update("/clear", thread_id=321)
         ctx = _make_context()
@@ -2355,7 +2392,7 @@ class TestCommands:
             is_fork=False,
         )
         old_team_name = root_team_key_for_lineage(("Old Topic",))
-        old_agent_name = native_agent_name_for_lineage(("Old Topic",))
+        old_agent_name = agent_name_for_lineage(("Old Topic",))
 
         update = _make_update("/new ⚡ Fresh Start", thread_id=321)
         ctx = _make_context()
@@ -2386,9 +2423,10 @@ class TestCommands:
             team_name=old_team_name,
             agent_name=old_agent_name,
         ) is None
+        new_team_name = root_team_key_for_lineage(("Fresh Start",))
         assert bot._resolve_route_inbox_target(
-            team_name=root_team_key_for_lineage(("Fresh Start",)),
-            agent_name=native_agent_name_for_lineage(("Fresh Start",)),
+            team_name=new_team_name,
+            agent_name=new_team_name,
         ) is state
         assert (
             ctx.bot.send_message.call_args.kwargs["text"]
@@ -2418,6 +2456,221 @@ class TestCommands:
         assert title == "Fresh Start"
         assert emoji == "⚡"
         assert icon == "emoji-requested"
+
+    async def test_tree_renders_nested_display_names_and_topic_links(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        state = bot._get_state(route, topic_title="Branch")
+        assert state is not None
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root", "Branch"),
+            origin="agent_task_fresh",
+            is_fork=False,
+        )
+        tree_context = bot._current_tree_context(state)
+        assert tree_context is not None
+        team_name, current_agent_name, current_lineage = tree_context
+        root_agent_name = agent_name_for_lineage(("Root",), team_key=team_name)
+        child_agent_name = agent_name_for_lineage(("Root", "Branch", "Child"), team_key=team_name)
+        grandchild_agent_name = agent_name_for_lineage(("Root", "Branch", "Child", "Grandchild"), team_key=team_name)
+        sibling_agent_name = agent_name_for_lineage(("Root", "Sibling"), team_key=team_name)
+        team_dir = tmp_path / ".claude" / "teams" / team_name
+        (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
+        for agent_name in (
+            root_agent_name,
+            current_agent_name,
+            child_agent_name,
+            grandchild_agent_name,
+            sibling_agent_name,
+        ):
+            (team_dir / "inboxes" / f"{agent_name}.json").write_text("[]", encoding="utf-8")
+        (team_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "members": [
+                        {
+                            "name": root_agent_name,
+                            "obs": {
+                                "display_name": "Root",
+                                "lineage": ["Root"],
+                                "lineage_length": 1,
+                                "topic_chat_id": -10067890,
+                                "topic_thread_id": 111,
+                            },
+                        },
+                        {
+                            "name": current_agent_name,
+                            "obs": {
+                                "display_name": "Branch",
+                                "lineage": ["Root", "Branch"],
+                                "lineage_length": 2,
+                                "parent_agent_name": root_agent_name,
+                                "parent_display_name": "Root",
+                                "topic_chat_id": -10067890,
+                                "topic_thread_id": 321,
+                            },
+                        },
+                        {
+                            "name": child_agent_name,
+                            "obs": {
+                                "display_name": "Child",
+                                "lineage": ["Root", "Branch", "Child"],
+                                "lineage_length": 3,
+                                "parent_agent_name": current_agent_name,
+                                "parent_display_name": "Branch",
+                                "topic_chat_id": -10067890,
+                                "topic_thread_id": 333,
+                            },
+                        },
+                        {
+                            "name": grandchild_agent_name,
+                            "obs": {
+                                "display_name": "Grandchild",
+                                "lineage": ["Root", "Branch", "Child", "Grandchild"],
+                                "lineage_length": 4,
+                                "parent_agent_name": child_agent_name,
+                                "parent_display_name": "Child",
+                                "topic_chat_id": -10067890,
+                                "topic_thread_id": 444,
+                            },
+                        },
+                        {
+                            "name": sibling_agent_name,
+                            "obs": {
+                                "display_name": "Sibling",
+                                "lineage": ["Root", "Sibling"],
+                                "lineage_length": 2,
+                                "parent_agent_name": root_agent_name,
+                                "parent_display_name": "Root",
+                                "topic_chat_id": -10067890,
+                                "topic_thread_id": 555,
+                            },
+                        },
+                    ]
+                },
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        members = bot._load_tree_members(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=current_lineage,
+            current_route=route,
+        )
+        html_text = bot._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=current_lineage,
+            members=members,
+            mode="tree",
+        )
+        assert '- <a href="https://t.me/c/67890/111/111">Root</a>' in html_text
+        assert '&nbsp;&nbsp;- <a href="https://t.me/c/67890/321/321">Branch</a> (current)' in html_text
+        assert '&nbsp;&nbsp;&nbsp;&nbsp;- <a href="https://t.me/c/67890/333/333">Child</a>' in html_text
+        assert 'https://t.me/c/67890/444/444' in html_text
+        assert 'Sibling' in html_text
+        await bot.shutdown()
+
+    async def test_tree_ancestors_and_descendants_filters(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        state = bot._get_state(route, topic_title="Branch")
+        assert state is not None
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root", "Branch"),
+            origin="agent_task_fresh",
+            is_fork=False,
+        )
+        team_name, current_agent_name, current_lineage = bot._current_tree_context(state)
+        root_agent_name = agent_name_for_lineage(("Root",), team_key=team_name)
+        child_agent_name = agent_name_for_lineage(("Root", "Branch", "Child"), team_key=team_name)
+        grandchild_agent_name = agent_name_for_lineage(("Root", "Branch", "Child", "Grandchild"), team_key=team_name)
+        sibling_agent_name = agent_name_for_lineage(("Root", "Sibling"), team_key=team_name)
+        team_dir = tmp_path / ".claude" / "teams" / team_name
+        (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
+        for agent_name in (
+            root_agent_name,
+            current_agent_name,
+            child_agent_name,
+            grandchild_agent_name,
+            sibling_agent_name,
+        ):
+            (team_dir / "inboxes" / f"{agent_name}.json").write_text("[]", encoding="utf-8")
+        (team_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "members": [
+                        {"name": root_agent_name, "obs": {"display_name": "Root", "lineage": ["Root"], "lineage_length": 1}},
+                        {"name": current_agent_name, "obs": {"display_name": "Branch", "lineage": ["Root", "Branch"], "lineage_length": 2, "parent_agent_name": root_agent_name, "parent_display_name": "Root"}},
+                        {"name": child_agent_name, "obs": {"display_name": "Child", "lineage": ["Root", "Branch", "Child"], "lineage_length": 3, "parent_agent_name": current_agent_name, "parent_display_name": "Branch"}},
+                        {"name": grandchild_agent_name, "obs": {"display_name": "Grandchild", "lineage": ["Root", "Branch", "Child", "Grandchild"], "lineage_length": 4, "parent_agent_name": child_agent_name, "parent_display_name": "Child"}},
+                        {"name": sibling_agent_name, "obs": {"display_name": "Sibling", "lineage": ["Root", "Sibling"], "lineage_length": 2, "parent_agent_name": root_agent_name, "parent_display_name": "Root"}},
+                    ]
+                },
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        members = bot._load_tree_members(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=current_lineage,
+            current_route=route,
+        )
+        ancestors_html = bot._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=current_lineage,
+            members=members,
+            mode="ancestors",
+        )
+        assert "Root" in ancestors_html
+        assert "Branch" in ancestors_html
+        assert "Child" not in ancestors_html
+
+        descendants_html = bot._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=current_lineage,
+            members=members,
+            mode="descendants",
+        )
+        assert "Branch" in descendants_html
+        assert "Child" in descendants_html
+        assert "Grandchild" in descendants_html
+        assert "Sibling" not in descendants_html
+        await bot.shutdown()
+
+    async def test_tree_alias_command_maps_hyphen_variants(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/tree-ancestors", chat_id=67890, thread_id=321)
+        ctx = _make_context()
+        with patch.object(bot, "_handle_tree_view", new_callable=AsyncMock) as mock_tree:
+            await bot.handle_tree_alias_command(update, ctx)
+        assert mock_tree.await_args.kwargs["mode"] == "ancestors"
+
+        update.effective_message.text = "/tree-"
+        with patch.object(bot, "_handle_tree_view", new_callable=AsyncMock) as mock_tree:
+            await bot.handle_tree_alias_command(update, ctx)
+        assert mock_tree.await_args.kwargs["mode"] == "descendants"
+        await bot.shutdown()
 
     async def test_new_visibility_generates_random_title_and_non_current_emoji(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -2460,17 +2713,14 @@ class TestCommands:
             session_id="sid-worker",
         )
         team_name = root_team_key_for_lineage(("Root", "Worker"))
-        agent_name = native_agent_name_for_lineage(("Root", "Worker"))
+        agent_name = agent_name_for_lineage(("Root", "Worker"))
 
         assert bot._recipient_delivery_status(team_name=team_name, agent_name=agent_name)["deliverable"] is True
 
         await bot._drop_route_state(child_route, terminal_status="failed")
 
         after_delete = bot._recipient_delivery_status(team_name=team_name, agent_name=agent_name)
-        # After deletion, messages still deliver (to inbox file). The agent
-        # is not "dead" until the topic is gone — and even then, the inbox
-        # file persists. deliverable=True with a warning is correct.
-        assert after_delete["deliverable"] is True
+        assert after_delete["deliverable"] is False
 
         reborn_state = bot._get_state(child_route, topic_title="Root - Worker")
         assert reborn_state is not None
@@ -2485,6 +2735,121 @@ class TestCommands:
         )
 
         assert bot._recipient_delivery_status(team_name=team_name, agent_name=agent_name)["deliverable"] is True
+        await bot.shutdown()
+
+    async def test_launch_fresh_child_reuses_unbound_inbox_projection_after_delete(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        parent_route = TelegramRoute(chat_id=-10067890, thread_id=55)
+        parent_state = bot._get_state(parent_route, topic_title="Root")
+        assert parent_state is not None
+        parent_state.last_bot = MagicMock()
+        parent_state.last_bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=333))
+        parent_state.last_bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=920), MagicMock(message_id=921), MagicMock(message_id=922)]
+        )
+        parent_state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(parent_state)
+        bot._prime_obs_bootstrap(
+            parent_state,
+            lineage=("Root",),
+            origin="user_thread",
+            is_fork=False,
+            session_id="sid-root",
+        )
+
+        child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        child_state = bot._get_state(child_route, topic_title="Root - Worker")
+        assert child_state is not None
+        child_state.session_manager.set_session_id("sid-worker")
+        bot._bind_state_session(child_state)
+        bot._prime_obs_bootstrap(
+            child_state,
+            lineage=("Root", "Worker"),
+            origin="agent_task_fresh",
+            is_fork=False,
+            session_id="sid-worker",
+        )
+        team_name = root_team_key_for_lineage(("Root", "Worker"))
+        agent_name = agent_name_for_lineage(("Root", "Worker"))
+        inbox_path = bot._team_inbox_path(team_name, agent_name)
+        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        inbox_path.write_text("[]", encoding="utf-8")
+
+        await bot._drop_route_state(child_route, terminal_status="failed")
+        assert bot._recipient_delivery_status(team_name=team_name, agent_name=agent_name)["deliverable"] is False
+
+        fake_task_id = uuid.UUID("22222222-2222-2222-2222-222222222222")
+        with patch("obs_agent.telegram.uuid.uuid4", side_effect=[fake_task_id]), patch.object(
+            bot,
+            "_execute_fork_task",
+            new_callable=AsyncMock,
+        ):
+            launched = await bot._launch_fork_task(
+                route=parent_route,
+                args={
+                    "prompt": "Return READY",
+                    "display_name": "Worker",
+                    "fork": False,
+                    "team_name": team_name,
+                },
+            )
+
+        assert "AgentTask launched successfully." in launched["content"][0]["text"]
+        record = bot._fork_tasks_by_id[str(fake_task_id)]
+        assert record.team_name == team_name
+        assert record.agent_name == agent_name
+        await bot.shutdown()
+
+    async def test_drop_route_state_sweeps_stale_team_worker_binding_when_cancel_path_misses_it(
+        self,
+        config,
+    ):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=654)
+        state = bot._get_state(route, topic_title="Root - Worker")
+        assert state is not None
+        state.session_manager.set_session_id("sid-worker")
+        bot._bind_state_session(state)
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root", "Worker"),
+            origin="agent_task_fresh",
+            is_fork=False,
+            session_id="sid-worker",
+        )
+
+        team_name = root_team_key_for_lineage(("Root", "Worker"))
+        agent_name = agent_name_for_lineage(("Root", "Worker"))
+        record = _ForkTaskRecord(
+            task_id="task-worker-1",
+            parent_route=TelegramRoute(chat_id=67890, thread_id=321),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="uuid-parent",
+            child_route=route,
+            child_session_id="sid-worker",
+            prompt="",
+            description="Worker",
+            status="launched",
+            is_fork=False,
+            launch_tool_name="AgentTask",
+            team_name=team_name,
+            agent_name=agent_name,
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        bot._fork_task_by_child_route[route] = record.task_id
+        bot._register_team_worker_record(record)
+
+        assert bot._resolve_team_worker_record(team_name=team_name, agent_name=agent_name) is not None
+        assert bot._state_store.load_snapshot().team_worker_states
+
+        with patch.object(bot, "_cancel_route_fork_tasks", new=AsyncMock()) as cancel_mock:
+            await bot._drop_route_state(route, terminal_status="failed")
+
+        cancel_mock.assert_awaited_once_with(route, status="failed")
+        assert bot._resolve_team_worker_record(team_name=team_name, agent_name=agent_name) is None
+        assert bot._state_store.load_snapshot().team_worker_states == []
+        assert bot._fork_task_by_child_route.get(route) is None
+        assert bot._fork_tasks_by_id[record.task_id].terminal_request == "failed"
         await bot.shutdown()
 
     async def test_unschedule_no_args_removes_next_upcoming_only(self, config):
@@ -3447,6 +3812,15 @@ class TestForkTaskRuntime:
             f"Expected a member with 'peer-a' in name, got: {member_names}"
         assert any("peer-b" in n for n in member_names), \
             f"Expected a member with 'peer-b' in name, got: {member_names}"
+        peer_a = next(member for member in members if isinstance(member, dict) and "peer-a" in str(member.get("name")))
+        peer_a_obs = peer_a.get("obs")
+        assert isinstance(peer_a_obs, dict)
+        assert peer_a_obs["display_name"] == "Peer A"
+        assert peer_a_obs["lineage"] == ["General", "Peer A"]
+        assert peer_a_obs["root_team_key"] == "team-alpha"
+        assert peer_a_obs["parent_agent_name"] == "team-alpha"
+        assert peer_a_obs["topic_chat_id"] == -10067890
+        assert peer_a_obs["topic_thread_id"] == 333
         await bot.shutdown()
 
     def test_build_super_task_lifecycle_html_uses_system_heading_and_cursive_body(self, config):
@@ -3825,9 +4199,11 @@ class TestForkTaskRuntime:
         assert fake_bot.send_message.await_count == 1
         await bot.shutdown()
 
-    async def test_inbox_message_sets_pending_wake_when_worker_is_running(self, config):
+    async def test_inbox_message_queues_notice_when_worker_is_running(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        child_state = bot._get_state(child_route, topic_title="Worker Topic")
+        assert child_state is not None
         record = _ForkTaskRecord(
             task_id="task-team",
             parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
@@ -3863,13 +4239,45 @@ class TestForkTaskRuntime:
             with suppress(asyncio.CancelledError):
                 await running
 
-        assert record.wake_requested is True
-        assert record.wake_source_sender == "worker-b"
-        assert record.wake_source_summary == "handoff"
-        assert record.wake_source_content == "process item 8"
+        queued = child_state.hook_state.message_queue.get_nowait()
+        assert isinstance(queued, QueuedMessage)
+        assert "System notification: New teammate messages arrived while you were still running." in queued.text
+        assert "ReadInbox with team_name=team-alpha, agent=worker-a" in queued.text
+        assert "Latest sender: worker-b." in queued.text
+        assert "Latest summary: handoff." in queued.text
+        assert "Latest content preview: process item 8" in queued.text
+        assert record.wake_requested is False
         await bot.shutdown()
 
-    async def test_poll_team_worker_inbox_sets_pending_wake_when_worker_is_running(
+    async def test_inbox_message_queues_notice_when_route_is_running(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=222)
+        state = bot._get_state(route, topic_title="Busy Root")
+        assert state is not None
+        state.busy = True
+        bot._route_inbox_targets[("team-alpha", "root-agent")] = route
+
+        await bot._handle_inbox_message_notification(
+            sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
+            payload={
+                "team_name": "team-alpha",
+                "recipient": "root-agent",
+                "sender": "worker-b",
+                "summary": "handoff",
+                "content": "process root item 3",
+            },
+        )
+
+        queued = state.hook_state.message_queue.get_nowait()
+        assert isinstance(queued, QueuedMessage)
+        assert "System notification: New teammate messages arrived while you were still running." in queued.text
+        assert "ReadInbox with team_name=team-alpha, agent=root-agent" in queued.text
+        assert "Latest sender: worker-b." in queued.text
+        assert "Latest summary: handoff." in queued.text
+        assert "Latest content preview: process root item 3" in queued.text
+        await bot.shutdown()
+
+    async def test_poll_team_worker_inbox_queues_notice_when_worker_is_running(
         self,
         config,
         monkeypatch,
@@ -3878,6 +4286,8 @@ class TestForkTaskRuntime:
         monkeypatch.setenv("HOME", str(tmp_path))
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        child_state = bot._get_state(child_route, topic_title="Worker Topic")
+        assert child_state is not None
         record = _ForkTaskRecord(
             task_id="task-team",
             parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
@@ -3922,10 +4332,14 @@ class TestForkTaskRuntime:
             with suppress(asyncio.CancelledError):
                 await running
 
-        assert record.wake_requested is True
-        assert record.wake_source_sender == "worker-b"
-        assert record.wake_source_summary == "handoff"
-        assert record.wake_source_content == "process item 8"
+        queued = child_state.hook_state.message_queue.get_nowait()
+        assert isinstance(queued, QueuedMessage)
+        assert "System notification: New teammate messages arrived while you were still running." in queued.text
+        assert "ReadInbox with team_name=team-alpha, agent=worker-a" in queued.text
+        assert "Latest sender: worker-b." in queued.text
+        assert "Latest summary: handoff." in queued.text
+        assert "Latest content preview: process item 8" in queued.text
+        assert record.wake_requested is False
         await bot.shutdown()
 
     async def test_poll_team_worker_inbox_keeps_team_scopes_separate(
@@ -4028,7 +4442,7 @@ class TestForkTaskRuntime:
         state.last_bot = fake_bot
         lineage = ("General", "Fork Child")
         team_name = root_team_key_for_lineage(lineage)
-        agent_name = native_agent_name_for_lineage(lineage)
+        agent_name = agent_name_for_lineage(lineage)
         bot._prime_obs_bootstrap(
             state,
             lineage=lineage,
@@ -4088,7 +4502,7 @@ class TestForkTaskRuntime:
         state.last_bot = fake_bot
         lineage = ("General", "Fork Child")
         team_name = root_team_key_for_lineage(lineage)
-        agent_name = native_agent_name_for_lineage(lineage)
+        agent_name = agent_name_for_lineage(lineage)
         bot._prime_obs_bootstrap(
             state,
             lineage=lineage,
@@ -4787,7 +5201,7 @@ class TestForkTaskRuntime:
                     "resume": "task-123",
                     "description": "New",
                     "team_name": "team-resume",
-                    "name": "worker-resume",
+                    "agent_name": "worker-resume",
                     "task_tool_name": "AgentTask",
                 },
             )
@@ -5510,7 +5924,7 @@ class TestTelegramStatePersistence:
         restored_topic_env = restored_topic.session_manager.sdk_env_overrides
         assert restored_topic_env["CLAUDE_CODE_TEAM_NAME"] == root_team_key_for_lineage(("General", "Worker"))
         assert restored_topic_env["CLAUDE_CODE_TASK_LIST_ID"] == root_team_key_for_lineage(("General", "Worker"))
-        assert restored_topic_env["CLAUDE_CODE_AGENT_NAME"] == native_agent_name_for_lineage(("General", "Worker"))
+        assert restored_topic_env["CLAUDE_CODE_AGENT_NAME"] == agent_name_for_lineage(("General", "Worker"))
         assert restored._message_map[(67890, 55)].jsonl_uuid == "uuid-general"
         assert restored._message_map[(67890, 88)].jsonl_uuid == "uuid-topic"
         assert restored._message_map[(67991, 12)].jsonl_uuid == "uuid-other"
@@ -5520,8 +5934,48 @@ class TestTelegramStatePersistence:
         assert restored._last_inbound_message_id_by_route[route_other_chat] == 12
         assert restored._resolve_route_inbox_target(
             team_name=root_team_key_for_lineage(("General", "Worker")),
-            agent_name=native_agent_name_for_lineage(("General", "Worker")),
+            agent_name=agent_name_for_lineage(("General", "Worker")),
         ) is restored_topic
+        await restored.shutdown()
+
+    async def test_initialize_runtime_restores_trunk_agent_name_from_persisted_team_key(self, config):
+        route = TelegramRoute(chat_id=67890, thread_id=None)
+        team_key = "2026-03-30-10-10-general"
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        bot._state_store.upsert_route_state(
+            chat_id=route.chat_id,
+            thread_id=route.thread_id,
+            session_id="sid-root",
+            topic_title="General",
+            topic_icon_custom_emoji_id=None,
+            child_fork_count=0,
+            child_fork_base_title=None,
+            notify_on_completion=False,
+            last_inbound_message_id=None,
+            agent_lineage=("General",),
+            pending_obs_bootstrap=None,
+        )
+        await bot.shutdown()
+
+        restored = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        original_build_session_state = restored._build_session_state
+
+        def _patched_build_session_state(*args, **kwargs):
+            state = original_build_session_state(*args, **kwargs)
+            state.session_manager.set_sdk_env_overrides(
+                restored._build_team_worker_env(team_name=team_key)
+            )
+            return state
+
+        with patch.object(restored, "_build_session_state", side_effect=_patched_build_session_state):
+            await restored.initialize_runtime()
+
+        restored_state = restored._get_state(route, create=False)
+        assert restored_state is not None
+        restored_env = restored_state.session_manager.sdk_env_overrides
+        assert restored_env["CLAUDE_CODE_TEAM_NAME"] == team_key
+        assert restored_env["CLAUDE_CODE_AGENT_NAME"] == team_key
         await restored.shutdown()
 
     async def test_pre_restart_message_remains_forkable(self, config):
@@ -5744,7 +6198,7 @@ class TestTelegramStatePersistence:
         fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=993))
         restored_child_state.last_bot = fake_bot
         team_name = root_team_key_for_lineage(("General", "Fork Child"))
-        agent_name = native_agent_name_for_lineage(("General", "Fork Child"))
+        agent_name = agent_name_for_lineage(("General", "Fork Child"))
 
         with patch.object(
             restored,

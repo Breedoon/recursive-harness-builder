@@ -41,11 +41,13 @@ class ObsBootstrap:
     parent_session_id: str | None
     root_team_key: str | None
     agent_name: str | None
+    parent_agent_name: str | None
+    parent_display_name: str | None
 
-    @property
-    def native_agent_name(self) -> str | None:
-        """Backward-compat alias for agent_name."""
-        return self.agent_name
+    def __getattr__(self, name: str) -> Any:
+        if name == "native_agent_name":
+            return self.agent_name
+        raise AttributeError(name)
 
 
 def normalize_lineage_name(value: str | None) -> str:
@@ -55,7 +57,7 @@ def normalize_lineage_name(value: str | None) -> str:
 
 
 def slugify_projection_label(value: str | None, *, fallback: str) -> str:
-    """Build a filesystem-safe slug for native team/inbox projection."""
+    """Build a filesystem-safe slug for flat team/inbox projection."""
     normalized = normalize_lineage_name(value)
     slug = _NON_ALNUM_RE.sub("-", normalized).strip("-").lower()
     return slug or fallback
@@ -72,7 +74,7 @@ def root_team_key_for_lineage(
     *,
     timestamp: float | None = None,
 ) -> str:
-    """Project a lineage tree onto a timestamp-based native team key.
+    """Project a lineage tree onto a timestamp-based root team key.
 
     Format: ``YYYY-MM-DD-HH-MM-{slug}``
 
@@ -90,12 +92,12 @@ def root_team_key_for_lineage(
     return f"{prefix}-{slug}"
 
 
-def native_agent_name_for_lineage(
+def agent_name_for_lineage(
     lineage: Sequence[str],
     *,
     team_key: str | None = None,
 ) -> str:
-    """Project a lineage member onto one safe native agent name.
+    """Project a lineage member onto one safe agent name.
 
     Two-tier naming:
     - **Trunk** (single-element lineage): the team key if provided,
@@ -122,11 +124,6 @@ def native_agent_name_for_lineage(
     parent_hash = lineage_fingerprint(parent_lineage)
     return f"{parent_hash}-{slug}"
 
-
-# Canonical name — ``native_agent_name_for_lineage`` is kept as an alias.
-agent_name_for_lineage = native_agent_name_for_lineage
-
-
 def build_obs_bootstrap_xml(
     *,
     lineage: Sequence[str],
@@ -137,28 +134,37 @@ def build_obs_bootstrap_xml(
     parent_session_id: str | None = None,
     root_team_key: str | None = None,
     agent_name: str | None = None,
-    native_agent_name: str | None = None,  # Backward-compat alias for agent_name
+    parent_agent_name: str | None = None,
+    parent_display_name: str | None = None,
+    **legacy_kwargs: Any,
 ) -> str:
     """Serialize the canonical OBS bootstrap XML envelope (v2).
 
     Each ``obs-node`` element carries both a human-readable ``display_name``
     and the machine-safe ``agent_name`` that can be used for messaging.
     """
-    resolved_agent_name = agent_name or native_agent_name
+    legacy_agent_name = legacy_kwargs.pop("native_agent_name", None)
+    if legacy_kwargs:
+        unexpected = ", ".join(sorted(legacy_kwargs))
+        raise TypeError(f"Unexpected keyword argument(s): {unexpected}")
+    resolved_agent_name = agent_name or legacy_agent_name
     root = ET.Element("obs-bootstrap", {"version": "2"})
     lineage_el = ET.SubElement(root, "obs-lineage")
     normalized = [normalize_lineage_name(n) for n in lineage]
     for idx, node_name in enumerate(normalized):
         attrs: dict[str, str] = {"display_name": node_name}
-        # Compute the agent_name for the sub-lineage up to and including this node.
-        # For the trunk (first node), use the passed agent_name (= team key in
-        # the Telegram runtime) instead of computing from lineage — the pure
-        # function can't know the team key.
         sub_lineage = tuple(normalized[: idx + 1])
-        if idx == 0 and resolved_agent_name:
+        computed_name = agent_name_for_lineage(
+            sub_lineage,
+            team_key=root_team_key if idx == 0 else None,
+        )
+        # Only the leaf node should use the explicit resolved agent_name.
+        # Parent nodes must keep their own projected names, otherwise descendant
+        # bootstraps incorrectly show the child's agent_name on ancestor nodes.
+        if idx == len(normalized) - 1 and resolved_agent_name:
             attrs["agent_name"] = resolved_agent_name
         else:
-            attrs["agent_name"] = agent_name_for_lineage(sub_lineage)
+            attrs["agent_name"] = computed_name
         ET.SubElement(lineage_el, "obs-node", attrs)
 
     fork_context = ET.SubElement(root, "fork_context")
@@ -176,6 +182,10 @@ def build_obs_bootstrap_xml(
         ET.SubElement(team_context, "root_team_key").text = root_team_key
     if resolved_agent_name:
         ET.SubElement(team_context, "agent_name").text = resolved_agent_name
+    if parent_agent_name:
+        ET.SubElement(team_context, "parent_agent_name").text = parent_agent_name
+    if parent_display_name:
+        ET.SubElement(team_context, "parent_display_name").text = parent_display_name
 
     return ET.tostring(root, encoding="unicode", short_empty_elements=True)
 
@@ -217,7 +227,7 @@ def parse_obs_bootstrap_xml(xml_text: str) -> ObsBootstrap:
         return text or None
 
     is_fork_text = (_child_text(fork_context, "is_fork") or "").lower()
-    # v2 uses <agent_name>, v1 uses <native_agent_name>. Try new first.
+    # v2 uses <agent_name>; legacy v1 uses <native_agent_name>. Try new first.
     resolved_agent = (
         _child_text(team_context, "agent_name")
         or _child_text(team_context, "native_agent_name")
@@ -232,6 +242,8 @@ def parse_obs_bootstrap_xml(xml_text: str) -> ObsBootstrap:
         parent_session_id=_child_text(fork_context, "parent_session_id"),
         root_team_key=_child_text(team_context, "root_team_key"),
         agent_name=resolved_agent,
+        parent_agent_name=_child_text(team_context, "parent_agent_name"),
+        parent_display_name=_child_text(team_context, "parent_display_name"),
     )
 
 
@@ -307,3 +319,8 @@ def find_latest_obs_bootstrap_for_session(
         return None
     return find_latest_obs_bootstrap_in_jsonl(path)
 
+
+def __getattr__(name: str) -> Any:
+    if name == "native_agent_name_for_lineage":
+        return agent_name_for_lineage
+    raise AttributeError(name)

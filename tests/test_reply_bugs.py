@@ -18,16 +18,12 @@ from pathlib import Path
 import pytest
 
 from obs_agent.lineage import (
+    agent_name_for_lineage,
     build_obs_bootstrap_xml,
     parse_obs_bootstrap_xml,
     normalize_lineage_name,
     lineage_fingerprint,
 )
-
-try:
-    from obs_agent.lineage import agent_name_for_lineage
-except ImportError:
-    from obs_agent.lineage import native_agent_name_for_lineage as agent_name_for_lineage
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +74,23 @@ class TestBug1TrunkAgentNameInXML:
         assert "-" in child_agent_name
         assert child_agent_name != team_key
 
+    def test_descendant_xml_root_node_keeps_team_key(self):
+        """Descendant bootstraps must not stamp the leaf agent_name onto the root node."""
+        team_key = "2026-03-17-21-06-myproject"
+        xml = build_obs_bootstrap_xml(
+            lineage=("MyProject", "Worker"),
+            origin="agent_task_fork",
+            is_fork=True,
+            session_id="sid-2",
+            root_team_key=team_key,
+            agent_name="a94a8fe5cc-worker",
+        )
+        root = ET.fromstring(xml)
+        nodes = root.findall(".//obs-node")
+        assert len(nodes) == 2
+        assert nodes[0].attrib.get("agent_name") == team_key
+        assert nodes[1].attrib.get("agent_name") == "a94a8fe5cc-worker"
+
     def test_parsed_trunk_agent_name_matches_team_key(self):
         """Round-trip: parse the XML back and trunk agent_name = team key."""
         team_key = "2026-03-17-21-06-test"
@@ -92,7 +105,7 @@ class TestBug1TrunkAgentNameInXML:
         bootstrap = parse_obs_bootstrap_xml(xml)
         assert bootstrap is not None
         # The bootstrap's agent_name should be the team key
-        agent_name = getattr(bootstrap, "agent_name", None) or getattr(bootstrap, "native_agent_name", None)
+        agent_name = getattr(bootstrap, "agent_name", None)
         assert agent_name == team_key, (
             f"Parsed bootstrap agent_name is '{agent_name}', expected '{team_key}'"
         )
@@ -323,8 +336,7 @@ class TestLiveNeedsReplyBehavior:
             token=f"REPLY-LIN-{tag}",
             timeout=240.0,
         )
-        root_facts = _extract_lineage_fact_line(root_lineage)
-        root_agent = root_facts.get("agent_name") or root_facts.get("native_agent_name")
+        root_agent = root_lineage.get("agent_name")
         assert root_agent, "Could not extract root agent name"
 
         # Launch child
@@ -337,8 +349,7 @@ class TestLiveNeedsReplyBehavior:
             lineage_token=f"REPLY-CHILD-LIN-{tag}",
             timeout=240.0,
         )
-        child_facts = _extract_lineage_fact_line(child_lineage)
-        child_agent = child_facts.get("agent_name") or child_facts.get("native_agent_name")
+        child_agent = child_lineage.get("agent_name")
         assert child_agent, "Could not extract child agent name"
 
         # Wait for child to settle

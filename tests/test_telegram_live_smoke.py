@@ -12,7 +12,7 @@ import uuid
 
 import pytest
 
-from obs_agent.lineage import native_agent_name_for_lineage
+from obs_agent.lineage import agent_name_for_lineage
 from tests.evals.platform_telegram_forum import TelegramForumPlatform
 from tests.test_telegram_live_forum_topics import (
     _append_unread_inbox_message,
@@ -35,27 +35,54 @@ from tests.test_telegram_live_forum_topics import (
 
 _LINEAGE_FACT_RE = re.compile(
     r"root_team_key=(?P<root_team_key>[^|\n]+)\|"
-    r"native_agent_name=(?P<native_agent_name>[^|\n]+)\|"
+    r"agent_name=(?P<agent_name>[^|\n]+)\|"
     r"lineage_length=(?P<lineage_length>\d+)"
 )
 
 _LINEAGE_PAYLOAD_FACT_RE = re.compile(
     r"root_team_key=(?P<root_team_key>[^|\n]+)\|"
-    r"native_agent_name=(?P<native_agent_name>[^|\n]+)\|"
+    r"agent_name=(?P<agent_name>[^|\n]+)\|"
     r"lineage_length=(?P<lineage_length>\d+)\|"
     r"origin=(?P<origin>[^|\n]+)\|"
     r"session_id=(?P<session_id>[^|\n]*)\|"
     r"lineage=(?P<lineage>[^\n]+)"
 )
 
+_FALLBACK_ROOT_TEAM_RE = re.compile(r"root_team_key\s*[:=]\s*[\"']?(?P<value>[^\"'\n<][^\"'\n]*)", re.IGNORECASE)
+_FALLBACK_AGENT_NAME_RE = re.compile(
+    r"agent_name(?:\s*\([^)]*\))?\s*[:=]\s*[\"']?(?P<value>[^\"'\n<][^\"'\n]*)",
+    re.IGNORECASE,
+)
+_FALLBACK_LINEAGE_LENGTH_RE = re.compile(r"lineage_length\s*[:=]\s*(?P<value>\d+)", re.IGNORECASE)
+_FALLBACK_ORIGIN_RE = re.compile(r"origin\s*[:=]\s*[\"']?(?P<value>[^\"'\n<][^\"'\n]*)", re.IGNORECASE)
+_FALLBACK_SESSION_ID_RE = re.compile(r"session_id\s*[:=]\s*[\"']?(?P<value>[^\"'\n<][^\"'\n]*)", re.IGNORECASE)
+_FALLBACK_LINEAGE_RE = re.compile(r"lineage\s*[:=]\s*[\"']?(?P<value>[^\"'\n<][^\"'\n]*)", re.IGNORECASE)
+
+
+def _first_named_value(pattern: re.Pattern[str], text: str) -> str | None:
+    for match in pattern.finditer(text):
+        value = match.group("value").strip().strip(",")
+        if value and "<value>" not in value.lower():
+            return value
+    return None
+
 
 def _extract_lineage_fact_line(text: str) -> dict[str, str]:
     match = _LINEAGE_FACT_RE.search(text)
-    assert match, f"missing lineage fact line in:\n{text}"
+    if match:
+        return {
+            "root_team_key": match.group("root_team_key").strip(),
+            "agent_name": match.group("agent_name").strip(),
+            "lineage_length": match.group("lineage_length").strip(),
+        }
+    root_team_key = _first_named_value(_FALLBACK_ROOT_TEAM_RE, text)
+    agent_name = _first_named_value(_FALLBACK_AGENT_NAME_RE, text)
+    lineage_length = _first_named_value(_FALLBACK_LINEAGE_LENGTH_RE, text)
+    assert root_team_key and agent_name and lineage_length, f"missing lineage fact line in:\n{text}"
     return {
-        "root_team_key": match.group("root_team_key").strip(),
-        "native_agent_name": match.group("native_agent_name").strip(),
-        "lineage_length": match.group("lineage_length").strip(),
+        "root_team_key": root_team_key,
+        "agent_name": agent_name,
+        "lineage_length": lineage_length,
     }
 
 
@@ -66,14 +93,32 @@ def _message_is_exact_token(message_text: str, token: str) -> bool:
 
 def _extract_lineage_payload_fact_line(text: str) -> dict[str, object]:
     match = _LINEAGE_PAYLOAD_FACT_RE.search(text)
-    assert match, f"missing lineage payload fact line in:\n{text}"
-    lineage = [segment.strip() for segment in match.group("lineage").split(" >>> ") if segment.strip()]
+    if match:
+        lineage = [segment.strip() for segment in match.group("lineage").split(" >>> ") if segment.strip()]
+        return {
+            "root_team_key": match.group("root_team_key").strip(),
+            "agent_name": match.group("agent_name").strip(),
+            "lineage_length": int(match.group("lineage_length")),
+            "origin": match.group("origin").strip(),
+            "session_id": match.group("session_id").strip(),
+            "lineage": lineage,
+        }
+    root_team_key = _first_named_value(_FALLBACK_ROOT_TEAM_RE, text)
+    agent_name = _first_named_value(_FALLBACK_AGENT_NAME_RE, text)
+    lineage_length = _first_named_value(_FALLBACK_LINEAGE_LENGTH_RE, text)
+    origin = _first_named_value(_FALLBACK_ORIGIN_RE, text)
+    session_id = _first_named_value(_FALLBACK_SESSION_ID_RE, text) or ""
+    raw_lineage = _first_named_value(_FALLBACK_LINEAGE_RE, text) or ""
+    lineage = [segment.strip() for segment in raw_lineage.split(" >>> ") if segment.strip()]
+    assert (
+        root_team_key and agent_name and lineage_length and origin
+    ), f"missing lineage payload fact line in:\n{text}"
     return {
-        "root_team_key": match.group("root_team_key").strip(),
-        "native_agent_name": match.group("native_agent_name").strip(),
-        "lineage_length": int(match.group("lineage_length")),
-        "origin": match.group("origin").strip(),
-        "session_id": match.group("session_id").strip(),
+        "root_team_key": root_team_key,
+        "agent_name": agent_name,
+        "lineage_length": int(lineage_length),
+        "origin": origin,
+        "session_id": session_id,
         "lineage": lineage,
     }
 
@@ -90,23 +135,76 @@ async def _query_session_lineage_payload(
         (
             "This is a deterministic lineage smoke test. "
             "Call session_lineage exactly once. "
-            f"Then reply with exactly {token}|root_team_key=<value>|native_agent_name=<value>|"
+            f"Then reply with exactly {token}|root_team_key=<value>|agent_name=<value>|"
             "lineage_length=<value>|origin=<value>|session_id=<value>|lineage=<value>. "
             "Use the literal values returned by the tool. "
-            "For lineage, join the lineage items with exactly ' >>> ' and nothing else."
+            "For lineage, join the lineage items with exactly ' >>> ' and nothing else. "
+            "Do not explain, do not repeat placeholders like <value>, and do not add any surrounding text."
         ),
         thread_id=thread_id,
         require_done=False,
         timeout=timeout,
     )
-    lineage_message = await _wait_for_message_after_containing(
-        harness,
+    deadline = asyncio.get_running_loop().time() + timeout + 120.0
+    while True:
+        recent = await harness.platform.get_recent_messages(thread_id=thread_id, limit=40)
+        for message in recent:
+            if message.message_id <= baseline or f"{token}|" not in message.text:
+                continue
+            try:
+                return _extract_lineage_payload_fact_line(message.text)
+            except AssertionError:
+                continue
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for parseable session_lineage payload after message {baseline}\n"
+                + harness.failure_context()
+            )
+        await asyncio.sleep(1.0)
+
+
+async def _query_search_team_payload(
+    harness: _LiveForumHarness,
+    *,
+    thread_id: int,
+    mode: str,
+    timeout: float = 240.0,
+) -> dict[str, object]:
+    baseline = await harness.platform.latest_bot_message_id(thread_id=thread_id)
+    token = f"SEARCHTEAM-{uuid.uuid4().hex[:8]}"
+    await harness.platform.send(
+        (
+            "This is a deterministic team-discovery smoke test. "
+            f"Call search_team exactly once with mode={mode!r}. "
+            f"Then reply with exactly {token}| followed by only a JSON object. "
+            "For mode='family', use the exact shape "
+            "{\"mode\":\"family\",\"parent\":<string-or-null>,\"children\":[<sorted names>],\"siblings\":[<sorted names>]}. "
+            "For mode='tree', use the exact shape "
+            "{\"mode\":\"tree\",\"tree\":[<sorted names>]}. "
+            "Copy the literal teammate names returned by the tool and sort arrays lexicographically."
+        ),
         thread_id=thread_id,
-        after_message_id=baseline,
-        token=f"{token}|",
-        timeout=timeout + 120.0,
+        require_done=False,
+        timeout=timeout,
     )
-    return _extract_lineage_payload_fact_line(lineage_message.text)
+    deadline = asyncio.get_running_loop().time() + timeout + 120.0
+    while True:
+        recent = await harness.platform.get_recent_messages(thread_id=thread_id, limit=40)
+        for message in recent:
+            if message.message_id <= baseline or f"{token}|" not in message.text:
+                continue
+            try:
+                payload = _extract_json_object(message.text)
+            except Exception:
+                continue
+            if payload.get("mode") == mode:
+                return payload
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for parsable search_team payload mode={mode} after message {baseline}\n"
+                + harness.failure_context()
+            )
+        await asyncio.sleep(1.0)
 
 
 async def _query_session_lineage(
@@ -121,21 +219,30 @@ async def _query_session_lineage(
         (
             "This is a deterministic lineage smoke test. "
             "Call session_lineage exactly once. "
-            f"Then reply with exactly {token}|root_team_key=<value>|native_agent_name=<value>|lineage_length=<value> "
-            "using the literal values returned by the tool."
+            f"Then reply with exactly {token}|root_team_key=<value>|agent_name=<value>|lineage_length=<value> "
+            "using the literal values returned by the tool. "
+            "Replace the placeholders with the real values. Do not explain or add any other text."
         ),
         thread_id=thread_id,
         require_done=False,
         timeout=timeout,
     )
-    lineage_message = await _wait_for_message_after_containing(
-        harness,
-        thread_id=thread_id,
-        after_message_id=baseline,
-        token=f"{token}|",
-        timeout=timeout + 120.0,
-    )
-    return _extract_lineage_fact_line(lineage_message.text)
+    deadline = asyncio.get_running_loop().time() + timeout + 120.0
+    while True:
+        recent = await harness.platform.get_recent_messages(thread_id=thread_id, limit=40)
+        for message in recent:
+            if message.message_id <= baseline or f"{token}|" not in message.text:
+                continue
+            try:
+                return _extract_lineage_fact_line(message.text)
+            except AssertionError:
+                continue
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for parseable session_lineage reply token={token} after message {baseline}\n"
+                + harness.failure_context()
+            )
+        await asyncio.sleep(1.0)
 
 
 async def _launch_lineage_worker(
@@ -153,10 +260,16 @@ async def _launch_lineage_worker(
         (
             "This is a deterministic lineage smoke test. "
             f"Use AgentTask exactly once with fork={'true' if fork else 'false'}, "
-            f"alias={alias}, and prompt "
+            f"display_name={alias!r}, and prompt "
+            f"Important: the display_name must be exactly {alias!r}. "
+            f"Do not derive the display_name from {launch_token!r} or {lineage_token!r}, "
+            "and do not invent a different display_name, alias, name, or description. "
+            "Use the display_name string verbatim. "
+            "Then pass this exact prompt to the launched worker: "
             f"'Call session_lineage exactly once. "
-            f"Then reply with exactly {lineage_token}|root_team_key=<value>|native_agent_name=<value>|lineage_length=<value> "
-            "using the literal values returned by the tool.' "
+            f"Then reply with exactly {lineage_token}|root_team_key=<value>|agent_name=<value>|lineage_length=<value> "
+            "using the literal values returned by the tool. "
+            "Replace the placeholders with the real values. Do not explain or add any other text.' "
             f"After launching, reply with only {launch_token}."
         ),
         thread_id=launcher_thread_id,
@@ -184,14 +297,23 @@ async def _launch_lineage_worker(
         token="agentId:",
         timeout=240.0,
     )
-    lineage_message = await _wait_for_message_after_containing(
-        harness,
-        thread_id=child_thread_id,
-        after_message_id=child_launch_message.message_id,
-        token=f"{lineage_token}|",
-        timeout=420.0,
-    )
-    return child_thread_id, _extract_lineage_fact_line(lineage_message.text)
+    deadline = asyncio.get_running_loop().time() + 420.0
+    while True:
+        recent = await harness.platform.get_recent_messages(thread_id=child_thread_id, limit=40)
+        for message in recent:
+            if message.message_id <= child_launch_message.message_id or f"{lineage_token}|" not in message.text:
+                continue
+            try:
+                return child_thread_id, _extract_lineage_fact_line(message.text)
+            except AssertionError:
+                continue
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for parseable launched-worker lineage token={lineage_token} "
+                f"after message {child_launch_message.message_id}\n"
+                + harness.failure_context()
+            )
+        await asyncio.sleep(1.0)
 
 
 async def _send_inbox_message_and_wait_ack(
@@ -216,11 +338,11 @@ async def _send_inbox_message_and_wait_ack(
         require_done=False,
         timeout=timeout,
     )
-    await _wait_for_message_after_containing(
+    await _wait_for_exact_message_after_any_token(
         harness,
         thread_id=sender_thread_id,
         after_message_id=baseline,
-        token=ack_token,
+        tokens=[ack_token],
         timeout=timeout + 120.0,
     )
 
@@ -249,7 +371,7 @@ async def _send_inbox_message_and_expect_outcome(
         require_done=False,
         timeout=timeout,
     )
-    result_message = await _wait_for_message_after_any_token(
+    result_message = await _wait_for_exact_message_after_any_token(
         harness,
         thread_id=sender_thread_id,
         after_message_id=baseline,
@@ -271,14 +393,50 @@ async def _wait_for_message_after_any_token(
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         recent = await harness.platform.get_recent_messages(thread_id=thread_id, limit=limit)
+        exact_match: TelegramForumObservedMessage | None = None
+        substring_match: TelegramForumObservedMessage | None = None
         for message in recent:
             if message.message_id <= after_message_id:
                 continue
-            if any(token in message.text for token in tokens):
-                return message
+            if exact_match is None and any(
+                _message_is_exact_token(message.text, token) for token in tokens
+            ):
+                exact_match = message
+                continue
+            if substring_match is None and any(token in message.text for token in tokens):
+                substring_match = message
+        if exact_match is not None:
+            return exact_match
+        if substring_match is not None:
+            return substring_match
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError(
                 f"Timed out waiting for any of {tokens!r} after message {after_message_id} in thread {thread_id}\n"
+                f"{harness.failure_context()}"
+            )
+        await asyncio.sleep(1.0)
+
+
+async def _wait_for_exact_message_after_any_token(
+    harness: _LiveForumHarness,
+    *,
+    thread_id: int | None,
+    after_message_id: int,
+    tokens: list[str],
+    timeout: float = 120.0,
+    limit: int = 40,
+):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        recent = await harness.platform.get_recent_messages(thread_id=thread_id, limit=limit)
+        for message in recent:
+            if message.message_id <= after_message_id:
+                continue
+            if any(_message_is_exact_token(message.text, token) for token in tokens):
+                return message
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for exact reply among {tokens!r} after message {after_message_id} in thread {thread_id}\n"
                 f"{harness.failure_context()}"
             )
         await asyncio.sleep(1.0)
@@ -1165,7 +1323,7 @@ class TestTelegramLiveSmoke:
             (
                 "This is a deterministic lineage smoke test. "
                 "Call session_lineage exactly once. "
-                f"Then reply with exactly LINEAGE-ROOT-{tag}|root_team_key=<value>|native_agent_name=<value>|lineage_length=<value> "
+                f"Then reply with exactly LINEAGE-ROOT-{tag}|root_team_key=<value>|agent_name=<value>|lineage_length=<value> "
                 "using the literal values returned by the tool."
             ),
             thread_id=parent_thread_id,
@@ -1216,7 +1374,7 @@ class TestTelegramLiveSmoke:
         await live_tg_forum.platform.send(
             (
                 "This is a deterministic lineage smoke test. "
-                f"Use SendInboxMessage exactly once with recipient={lineage_b['native_agent_name']}, "
+                f"Use SendInboxMessage exactly once with recipient={lineage_b['agent_name']}, "
                 f"content={token_c_to_b}, summary=\"cross-branch\", and omit team_name and sender. "
                 f"Reply with only WORKER-C-SENT-B-{tag}."
             ),
@@ -1239,7 +1397,7 @@ class TestTelegramLiveSmoke:
                 "This is a deterministic lineage smoke test. "
                 "Call ReadInbox exactly once with no arguments and verify "
                 f"{token_c_to_b} exists in unread messages. "
-                f"Then use SendInboxMessage exactly once with recipient={lineage_a['native_agent_name']}, "
+                f"Then use SendInboxMessage exactly once with recipient={lineage_a['agent_name']}, "
                 f"content={token_b_to_a}, summary=\"bounce\", and omit team_name and sender. "
                 f"Reply with only WORKER-B-READ-C-SENT-A-{tag}."
             ),
@@ -1280,7 +1438,7 @@ class TestTelegramLiveSmoke:
         await live_tg_forum.platform.send(
             (
                 "This is a deterministic lineage smoke test. "
-                f"Use SendInboxMessage exactly once with recipient={lineage_c['native_agent_name']}, "
+                f"Use SendInboxMessage exactly once with recipient={lineage_c['agent_name']}, "
                 f"content={token_root_to_c}, summary=\"root-down\", and omit team_name and sender. "
                 f"Reply with only ROOT-SENT-C-{tag}."
             ),
@@ -1303,7 +1461,7 @@ class TestTelegramLiveSmoke:
                 "This is a deterministic lineage smoke test. "
                 "Call ReadInbox exactly once with no arguments and verify "
                 f"{token_root_to_c} exists in unread messages. "
-                f"Then use SendInboxMessage exactly once with recipient={lineage_root['native_agent_name']}, "
+                f"Then use SendInboxMessage exactly once with recipient={lineage_root['agent_name']}, "
                 f"content={token_c_to_root}, summary=\"root-up\", and omit team_name and sender. "
                 f"Reply with only WORKER-C-READ-ROOT-SENT-ROOT-{tag}."
             ),
@@ -1342,13 +1500,274 @@ class TestTelegramLiveSmoke:
         assert lineage_root["root_team_key"] == lineage_a["root_team_key"], live_tg_forum.failure_context()
         assert lineage_a["root_team_key"] == lineage_b["root_team_key"], live_tg_forum.failure_context()
         assert lineage_b["root_team_key"] == lineage_c["root_team_key"], live_tg_forum.failure_context()
-        assert lineage_root["native_agent_name"] != lineage_a["native_agent_name"], live_tg_forum.failure_context()
-        assert lineage_a["native_agent_name"] != lineage_b["native_agent_name"], live_tg_forum.failure_context()
-        assert lineage_b["native_agent_name"] != lineage_c["native_agent_name"], live_tg_forum.failure_context()
+        assert lineage_root["agent_name"] != lineage_a["agent_name"], live_tg_forum.failure_context()
+        assert lineage_a["agent_name"] != lineage_b["agent_name"], live_tg_forum.failure_context()
+        assert lineage_b["agent_name"] != lineage_c["agent_name"], live_tg_forum.failure_context()
         assert int(lineage_root["lineage_length"]) == 1, live_tg_forum.failure_context()
         assert int(lineage_a["lineage_length"]) == 2, live_tg_forum.failure_context()
         assert int(lineage_b["lineage_length"]) == 2, live_tg_forum.failure_context()
         assert int(lineage_c["lineage_length"]) == 3, live_tg_forum.failure_context()
+
+    async def test_live_smoke_search_team_child_alias_and_parent_reply(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        root_thread_id = await live_tg_forum.platform.create_topic(f"Smoke Search Team {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only SEARCHTEAM-PRIME-{tag}.",
+            thread_id=root_thread_id,
+            token=f"SEARCHTEAM-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        thread_a, lineage_a = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=False,
+            alias=f"Alpha-{tag}",
+            launch_token=f"ROOT-LAUNCHED-ALPHA-{tag}",
+            lineage_token=f"LINEAGE-ALPHA-{tag}",
+            timeout=240.0,
+        )
+        thread_b, lineage_b = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=thread_a,
+            fork=True,
+            alias=f"Bravo-{tag}",
+            launch_token=f"ALPHA-LAUNCHED-BRAVO-{tag}",
+            lineage_token=f"LINEAGE-BRAVO-{tag}",
+            timeout=240.0,
+        )
+        await asyncio.sleep(2.0)
+
+        root_tree = await _query_search_team_payload(
+            live_tg_forum,
+            thread_id=root_thread_id,
+            mode="tree",
+            timeout=240.0,
+        )
+        assert root_tree["mode"] == "tree", live_tg_forum.failure_context()
+        assert lineage_a["agent_name"] in root_tree["tree"], live_tg_forum.failure_context()
+        assert lineage_b["agent_name"] in root_tree["tree"], live_tg_forum.failure_context()
+
+        bravo_family = await _query_search_team_payload(
+            live_tg_forum,
+            thread_id=thread_b,
+            mode="family",
+            timeout=240.0,
+        )
+        assert bravo_family["mode"] == "family", live_tg_forum.failure_context()
+        assert bravo_family["parent"] == lineage_a["agent_name"], live_tg_forum.failure_context()
+        assert bravo_family["children"] == [], live_tg_forum.failure_context()
+        await asyncio.sleep(2.0)
+
+        token_root_to_alpha = f"SEARCHTEAM-ROOT-ALPHA-{tag}"
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=root_thread_id,
+            recipient=f"Alpha-{tag}",
+            content=token_root_to_alpha,
+            ack_token=f"ROOT-ALIAS-SENT-ALPHA-{tag}",
+            summary="search-team-root-alias",
+            timeout=240.0,
+        )
+        alpha_read = await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic search-team smoke test. "
+                "Call ReadInbox exactly once with include_read=true, mark_read=false, limit=20. "
+                f"If you find a message whose exact text is {token_root_to_alpha}, reply with only ALPHA-GOT-ROOT-{tag}. "
+                f"Otherwise reply with only ALPHA-MISSED-ROOT-{tag}."
+            ),
+            thread_id=thread_a,
+            token=f"ALPHA-GOT-ROOT-{tag}",
+            timeout=300.0,
+        )
+        assert f"ALPHA-GOT-ROOT-{tag}" in alpha_read.text, live_tg_forum.failure_context()
+        await asyncio.sleep(2.0)
+
+        token_alpha_to_bravo = f"SEARCHTEAM-ALPHA-BRAVO-{tag}"
+        await _send_inbox_message_and_wait_ack(
+            live_tg_forum,
+            sender_thread_id=thread_a,
+            recipient=f"Bravo-{tag}",
+            content=token_alpha_to_bravo,
+            ack_token=f"ALPHA-ALIAS-SENT-BRAVO-{tag}",
+            summary="search-team-child-alias",
+            timeout=240.0,
+        )
+        bravo_read = await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic search-team smoke test. "
+                "Call ReadInbox exactly once with include_read=true, mark_read=false, limit=20. "
+                f"If you find a message whose exact text is {token_alpha_to_bravo}, reply with only BRAVO-GOT-ALPHA-{tag}. "
+                f"Otherwise reply with only BRAVO-MISSED-ALPHA-{tag}."
+            ),
+            thread_id=thread_b,
+            token=f"BRAVO-GOT-ALPHA-{tag}",
+            timeout=300.0,
+        )
+        assert f"BRAVO-GOT-ALPHA-{tag}" in bravo_read.text, live_tg_forum.failure_context()
+        await asyncio.sleep(2.0)
+
+        baseline_bravo = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_b)
+        token_bravo_to_parent = f"SEARCHTEAM-BRAVO-PARENT-{tag}"
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic search-team smoke test. "
+                "Call search_team exactly once with mode='parent'. "
+                f"Use SendInboxMessage exactly once with recipient equal to that parent and content={token_bravo_to_parent!r}, "
+                "summary='search-team-parent', and omit team_name and sender. "
+                f"Then reply with only BRAVO-SENT-PARENT-{tag}."
+            ),
+            thread_id=thread_b,
+            require_done=False,
+            timeout=240.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_b,
+            after_message_id=baseline_bravo,
+            token=f"BRAVO-SENT-PARENT-{tag}",
+            timeout=360.0,
+        )
+        parent_read = await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic search-team smoke test. "
+                "Call ReadInbox exactly once with include_read=true, mark_read=false, limit=20. "
+                f"If you find a message whose exact text is {token_bravo_to_parent}, reply with only ALPHA-GOT-PARENT-REPLY-{tag}. "
+                f"Otherwise reply with only ALPHA-MISSED-PARENT-REPLY-{tag}."
+            ),
+            thread_id=thread_a,
+            token=f"ALPHA-GOT-PARENT-REPLY-{tag}",
+            timeout=300.0,
+        )
+        assert f"ALPHA-GOT-PARENT-REPLY-{tag}" in parent_read.text, live_tg_forum.failure_context()
+
+    async def test_live_smoke_restart_preserves_exact_team_key_and_parent_routing(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        root_thread_id = await live_tg_forum.platform.create_topic(f"Smoke Restart Parent {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only RESTART-PARENT-PRIME-{tag}.",
+            thread_id=root_thread_id,
+            token=f"RESTART-PARENT-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        child_thread_id, lineage_child = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread_id,
+            fork=False,
+            alias=f"RestartChild-{tag}",
+            launch_token=f"RESTART-LAUNCHED-CHILD-{tag}",
+            lineage_token=f"RESTART-LINEAGE-CHILD-{tag}",
+            timeout=240.0,
+        )
+        grandchild_thread_id, lineage_grandchild = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=child_thread_id,
+            fork=False,
+            alias=f"RestartGrand-{tag}",
+            launch_token=f"RESTART-LAUNCHED-GRAND-{tag}",
+            lineage_token=f"RESTART-LINEAGE-GRAND-{tag}",
+            timeout=240.0,
+        )
+        await asyncio.sleep(2.0)
+
+        lineage_before = await _query_session_lineage_payload(
+            live_tg_forum,
+            thread_id=grandchild_thread_id,
+            timeout=240.0,
+        )
+        family_before = await _query_search_team_payload(
+            live_tg_forum,
+            thread_id=grandchild_thread_id,
+            mode="family",
+            timeout=240.0,
+        )
+        assert family_before["parent"] == lineage_child["agent_name"], live_tg_forum.failure_context()
+        await asyncio.sleep(2.0)
+
+        _stop_bot(live_tg_forum.proc)
+        assert live_tg_forum.temp_root is not None
+        live_tg_forum.proc, live_tg_forum.log_file = _start_bot(
+            live_tg_forum.vault_path,
+            live_tg_forum.temp_root,
+            state_db_path=live_tg_forum.state_db_path,
+        )
+        await asyncio.sleep(2.0)
+
+        root_post_restart_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=root_thread_id)
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only RESTART-ROOT-READY-{tag}.",
+            thread_id=root_thread_id,
+            token=f"RESTART-ROOT-READY-{tag}",
+            timeout=240.0,
+        )
+        assert root_post_restart_baseline is not None
+
+        lineage_after = await _query_session_lineage_payload(
+            live_tg_forum,
+            thread_id=grandchild_thread_id,
+            timeout=240.0,
+        )
+        family_after = await _query_search_team_payload(
+            live_tg_forum,
+            thread_id=grandchild_thread_id,
+            mode="family",
+            timeout=240.0,
+        )
+        assert lineage_after["root_team_key"] == lineage_before["root_team_key"], live_tg_forum.failure_context()
+        assert lineage_after["agent_name"] == lineage_before["agent_name"], live_tg_forum.failure_context()
+        assert family_after["parent"] == lineage_child["agent_name"], live_tg_forum.failure_context()
+
+        baseline_grand = await live_tg_forum.platform.latest_bot_message_id(thread_id=grandchild_thread_id)
+        token_post_restart_parent = f"RESTART-PARENT-TOKEN-{tag}"
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic restart-parent smoke test. "
+                "Call search_team exactly once with mode='parent'. "
+                f"Use SendInboxMessage exactly once with recipient equal to that parent and content={token_post_restart_parent!r}, "
+                "summary='restart-parent', and omit team_name and sender. "
+                f"Then reply with only GRAND-SENT-PARENT-AFTER-RESTART-{tag}."
+            ),
+            thread_id=grandchild_thread_id,
+            require_done=False,
+            timeout=240.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=grandchild_thread_id,
+            after_message_id=baseline_grand,
+            token=f"GRAND-SENT-PARENT-AFTER-RESTART-{tag}",
+            timeout=360.0,
+        )
+        parent_check = await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic restart-parent smoke test. "
+                "Call ReadInbox exactly once with include_read=true, mark_read=false, limit=20. "
+                f"If you find a message whose exact text is {token_post_restart_parent}, reply with only PARENT-GOT-RESTART-{tag}. "
+                f"Otherwise reply with only PARENT-MISSED-RESTART-{tag}."
+            ),
+            thread_id=child_thread_id,
+            token=f"PARENT-GOT-RESTART-{tag}",
+            timeout=300.0,
+        )
+        assert f"PARENT-GOT-RESTART-{tag}" in parent_check.text, live_tg_forum.failure_context()
 
     async def test_live_smoke_deep_lineage_any_direction_inbox_routing(
         self,
@@ -1371,7 +1790,7 @@ class TestTelegramLiveSmoke:
             (
                 "This is a deterministic deep-lineage smoke test. "
                 "Call session_lineage exactly once. "
-                f"Then reply with exactly DEEP-ROOT-{tag}|root_team_key=<value>|native_agent_name=<value>|lineage_length=<value> "
+                f"Then reply with exactly DEEP-ROOT-{tag}|root_team_key=<value>|agent_name=<value>|lineage_length=<value> "
                 "using the literal values returned by the tool."
             ),
             thread_id=root_thread_id,
@@ -1438,7 +1857,7 @@ class TestTelegramLiveSmoke:
         await live_tg_forum.platform.send(
             (
                 "This is a deterministic deep-lineage smoke test. "
-                f"Use SendInboxMessage exactly once with recipient={lineage_root['native_agent_name']}, "
+                f"Use SendInboxMessage exactly once with recipient={lineage_root['agent_name']}, "
                 f"content={token_d_to_root}, summary=\"deep-up\", and omit team_name and sender. "
                 f"Reply with only D-SENT-ROOT-{tag}."
             ),
@@ -1461,7 +1880,7 @@ class TestTelegramLiveSmoke:
                 "This is a deterministic deep-lineage smoke test. "
                 "Call ReadInbox exactly once with no arguments and verify "
                 f"{token_d_to_root} exists in unread messages. "
-                f"Then use SendInboxMessage exactly once with recipient={lineage_e['native_agent_name']}, "
+                f"Then use SendInboxMessage exactly once with recipient={lineage_e['agent_name']}, "
                 f"content={token_root_to_e}, summary=\"deep-down\", and omit team_name and sender. "
                 f"Reply with only ROOT-READ-D-SENT-E-{tag}."
             ),
@@ -1484,7 +1903,7 @@ class TestTelegramLiveSmoke:
                 "This is a deterministic deep-lineage smoke test. "
                 "Call ReadInbox exactly once with no arguments and verify "
                 f"{token_root_to_e} exists in unread messages. "
-                f"Then use SendInboxMessage exactly once with recipient={lineage_b['native_agent_name']}, "
+                f"Then use SendInboxMessage exactly once with recipient={lineage_b['agent_name']}, "
                 f"content={token_e_to_b}, summary=\"sibling-hop\", and omit team_name and sender. "
                 f"Reply with only E-READ-ROOT-SENT-B-{tag}."
             ),
@@ -1507,7 +1926,7 @@ class TestTelegramLiveSmoke:
                 "This is a deterministic deep-lineage smoke test. "
                 "Call ReadInbox exactly once with no arguments and verify "
                 f"{token_e_to_b} exists in unread messages. "
-                f"Then use SendInboxMessage exactly once with recipient={lineage_d['native_agent_name']}, "
+                f"Then use SendInboxMessage exactly once with recipient={lineage_d['agent_name']}, "
                 f"content={token_b_to_d}, summary=\"deep-down-2\", and omit team_name and sender. "
                 f"Reply with only B-READ-E-SENT-D-{tag}."
             ),
@@ -1530,7 +1949,7 @@ class TestTelegramLiveSmoke:
                 "This is a deterministic deep-lineage smoke test. "
                 "Call ReadInbox exactly once with no arguments and verify "
                 f"{token_b_to_d} exists in unread messages. "
-                f"Then use SendInboxMessage exactly once with recipient={lineage_c['native_agent_name']}, "
+                f"Then use SendInboxMessage exactly once with recipient={lineage_c['agent_name']}, "
                 f"content={token_d_to_c}, summary=\"parent-hop\", and omit team_name and sender. "
                 f"Reply with only D-READ-B-SENT-C-{tag}."
             ),
@@ -1568,9 +1987,9 @@ class TestTelegramLiveSmoke:
 
         all_lineages = [lineage_root, lineage_a, lineage_b, lineage_c, lineage_d, lineage_e]
         root_keys = {entry["root_team_key"] for entry in all_lineages}
-        native_names = {entry["native_agent_name"] for entry in all_lineages}
+        agent_names = {entry["agent_name"] for entry in all_lineages}
         assert len(root_keys) == 1, live_tg_forum.failure_context()
-        assert len(native_names) == len(all_lineages), live_tg_forum.failure_context()
+        assert len(agent_names) == len(all_lineages), live_tg_forum.failure_context()
         assert int(lineage_root["lineage_length"]) == 1, live_tg_forum.failure_context()
         assert int(lineage_a["lineage_length"]) == 2, live_tg_forum.failure_context()
         assert int(lineage_b["lineage_length"]) == 3, live_tg_forum.failure_context()
@@ -1645,7 +2064,7 @@ class TestTelegramLiveSmoke:
                     "This is a deterministic concurrent lineage wake smoke test. "
                     f"Reply with only A-WAKE-READY-{tag} now. "
                     f"Important for later wake turns: if you read an inbox message containing {ping_c_to_a}, "
-                    f"send SendInboxMessage to recipient={lineage_c['native_agent_name']} with content={pong_a_to_c}, "
+                    f"send SendInboxMessage to recipient={lineage_c['agent_name']} with content={pong_a_to_c}, "
                     "summary=\"lineage-pong-a\", and omit team_name and sender. "
                     f"Then reply with only A-WAKE-PONG-SENT-{tag}."
                 ),
@@ -1658,7 +2077,7 @@ class TestTelegramLiveSmoke:
                     "This is a deterministic concurrent lineage wake smoke test. "
                     f"Reply with only D-WAKE-READY-{tag} now. "
                     f"Important for later wake turns: if you read an inbox message containing {ping_b_to_d}, "
-                    f"send SendInboxMessage to recipient={lineage_b['native_agent_name']} with content={pong_d_to_b}, "
+                    f"send SendInboxMessage to recipient={lineage_b['agent_name']} with content={pong_d_to_b}, "
                     "summary=\"lineage-pong-d\", and omit team_name and sender. "
                     f"Then reply with only D-WAKE-PONG-SENT-{tag}."
                 ),
@@ -1688,7 +2107,7 @@ class TestTelegramLiveSmoke:
             live_tg_forum.platform.send(
                 (
                     "This is a deterministic concurrent lineage wake smoke test. "
-                    f"Use SendInboxMessage exactly once with recipient={lineage_d['native_agent_name']}, "
+                    f"Use SendInboxMessage exactly once with recipient={lineage_d['agent_name']}, "
                     f"content={ping_b_to_d}, summary=\"cross-branch-ping-b\", and omit team_name and sender. "
                     f"Then reply with only B-SENT-D-{tag}. "
                     f"Important for later wake turns: if you read an inbox message containing {pong_d_to_b}, "
@@ -1701,7 +2120,7 @@ class TestTelegramLiveSmoke:
             live_tg_forum.platform.send(
                 (
                     "This is a deterministic concurrent lineage wake smoke test. "
-                    f"Use SendInboxMessage exactly once with recipient={lineage_a['native_agent_name']}, "
+                    f"Use SendInboxMessage exactly once with recipient={lineage_a['agent_name']}, "
                     f"content={ping_c_to_a}, summary=\"cross-branch-ping-c\", and omit team_name and sender. "
                     f"Then reply with only C-SENT-A-{tag}. "
                     f"Important for later wake turns: if you read an inbox message containing {pong_a_to_c}, "
@@ -1741,8 +2160,8 @@ class TestTelegramLiveSmoke:
             token="agent task wake: teammate message received",
             timeout=480.0,
         )
-        assert lineage_c["native_agent_name"] in wake_a.text, live_tg_forum.failure_context()
-        assert lineage_b["native_agent_name"] in wake_d.text, live_tg_forum.failure_context()
+        assert lineage_c["agent_name"] in wake_a.text, live_tg_forum.failure_context()
+        assert lineage_b["agent_name"] in wake_d.text, live_tg_forum.failure_context()
 
         pong_a = await _wait_for_message_after_containing(
             live_tg_forum,
@@ -1775,8 +2194,8 @@ class TestTelegramLiveSmoke:
             token="agent task wake: teammate message received",
             timeout=480.0,
         )
-        assert lineage_d["native_agent_name"] in wake_b.text, live_tg_forum.failure_context()
-        assert lineage_a["native_agent_name"] in wake_c.text, live_tg_forum.failure_context()
+        assert lineage_d["agent_name"] in wake_b.text, live_tg_forum.failure_context()
+        assert lineage_a["agent_name"] in wake_c.text, live_tg_forum.failure_context()
 
         got_pong_b = await _wait_for_message_after_containing(
             live_tg_forum,
@@ -1801,14 +2220,14 @@ class TestTelegramLiveSmoke:
             lineage_c["root_team_key"],
             lineage_d["root_team_key"],
         }
-        native_names = {
-            lineage_a["native_agent_name"],
-            lineage_b["native_agent_name"],
-            lineage_c["native_agent_name"],
-            lineage_d["native_agent_name"],
+        agent_names = {
+            lineage_a["agent_name"],
+            lineage_b["agent_name"],
+            lineage_c["agent_name"],
+            lineage_d["agent_name"],
         }
         assert len(root_keys) == 1, live_tg_forum.failure_context()
-        assert len(native_names) == 4, live_tg_forum.failure_context()
+        assert len(agent_names) == 4, live_tg_forum.failure_context()
         assert int(lineage_a["lineage_length"]) == 2, live_tg_forum.failure_context()
         assert int(lineage_b["lineage_length"]) == 3, live_tg_forum.failure_context()
         assert int(lineage_d["lineage_length"]) == 2, live_tg_forum.failure_context()
@@ -2097,7 +2516,7 @@ class TestTelegramLiveSmoke:
                 _send_inbox_message_and_wait_ack(
                     live_tg_forum,
                     sender_thread_id=sender_thread_id,
-                    recipient=lineage_target["native_agent_name"],
+                    recipient=lineage_target["agent_name"],
                     content=token,
                     ack_token=f"FANIN-SENT-{tag}-{index:02d}",
                     summary="fan-in",
@@ -2157,7 +2576,7 @@ class TestTelegramLiveSmoke:
             timeout=180.0,
         )
         child_thread_id, _ = _extract_topic_link(fork_message.text)
-        child_native_agent = native_agent_name_for_lineage((root_title, fork_alias))
+        child_agent_name = agent_name_for_lineage((root_title, fork_alias))
 
         sender_thread_id, _ = await _launch_lineage_worker(
             live_tg_forum,
@@ -2173,7 +2592,7 @@ class TestTelegramLiveSmoke:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=sender_thread_id,
-            recipient=child_native_agent,
+            recipient=child_agent_name,
             content=f"Reply in your topic with only {instruction_token}.",
             ack_token=f"SENDER-SENT-UNRUN-{tag}",
             summary="wake-unrun",
@@ -2263,18 +2682,15 @@ class TestTelegramLiveSmoke:
         )
         # After /clear, lineage identity is preserved. Team key and agent name
         # should stay the same. Lineage length is always preserved.
-        assert lineage_after["native_agent_name"] == lineage_before["native_agent_name"], (
-            f"agent_name changed after /clear: {lineage_before['native_agent_name']} -> {lineage_after['native_agent_name']}\n"
+        assert lineage_after["agent_name"] == lineage_before["agent_name"], (
+            f"agent_name changed after /clear: {lineage_before['agent_name']} -> {lineage_after['agent_name']}\n"
             + live_tg_forum.failure_context()
         )
         assert lineage_after["lineage_length"] == lineage_before["lineage_length"], (
             f"lineage_length changed after /clear\n" + live_tg_forum.failure_context()
         )
-        # Team key may regenerate timestamp on /clear — check slug suffix matches
-        before_slug = lineage_before["root_team_key"].split("-", 5)[-1] if "-" in lineage_before["root_team_key"] else lineage_before["root_team_key"]
-        after_slug = lineage_after["root_team_key"].split("-", 5)[-1] if "-" in lineage_after["root_team_key"] else lineage_after["root_team_key"]
-        assert after_slug == before_slug, (
-            f"team key slug changed after /clear: {lineage_before['root_team_key']} -> {lineage_after['root_team_key']}\n"
+        assert lineage_after["root_team_key"] == lineage_before["root_team_key"], (
+            f"team key changed after /clear: {lineage_before['root_team_key']} -> {lineage_after['root_team_key']}\n"
             + live_tg_forum.failure_context()
         )
 
@@ -2282,7 +2698,7 @@ class TestTelegramLiveSmoke:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=sender_thread_id,
-            recipient=lineage_before["native_agent_name"],
+            recipient=lineage_before["agent_name"],
             content=inbox_token,
             ack_token=f"CLEAR-SENDER-SENT-{tag}",
             summary="clear-preserve",
@@ -2385,23 +2801,21 @@ class TestTelegramLiveSmoke:
             target_lineage_after["root_team_key"] != target_lineage_before["root_team_key"]
         ), live_tg_forum.failure_context()
         assert (
-            target_lineage_after["native_agent_name"] != target_lineage_before["native_agent_name"]
+            target_lineage_after["agent_name"] != target_lineage_before["agent_name"]
         ), live_tg_forum.failure_context()
 
         dead_period_token = f"NEW-DEAD-PERIOD-{tag}"
         delivered = await _send_inbox_message_and_expect_outcome(
             live_tg_forum,
             sender_thread_id=sender_thread_id,
-            recipient=target_lineage_before["native_agent_name"],
+            recipient=target_lineage_before["agent_name"],
             content=dead_period_token,
             delivered_token=f"NEW-DEAD-DELIVERED-{tag}",
             undelivered_token=f"NEW-DEAD-UNDELIVERED-{tag}",
             summary="new-undelivered",
             timeout=240.0,
         )
-        # Always-deliver: messages go to inbox file even for old identity.
-        # The NEW identity won't see it (different inbox key).
-        assert delivered is True, live_tg_forum.failure_context()
+        assert delivered is False, live_tg_forum.failure_context()
 
         dead_check = await _send_and_wait_for_token(
             live_tg_forum,
@@ -2456,7 +2870,7 @@ class TestTelegramLiveSmoke:
         backlog_token = f"RESPAWN-BACKLOG-{tag}"
         _append_unread_inbox_message(
             team_name=target_lineage_before["root_team_key"],
-            recipient=target_lineage_before["native_agent_name"],
+            recipient=target_lineage_before["agent_name"],
             content=backlog_token,
             summary="pre-delete backlog",
             sender="external-live-test",
@@ -2472,56 +2886,65 @@ class TestTelegramLiveSmoke:
         delivered = await _send_inbox_message_and_expect_outcome(
             live_tg_forum,
             sender_thread_id=sender_thread_id,
-            recipient=target_lineage_before["native_agent_name"],
+            recipient=target_lineage_before["agent_name"],
             content=dead_period_token,
             delivered_token=f"RESPAWN-DEAD-DELIVERED-{tag}",
             undelivered_token=f"RESPAWN-DEAD-UNDELIVERED-{tag}",
             summary="respawn-undelivered",
             timeout=240.0,
         )
-        # Always-deliver: message goes to inbox file even after /delete.
-        # The respawned agent may or may not see it depending on inbox key.
-        assert delivered is True, live_tg_forum.failure_context()
+        assert delivered is False, live_tg_forum.failure_context()
 
         reborn_thread_id, target_lineage_after = await _launch_lineage_worker(
             live_tg_forum,
             launcher_thread_id=root_thread_id,
             fork=False,
             alias=target_alias,
-            launch_token=f"RESPAWN-LAUNCHED-REBORN-{tag}",
-            lineage_token=f"RESPAWN-LINEAGE-REBORN-{tag}",
+            launch_token=f"RESPAWN-LAUNCHED-R2-{tag}",
+            lineage_token=f"RESPAWN-LINEAGE-R2-{tag}",
             timeout=240.0,
         )
         assert target_lineage_after == target_lineage_before, live_tg_forum.failure_context()
 
+        backlog_only_token = f"RESPAWN-BACKLOG-ONLY-{tag}"
+        backlog_both_token = f"RESPAWN-BACKLOG-AND-DEAD-{tag}"
+        backlog_dead_only_token = f"RESPAWN-DEAD-ONLY-{tag}"
+        backlog_none_token = f"RESPAWN-BACKLOG-NONE-{tag}"
         backlog_check_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=reborn_thread_id)
         await live_tg_forum.platform.send(
             (
                 "This is a deterministic smoke test. "
                 "Call ReadInbox exactly once with include_read=true, mark_read=false, limit=20. "
-                f"Reply with only a JSON object of the exact form {{\"texts\": [<sorted texts>]}} "
-                f"containing every inbox text equal to {backlog_token!r} or {dead_period_token!r}, "
-                "sorted lexicographically."
+                f"If you find {backlog_token!r} and do not find {dead_period_token!r}, reply with only {backlog_only_token}. "
+                f"If you find both {backlog_token!r} and {dead_period_token!r}, reply with only {backlog_both_token}. "
+                f"If you find only {dead_period_token!r}, reply with only {backlog_dead_only_token}. "
+                f"If you find neither, reply with only {backlog_none_token}."
             ),
             thread_id=reborn_thread_id,
             require_done=False,
             timeout=240.0,
         )
-        backlog_check_message = await _wait_for_message_after_containing(
+        backlog_check_message = await _wait_for_exact_message_after_any_token(
             live_tg_forum,
             thread_id=reborn_thread_id,
             after_message_id=backlog_check_baseline,
-            token="\"texts\":",
+            tokens=[
+                backlog_only_token,
+                backlog_both_token,
+                backlog_dead_only_token,
+                backlog_none_token,
+            ],
             timeout=360.0,
         )
-        backlog_payload = _extract_json_object(backlog_check_message.text)
-        assert backlog_payload["texts"] == [backlog_token], live_tg_forum.failure_context()
+        assert _message_is_exact_token(backlog_check_message.text, backlog_only_token), (
+            live_tg_forum.failure_context()
+        )
 
         post_respawn_token = f"RESPAWN-POST-{tag}"
         delivered_post = await _send_inbox_message_and_expect_outcome(
             live_tg_forum,
             sender_thread_id=sender_thread_id,
-            recipient=target_lineage_before["native_agent_name"],
+            recipient=target_lineage_before["agent_name"],
             content=post_respawn_token,
             delivered_token=f"RESPAWN-POST-DELIVERED-{tag}",
             undelivered_token=f"RESPAWN-POST-UNDELIVERED-{tag}",
@@ -2538,28 +2961,29 @@ class TestTelegramLiveSmoke:
         )
         assert "teammate message received" in wake_message.text.lower(), live_tg_forum.failure_context()
 
+        final_ok_token = f"RESPAWN-FINAL-OK-{tag}"
+        final_bad_token = f"RESPAWN-FINAL-BAD-{tag}"
         final_check_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=reborn_thread_id)
         await live_tg_forum.platform.send(
             (
                 "This is a deterministic smoke test. "
                 "Call ReadInbox exactly once with include_read=true, mark_read=false, limit=30. "
-                f"Collect every inbox text equal to {backlog_token!r}, {dead_period_token!r}, or {post_respawn_token!r}. "
-                "Reply with only a JSON object of the exact form {\"texts\": [<sorted texts>]}. "
-                "Sort the texts lexicographically."
+                f"If you find both {backlog_token!r} and {post_respawn_token!r} and do not find {dead_period_token!r}, "
+                f"reply with only {final_ok_token}. "
+                f"Otherwise reply with only {final_bad_token}."
             ),
             thread_id=reborn_thread_id,
             require_done=False,
             timeout=240.0,
         )
-        final_check_message = await _wait_for_message_after_containing(
+        final_check_message = await _wait_for_exact_message_after_any_token(
             live_tg_forum,
             thread_id=reborn_thread_id,
             after_message_id=final_check_baseline,
-            token="\"texts\":",
+            tokens=[final_ok_token, final_bad_token],
             timeout=360.0,
         )
-        final_payload = _extract_json_object(final_check_message.text)
-        assert final_payload["texts"] == sorted([backlog_token, post_respawn_token]), (
+        assert _message_is_exact_token(final_check_message.text, final_ok_token), (
             live_tg_forum.failure_context()
         )
 
@@ -2616,7 +3040,7 @@ class TestTelegramLiveSmoke:
             _send_inbox_message_and_wait_ack(
                 live_tg_forum,
                 sender_thread_id=sender_thread_id,
-                recipient=str(lineage_before["native_agent_name"]),
+                recipient=str(lineage_before["agent_name"]),
                 content=inbox_token,
                 ack_token=f"INLINE-SENDER-SENT-{tag}",
                 summary="inline-race",
@@ -2664,7 +3088,7 @@ class TestTelegramLiveSmoke:
         )
         assert lineage_after["lineage"] == lineage_before["lineage"], live_tg_forum.failure_context()
         assert (
-            lineage_after["native_agent_name"] == lineage_before["native_agent_name"]
+            lineage_after["agent_name"] == lineage_before["agent_name"]
         ), live_tg_forum.failure_context()
         assert lineage_after["root_team_key"] == lineage_before["root_team_key"], live_tg_forum.failure_context()
         assert lineage_after["origin"] == "inline_fork", live_tg_forum.failure_context()
@@ -2753,7 +3177,7 @@ class TestTelegramLiveSmoke:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=root_thread_id,
-            recipient=grandchild_lineage["native_agent_name"],
+            recipient=grandchild_lineage["agent_name"],
             content=pre_restart_inbox_token,
             ack_token=f"PRE-RESTART-SENT-{tag}",
             summary="pre-restart-direct",
@@ -2802,7 +3226,7 @@ class TestTelegramLiveSmoke:
         )
         assert lineage_after["lineage"] == lineage_before["lineage"], live_tg_forum.failure_context()
         assert (
-            lineage_after["native_agent_name"] == lineage_before["native_agent_name"]
+            lineage_after["agent_name"] == lineage_before["agent_name"]
         ), live_tg_forum.failure_context()
         assert lineage_after["root_team_key"] == lineage_before["root_team_key"], live_tg_forum.failure_context()
 
@@ -2810,7 +3234,7 @@ class TestTelegramLiveSmoke:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=root_thread_id,
-            recipient=grandchild_lineage["native_agent_name"],
+            recipient=grandchild_lineage["agent_name"],
             content=restart_inbox_token,
             ack_token=f"RESTART-SENT-INBOX-{tag}",
             summary="restart-post",
@@ -2939,13 +3363,13 @@ class TestTelegramLiveSmoke:
             timeout=300.0,
         )
 
-        expected_native_agent_name = native_agent_name_for_lineage((original_root_title, child_alias))
-        renamed_native_agent_name = native_agent_name_for_lineage((f"Visible Root Renamed {tag}", child_alias))
-        if renamed_native_agent_name != expected_native_agent_name:
+        expected_agent_name = agent_name_for_lineage((original_root_title, child_alias))
+        renamed_agent_name = agent_name_for_lineage((f"Visible Root Renamed {tag}", child_alias))
+        if renamed_agent_name != expected_agent_name:
             delivered_wrong = await _send_inbox_message_and_expect_outcome(
                 live_tg_forum,
                 sender_thread_id=root_thread_id,
-                recipient=renamed_native_agent_name,
+                recipient=renamed_agent_name,
                 content=f"RENAME-WRONG-INBOX-{tag}",
                 delivered_token=f"RENAME-WRONG-DELIVERED-{tag}",
                 undelivered_token=f"RENAME-WRONG-UNDELIVERED-{tag}",
@@ -2960,7 +3384,7 @@ class TestTelegramLiveSmoke:
         await _send_inbox_message_and_wait_ack(
             live_tg_forum,
             sender_thread_id=root_thread_id,
-            recipient=expected_native_agent_name,
+            recipient=expected_agent_name,
             content=(
                 "This is a deterministic teammate instruction after rename and resume. "
                 f"Reply with only {inbox_token}."
@@ -3045,7 +3469,7 @@ class TestTelegramLiveSmoke:
                 _send_inbox_message_and_wait_ack(
                     live_tg_forum,
                     sender_thread_id=sender_thread_id,
-                    recipient=target_lineage_before["native_agent_name"],
+                    recipient=target_lineage_before["agent_name"],
                     content=token,
                     ack_token=f"TERMINAL-PRE-SENT-{tag}-{index:02d}",
                     summary="terminal-pre",
@@ -3085,7 +3509,7 @@ class TestTelegramLiveSmoke:
                 _send_inbox_message_and_expect_outcome(
                     live_tg_forum,
                     sender_thread_id=sender_thread_id,
-                    recipient=target_lineage_before["native_agent_name"],
+                    recipient=target_lineage_before["agent_name"],
                     content=token,
                     delivered_token=f"TERMINAL-POST-DELIVERED-{tag}-{index:02d}",
                     undelivered_token=f"TERMINAL-POST-UNDELIVERED-{tag}-{index:02d}",
@@ -3098,8 +3522,7 @@ class TestTelegramLiveSmoke:
                 )
             ]
         )
-        # Always-deliver: messages go to inbox file even after /new replaces identity.
-        assert delivered_results == [True] * len(post_tokens), live_tg_forum.failure_context()
+        assert delivered_results == [False] * len(post_tokens), live_tg_forum.failure_context()
 
         final_check_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=target_thread_id)
         await live_tg_forum.platform.send(

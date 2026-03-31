@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from obs_agent.lineage import (
-    native_agent_name_for_lineage,
+    agent_name_for_lineage,
     root_team_key_for_lineage,
 )
 from obs_agent.tools import (
@@ -102,22 +102,17 @@ class TestMustReplyPingPongLoop:
 
 
 class TestAlwaysDeliver:
-    """Messages should ALWAYS deliver to inbox. The validator is advisory
-    (for wake attempts), not a gate that blocks delivery."""
+    """Unbound recipients should underdeliver explicitly instead of black-holing."""
 
-    def test_send_inbox_message_succeeds_even_when_validator_says_no(self):
-        """When the validator returns deliverable=False, the message
-        should still be written to the inbox file. Verify via source."""
+    def test_send_inbox_message_reports_underdelivery_on_validator_failure(self):
+        """Validator/notifier failure should produce an explicit underdelivery path."""
         source = (Path(__file__).resolve().parent.parent / "src" / "obs_agent" / "tools.py").read_text()
         # Find the _send_inbox_message function
         idx = source.find("async def _send_inbox_message(")
         assert idx > 0, "_send_inbox_message not found"
         func_source = source[idx : idx + 3000]
-        # The validator should NOT return an error — it should set
-        # a flag that controls wake behavior
-        assert "_recipient_wakeable" in func_source
-        # Old blocking pattern should be gone
-        assert "message undelivered" not in func_source
+        assert "message underdelivered" in func_source
+        assert "_rollback_written_message" in func_source
 
     def test_recipient_delivery_status_never_removes_mappings(self):
         """_recipient_delivery_status should be a pure read — no side effects.
@@ -186,7 +181,7 @@ class TestTrunkNaming:
 
     def test_trunk_agent_name_is_just_slug(self):
         """For trunk agents (single-element lineage), agent_name is just the slug."""
-        name = native_agent_name_for_lineage(("My Topic",))
+        name = agent_name_for_lineage(("My Topic",))
         assert name == "my-topic"
 
     def test_trunk_team_key_has_timestamp(self):
@@ -198,22 +193,22 @@ class TestTrunkNaming:
 
 
 # ---------------------------------------------------------------------------
-# BUG 6: AgentTask should return native_agent_name
+# BUG 6: AgentTask should return agent_name
 # ---------------------------------------------------------------------------
 
 
 class TestAgentTaskReturnsAgentName:
-    """AgentTask launch confirmation should include native_agent_name."""
+    """AgentTask launch confirmation should include agent_name."""
 
     def test_launch_text_includes_agent_name(self):
-        """_build_fork_task_launch_text should include native_agent_name."""
+        """_build_fork_task_launch_text should include agent_name."""
         from obs_agent.telegram import TelegramBot
 
-        # Check the function signature accepts native_agent_name
+        # Check the function signature accepts agent_name
         import inspect
 
         sig = inspect.signature(TelegramBot._build_fork_task_launch_text)
-        assert "native_agent_name" in sig.parameters
+        assert "agent_name" in sig.parameters
         assert "team_name" in sig.parameters
 
 
@@ -234,4 +229,4 @@ class TestReadInboxDefaults:
         func_source = source[idx : idx + 1000]
         # Should have fallback logic from bootstrap
         assert "bootstrap" in func_source
-        assert "native_agent_name" in func_source or "agent_name" in func_source
+        assert "agent_name" in func_source
