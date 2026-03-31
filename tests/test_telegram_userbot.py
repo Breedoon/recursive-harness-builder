@@ -322,3 +322,46 @@ async def test_finalize_joined_allowed_user_skips_self_userbot(monkeypatch, tmp_
     assert left is False
     resolve_target.assert_not_called()
     promote_admin.assert_not_called()
+
+
+async def test_finalize_joined_allowed_user_skips_when_userbot_already_left(monkeypatch, tmp_path: Path):
+    provisioner = TelegramUserbotProvisioner(config=None, env_path=tmp_path / ".env")
+    me = SimpleNamespace(id=111)
+    channel = SimpleNamespace(id=777, left=True)
+
+    class _FakeClient:
+        async def get_me(self):
+            return me
+
+        async def get_entity(self, entity):
+            if entity == -1000000000777:
+                return channel
+            return entity
+
+    class _FakeClientContext:
+        def __init__(self, client) -> None:
+            self._client = client
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = _FakeClient()
+    monkeypatch.setattr(provisioner, "_ensure_available", lambda: None)
+    monkeypatch.setattr(provisioner, "_client", lambda: _FakeClientContext(client))
+    resolve_target = AsyncMock()
+    promote_admin = AsyncMock()
+    monkeypatch.setattr(provisioner, "_resolve_target_user", resolve_target)
+    monkeypatch.setattr(provisioner, "_promote_admin", promote_admin)
+
+    left = await provisioner.finalize_joined_allowed_user(
+        chat_id=-1000000000777,
+        joined_user_id=222,
+        joined_username="produser",
+    )
+
+    assert left is False
+    resolve_target.assert_not_called()
+    promote_admin.assert_not_called()

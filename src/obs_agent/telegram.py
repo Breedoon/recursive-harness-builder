@@ -4488,6 +4488,11 @@ class TelegramBot:
             chat_title = getattr(chat, "title", None)
             if isinstance(chat_title, str) and chat_title.strip():
                 self._chat_titles[message.chat_id] = chat_title.strip()
+        await self._maybe_finalize_joined_allowed_user(
+            chat_id=message.chat_id,
+            joined_user_id=user_id,
+            joined_username=self._coerce_username(update.effective_user),
+        )
         route = self._route_for_message(message)
         state = self._get_state(route)
         if state is not None:
@@ -6634,6 +6639,37 @@ class TelegramBot:
         _ = context
         self._update_topic_metadata_from_update(update)
 
+    async def _maybe_finalize_joined_allowed_user(
+        self,
+        *,
+        chat_id: int,
+        joined_user_id: int,
+        joined_username: str | None,
+    ) -> bool:
+        if chat_id >= 0:
+            return False
+        provisioner = self._build_userbot_provisioner()
+        try:
+            left = await provisioner.finalize_joined_allowed_user(
+                chat_id=chat_id,
+                joined_user_id=joined_user_id,
+                joined_username=joined_username,
+            )
+        except Exception:
+            logger.exception(
+                "Failed finalizing joined allowed user chat_id=%s joined_user_id=%s",
+                chat_id,
+                joined_user_id,
+            )
+            return False
+        if left:
+            logger.info(
+                "Userbot left chat_id=%s after allowed user_id=%s joined",
+                chat_id,
+                joined_user_id,
+            )
+        return left
+
     async def handle_new_chat_members(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -6655,27 +6691,11 @@ class TelegramBot:
         if joined_allowed_user is None:
             return
 
-        provisioner = self._build_userbot_provisioner()
-        joined_user_id = int(joined_allowed_user.id)
-        try:
-            left = await provisioner.finalize_joined_allowed_user(
-                chat_id=message.chat_id,
-                joined_user_id=joined_user_id,
-                joined_username=self._coerce_username(joined_allowed_user),
-            )
-        except Exception:
-            logger.exception(
-                "Failed finalizing joined allowed user chat_id=%s joined_user_id=%s",
-                message.chat_id,
-                joined_user_id,
-            )
-            return
-        if left:
-            logger.info(
-                "Userbot left chat_id=%s after allowed user_id=%s joined",
-                message.chat_id,
-                joined_user_id,
-            )
+        await self._maybe_finalize_joined_allowed_user(
+            chat_id=message.chat_id,
+            joined_user_id=int(joined_allowed_user.id),
+            joined_username=self._coerce_username(joined_allowed_user),
+        )
 
     async def _drop_route_state(
         self,

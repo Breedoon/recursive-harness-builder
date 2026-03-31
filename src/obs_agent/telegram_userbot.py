@@ -272,6 +272,8 @@ class TelegramUserbotProvisioner:
                 return False
 
             channel = await client.get_entity(int(chat_id))
+            if bool(getattr(channel, "left", False)):
+                return False
             joined_entity = await self._resolve_target_user(
                 client,
                 default_user_id=joined_user_id,

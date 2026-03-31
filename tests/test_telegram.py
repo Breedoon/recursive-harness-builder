@@ -5716,13 +5716,12 @@ class TestTelegramProvisioningCommands:
         update = _make_update("", user_id=999, chat_id=-100777)
         update.effective_message.new_chat_members = [SimpleNamespace(id=12345, username="breedooon")]
         ctx = _make_context()
-        provisioner = MagicMock()
-        provisioner.finalize_joined_allowed_user = AsyncMock(return_value=True)
+        finalize_mock = AsyncMock(return_value=True)
 
-        with patch.object(bot, "_build_userbot_provisioner", return_value=provisioner):
+        with patch.object(bot, "_maybe_finalize_joined_allowed_user", new=finalize_mock):
             await bot.handle_new_chat_members(update, ctx)
 
-        provisioner.finalize_joined_allowed_user.assert_awaited_once_with(
+        finalize_mock.assert_awaited_once_with(
             chat_id=-100777,
             joined_user_id=12345,
             joined_username="breedooon",
@@ -5734,13 +5733,34 @@ class TestTelegramProvisioningCommands:
         update = _make_update("", user_id=999, chat_id=-100777)
         update.effective_message.new_chat_members = [SimpleNamespace(id=67890, username="someoneelse")]
         ctx = _make_context()
-        provisioner = MagicMock()
-        provisioner.finalize_joined_allowed_user = AsyncMock()
+        finalize_mock = AsyncMock()
 
-        with patch.object(bot, "_build_userbot_provisioner", return_value=provisioner):
+        with patch.object(bot, "_maybe_finalize_joined_allowed_user", new=finalize_mock):
             await bot.handle_new_chat_members(update, ctx)
 
-        provisioner.finalize_joined_allowed_user.assert_not_called()
+        finalize_mock.assert_not_called()
+
+    async def test_handle_message_finalizes_joined_allowed_user_for_group_message(self, config):
+        config.telegram_allowed_user_ids = [12345]
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("hello", user_id=12345, chat_id=-100777)
+        update.effective_user.username = "breedoon"
+        ctx = _make_context()
+
+        with (
+            patch.object(bot, "_ensure_background_poller", new=AsyncMock()) as ensure_poller,
+            patch.object(bot, "_maybe_finalize_joined_allowed_user", new=AsyncMock()) as finalize_mock,
+            patch.object(bot._fragment_buffer, "add", new=AsyncMock()) as fragment_add,
+        ):
+            await bot.handle_message(update, ctx)
+
+        ensure_poller.assert_awaited_once_with(ctx.bot)
+        finalize_mock.assert_awaited_once_with(
+            chat_id=-100777,
+            joined_user_id=12345,
+            joined_username="breedoon",
+        )
+        fragment_add.assert_awaited_once_with(update, ctx)
 
 
 class TestTelegramSenderSelection:
