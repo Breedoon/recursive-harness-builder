@@ -765,6 +765,8 @@ class TelegramBot:
         self._chat_pending_ops[chat_id] = remaining
 
     def _sender_candidates(self, *, fallback_bot: Any | None, chat_id: int) -> list[Any]:
+        if fallback_bot is not None and chat_id > 0:
+            return [fallback_bot]
         candidates: list[Any] = []
         if fallback_bot is not None:
             candidates.append(fallback_bot)
@@ -5100,6 +5102,14 @@ class TelegramBot:
             return
 
         route = self._route_for_message(update.effective_message)
+        started_text = self._userbot_command_started_text(action_name)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=started_text,
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
         try:
             result_text = await command_cb()
         except Exception as exc:
@@ -5112,6 +5122,16 @@ class TelegramBot:
             disable_notification=True,
             reply_to_message_id=update.effective_message.message_id,
         )
+
+    def _userbot_command_started_text(self, action_name: str) -> str:
+        normalized = action_name.strip().lower()
+        if normalized == "new bot":
+            wait_target = "BotFather"
+        elif normalized == "new group":
+            wait_target = "Telegram"
+        else:
+            wait_target = "Telegram"
+        return f"{action_name} started: waiting on {wait_target}; this can take a bit"
 
     def _build_userbot_provisioner(self) -> TelegramUserbotProvisioner:
         return TelegramUserbotProvisioner(self._config)

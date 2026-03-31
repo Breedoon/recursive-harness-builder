@@ -5678,7 +5678,11 @@ class TestTelegramProvisioningCommands:
             context=ctx,
             raw_args="Provisioned Group",
         )
-        assert "created group: Provisioned Group" in send_mock.await_args.kwargs["text"]
+        assert send_mock.await_count == 2
+        started_text = send_mock.await_args_list[0].kwargs["text"]
+        completed_text = send_mock.await_args_list[1].kwargs["text"]
+        assert "new group started" in started_text
+        assert "created group: Provisioned Group" in completed_text
 
     async def test_new_bot_delegates_to_userbot_helper(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -5700,7 +5704,27 @@ class TestTelegramProvisioningCommands:
             context=ctx,
             raw_args=None,
         )
-        assert "created bot: ClaudiaObsTest123Bot" in send_mock.await_args.kwargs["text"]
+        assert send_mock.await_count == 2
+        started_text = send_mock.await_args_list[0].kwargs["text"]
+        completed_text = send_mock.await_args_list[1].kwargs["text"]
+        assert "new bot started" in started_text
+        assert "created bot: ClaudiaObsTest123Bot" in completed_text
+
+
+class TestTelegramSenderSelection:
+    def test_private_chat_uses_primary_bot_only(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        primary = object()
+        secondary_a = object()
+        secondary_b = object()
+        bot._sender_bots = [secondary_a, secondary_b]
+
+        candidates = bot._sender_candidates(
+            fallback_bot=primary,
+            chat_id=5129431382,
+        )
+
+        assert candidates == [primary]
 
 
 class TestRunTelegramBotSupervisor:

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
-from obs_agent.telegram_userbot import append_profile_bot_token
+from obs_agent.telegram_userbot import TelegramUserbotProvisioner, append_profile_bot_token
 
 
 def test_append_profile_bot_token_seeds_primary_and_appends(monkeypatch, tmp_path: Path):
@@ -59,3 +60,69 @@ def test_append_profile_bot_token_dedupes_existing_values(monkeypatch, tmp_path:
 
     assert tokens == ["primary-token", "secondary-token"]
     assert env_path.read_text(encoding="utf-8").count("secondary-token") == 1
+
+
+@dataclass
+class _FakeBotfatherMessage:
+    id: int
+    message: str
+    out: bool = False
+
+
+class _FakeBotfatherClient:
+    def __init__(self, messages: list[_FakeBotfatherMessage]) -> None:
+        self._messages = messages
+
+    async def iter_messages(self, peer, limit: int = 12):
+        _ = peer, limit
+        for message in self._messages:
+            yield message
+
+
+async def test_wait_for_bot_reply_ignores_non_matching_stale_messages(tmp_path: Path):
+    provisioner = TelegramUserbotProvisioner(config=None, env_path=tmp_path / ".env")
+    client = _FakeBotfatherClient(
+        [
+            _FakeBotfatherMessage(id=14, message="Choose a name for your bot."),
+            _FakeBotfatherMessage(id=13, message="Privacy mode disabled for @oldbot."),
+            _FakeBotfatherMessage(id=12, message="Older baseline"),
+        ]
+    )
+
+    response = await provisioner._wait_for_bot_reply(
+        client,
+        peer=object(),
+        after_id=12,
+        timeout=0.1,
+        match_text=lambda text: "name for your bot" in text.lower(),
+        settle_seconds=0.0,
+    )
+
+    assert response == "Choose a name for your bot."
+
+
+async def test_wait_for_bot_reply_surfaces_botfather_rate_limit(tmp_path: Path):
+    provisioner = TelegramUserbotProvisioner(config=None, env_path=tmp_path / ".env")
+    client = _FakeBotfatherClient(
+        [
+            _FakeBotfatherMessage(
+                id=14,
+                message="Sorry, too many attempts. Please try again in 54722 seconds.",
+            ),
+            _FakeBotfatherMessage(id=12, message="Older baseline"),
+        ]
+    )
+
+    try:
+        await provisioner._wait_for_bot_reply(
+            client,
+            peer=object(),
+            after_id=12,
+            timeout=0.1,
+            settle_seconds=0.0,
+        )
+    except RuntimeError as exc:
+        assert "BotFather rate limit" in str(exc)
+        assert "too many attempts" in str(exc).lower()
+    else:
+        raise AssertionError("Expected BotFather rate limit to raise RuntimeError")

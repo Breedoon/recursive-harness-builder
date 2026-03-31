@@ -10,7 +10,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import httpx
 
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
 
 try:  # pragma: no cover - optional import path exercised in integration
-    from telethon import TelegramClient
+    from telethon import TelegramClient, events
     from telethon.sessions import StringSession
     from telethon.tl.functions.channels import (
         CreateChannelRequest,
@@ -33,6 +33,7 @@ try:  # pragma: no cover - optional import path exercised in integration
     from telethon.utils import get_peer_id
 except Exception:  # pragma: no cover - absence handled at runtime
     TelegramClient = None
+    events = None
     StringSession = None
     CreateChannelRequest = None
     EditAdminRequest = None
@@ -243,8 +244,30 @@ class TelegramUserbotProvisioner:
             token: str | None = None
             botfather = await client.get_entity("BotFather")
             await self._reset_botfather(client, botfather)
-            await self._botfather_exchange(client, botfather, "/newbot", timeout=30.0)
-            await self._botfather_exchange(client, botfather, display_name, timeout=30.0)
+            await self._botfather_exchange(
+                client,
+                botfather,
+                "/newbot",
+                timeout=30.0,
+                match_text=self._text_matches_any(
+                    "choose a name",
+                    "how are we going to call it",
+                    "send me the name",
+                    "bot's name",
+                    "name for your bot",
+                ),
+            )
+            await self._botfather_exchange(
+                client,
+                botfather,
+                display_name,
+                timeout=30.0,
+                match_text=self._text_matches_any(
+                    "choose a username",
+                    "username",
+                    "t.me/",
+                ),
+            )
 
             last_response_text = ""
             for attempt in range(5):
@@ -254,6 +277,7 @@ class TelegramUserbotProvisioner:
                     botfather,
                     candidate,
                     timeout=45.0,
+                    match_text=self._is_bot_creation_reply,
                 )
                 last_response_text = response_text
                 maybe_token = self._extract_token(response_text)
@@ -434,6 +458,12 @@ class TelegramUserbotProvisioner:
                 botfather,
                 "/cancel",
                 timeout=8.0,
+                match_text=self._text_matches_any(
+                    "cancelled",
+                    "canceled",
+                    "no operation",
+                    "nothing to cancel",
+                ),
             )
         except Exception:
             return
@@ -445,16 +475,44 @@ class TelegramUserbotProvisioner:
         text: str,
         *,
         timeout: float,
+        match_text: Callable[[str], bool] | None = None,
     ) -> str:
         baseline_id = await self._latest_peer_message_id(client, botfather)
-        await client.send_message(botfather, text)
-        response = await self._wait_for_bot_reply(
-            client,
-            botfather,
-            after_id=baseline_id,
-            timeout=timeout,
-        )
-        return response
+        event_queue: asyncio.Queue[tuple[int, str]] | None = None
+        handler = None
+
+        if events is not None:
+            event_queue = asyncio.Queue()
+
+            async def _handler(event) -> None:
+                message = getattr(event, "message", None)
+                if message is None:
+                    return
+                message_id = int(getattr(message, "id", 0) or 0)
+                if message_id <= baseline_id:
+                    return
+                if bool(getattr(message, "out", False)):
+                    return
+                payload = str(getattr(message, "message", "") or "")
+                event_queue.put_nowait((message_id, payload))
+
+            handler = _handler
+            client.add_event_handler(handler, events.NewMessage(chats=botfather))
+
+        try:
+            await client.send_message(botfather, text)
+            response = await self._wait_for_bot_reply(
+                client,
+                botfather,
+                after_id=baseline_id,
+                timeout=timeout,
+                match_text=match_text,
+                event_queue=event_queue,
+            )
+            return response
+        finally:
+            if handler is not None:
+                client.remove_event_handler(handler)
 
     async def _latest_peer_message_id(self, client: TelegramClient, peer: Any) -> int:
         async for message in client.iter_messages(peer, limit=1):
@@ -468,23 +526,65 @@ class TelegramUserbotProvisioner:
         *,
         after_id: int,
         timeout: float,
+        match_text: Callable[[str], bool] | None = None,
+        settle_seconds: float = 0.75,
+        event_queue: asyncio.Queue[tuple[int, str]] | None = None,
     ) -> str:
         deadline = time.monotonic() + timeout
+        if event_queue is not None:
+            latest_match: tuple[int, str] | None = None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Timed out waiting for BotFather reply after sending message")
+                wait_timeout = remaining if latest_match is None else min(max(settle_seconds, 0.0), remaining)
+                if latest_match is not None and settle_seconds <= 0:
+                    return latest_match[1]
+                try:
+                    message_id, text = await asyncio.wait_for(event_queue.get(), timeout=wait_timeout)
+                except asyncio.TimeoutError:
+                    if latest_match is not None:
+                        return latest_match[1]
+                    raise RuntimeError("Timed out waiting for BotFather reply after sending message") from None
+                if message_id <= after_id:
+                    continue
+                if self._is_botfather_rate_limited(text):
+                    raise RuntimeError(f"BotFather rate limit: {text}")
+                if match_text is not None and not match_text(text):
+                    continue
+                if latest_match is None or message_id > latest_match[0]:
+                    latest_match = (message_id, text)
+
+        last_seen_inbound_id = after_id
+        last_progress_at = time.monotonic()
         while True:
             newest_match: tuple[int, str] | None = None
+            newest_inbound_id = after_id
             async for message in client.iter_messages(peer, limit=12):
                 if int(message.id) <= after_id:
                     continue
                 if bool(getattr(message, "out", False)):
                     continue
                 text = str(getattr(message, "message", "") or "")
-                if newest_match is None or int(message.id) < newest_match[0]:
-                    newest_match = (int(message.id), text)
-            if newest_match is not None:
+                message_id = int(message.id)
+                if message_id > newest_inbound_id:
+                    newest_inbound_id = message_id
+                if self._is_botfather_rate_limited(text):
+                    raise RuntimeError(f"BotFather rate limit: {text}")
+                if match_text is not None and not match_text(text):
+                    continue
+                if newest_match is None or message_id > newest_match[0]:
+                    newest_match = (message_id, text)
+            if newest_inbound_id > last_seen_inbound_id:
+                last_seen_inbound_id = newest_inbound_id
+                last_progress_at = time.monotonic()
+            if newest_match is not None and time.monotonic() - last_progress_at >= settle_seconds:
+                return newest_match[1]
+            if newest_match is not None and settle_seconds <= 0:
                 return newest_match[1]
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"Timed out waiting for BotFather reply after sending message")
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
 
     async def _configure_botfather_toggle(
         self,
@@ -497,9 +597,43 @@ class TelegramUserbotProvisioner:
     ) -> bool:
         try:
             await self._reset_botfather(client, botfather)
-            await self._botfather_exchange(client, botfather, command, timeout=20.0)
-            await self._botfather_exchange(client, botfather, f"@{bot_username}", timeout=20.0)
-            response = await self._botfather_exchange(client, botfather, choice, timeout=20.0)
+            await self._botfather_exchange(
+                client,
+                botfather,
+                command,
+                timeout=20.0,
+                match_text=self._text_matches_any(
+                    "choose a bot",
+                    "send me the bot",
+                    "which bot",
+                    "select a bot",
+                ),
+            )
+            await self._botfather_exchange(
+                client,
+                botfather,
+                f"@{bot_username}",
+                timeout=20.0,
+                match_text=self._text_matches_any(
+                    choice.lower(),
+                    "enable",
+                    "disable",
+                    "privacy",
+                    "groups",
+                ),
+            )
+            response = await self._botfather_exchange(
+                client,
+                botfather,
+                choice,
+                timeout=20.0,
+                match_text=self._text_matches_any(
+                    "enabled",
+                    "disabled",
+                    "success",
+                    "updated",
+                ),
+            )
             text = response.lower()
             return "enabled" in text or "disabled" in text or "success" in text or "updated" in text
         except Exception:
@@ -532,3 +666,29 @@ class TelegramUserbotProvisioner:
         if not match:
             return None
         return match.group(1)
+
+    def _text_matches_any(self, *needles: str) -> Callable[[str], bool]:
+        normalized = tuple(needle.lower() for needle in needles if needle)
+
+        def _matcher(text: str) -> bool:
+            lowered = (text or "").lower()
+            return any(needle in lowered for needle in normalized)
+
+        return _matcher
+
+    def _is_bot_creation_reply(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return self._extract_token(text) is not None or any(
+            needle in lowered
+            for needle in (
+                "already taken",
+                "another username",
+                "must end in bot",
+                "is invalid",
+                "sorry",
+            )
+        )
+
+    def _is_botfather_rate_limited(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return "too many attempts" in lowered or "try again in" in lowered
