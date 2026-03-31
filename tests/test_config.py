@@ -352,3 +352,18 @@ class TestTelegramSettings:
         monkeypatch.setenv("OBS_TELEGRAM_TRANSCRIPTION_SCRIPT", str(script))
         cfg = OBSConfig.from_env()
         assert cfg.telegram_transcription_script == script
+
+    def test_userbot_api_id_from_env(self, monkeypatch):
+        monkeypatch.setenv("OBS_TELEGRAM_USERBOT_API_ID", "123456")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_userbot_api_id == 123456
+
+    def test_userbot_api_hash_from_env(self, monkeypatch):
+        monkeypatch.setenv("OBS_TELEGRAM_USERBOT_API_HASH", "hash-xyz")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_userbot_api_hash == "hash-xyz"
+
+    def test_userbot_session_from_env(self, monkeypatch):
+        monkeypatch.setenv("OBS_TELEGRAM_USERBOT_SESSION", "session-xyz")
+        cfg = OBSConfig.from_env()
+        assert cfg.telegram_userbot_session == "session-xyz"

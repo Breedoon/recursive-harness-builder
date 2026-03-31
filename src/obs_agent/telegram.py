@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import re
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -61,6 +62,7 @@ from obs_agent.session import SessionManager
 from obs_agent.telegram_format import md_to_telegram_html, split_message
 from obs_agent.telegram_ingest import TelegramInboundNormalizer
 from obs_agent.telegram_state_store import TelegramStateStore
+from obs_agent.telegram_userbot import TelegramUserbotProvisioner
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -134,6 +136,9 @@ _RANDOM_TOPIC_WORDS = (
     "tidal",
     "willow",
 )
+
+_NEW_GROUP_ALIAS_PATTERN = r"^/new-group(?:@[A-Za-z0-9_]+)?(?:\s|$)"
+_NEW_BOT_ALIAS_PATTERN = r"^/new-bot(?:@[A-Za-z0-9_]+)?(?:\s|$)"
 
 
 # ---------------------------------------------------------------------------
@@ -4869,6 +4874,20 @@ class TelegramBot:
         """Handle /new - reset current topic into a new trunk identity."""
         if update.effective_user is None or update.effective_message is None:
             return
+        first_arg = str(context.args[0]).strip().lower() if context.args else ""
+        if first_arg == "-group":
+            await self.handle_new_group_alias(update, context)
+            return
+        if first_arg == "-bot":
+            await self.handle_new_bot_alias(update, context)
+            return
+        raw_text = str(getattr(update.effective_message, "text", "") or "").strip()
+        if re.match(_NEW_GROUP_ALIAS_PATTERN, raw_text):
+            await self.handle_new_group_alias(update, context)
+            return
+        if re.match(_NEW_BOT_ALIAS_PATTERN, raw_text):
+            await self.handle_new_bot_alias(update, context)
+            return
         if not self._is_authorized(update.effective_user.id):
             return
 
@@ -4918,6 +4937,246 @@ class TelegramBot:
             text=f"new trunk session created: {topic_label}",
             disable_notification=True,
         )
+
+    async def handle_new_group(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /new_group - provision a fresh forum supergroup via the userbot."""
+        raw_args = self._extract_command_args(
+            update,
+            context,
+            command_names=("new_group",),
+        )
+        await self._run_userbot_command(
+            update,
+            context,
+            action_name="new group",
+            command_cb=lambda: self._provision_new_group(
+                update=update,
+                context=context,
+                raw_args=raw_args,
+            ),
+        )
+
+    async def handle_new_group_alias(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /new-group raw-text alias."""
+        raw_args = self._extract_command_args(
+            update,
+            context,
+            command_names=("new-group", "new_group"),
+        )
+        await self._run_userbot_command(
+            update,
+            context,
+            action_name="new group",
+            command_cb=lambda: self._provision_new_group(
+                update=update,
+                context=context,
+                raw_args=raw_args,
+            ),
+        )
+
+    async def handle_new_bot(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /new_bot - create a new sender bot via BotFather."""
+        raw_args = self._extract_command_args(
+            update,
+            context,
+            command_names=("new_bot",),
+        )
+        await self._run_userbot_command(
+            update,
+            context,
+            action_name="new bot",
+            command_cb=lambda: self._provision_new_bot(
+                update=update,
+                context=context,
+                raw_args=raw_args,
+            ),
+        )
+
+    async def handle_new_bot_alias(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /new-bot raw-text alias."""
+        raw_args = self._extract_command_args(
+            update,
+            context,
+            command_names=("new-bot", "new_bot"),
+        )
+        await self._run_userbot_command(
+            update,
+            context,
+            action_name="new bot",
+            command_cb=lambda: self._provision_new_bot(
+                update=update,
+                context=context,
+                raw_args=raw_args,
+            ),
+        )
+
+    def _extract_command_args(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        command_names: tuple[str, ...],
+    ) -> str | None:
+        joined = " ".join(context.args).strip()
+        if joined:
+            return joined
+        message = update.effective_message
+        if message is None:
+            return None
+        text = str(getattr(message, "text", "") or "").strip()
+        for command_name in command_names:
+            pattern = rf"^/{re.escape(command_name)}(?:@[A-Za-z0-9_]+)?(?:\s+(.*))?\s*$"
+            match = re.match(pattern, text)
+            if match:
+                extracted = (match.group(1) or "").strip()
+                return extracted or None
+        return None
+
+    async def _run_userbot_command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        action_name: str,
+        command_cb,
+    ) -> None:
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+
+        route = self._route_for_message(update.effective_message)
+        try:
+            result_text = await command_cb()
+        except Exception as exc:
+            logger.exception("Telegram %s failed", action_name)
+            result_text = f"{action_name} failed: {exc}"
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=result_text,
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
+
+    def _build_userbot_provisioner(self) -> TelegramUserbotProvisioner:
+        return TelegramUserbotProvisioner(self._config)
+
+    def _coerce_username(self, user: Any) -> str | None:
+        username = getattr(user, "username", None)
+        if not isinstance(username, str):
+            return None
+        normalized = username.lstrip("@").strip()
+        return normalized or None
+
+    def _parse_new_group_request(self, raw_args: str | None) -> tuple[str | None, str]:
+        if not raw_args or not raw_args.strip():
+            raise RuntimeError("group title required: /new-group <group title>")
+        try:
+            parts = shlex.split(raw_args)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid /new-group arguments: {exc}") from exc
+
+        target_override: str | None = None
+        idx = 0
+        while idx < len(parts) and parts[idx].startswith("--"):
+            option = parts[idx]
+            if option == "--user":
+                if idx + 1 >= len(parts):
+                    raise RuntimeError("--user requires @handle or numeric id")
+                target_override = parts[idx + 1].strip()
+                idx += 2
+                continue
+            if option.startswith("--user="):
+                target_override = option.partition("=")[2].strip()
+                idx += 1
+                continue
+            raise RuntimeError(f"unsupported /new-group option: {option}")
+
+        title = " ".join(parts[idx:]).strip()
+        if not title:
+            raise RuntimeError("group title required: /new-group <group title>")
+        return target_override, title
+
+    async def _provision_new_group(
+        self,
+        *,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        raw_args: str | None,
+    ) -> str:
+        if update.effective_user is None:
+            raise RuntimeError("missing effective user")
+        target_override, title = self._parse_new_group_request(raw_args)
+        provisioner = self._build_userbot_provisioner()
+        result = await provisioner.create_group(
+            title=title,
+            default_user_id=update.effective_user.id,
+            default_username=self._coerce_username(update.effective_user),
+            target_override=target_override,
+        )
+        target_label = (
+            f"@{result.target_username}" if result.target_username
+            else str(result.target_user_id) if result.target_user_id is not None
+            else "unknown"
+        )
+        bot_label = ", ".join(f"@{username}" for username in result.added_bot_usernames) or "none"
+        leave_label = "userbot left after setup" if result.creator_left else "userbot stayed as owner"
+        layout_label = "list" if not result.forum_tabs_enabled else "tabs"
+        return (
+            f"created group: {result.title} "
+            f"(chat_id={result.chat_id}; target={target_label}; bots={bot_label}; forum_layout={layout_label}; {leave_label})"
+        )
+
+    async def _provision_new_bot(
+        self,
+        *,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        raw_args: str | None,
+    ) -> str:
+        _ = update, context
+        display_name = (raw_args or "").strip() or "Claudia"
+        provisioner = self._build_userbot_provisioner()
+        created = await provisioner.create_bot(display_name=display_name)
+        await self._register_secondary_sender_bot(created.token)
+        groups_text = "enabled" if created.groups_enabled else "not confirmed"
+        privacy_text = "disabled" if created.privacy_disabled else "not confirmed"
+        return (
+            f"created bot: {created.username} "
+            f"(display_name={created.display_name}; env_key={created.env_key}; groups={groups_text}; privacy={privacy_text})"
+        )
+
+    async def _register_secondary_sender_bot(self, token: str) -> None:
+        primary = self._config.telegram_primary_bot_token
+        if token == primary:
+            return
+        if token in self._config.telegram_bot_tokens:
+            return
+        await self._ensure_sender_pool()
+        self._config.telegram_bot_tokens.append(token)
+        new_sender = Bot(token=token)
+        try:
+            await new_sender.delete_my_commands()
+        except Exception:
+            logger.warning("Failed clearing commands on newly created secondary bot", exc_info=True)
+        self._sender_bots.append(new_sender)
 
     async def handle_unschedule(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -8341,6 +8600,8 @@ def create_telegram_app(config: OBSConfig) -> Application:
     )
     app.add_handler(CommandHandler("clear", bot.handle_clear))
     app.add_handler(CommandHandler("new", bot.handle_new))
+    app.add_handler(CommandHandler("new_group", bot.handle_new_group))
+    app.add_handler(CommandHandler("new_bot", bot.handle_new_bot))
     app.add_handler(CommandHandler("unschedule", bot.handle_unschedule))
     app.add_handler(CommandHandler("stop", bot.handle_stop))
     app.add_handler(CommandHandler("context", bot.handle_context))
@@ -8350,6 +8611,18 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("tree_ancestors", bot.handle_tree_ancestors))
     app.add_handler(CommandHandler("fork", bot.handle_fork))
     app.add_handler(CommandHandler("delete", bot.handle_delete))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(_NEW_GROUP_ALIAS_PATTERN),
+            bot.handle_new_group_alias,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(_NEW_BOT_ALIAS_PATTERN),
+            bot.handle_new_bot_alias,
+        )
+    )
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, bot.handle_forum_topic_created))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED, bot.handle_forum_topic_edited))
     inbound_filter = (
@@ -8375,6 +8648,8 @@ async def _set_bot_commands(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("clear", "Clear this topic but keep its agent identity; use '/clear all' for the whole group"),
         BotCommand("new", "Reset this topic into a new trunk agent; optional: /new [emoji] [name]"),
+        BotCommand("new_group", "Create a new forum supergroup and add the configured OBS bots"),
+        BotCommand("new_bot", "Create a new Claudia sender bot through BotFather"),
         BotCommand("unschedule", "Remove schedule(s) from this topic; use /unschedule all"),
         BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
         BotCommand("context", "Show session and context window info"),
@@ -8385,6 +8660,15 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("fork", "Create a new topic from this head or replied message"),
         BotCommand("delete", "Delete this topic; use '/delete all' to remove all non-General topics"),
     ])
+
+
+async def _clear_secondary_bot_commands(config: OBSConfig) -> None:
+    """Clear stale official command menus from secondary sender bots."""
+    for token in config.telegram_sender_bot_tokens[1:]:
+        try:
+            await Bot(token=token).delete_my_commands()
+        except Exception:
+            logger.warning("Failed clearing commands on secondary sender bot", exc_info=True)
 
 
 _TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS = 0.5
@@ -8428,6 +8712,7 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
         await tg_bot.initialize_runtime()
         await app.initialize()
         await tg_bot._ensure_background_poller(app.bot)
+        await _clear_secondary_bot_commands(config)
         await _set_bot_commands(app)
         await app.start()
         drop_pending_updates = (

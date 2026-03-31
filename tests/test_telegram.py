@@ -32,8 +32,10 @@ from obs_agent.telegram import (
     _TopicScheduleRecord,
     _RunOutcome,
     _TelegramMessageBinding,
+    _clear_secondary_bot_commands,
     create_reply_wake_schedule,
     create_telegram_app,
+    _set_bot_commands,
     run_telegram_bot,
 )
 
@@ -388,7 +390,7 @@ class TestTelegramMessageFlow:
         assert calls[2]["disable_notification"] is True
         assert "<i>Read: CLAUDE.md</i>" in calls[2]["text"]
         assert "Hello from tool run" in calls[2]["text"]
-        assert calls[3]["text"] == "<u><i>context: 0 / 200k</i></u>"
+        assert calls[3]["text"] == "<u><i>context: 0 / 1m</i></u>"
         assert calls[3]["disable_notification"] is False
 
     async def test_thinking_content_is_rendered_verbatim(self, config):
@@ -509,7 +511,7 @@ class TestTelegramMessageFlow:
         assert calls[1] == "<u><i>working</i></u>"
         assert "turn one" in calls[2]
         assert "turn two" in calls[3]
-        assert calls[4] == "<u><i>context: 0 / 200k</i></u>"
+        assert calls[4] == "<u><i>context: 0 / 1m</i></u>"
 
     async def test_completion_summary_omits_username_when_configured(self, config):
         config.telegram_notify_username = "breedoon"
@@ -531,7 +533,7 @@ class TestTelegramMessageFlow:
             await bot.handle_message(update, ctx)
 
         calls = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
-        assert calls[-1] == "<u><i>context: 0 / 200k</i></u>"
+        assert calls[-1] == "<u><i>context: 0 / 1m</i></u>"
 
     async def test_attachment_receipt_is_sent_before_normalization(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -3669,7 +3671,7 @@ class TestForkTaskRuntime:
         assert record.child_session_id == "sid-child"
         assert record.launch_child_message_id == 900
         assert record.launch_parent_message_id == 902
-        assert record.max_turns == 9
+        assert record.max_turns is None
         assert task_id in state.active_fork_task_ids
         send_calls = state.last_bot.send_message.await_args_list
         assert "fork task launched by agent" in send_calls[0].kwargs["text"]
@@ -5294,17 +5296,17 @@ class TestForkTaskRuntime:
         config.bg_fork_timeout = 600.0
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
 
-        assert bot._coerce_timeout_ms(None) == 600_000
-        assert bot._coerce_timeout_ms(120_000) == 600_000
-        assert bot._coerce_timeout_ms("300000") == 600_000
+        assert bot._coerce_timeout_ms(None) is None
+        assert bot._coerce_timeout_ms(120_000) == 120_000
+        assert bot._coerce_timeout_ms("300000") == 300_000
         assert bot._coerce_timeout_ms(900_000) == 900_000
 
     def test_coerce_timeout_ms_respects_custom_default_floor(self, config):
         config.bg_fork_timeout = 300.0
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
 
-        assert bot._coerce_timeout_ms(None) == 300_000
-        assert bot._coerce_timeout_ms(120_000) == 300_000
+        assert bot._coerce_timeout_ms(None) is None
+        assert bot._coerce_timeout_ms(120_000) == 120_000
         assert bot._coerce_timeout_ms(450_000) == 450_000
 
     async def test_resolve_fork_source_falls_back_to_latest_persisted_uuid(self, config, tmp_path):
@@ -5524,6 +5526,181 @@ class TestCreateTelegramApp:
         config.telegram_allowed_user_ids = [12345]
         app = create_telegram_app(config)
         assert app is not None
+
+    def test_registers_new_group_and_new_bot_handlers(self, config):
+        config.telegram_bot_token = "fake-token"
+        config.telegram_allowed_user_ids = [12345]
+        app = create_telegram_app(config)
+        handlers = app.handlers[0]
+
+        command_map = {
+            next(iter(handler.commands)): handler.callback.__name__
+            for handler in handlers
+            if getattr(handler, "commands", None)
+        }
+        assert command_map["new_group"] == "handle_new_group"
+        assert command_map["new_bot"] == "handle_new_bot"
+
+        callback_names = [getattr(getattr(handler, "callback", None), "__name__", None) for handler in handlers]
+        assert "handle_new_group_alias" in callback_names
+        assert "handle_new_bot_alias" in callback_names
+
+
+class TestTelegramCommandRegistration:
+    async def test_set_bot_commands_registers_userbot_provisioning_commands(self):
+        app = MagicMock()
+        app.bot.set_my_commands = AsyncMock()
+
+        await _set_bot_commands(app)
+
+        commands = app.bot.set_my_commands.await_args.args[0]
+        names = [command.command for command in commands]
+        assert "new_group" in names
+        assert "new_bot" in names
+
+    async def test_clear_secondary_bot_commands_only_targets_non_primary_tokens(self, config):
+        config.telegram_bot_token = "primary-token"
+        config.telegram_bot_tokens = ["primary-token", "secondary-a", "secondary-b"]
+
+        fake_secondary_a = MagicMock()
+        fake_secondary_a.delete_my_commands = AsyncMock()
+        fake_secondary_b = MagicMock()
+        fake_secondary_b.delete_my_commands = AsyncMock()
+
+        with patch("obs_agent.telegram.Bot", side_effect=[fake_secondary_a, fake_secondary_b]) as bot_cls:
+            await _clear_secondary_bot_commands(config)
+
+        created_tokens = [call.kwargs["token"] for call in bot_cls.call_args_list]
+        assert created_tokens == ["secondary-a", "secondary-b"]
+        fake_secondary_a.delete_my_commands.assert_awaited_once()
+        fake_secondary_b.delete_my_commands.assert_awaited_once()
+
+
+class TestTelegramProvisioningCommands:
+    def test_parse_new_group_request_defaults_to_sender_target(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        target_override, title = bot._parse_new_group_request("Provisioned Group")
+
+        assert target_override is None
+        assert title == "Provisioned Group"
+
+    def test_parse_new_group_request_supports_handle_override(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        target_override, title = bot._parse_new_group_request("--user @breedooon Provisioned Group")
+
+        assert target_override == "@breedooon"
+        assert title == "Provisioned Group"
+
+    def test_parse_new_group_request_supports_numeric_override(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        target_override, title = bot._parse_new_group_request("--user 5129431382 Provisioned Group")
+
+        assert target_override == "5129431382"
+        assert title == "Provisioned Group"
+
+    def test_extract_command_args_supports_addressed_new_group_alias(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/new-group@obsTopicTestBot Provisioned Group", thread_id=None)
+        ctx = _make_context()
+
+        raw_args = bot._extract_command_args(
+            update,
+            ctx,
+            command_names=("new-group", "new_group"),
+        )
+
+        assert raw_args == "Provisioned Group"
+
+    async def test_new_command_redirects_new_bot_dash_arg_alias(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/new", thread_id=None)
+        ctx = _make_context()
+        ctx.args = ["-bot"]
+
+        with patch.object(bot, "handle_new_bot_alias", new=AsyncMock()) as alias_mock:
+            await bot.handle_new(update, ctx)
+
+        alias_mock.assert_awaited_once_with(update, ctx)
+
+    async def test_new_command_redirects_new_group_dash_arg_alias(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/new", thread_id=None)
+        ctx = _make_context()
+        ctx.args = ["-group", "Test", "Group"]
+
+        with patch.object(bot, "handle_new_group_alias", new=AsyncMock()) as alias_mock:
+            await bot.handle_new(update, ctx)
+
+        alias_mock.assert_awaited_once_with(update, ctx)
+
+    async def test_new_command_redirects_new_bot_hyphen_alias(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/new-bot", thread_id=None)
+        ctx = _make_context()
+        ctx.args = ["-bot"]
+
+        with patch.object(bot, "handle_new_bot_alias", new=AsyncMock()) as alias_mock:
+            await bot.handle_new(update, ctx)
+
+        alias_mock.assert_awaited_once_with(update, ctx)
+
+    async def test_new_command_redirects_new_group_hyphen_alias(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/new-group Test Group", thread_id=None)
+        ctx = _make_context()
+        ctx.args = ["-group", "Test", "Group"]
+
+        with patch.object(bot, "handle_new_group_alias", new=AsyncMock()) as alias_mock:
+            await bot.handle_new(update, ctx)
+
+        alias_mock.assert_awaited_once_with(update, ctx)
+
+    async def test_new_group_delegates_to_userbot_helper(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/new-group Provisioned Group", thread_id=None)
+        ctx = _make_context()
+
+        with (
+            patch.object(
+                bot,
+                "_provision_new_group",
+                new=AsyncMock(return_value="created group: Provisioned Group"),
+            ) as provision_mock,
+            patch.object(bot, "_send_system_message", new=AsyncMock()) as send_mock,
+        ):
+            await bot.handle_new_group_alias(update, ctx)
+
+        provision_mock.assert_awaited_once_with(
+            update=update,
+            context=ctx,
+            raw_args="Provisioned Group",
+        )
+        assert "created group: Provisioned Group" in send_mock.await_args.kwargs["text"]
+
+    async def test_new_bot_delegates_to_userbot_helper(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/new-bot", thread_id=None)
+        ctx = _make_context()
+
+        with (
+            patch.object(
+                bot,
+                "_provision_new_bot",
+                new=AsyncMock(return_value="created bot: ClaudiaObsTest123Bot"),
+            ) as provision_mock,
+            patch.object(bot, "_send_system_message", new=AsyncMock()) as send_mock,
+        ):
+            await bot.handle_new_bot_alias(update, ctx)
+
+        provision_mock.assert_awaited_once_with(
+            update=update,
+            context=ctx,
+            raw_args=None,
+        )
+        assert "created bot: ClaudiaObsTest123Bot" in send_mock.await_args.kwargs["text"]
 
 
 class TestRunTelegramBotSupervisor:
@@ -5825,7 +6002,7 @@ class TestTelegramErrorHandling:
 
             texts = [c.kwargs.get("text", "") for c in ctx.bot.send_message.call_args_list]
             assert any("FINAL_MARKER" in t for t in texts)
-            assert texts[-1] == "<u><i>context: 0 / 200k</i></u>"
+            assert texts[-1] == "<u><i>context: 0 / 1m</i></u>"
 
 
 class TestTelegramStatePersistence:

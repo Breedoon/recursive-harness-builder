@@ -52,6 +52,9 @@ class OBSConfig:
     # Telegram
     telegram_bot_token: str | None = None
     telegram_bot_tokens: list[str] = field(default_factory=list)
+    telegram_userbot_api_id: int | None = None
+    telegram_userbot_api_hash: str | None = None
+    telegram_userbot_session: str | None = None
     telegram_allowed_user_ids: list[int] = field(default_factory=list)
     telegram_notify_username: str | None = None
     telegram_temp_root: Path = field(default_factory=lambda: _DEFAULT_TELEGRAM_TEMP_ROOT)
@@ -99,6 +102,12 @@ class OBSConfig:
             ]
         if tg_token := os.environ.get("OBS_TELEGRAM_BOT_TOKEN"):
             kwargs["telegram_bot_token"] = tg_token.strip()
+        if userbot_api_id := os.environ.get("OBS_TELEGRAM_USERBOT_API_ID"):
+            kwargs["telegram_userbot_api_id"] = int(userbot_api_id)
+        if userbot_api_hash := os.environ.get("OBS_TELEGRAM_USERBOT_API_HASH"):
+            kwargs["telegram_userbot_api_hash"] = userbot_api_hash.strip()
+        if userbot_session := os.environ.get("OBS_TELEGRAM_USERBOT_SESSION"):
+            kwargs["telegram_userbot_session"] = userbot_session.strip()
         if tg_users := os.environ.get("OBS_TELEGRAM_ALLOWED_USERS"):
             kwargs["telegram_allowed_user_ids"] = [
                 int(uid.strip()) for uid in tg_users.split(",") if uid.strip()

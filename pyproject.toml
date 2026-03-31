@@ -17,6 +17,7 @@ dependencies = [
     "python-telegram-bot>=21.0",
     "markdown-it-py>=3.0",
     "croniter>=3.0.3",
+    "telethon>=1.36.0",
 ]
 
 [project.optional-dependencies]
@@ -25,7 +26,6 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-timeout>=2.3.0",
     "pexpect>=4.9.0",
-    "telethon>=1.36.0",
 ]
 
 [project.scripts]
