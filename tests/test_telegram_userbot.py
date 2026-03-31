@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from telethon.tl.functions.channels import CreateChannelRequest, LeaveChannelRequest, ToggleForumRequest
+from telethon.tl.types import Channel, ChatPhotoEmpty
 
 from obs_agent.telegram_userbot import TelegramUserbotProvisioner, append_profile_bot_token
 
@@ -147,3 +152,173 @@ def test_append_unique_input_peer_dedupes_channel_ids(tmp_path: Path):
 
     assert changed is False
     assert len(peers) == 1
+
+
+async def test_create_group_keeps_userbot_in_group_and_only_invites_bots(monkeypatch, tmp_path: Path):
+    provisioner = TelegramUserbotProvisioner(config=None, env_path=tmp_path / ".env")
+    created_channel = Channel(
+        id=777,
+        title="NCS",
+        photo=ChatPhotoEmpty(),
+        date=None,
+        creator=True,
+        megagroup=True,
+        forum=True,
+        forum_tabs=False,
+    )
+    refreshed_channel = Channel(
+        id=777,
+        title="NCS",
+        photo=ChatPhotoEmpty(),
+        date=None,
+        creator=True,
+        megagroup=True,
+        forum=True,
+        forum_tabs=False,
+    )
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def __call__(self, request):
+            self.requests.append(request)
+            if isinstance(request, CreateChannelRequest):
+                return SimpleNamespace(chats=[created_channel])
+            if isinstance(request, ToggleForumRequest):
+                return None
+            if isinstance(request, LeaveChannelRequest):
+                raise AssertionError("create_group should not leave the channel")
+            raise AssertionError(f"unexpected request: {request!r}")
+
+        async def get_entity(self, entity):
+            if isinstance(entity, Channel):
+                return refreshed_channel
+            return entity
+
+    class _FakeClientContext:
+        def __init__(self, client) -> None:
+            self._client = client
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = _FakeClient()
+    monkeypatch.setattr(provisioner, "_ensure_available", lambda: None)
+    monkeypatch.setattr(provisioner, "_client", lambda: _FakeClientContext(client))
+    safe_invite = AsyncMock()
+    promote_admin = AsyncMock()
+    bot_entities = [SimpleNamespace(id=901, username="bot_a"), SimpleNamespace(id=902, username="bot_b")]
+    discover_bots = AsyncMock(return_value=(bot_entities, ["bot_a", "bot_b"]))
+    maybe_add_to_chatlist = AsyncMock(return_value=(None, None, False, False))
+    monkeypatch.setattr(provisioner, "_safe_invite", safe_invite)
+    monkeypatch.setattr(provisioner, "_promote_admin", promote_admin)
+    monkeypatch.setattr(provisioner, "_discover_bot_entities", discover_bots)
+    monkeypatch.setattr(provisioner, "_maybe_add_group_to_chatlist", maybe_add_to_chatlist)
+
+    result = await provisioner.create_group(
+        title="NCS",
+        default_user_id=222,
+        default_username="produser",
+    )
+
+    assert result.creator_left is False
+    assert result.chat_id == -1000000000777
+    assert result.target_user_id == 222
+    assert result.target_username == "produser"
+    assert safe_invite.await_count == 2
+    assert promote_admin.await_count == 2
+    assert [call.args[2] for call in safe_invite.await_args_list] == bot_entities
+    assert [call.args[2] for call in promote_admin.await_args_list] == bot_entities
+
+
+async def test_finalize_joined_allowed_user_promotes_then_leaves(monkeypatch, tmp_path: Path):
+    provisioner = TelegramUserbotProvisioner(config=None, env_path=tmp_path / ".env")
+    channel = SimpleNamespace(id=777)
+    joined_user = SimpleNamespace(id=222, username="produser")
+    me = SimpleNamespace(id=111)
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def get_me(self):
+            return me
+
+        async def __call__(self, request):
+            self.requests.append(request)
+            if isinstance(request, LeaveChannelRequest):
+                return None
+            raise AssertionError(f"unexpected request: {request!r}")
+
+        async def get_entity(self, entity):
+            if entity == -1000000000777:
+                return channel
+            return entity
+
+    class _FakeClientContext:
+        def __init__(self, client) -> None:
+            self._client = client
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = _FakeClient()
+    monkeypatch.setattr(provisioner, "_ensure_available", lambda: None)
+    monkeypatch.setattr(provisioner, "_client", lambda: _FakeClientContext(client))
+    resolve_target = AsyncMock(return_value=joined_user)
+    promote_admin = AsyncMock()
+    monkeypatch.setattr(provisioner, "_resolve_target_user", resolve_target)
+    monkeypatch.setattr(provisioner, "_promote_admin", promote_admin)
+
+    left = await provisioner.finalize_joined_allowed_user(
+        chat_id=-1000000000777,
+        joined_user_id=222,
+        joined_username="produser",
+    )
+
+    assert left is True
+    promote_admin.assert_awaited_once_with(client, channel, joined_user, rank="obs-owner-user")
+    assert any(isinstance(request, LeaveChannelRequest) for request in client.requests)
+
+
+async def test_finalize_joined_allowed_user_skips_self_userbot(monkeypatch, tmp_path: Path):
+    provisioner = TelegramUserbotProvisioner(config=None, env_path=tmp_path / ".env")
+    me = SimpleNamespace(id=222)
+
+    class _FakeClient:
+        async def get_me(self):
+            return me
+
+    class _FakeClientContext:
+        def __init__(self, client) -> None:
+            self._client = client
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = _FakeClient()
+    monkeypatch.setattr(provisioner, "_ensure_available", lambda: None)
+    monkeypatch.setattr(provisioner, "_client", lambda: _FakeClientContext(client))
+    resolve_target = AsyncMock()
+    promote_admin = AsyncMock()
+    monkeypatch.setattr(provisioner, "_resolve_target_user", resolve_target)
+    monkeypatch.setattr(provisioner, "_promote_admin", promote_admin)
+
+    left = await provisioner.finalize_joined_allowed_user(
+        chat_id=-1000000000777,
+        joined_user_id=222,
+        joined_username="produser",
+    )
+
+    assert left is False
+    resolve_target.assert_not_called()
+    promote_admin.assert_not_called()

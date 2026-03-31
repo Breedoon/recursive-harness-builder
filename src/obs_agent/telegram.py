@@ -6634,6 +6634,49 @@ class TelegramBot:
         _ = context
         self._update_topic_metadata_from_update(update)
 
+    async def handle_new_chat_members(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        _ = context
+        if update.effective_message is None:
+            return
+        message = update.effective_message
+        joined_members = list(getattr(message, "new_chat_members", []) or [])
+        if not joined_members:
+            return
+        joined_allowed_user = next(
+            (
+                member
+                for member in joined_members
+                if isinstance(getattr(member, "id", None), int) and self._is_authorized(int(member.id))
+            ),
+            None,
+        )
+        if joined_allowed_user is None:
+            return
+
+        provisioner = self._build_userbot_provisioner()
+        joined_user_id = int(joined_allowed_user.id)
+        try:
+            left = await provisioner.finalize_joined_allowed_user(
+                chat_id=message.chat_id,
+                joined_user_id=joined_user_id,
+                joined_username=self._coerce_username(joined_allowed_user),
+            )
+        except Exception:
+            logger.exception(
+                "Failed finalizing joined allowed user chat_id=%s joined_user_id=%s",
+                message.chat_id,
+                joined_user_id,
+            )
+            return
+        if left:
+            logger.info(
+                "Userbot left chat_id=%s after allowed user_id=%s joined",
+                message.chat_id,
+                joined_user_id,
+            )
+
     async def _drop_route_state(
         self,
         route: TelegramRoute,
@@ -8692,6 +8735,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     )
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, bot.handle_forum_topic_created))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED, bot.handle_forum_topic_edited))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.handle_new_chat_members))
     inbound_filter = (
         filters.TEXT
         | filters.CAPTION

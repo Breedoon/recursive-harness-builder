@@ -208,7 +208,6 @@ class TelegramUserbotProvisioner:
     ) -> ProvisionedGroup:
         self._ensure_available()
         async with self._client() as client:
-            me = await client.get_me()
             created = await client(
                 CreateChannelRequest(
                     title=title,
@@ -223,18 +222,11 @@ class TelegramUserbotProvisioner:
             await client(ToggleForumRequest(channel=channel, enabled=True, tabs=False))
             channel = await client.get_entity(channel)
 
-            target_entity = await self._resolve_target_user(
-                client,
+            target_user_id, target_username = self._target_reference(
                 default_user_id=default_user_id,
                 default_username=default_username,
                 target_override=target_override,
             )
-            target_user_id = getattr(target_entity, "id", None)
-            target_username = getattr(target_entity, "username", None)
-
-            if target_user_id is not None and target_user_id != getattr(me, "id", None):
-                await self._safe_invite(client, channel, target_entity)
-                await self._promote_admin(client, channel, target_entity, rank="obs-owner-user")
 
             bot_entities, bot_usernames = await self._discover_bot_entities(client)
             for entity in bot_entities:
@@ -251,24 +243,46 @@ class TelegramUserbotProvisioner:
                 refreshed,
             )
 
-            creator_left = False
-            if target_user_id is not None and target_user_id != getattr(me, "id", None):
-                await client(LeaveChannelRequest(channel=channel))
-                creator_left = True
-
             return ProvisionedGroup(
                 title=title,
                 chat_id=int(get_peer_id(refreshed)),
                 target_user_id=target_user_id if isinstance(target_user_id, int) else None,
                 target_username=target_username if isinstance(target_username, str) and target_username else None,
                 added_bot_usernames=tuple(bot_usernames),
-                creator_left=creator_left,
+                creator_left=False,
                 forum_tabs_enabled=forum_tabs_enabled,
                 folder_title=folder_title,
                 addlist_url=addlist_url,
                 added_to_folder=added_to_folder,
                 added_to_addlist=added_to_addlist,
             )
+
+    async def finalize_joined_allowed_user(
+        self,
+        *,
+        chat_id: int,
+        joined_user_id: int,
+        joined_username: str | None = None,
+    ) -> bool:
+        self._ensure_available()
+        async with self._client() as client:
+            me = await client.get_me()
+            me_id = getattr(me, "id", None)
+            if me_id is not None and int(me_id) == int(joined_user_id):
+                return False
+
+            channel = await client.get_entity(int(chat_id))
+            joined_entity = await self._resolve_target_user(
+                client,
+                default_user_id=joined_user_id,
+                default_username=joined_username,
+                target_override=None,
+            )
+            await self._promote_admin(client, channel, joined_entity, rank="obs-owner-user")
+            if LeaveChannelRequest is None:
+                raise RuntimeError("Telethon leave-channel API is unavailable")
+            await client(LeaveChannelRequest(channel=channel))
+            return True
 
     async def create_bot(self, *, display_name: str = "Claudia") -> CreatedBot:
         self._ensure_available()
@@ -495,6 +509,27 @@ class TelegramUserbotProvisioner:
             except Exception:
                 logger.debug("Failed resolving default username; falling back to numeric user id", exc_info=True)
         return await client.get_entity(int(default_user_id))
+
+    def _target_reference(
+        self,
+        *,
+        default_user_id: int,
+        default_username: str | None,
+        target_override: str | None,
+    ) -> tuple[int | None, str | None]:
+        ref = (target_override or "").strip()
+        if ref:
+            if ref.startswith("@"):
+                normalized = ref.lstrip("@").strip()
+                if not normalized:
+                    raise RuntimeError(f"unsupported user reference: {ref}")
+                return None, normalized
+            if ref.isdigit():
+                return int(ref), None
+            raise RuntimeError(f"unsupported user reference: {ref}")
+
+        username = (default_username or "").lstrip("@").strip()
+        return int(default_user_id), username or None
 
     async def _discover_bot_entities(
         self,

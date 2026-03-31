@@ -5710,6 +5710,38 @@ class TestTelegramProvisioningCommands:
         assert "new bot started" in started_text
         assert "created bot: ClaudiaObsTest123Bot" in completed_text
 
+    async def test_new_chat_members_finalizes_joined_allowed_user(self, config):
+        config.telegram_allowed_user_ids = [12345]
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("", user_id=999, chat_id=-100777)
+        update.effective_message.new_chat_members = [SimpleNamespace(id=12345, username="breedooon")]
+        ctx = _make_context()
+        provisioner = MagicMock()
+        provisioner.finalize_joined_allowed_user = AsyncMock(return_value=True)
+
+        with patch.object(bot, "_build_userbot_provisioner", return_value=provisioner):
+            await bot.handle_new_chat_members(update, ctx)
+
+        provisioner.finalize_joined_allowed_user.assert_awaited_once_with(
+            chat_id=-100777,
+            joined_user_id=12345,
+            joined_username="breedooon",
+        )
+
+    async def test_new_chat_members_ignores_non_allowed_members(self, config):
+        config.telegram_allowed_user_ids = [12345]
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("", user_id=999, chat_id=-100777)
+        update.effective_message.new_chat_members = [SimpleNamespace(id=67890, username="someoneelse")]
+        ctx = _make_context()
+        provisioner = MagicMock()
+        provisioner.finalize_joined_allowed_user = AsyncMock()
+
+        with patch.object(bot, "_build_userbot_provisioner", return_value=provisioner):
+            await bot.handle_new_chat_members(update, ctx)
+
+        provisioner.finalize_joined_allowed_user.assert_not_called()
+
 
 class TestTelegramSenderSelection:
     def test_private_chat_uses_primary_bot_only(self, config):
