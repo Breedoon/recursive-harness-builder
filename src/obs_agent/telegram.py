@@ -1518,20 +1518,40 @@ class TelegramBot:
                         agent_name=agent_name,
                     )
                 )
-            elif state.agent_lineage:
+            else:
+                session_bootstrap = find_latest_obs_bootstrap_for_session(
+                    session_id=entry.session_id,
+                    cwd=self._config.vault_path,
+                )
+                if state.agent_lineage is None and session_bootstrap is not None and session_bootstrap.lineage:
+                    state.agent_lineage = session_bootstrap.lineage
                 # On restore without bootstrap: check SDK env overrides for
                 # persisted team key.  NEVER regenerate a timestamp — the
                 # team key was set once at creation and must be restored.
                 env = state.session_manager.sdk_env_overrides
-                persisted_team = env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
-                persisted_agent = env.get("CLAUDE_CODE_AGENT_NAME", "").strip()
+                persisted_team = (
+                    env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
+                    or (session_bootstrap.root_team_key if session_bootstrap is not None else "")
+                )
+                persisted_agent = (
+                    env.get("CLAUDE_CODE_AGENT_NAME", "").strip()
+                    or (session_bootstrap.agent_name if session_bootstrap is not None else "")
+                )
                 if persisted_team and persisted_agent:
-                    # Already restored from SQLite — nothing to do
-                    pass
+                    state.session_manager.set_sdk_env_overrides(
+                        self._build_team_worker_env(
+                            team_name=persisted_team,
+                            agent_name=persisted_agent,
+                        )
+                    )
                 elif persisted_team:
                     # Have team but no agent name — derive it
+                    restore_lineage = state.agent_lineage or self._ensure_state_lineage(
+                        state,
+                        session_id=entry.session_id,
+                    )
                     default_agent_name = agent_name_for_lineage(
-                        state.agent_lineage,
+                        restore_lineage,
                         team_key=persisted_team,
                     )
                     state.session_manager.set_sdk_env_overrides(
@@ -1543,7 +1563,13 @@ class TelegramBot:
                 else:
                     # No persisted team key at all — this is truly first
                     # creation (not a restart).  Generate a new team key.
-                    default_team_name, default_agent_name = self._default_team_projection(state.agent_lineage)
+                    restore_lineage = state.agent_lineage or self._ensure_state_lineage(
+                        state,
+                        session_id=entry.session_id,
+                    )
+                    default_team_name, default_agent_name = self._default_team_projection(
+                        restore_lineage
+                    )
                     state.session_manager.set_sdk_env_overrides(
                         self._build_team_worker_env(
                             team_name=default_team_name,
@@ -1815,6 +1841,7 @@ class TelegramBot:
         session_id = state.session_id
         if session_id:
             self._route_by_session_id[session_id] = state.route
+            self._upsert_route_inbox_target(state)
             self._persist_state_for_route(state.route)
 
     def _unbind_route_sessions(self, route: TelegramRoute) -> None:
@@ -2018,17 +2045,28 @@ class TelegramBot:
         lineage = state.agent_lineage
         if not lineage and bootstrap is not None and bootstrap.lineage:
             lineage = bootstrap.lineage
+        session_bootstrap = find_latest_obs_bootstrap_for_session(
+            session_id=state.session_id,
+            cwd=self._config.vault_path,
+        )
+        if session_bootstrap is not None and not lineage and session_bootstrap.lineage:
+            lineage = session_bootstrap.lineage
         if not lineage:
             return None
+        env = state.session_manager.sdk_env_overrides
         team_name = (
             bootstrap.root_team_key
             if bootstrap is not None and bootstrap.root_team_key
             else None
+        ) or env.get("CLAUDE_CODE_TEAM_NAME", "").strip() or (
+            session_bootstrap.root_team_key if session_bootstrap is not None else ""
         )
         agent_name = (
             bootstrap.agent_name
             if bootstrap is not None and bootstrap.agent_name
             else None
+        ) or env.get("CLAUDE_CODE_AGENT_NAME", "").strip() or (
+            session_bootstrap.agent_name if session_bootstrap is not None else ""
         )
         if not team_name or not agent_name:
             default_team_name, default_agent_name = self._default_team_projection(lineage)
@@ -5432,15 +5470,19 @@ class TelegramBot:
             if state.pending_obs_bootstrap is None and not self._session_heads.get(state.session_id or ""):
                 had_lineage = state.agent_lineage is not None
                 lineage = self._ensure_state_lineage(state)
+                projection = self._state_inbox_projection(state)
                 self._prime_obs_bootstrap(
                     state,
                     lineage=lineage,
                     origin="session_reset" if had_lineage else "trunk_start",
                     is_fork=False,
+                    team_name=projection[0] if projection is not None else None,
+                    agent_name=projection[1] if projection is not None else None,
+                    session_id=state.session_id,
                 )
             await state.session_manager.get_client()
             self._bind_state_session(state)
-            if state.pending_obs_bootstrap:
+            if state.pending_obs_bootstrap and not self._session_heads.get(state.session_id or ""):
                 pending_bootstrap_active = state.pending_obs_bootstrap
                 run_user_text = f"{pending_bootstrap_active}\n\n{run_user_text}"
             # Prepend server timestamp + context stats to user messages
@@ -5512,14 +5554,6 @@ class TelegramBot:
                     continue
 
                 if isinstance(event, TurnEndEvent):
-                    if (
-                        pending_bootstrap_active is not None
-                        and event.jsonl_uuid
-                        and event.message_role == "user"
-                    ):
-                        state.pending_obs_bootstrap = None
-                        pending_bootstrap_active = None
-                        self._persist_state_for_route(state.route)
                     if (
                         event.jsonl_uuid
                         and event.message_role == "user"
@@ -7087,6 +7121,7 @@ class TelegramBot:
             raise RuntimeError(
                 f"Cannot wake team worker {agent_name}: no bot available for route={record.child_route}"
             )
+        child_state.last_bot = bot
 
         sender_norm = (sender or "").strip() or None
         summary_norm = (summary or "").strip() or None
@@ -7244,15 +7279,17 @@ class TelegramBot:
         if not team_name or not recipient:
             return {"delivered": False, "reason": "recipient has no current route binding"}
 
-        # Clear dedup keys for this agent so a genuinely NEW message triggers
-        # a wake.  Only do this when called from the DIRECT path (SendInboxMessage)
-        # — the poller already checked the dedup set, and clearing here would
-        # undo that check, causing phantom re-notifications every poll cycle.
+        sender = str(payload.get("sender") or "").strip() or None
+        summary = str(payload.get("summary") or "").strip() or None
+        content = str(payload.get("content") or "").strip() or None
+        direct_notified_key: tuple[str, str, str] | None = None
         if payload.get("_direct_send"):
-            self._notified_inbox_keys = {
-                k for k in self._notified_inbox_keys
-                if k[0] != team_name or k[1] != recipient
-            }
+            fingerprint = f"{sender}:{summary}:{content}"[:200]
+            direct_notified_key = (team_name, recipient, fingerprint)
+
+        def _mark_direct_send_notified() -> None:
+            if direct_notified_key is not None:
+                self._notified_inbox_keys.add(direct_notified_key)
 
         # Handle reply_wake_clear signal: all must_reply messages replied
         if payload.get("_reply_wake_clear"):
@@ -7303,9 +7340,6 @@ class TelegramBot:
             team_name=team_name,
             agent_name=recipient,
         )
-        sender = str(payload.get("sender") or "").strip() or None
-        summary = str(payload.get("summary") or "").strip() or None
-        content = str(payload.get("content") or "").strip() or None
         if record is None:
             state = self._resolve_route_inbox_target(
                 team_name=team_name,
@@ -7331,6 +7365,7 @@ class TelegramBot:
                         summary=summary,
                         content=content,
                     )
+                _mark_direct_send_notified()
                 return {"delivered": True}
             except Exception as exc:
                 logger.warning(
@@ -7365,6 +7400,7 @@ class TelegramBot:
                 record.wake_source_summary = summary
                 record.wake_source_content = content
                 self._persist_task_handle_record(record)
+            _mark_direct_send_notified()
             return {"delivered": True}
 
         # Always try to wake regardless of record status (completed, failed,
@@ -7377,6 +7413,7 @@ class TelegramBot:
                 summary=summary,
                 content=content,
             )
+            _mark_direct_send_notified()
             return {"delivered": True}
         except Exception as exc:
             logger.warning(
@@ -7773,6 +7810,7 @@ class TelegramBot:
         bot = (
             (child_state.last_bot if child_state is not None else None)
             or (parent_state.last_bot if parent_state is not None else None)
+            or self._primary_bot
         )
         if child_state is None or bot is None:
             record.status = record.terminal_request or "failed"
@@ -7780,7 +7818,9 @@ class TelegramBot:
             record.completed_at = time.time()
             if parent_state is not None:
                 parent_state.active_fork_task_ids.discard(task_id)
+            self._persist_task_handle_record(record)
             return
+        child_state.last_bot = bot
 
         current_child_session_id = (child_state.session_id or "").strip()
         if current_child_session_id and current_child_session_id != record.child_session_id:

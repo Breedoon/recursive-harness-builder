@@ -1035,7 +1035,7 @@ class TestPhantomNotificationDedup:
         )
 
         # Extract child's agent_name
-        child_agent = _extract_lineage_fact_line(child_lineage, "agent_name")
+        child_agent = child_lineage["agent_name"]
         assert child_agent, "Failed to extract child agent_name"
 
         # Wait for child to finish initial turn and go idle
@@ -1116,7 +1116,7 @@ class TestPhantomNotificationDedup:
             lineage_token=f"PHANTOM-CHILD-{tag}",
             timeout=240.0,
         )
-        child_agent = _extract_lineage_fact_line(child_lineage, "agent_name")
+        child_agent = child_lineage["agent_name"]
         assert child_agent, "Failed to extract child agent_name"
 
         # Wait for child to finish initial turn and go idle
@@ -1137,15 +1137,14 @@ class TestPhantomNotificationDedup:
             live_tg_forum,
             thread_id=child_thread,
             look_for=f"PHANTOM-MSG-{tag}",
-            reply_to=_extract_lineage_fact_line(
+            reply_to=(
                 await _query_session_lineage(
                     live_tg_forum,
                     thread_id=root_thread,
                     token=f"PHANTOM-ROOT-AGENT-{tag}",
                     timeout=120.0,
-                ),
-                "agent_name",
-            ) or "unknown",
+                )
+            )["agent_name"],
             reply_content=f"PHANTOM-REPLY-{tag}",
             ack_token=f"PHANTOM-REPLIED-{tag}",
             timeout=240.0,
