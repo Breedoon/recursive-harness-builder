@@ -20,7 +20,7 @@ import pytest
 from telegram.error import BadRequest, TelegramError
 
 from obs_agent.events import StatusEvent
-from obs_agent.lineage import agent_name_for_lineage, root_team_key_for_lineage
+from obs_agent.lineage import ObsBootstrap, agent_name_for_lineage, root_team_key_for_lineage
 from obs_agent.queueing import QueuedMessage
 from obs_agent.runner import DoneEvent, TextEvent, TurnEndEvent
 from obs_agent.telegram import (
@@ -922,6 +922,78 @@ class TestBackgroundPoller:
         assert "<origin>trunk_start</origin>" in prompt
         assert "<session_id>" not in prompt
         assert prompt.strip().endswith("hello")
+
+    async def test_run_and_send_injects_pending_child_bootstrap_even_when_fork_session_has_parent_head(
+        self,
+        config,
+        monkeypatch,
+    ):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=222)
+        state = bot._get_state(route, topic_title="Alpha")
+        assert state is not None
+        state.session_manager.set_session_id("sid-child")
+        bot._bind_state_session(state)
+        bot._set_session_head(session_id="sid-child", jsonl_uuid="uuid-parent-head")
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root", "Alpha"),
+            origin="agent_task_fork",
+            is_fork=True,
+            session_id="sid-child",
+            parent_session_id="sid-root",
+        )
+
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=778))
+        captured_prompt: list[str] = []
+        stale_parent_bootstrap = ObsBootstrap(
+            raw_xml=(
+                "<obs-bootstrap version='2'>"
+                "<obs-lineage><obs-node display_name='Root' agent_name='2026-03-31-10-00-root' /></obs-lineage>"
+                "<fork_context><origin>trunk_start</origin><is_fork>false</is_fork><session_id>sid-child</session_id></fork_context>"
+                "<team_context><root_team_key>2026-03-31-10-00-root</root_team_key><agent_name>2026-03-31-10-00-root</agent_name></team_context>"
+                "</obs-bootstrap>"
+            ),
+            lineage=("Root",),
+            origin="trunk_start",
+            is_fork=False,
+            session_id="sid-child",
+            agent_id=None,
+            parent_session_id=None,
+            root_team_key="2026-03-31-10-00-root",
+            agent_name="2026-03-31-10-00-root",
+            parent_agent_name=None,
+            parent_display_name=None,
+        )
+
+        with (
+            patch.object(state.session_manager, "get_client", AsyncMock(return_value=MagicMock())),
+            patch(
+                "obs_agent.telegram.find_latest_obs_bootstrap_for_session",
+                return_value=stale_parent_bootstrap,
+            ),
+            patch("obs_agent.telegram.ConversationRunner") as mock_runner,
+        ):
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                captured_prompt.append(msg)
+                yield DoneEvent()
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+            await bot._run_and_send(
+                state=state,
+                user_text="hello from child",
+                bot=fake_bot,
+            )
+
+        assert len(captured_prompt) == 1
+        assert state.pending_obs_bootstrap is not None
+        assert state.pending_obs_bootstrap in captured_prompt[0]
+        assert "<obs-node display_name=\"Alpha\"" in captured_prompt[0]
+        await bot.shutdown()
 
     async def test_run_and_send_summary_uses_assistant_transport_priority(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
