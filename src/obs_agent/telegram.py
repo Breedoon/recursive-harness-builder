@@ -51,6 +51,7 @@ from obs_agent.lineage import (
     agent_name_for_lineage,
     build_obs_bootstrap_xml,
     find_latest_obs_bootstrap_for_session,
+    format_root_display_name,
     normalize_lineage_name,
     parse_obs_bootstrap_xml,
     root_team_key_for_lineage,
@@ -2154,6 +2155,11 @@ class TelegramBot:
         if len(normalized_lineage) > 1:
             parent_lineage = normalized_lineage[:-1]
             parent_display_name = parent_lineage[-1]
+            if len(parent_lineage) == 1:
+                parent_display_name = format_root_display_name(
+                    resolved_team_name,
+                    parent_display_name,
+                )
             parent_agent_name = agent_name_for_lineage(
                 parent_lineage,
                 team_key=resolved_team_name,
@@ -2350,6 +2356,10 @@ class TelegramBot:
                 if not schedule_ids:
                     self._schedule_ids_by_route.pop(record.route, None)
         self._state_store.delete_topic_schedule(schedule_id=schedule_id)
+
+    def _owns_topic_schedule_record(self, record: _TopicScheduleRecord) -> bool:
+        """Return True when *record* is still the registered schedule instance."""
+        return self._topic_schedules_by_id.get(record.schedule_id) is record
 
     def _delete_topic_schedules_for_route(self, route: TelegramRoute) -> None:
         for schedule_id in list(self._schedule_ids_by_route.get(route, set())):
@@ -2746,17 +2756,12 @@ class TelegramBot:
         lock = self._get_route_lock(record.route)
         if lock.locked() or state.busy or record.route in self._schedule_running_by_route:
             if is_reply_wake_schedule(record):
-                record.run_count += 1
-                if self._schedule_is_exhausted(record, now):
+                try:
+                    record.next_run_at = self._next_timed_run_at(record, base_ts=now)
+                except ValueError as exc:
                     record.enabled = False
+                    record.last_error = f"schedule config error: {exc}"
                     record.next_run_at = None
-                else:
-                    try:
-                        record.next_run_at = self._next_timed_run_at(record, base_ts=now)
-                    except ValueError as exc:
-                        record.enabled = False
-                        record.last_error = f"schedule config error: {exc}"
-                        record.next_run_at = None
                 self._register_topic_schedule(record)
             return False
 
@@ -2862,7 +2867,8 @@ class TelegramBot:
                 if record.trigger_kind in {"interval", "cron"}:
                     retry_delay = max(int(record.retry_delay_seconds), 1)
                     record.next_run_at = now_after + retry_delay
-                self._register_topic_schedule(record)
+                if self._owns_topic_schedule_record(record):
+                    self._register_topic_schedule(record)
                 await _emit_post_schedule_summary()
                 return False
             record.retry_attempt_count = 0
@@ -2885,6 +2891,10 @@ class TelegramBot:
                     record.schedule_id,
                     exc_info=True,
                 )
+
+        if not self._owns_topic_schedule_record(record):
+            await _emit_post_schedule_summary()
+            return run_succeeded
 
         if self._schedule_is_exhausted(record, now_after):
             record.enabled = False
@@ -3069,15 +3079,26 @@ class TelegramBot:
         if len(normalized_lineage) > 1:
             if resolved_parent_display is None:
                 resolved_parent_display = normalized_lineage[-2]
+            if len(normalized_lineage) == 2:
+                resolved_parent_display = format_root_display_name(
+                    normalized_team,
+                    resolved_parent_display,
+                )
             if resolved_parent_agent is None:
                 resolved_parent_agent = agent_name_for_lineage(
                     normalized_lineage[:-1],
                     team_key=normalized_team,
                 )
+        resolved_display_name = normalized_lineage[-1]
+        if len(normalized_lineage) == 1:
+            resolved_display_name = format_root_display_name(
+                normalized_team,
+                resolved_display_name,
+            )
         payload = {
             "root_team_key": normalized_team,
             "agent_name": normalized_agent,
-            "display_name": normalized_lineage[-1],
+            "display_name": resolved_display_name,
             "parent_agent_name": resolved_parent_agent,
             "parent_display_name": resolved_parent_display,
             "lineage": list(normalized_lineage),
@@ -4633,20 +4654,55 @@ class TelegramBot:
                 normalized = match.group(1)
         return normalized.replace("-", " ")
 
+    @staticmethod
+    def _tree_chat_token(chat_id: int) -> str | None:
+        chat_str = str(chat_id)
+        if chat_str.startswith("-100"):
+            return chat_str[4:]
+        if chat_str.startswith("-"):
+            return chat_str[1:]
+        return None
+
+    def _build_topic_link(self, route: TelegramRoute) -> str | None:
+        chat_token = self._tree_chat_token(route.chat_id)
+        if chat_token is None or route.thread_id is None:
+            return None
+        return f"https://t.me/c/{chat_token}/{route.thread_id}"
+
+    def _tree_display_name_for_member(self, member: dict[str, Any], team_name: str) -> str:
+        agent_name = str(member.get("agent_name") or "").strip()
+        display_name = str(member.get("display_name") or agent_name).strip()
+        lineage_length = member.get("lineage_length")
+        if agent_name == team_name or lineage_length == 1:
+            return format_root_display_name(team_name, display_name)
+        return display_name
+
     def _tree_link_for_member(self, member: dict[str, Any], team_name: str) -> str | None:
         agent_name = str(member.get("agent_name") or "").strip()
         if not agent_name:
             return None
+        record = self._resolve_team_worker_record(team_name=team_name, agent_name=agent_name)
+        if record is not None:
+            topic_link = self._build_topic_link(record.child_route)
+            if topic_link:
+                return topic_link
+            anchor_id = record.child_completion_message_id or record.launch_child_message_id
+            if anchor_id is not None:
+                return self._build_message_link(record.child_route, anchor_id)
         state = self._resolve_route_inbox_target(team_name=team_name, agent_name=agent_name)
-        if state is not None and state.route.thread_id is not None:
-            return self._build_message_link(state.route, state.route.thread_id)
+        if state is not None:
+            topic_link = self._build_topic_link(state.route)
+            if topic_link:
+                return topic_link
+            last_inbound_message_id = self._last_inbound_message_id_by_route.get(state.route)
+            if last_inbound_message_id is not None:
+                return self._build_message_link(state.route, last_inbound_message_id)
         topic_chat_id = member.get("topic_chat_id")
         topic_thread_id = member.get("topic_thread_id")
         if not isinstance(topic_chat_id, int) or not isinstance(topic_thread_id, int):
             return None
-        return self._build_message_link(
+        return self._build_topic_link(
             TelegramRoute(chat_id=topic_chat_id, thread_id=topic_thread_id),
-            topic_thread_id,
         )
 
     def _load_tree_members(
@@ -4749,34 +4805,75 @@ class TelegramBot:
             child_names.sort(key=_sort_key)
         root_names = sorted(set(root_names), key=_sort_key)
 
+        def _label_html(
+            agent_name: str,
+            *,
+            allow_link: bool,
+            bold: bool = False,
+        ) -> str:
+            member = members[agent_name]
+            display_name = self._tree_display_name_for_member(member, team_name)
+            label = html.escape(display_name)
+            if allow_link:
+                link = self._tree_link_for_member(member, team_name)
+                if link:
+                    label = f'<a href="{html.escape(link, quote=True)}">{label}</a>'
+            if bold:
+                label = f"<b>{label}</b>"
+            if agent_name == current_agent_name:
+                label = f"{label} (current)"
+            return label
+
+        if mode == "ancestors":
+            lineage_names = [
+                agent_name_for_lineage(current_lineage[: idx + 1], team_key=team_name)
+                for idx in range(len(current_lineage))
+            ]
+            lines = [
+                f"- {_label_html(agent_name, allow_link=agent_name != current_agent_name, bold=agent_name == current_agent_name)}"
+                for agent_name in lineage_names
+                if agent_name in allowed
+            ]
+            return "\n".join(lines)
+
         if mode == "descendants" and current_agent_name in allowed:
-            root_names = [current_agent_name]
-        elif mode == "ancestors":
+            header_agent_name = current_agent_name
+        else:
             root_agent = agent_name_for_lineage(current_lineage[:1], team_key=team_name)
-            root_names = [root_agent] if root_agent in allowed else root_names
-        elif team_name in allowed:
-            root_names = [team_name] + [name for name in root_names if name != team_name]
+            if root_agent in allowed:
+                header_agent_name = root_agent
+            elif root_names:
+                header_agent_name = root_names[0]
+            else:
+                return ""
+
+        body_roots = list(children_by_parent.get(header_agent_name, []))
+        if mode == "tree":
+            for root_name in root_names:
+                if root_name != header_agent_name and root_name not in body_roots:
+                    body_roots.append(root_name)
 
         lines: list[str] = []
 
         def _walk(agent_name: str, depth: int) -> None:
-            member = members[agent_name]
-            display_name = str(member.get("display_name") or agent_name)
-            link = self._tree_link_for_member(member, team_name)
-            label = html.escape(display_name)
-            if link:
-                label = f'<a href="{html.escape(link, quote=True)}">{label}</a>'
-            if agent_name == current_agent_name:
-                label = f"{label} (current)"
-            indent = "&nbsp;&nbsp;" * depth
-            lines.append(f"{indent}- {label}")
+            indent = "\u00A0" * (4 * depth)
+            lines.append(
+                f"{indent}- {_label_html(agent_name, allow_link=agent_name != current_agent_name)}"
+            )
             for child_name in children_by_parent.get(agent_name, []):
                 _walk(child_name, depth + 1)
 
-        for root_name in root_names:
+        for root_name in body_roots:
             _walk(root_name, 0)
 
-        return "<br/>".join(lines)
+        header = _label_html(
+            header_agent_name,
+            allow_link=header_agent_name != current_agent_name,
+            bold=True,
+        )
+        if not lines:
+            return header
+        return f"{header}\n\n" + "\n".join(lines)
 
     async def _handle_tree_view(
         self,
@@ -6416,12 +6513,8 @@ class TelegramBot:
                 logger.exception("Background poller iteration failed")
 
     def _build_message_link(self, route: TelegramRoute, message_id: int) -> str | None:
-        chat_str = str(route.chat_id)
-        if chat_str.startswith("-100"):
-            chat_token = chat_str[4:]
-        elif chat_str.startswith("-"):
-            chat_token = chat_str[1:]
-        else:
+        chat_token = self._tree_chat_token(route.chat_id)
+        if chat_token is None:
             return None
         if route.thread_id is None:
             return f"https://t.me/c/{chat_token}/{message_id}"

@@ -62,6 +62,8 @@ _FALLBACK_LINEAGE_LENGTH_RE = re.compile(r"lineage_length\s*[:=]\s*(?P<value>\d+
 _FALLBACK_ORIGIN_RE = re.compile(r"origin\s*[:=]\s*[\"']?(?P<value>[^\"'\n<][^\"'\n]*)", re.IGNORECASE)
 _FALLBACK_SESSION_ID_RE = re.compile(r"session_id\s*[:=]\s*[\"']?(?P<value>[^\"'\n<][^\"'\n]*)", re.IGNORECASE)
 _FALLBACK_LINEAGE_RE = re.compile(r"lineage\s*[:=]\s*[\"']?(?P<value>[^\"'\n<][^\"'\n]*)", re.IGNORECASE)
+_TOPIC_ONLY_LINK_RE = re.compile(r"^https://t\.me/c/\d+/\d+$")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https://t\.me/c/\d+/\d+)\)")
 
 
 def _first_named_value(pattern: re.Pattern[str], text: str) -> str | None:
@@ -94,6 +96,13 @@ def _extract_lineage_fact_line(text: str) -> dict[str, str]:
 def _message_is_exact_token(message_text: str, token: str) -> bool:
     normalized = message_text.strip().replace("_", "").replace("*", "").strip()
     return normalized == token
+
+
+def _normalized_tree_lines(text: str) -> list[str]:
+    normalized = text.replace("\u00A0", " ")
+    normalized = normalized.replace("**", "")
+    normalized = _MARKDOWN_LINK_RE.sub(r"\1", normalized)
+    return normalized.splitlines()
 
 
 def _extract_message_fact_line(text: str) -> dict[str, str]:
@@ -1908,6 +1917,119 @@ class TestTelegramLiveSmoke:
         )
         assert delta_family["parent"] == lineage_charlie["agent_name"], live_tg_forum.failure_context()
         assert delta_family["children"] == [lineage_echo["agent_name"]], live_tg_forum.failure_context()
+
+    async def test_live_smoke_tree_commands_render_nested_links(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        root_title = f"Smoke Tree Links {tag}"
+        root_thread_id = await live_tg_forum.platform.create_topic(root_title)
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic tree smoke test. Reply with only TREE-PRIME-{tag}.",
+            thread_id=root_thread_id,
+            token=f"TREE-PRIME-{tag}",
+            timeout=180.0,
+        )
+        async def _launch_child(
+            *,
+            parent_thread_id: int,
+            display_name: str,
+            ready_token: str,
+            launched_token: str,
+        ) -> int:
+            baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+            await live_tg_forum.platform.send(
+                (
+                    "This is a deterministic tree smoke test. "
+                    "Use AgentTask exactly once with fork=true, "
+                    f"display_name={display_name}, alias={display_name.lower()}, name={display_name}. "
+                    f"The child prompt must reply with only {ready_token}. "
+                    f"After the launch succeeds, reply with only {launched_token}."
+                ),
+                thread_id=parent_thread_id,
+                require_done=False,
+                timeout=240.0,
+            )
+            await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline,
+                token=launched_token,
+                timeout=300.0,
+            )
+            launch_message = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline,
+                token="https://t.me/c/",
+                timeout=300.0,
+            )
+            child_thread_id, _ = _extract_topic_link(launch_message.text)
+            await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=child_thread_id,
+                after_message_id=launch_message.message_id,
+                token=ready_token,
+                timeout=420.0,
+            )
+            return child_thread_id
+
+        alpha_thread_id = await _launch_child(
+            parent_thread_id=root_thread_id,
+            display_name="Alpha",
+            ready_token=f"TREE-ALPHA-READY-{tag}",
+            launched_token=f"TREE-ALPHA-LAUNCHED-{tag}",
+        )
+        gamma_thread_id = await _launch_child(
+            parent_thread_id=alpha_thread_id,
+            display_name="Gamma",
+            ready_token=f"TREE-GAMMA-READY-{tag}",
+            launched_token=f"TREE-GAMMA-LAUNCHED-{tag}",
+        )
+        await _wait_for_thread_quiescence(
+            live_tg_forum,
+            thread_id=alpha_thread_id,
+            seconds=2.0,
+            timeout=120.0,
+        )
+
+        root_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=alpha_thread_id)
+        await live_tg_forum.platform.send_control(
+            f"/tree@{live_tg_forum.bot_username}",
+            thread_id=alpha_thread_id,
+            timeout=60.0,
+        )
+        root_tree = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=alpha_thread_id,
+            after_message_id=root_baseline,
+            token=root_title,
+            timeout=120.0,
+        )
+        root_lines = _normalized_tree_lines(root_tree.text)
+        tree_urls = set(root_tree.text_urls) or {
+            match.group(2) for match in _MARKDOWN_LINK_RE.finditer(root_tree.text)
+        }
+        assert root_lines[0].endswith(root_title), live_tg_forum.failure_context()
+        assert "(current)" not in root_lines[0], live_tg_forum.failure_context()
+        assert root_lines[2].startswith("- Alpha (current)"), live_tg_forum.failure_context()
+        assert root_lines[3].startswith("    - Gamma"), live_tg_forum.failure_context()
+        assert any(
+            _TOPIC_ONLY_LINK_RE.match(url) and url.endswith(f"/{root_thread_id}")
+            for url in tree_urls
+        ), live_tg_forum.failure_context()
+        assert any(
+            _TOPIC_ONLY_LINK_RE.match(url) and url.endswith(f"/{gamma_thread_id}")
+            for url in tree_urls
+        ), live_tg_forum.failure_context()
+        assert all(
+            not url.endswith(f"/{alpha_thread_id}")
+            for url in tree_urls
+        ), live_tg_forum.failure_context()
 
     async def test_live_smoke_fork_child_identity_and_sender_match_actual_child(
         self,

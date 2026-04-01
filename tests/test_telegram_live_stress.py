@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sqlite3
 import uuid
 
 import pytest
@@ -153,6 +154,93 @@ async def _check_inbox_for_content(
         timeout=timeout + 120.0,
     )
     return found_token in result.text
+
+
+def _reply_wake_schedule_id_for_thread(harness: _LiveForumHarness, *, thread_id: int | None) -> str:
+    chat_id = harness.platform._chat_id
+    assert chat_id is not None
+    thread = thread_id if thread_id is not None else "general"
+    return f"reply-wake-{chat_id}-{thread}"
+
+
+def _read_reply_wake_schedule_row(
+    harness: _LiveForumHarness,
+    *,
+    thread_id: int | None,
+) -> dict[str, object] | None:
+    assert harness.state_db_path is not None
+    schedule_id = _reply_wake_schedule_id_for_thread(harness, thread_id=thread_id)
+    with sqlite3.connect(harness.state_db_path) as conn:
+        row = conn.execute(
+            """
+            select schedule_id, enabled, run_count, max_runs, next_run_at, last_run_at, last_success_at
+            from topic_schedule
+            where schedule_id = ?
+            """,
+            (schedule_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "schedule_id": row[0],
+        "enabled": bool(row[1]),
+        "run_count": int(row[2]),
+        "max_runs": int(row[3]) if row[3] is not None else None,
+        "next_run_at": row[4],
+        "last_run_at": row[5],
+        "last_success_at": row[6],
+    }
+
+
+async def _wait_for_reply_wake_state(
+    harness: _LiveForumHarness,
+    *,
+    thread_id: int | None,
+    predicate,
+    description: str,
+    timeout: float = 60.0,
+):
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_row: dict[str, object] | None = None
+    while True:
+        last_row = _read_reply_wake_schedule_row(harness, thread_id=thread_id)
+        if predicate(last_row):
+            return last_row
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for {description}. Last row={last_row}\n"
+                f"{harness.failure_context()}"
+            )
+        await asyncio.sleep(1.0)
+
+
+async def _wait_for_message_count_after_containing(
+    harness: _LiveForumHarness,
+    *,
+    thread_id: int | None,
+    after_message_id: int,
+    token: str,
+    expected_count: int,
+    timeout: float = 120.0,
+    limit: int = 80,
+):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        recent = await harness.platform.get_recent_messages(thread_id=thread_id, limit=limit)
+        matches = [
+            message
+            for message in recent
+            if message.message_id > after_message_id and token in message.text
+        ]
+        if len(matches) >= expected_count:
+            return matches
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for {expected_count} messages containing {token!r} "
+                f"after message {after_message_id} in thread {thread_id}\n"
+                f"{harness.failure_context()}"
+            )
+        await asyncio.sleep(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +573,203 @@ class TestMustReplyExhaustion:
         assert len(late_wakes) == 0, (
             f"Worker still getting wakes after schedule should have exhausted! "
             f"Late wakes: {[m.text[:100] for m in late_wakes]}"
+        )
+
+    async def test_live_must_reply_retries_after_initial_busy_turn(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        """A must_reply should survive the initial busy turn and retry after completion."""
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+
+        root_thread = await live_tg_forum.platform.create_topic(f"MRBusy {tag}")
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"Deterministic must_reply retry test. Reply with only MRBUSY-PRIME-{tag}.",
+            thread_id=root_thread,
+            token=f"MRBUSY-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        worker_thread, worker_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread,
+            fork=False,
+            alias=f"Busy-{tag}",
+            launch_token=f"LAUNCH-BUSY-{tag}",
+            lineage_token=f"LIN-BUSY-{tag}",
+            timeout=240.0,
+        )
+
+        seen_token = f"BUSY-SEEN-{tag}"
+        ignore_content = f"IGNORE-MR-{tag}"
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "Deterministic must_reply retry test. "
+                f"If you ever process an inbox message containing {ignore_content!r}, "
+                f"reply in THIS TOPIC with exactly {seen_token}. "
+                "Never use SendInboxMessage to answer that inbox message, even if it says "
+                "needs_reply or must_reply. "
+                "Do the same thing every time that same unreplied inbox message wakes you again. "
+                f"Reply with only BUSY-READY-{tag} now."
+            ),
+            thread_id=worker_thread,
+            token=f"BUSY-READY-{tag}",
+            timeout=180.0,
+        )
+
+        worker_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=worker_thread)
+        await _send_must_reply_message(
+            live_tg_forum,
+            sender_thread_id=root_thread,
+            recipient=worker_lineage["agent_name"],
+            content=ignore_content,
+            ack_token=f"ROOT-SENT-BUSY-{tag}",
+            summary="must-reply-busy-survives-initial-turn",
+            timeout=240.0,
+        )
+
+        first_seen = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=worker_thread,
+            after_message_id=worker_baseline,
+            token=seen_token,
+            timeout=180.0,
+        )
+        created = await _wait_for_reply_wake_state(
+            live_tg_forum,
+            thread_id=worker_thread,
+            predicate=lambda row: row is not None and bool(row["enabled"]),
+            description="reply_wake schedule to exist and stay enabled",
+            timeout=30.0,
+        )
+        assert created["run_count"] == 0, live_tg_forum.failure_context()
+
+        extra_seen = await _wait_for_message_count_after_containing(
+            live_tg_forum,
+            thread_id=worker_thread,
+            after_message_id=first_seen.message_id,
+            token=seen_token,
+            expected_count=1,
+            timeout=60.0,
+        )
+        assert extra_seen, live_tg_forum.failure_context()
+
+        exhausted = await _wait_for_reply_wake_state(
+            live_tg_forum,
+            thread_id=worker_thread,
+            predicate=lambda row: row is not None and (not bool(row["enabled"])) and row["run_count"] == 3,
+            description="reply_wake schedule to exhaust after three actual retries",
+            timeout=90.0,
+        )
+        assert exhausted["last_run_at"] is not None, live_tg_forum.failure_context()
+        assert exhausted["last_success_at"] is not None, live_tg_forum.failure_context()
+
+    async def test_live_must_reply_clears_only_after_delayed_reply(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        """A delayed reply should clear the schedule only after the reply is sent."""
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+
+        root_thread = await live_tg_forum.platform.create_topic(f"MRDelay {tag}")
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"Deterministic must_reply delayed-reply test. Reply with only MRDELAY-PRIME-{tag}.",
+            thread_id=root_thread,
+            token=f"MRDELAY-PRIME-{tag}",
+            timeout=180.0,
+        )
+        root_lineage = await _query_session_lineage(
+            live_tg_forum,
+            thread_id=root_thread,
+            token=f"ROOT-LIN-DELAY-{tag}",
+            timeout=240.0,
+        )
+
+        worker_thread, worker_lineage = await _launch_lineage_worker(
+            live_tg_forum,
+            launcher_thread_id=root_thread,
+            fork=False,
+            alias=f"Delay-{tag}",
+            launch_token=f"LAUNCH-DELAY-{tag}",
+            lineage_token=f"LIN-DELAY-{tag}",
+            timeout=240.0,
+        )
+
+        delay_content = f"DELAY-MR-{tag}"
+        wait_token = f"DELAY-WAIT-{tag}"
+        sent_token = f"DELAY-SENT-{tag}"
+        delayed_reply = f"DELAY-REPLY-{tag}"
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "Deterministic must_reply delayed-reply test. "
+                f"If you ever process an inbox message containing {delay_content!r}, "
+                f"then on the first two times you process that SAME inbox message, "
+                f"reply in THIS TOPIC with exactly {wait_token} and do not use SendInboxMessage. "
+                "On the third time you process that same inbox message, use SendInboxMessage exactly once "
+                f"to reply to {root_lineage['agent_name']!r} with content={delayed_reply!r}, "
+                "summary='delayed-reply', must_reply=false, then reply in THIS TOPIC with exactly "
+                f"{sent_token}. Reply with only DELAY-READY-{tag} now."
+            ),
+            thread_id=worker_thread,
+            token=f"DELAY-READY-{tag}",
+            timeout=180.0,
+        )
+
+        worker_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=worker_thread)
+        root_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=root_thread)
+        await _send_must_reply_message(
+            live_tg_forum,
+            sender_thread_id=root_thread,
+            recipient=worker_lineage["agent_name"],
+            content=delay_content,
+            ack_token=f"ROOT-SENT-DELAY-{tag}",
+            summary="must-reply-delayed-reply",
+            timeout=240.0,
+        )
+
+        await _wait_for_message_count_after_containing(
+            live_tg_forum,
+            thread_id=worker_thread,
+            after_message_id=worker_baseline,
+            token=wait_token,
+            expected_count=2,
+            timeout=90.0,
+        )
+        schedule_live = await _wait_for_reply_wake_state(
+            live_tg_forum,
+            thread_id=worker_thread,
+            predicate=lambda row: row is not None and bool(row["enabled"]),
+            description="reply_wake schedule to remain active before delayed reply",
+            timeout=30.0,
+        )
+        assert schedule_live["max_runs"] == 3, live_tg_forum.failure_context()
+
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=root_thread,
+            after_message_id=root_baseline,
+            token=delayed_reply,
+            timeout=120.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=worker_thread,
+            after_message_id=worker_baseline,
+            token=sent_token,
+            timeout=120.0,
+        )
+        await _wait_for_reply_wake_state(
+            live_tg_forum,
+            thread_id=worker_thread,
+            predicate=lambda row: row is None,
+            description="reply_wake schedule to clear after delayed reply",
+            timeout=60.0,
         )
 
 
