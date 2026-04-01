@@ -71,6 +71,15 @@ def _forum_thread_id(message: Any) -> int | None:
     return None
 
 
+def _extract_text_urls(message: Any) -> tuple[str, ...]:
+    urls: list[str] = []
+    for entity in getattr(message, "entities", None) or ():
+        url = getattr(entity, "url", None)
+        if isinstance(url, str) and url:
+            urls.append(url)
+    return tuple(urls)
+
+
 @dataclass(frozen=True)
 class TelegramForumObservedMessage:
     message_id: int
@@ -78,6 +87,7 @@ class TelegramForumObservedMessage:
     reply_to_message_id: int | None
     thread_id: int | None
     sender_id: int | None = None
+    text_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -420,6 +430,7 @@ class TelegramForumPlatform:
                     ),
                     thread_id=message_thread_id,
                     sender_id=getattr(message, "sender_id", None),
+                    text_urls=_extract_text_urls(message),
                 )
             )
             if len(observed) >= limit:

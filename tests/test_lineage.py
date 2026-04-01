@@ -112,6 +112,27 @@ def test_descendant_bootstrap_keeps_parent_node_agent_names() -> None:
     ]
 
 
+def test_bootstrap_root_display_name_includes_timestamp_but_parses_plain_lineage() -> None:
+    lineage = ("TestGroup2", "Agent-A")
+    team_key = "2026-03-31-19-42-testgroup2"
+    xml = build_obs_bootstrap_xml(
+        lineage=lineage,
+        origin="agent_task_fresh",
+        is_fork=False,
+        session_id="sid-root",
+        root_team_key=team_key,
+        agent_name=agent_name_for_lineage(lineage),
+    )
+
+    root = ET.fromstring(xml)
+    nodes = root.findall(".//obs-node")
+    assert nodes[0].attrib["display_name"] == "2026-03-31 19-42 TestGroup2"
+    assert nodes[0].attrib["agent_name"] == team_key
+
+    parsed = parse_obs_bootstrap_xml(xml)
+    assert parsed.lineage == lineage
+
+
 def test_extract_bootstrap_with_system_note_prefix():
     """Regression: bootstrap prefixed by <system-note> must still be found.
 

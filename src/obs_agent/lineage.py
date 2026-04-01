@@ -26,6 +26,9 @@ _OBS_BOOTSTRAP_RE = re.compile(
     r"(?s)(<obs-bootstrap\b[^>]*>.*?</obs-bootstrap>)"
 )
 _NON_ALNUM_RE = re.compile(r"[^A-Za-z0-9]+")
+_ROOT_TEAM_KEY_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})-(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<slug>.+)$"
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,42 @@ def root_team_key_for_lineage(
     return f"{prefix}-{slug}"
 
 
+def format_root_display_name(
+    root_team_key: str | None,
+    display_name: str | None,
+) -> str:
+    """Return the user-facing trunk display name, including the team timestamp."""
+    normalized = normalize_lineage_name(display_name)
+    if not normalized:
+        return normalized
+    match = _ROOT_TEAM_KEY_RE.match((root_team_key or "").strip())
+    if match is None:
+        return normalized
+    prefix = f"{match.group('date')} {match.group('hour')}-{match.group('minute')}"
+    if normalized.startswith(f"{prefix} "):
+        return normalized
+    return f"{prefix} {normalized}"
+
+
+def strip_root_display_timestamp(
+    display_name: str | None,
+    root_team_key: str | None,
+) -> str:
+    """Recover the canonical trunk lineage name from a timestamped display label."""
+    normalized = normalize_lineage_name(display_name)
+    if not normalized:
+        return normalized
+    match = _ROOT_TEAM_KEY_RE.match((root_team_key or "").strip())
+    if match is None:
+        return normalized
+    prefix = f"{match.group('date')} {match.group('hour')}-{match.group('minute')} "
+    if normalized.startswith(prefix):
+        stripped = normalize_lineage_name(normalized[len(prefix):])
+        if stripped:
+            return stripped
+    return normalized
+
+
 def agent_name_for_lineage(
     lineage: Sequence[str],
     *,
@@ -152,7 +191,12 @@ def build_obs_bootstrap_xml(
     lineage_el = ET.SubElement(root, "obs-lineage")
     normalized = [normalize_lineage_name(n) for n in lineage]
     for idx, node_name in enumerate(normalized):
-        attrs: dict[str, str] = {"display_name": node_name}
+        display_name = (
+            format_root_display_name(root_team_key, node_name)
+            if idx == 0
+            else node_name
+        )
+        attrs: dict[str, str] = {"display_name": display_name}
         sub_lineage = tuple(normalized[: idx + 1])
         computed_name = agent_name_for_lineage(
             sub_lineage,
@@ -206,14 +250,6 @@ def parse_obs_bootstrap_xml(xml_text: str) -> ObsBootstrap:
     if root.tag != "obs-bootstrap":
         raise ValueError(f"Unexpected root tag: {root.tag}")
 
-    lineage_el = root.find("obs-lineage")
-    lineage: list[str] = []
-    if lineage_el is not None:
-        for node in lineage_el.findall("obs-node"):
-            # v2 uses display_name=, v1 uses name=. Try new first, fall back.
-            display = node.attrib.get("display_name") or node.attrib.get("name")
-            lineage.append(normalize_lineage_name(display))
-
     fork_context = root.find("fork_context")
     team_context = root.find("team_context")
 
@@ -225,6 +261,21 @@ def parse_obs_bootstrap_xml(xml_text: str) -> ObsBootstrap:
             return None
         text = child.text.strip()
         return text or None
+
+    root_team_key = _child_text(team_context, "root_team_key")
+    lineage_el = root.find("obs-lineage")
+    lineage: list[str] = []
+    if lineage_el is not None:
+        for idx, node in enumerate(lineage_el.findall("obs-node")):
+            # v2 uses display_name=, v1 uses name=. Try new first, fall back.
+            display = node.attrib.get("display_name") or node.attrib.get("name")
+            normalized_display = normalize_lineage_name(display)
+            if idx == 0:
+                normalized_display = strip_root_display_timestamp(
+                    normalized_display,
+                    root_team_key,
+                )
+            lineage.append(normalized_display)
 
     is_fork_text = (_child_text(fork_context, "is_fork") or "").lower()
     # v2 uses <agent_name>; legacy v1 uses <native_agent_name>. Try new first.
@@ -240,7 +291,7 @@ def parse_obs_bootstrap_xml(xml_text: str) -> ObsBootstrap:
         session_id=_child_text(fork_context, "session_id"),
         agent_id=_child_text(fork_context, "agent_id"),
         parent_session_id=_child_text(fork_context, "parent_session_id"),
-        root_team_key=_child_text(team_context, "root_team_key"),
+        root_team_key=root_team_key,
         agent_name=resolved_agent,
         parent_agent_name=_child_text(team_context, "parent_agent_name"),
         parent_display_name=_child_text(team_context, "parent_display_name"),

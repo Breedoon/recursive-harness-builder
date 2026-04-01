@@ -20,7 +20,12 @@ import pytest
 from telegram.error import BadRequest, TelegramError
 
 from obs_agent.events import StatusEvent
-from obs_agent.lineage import ObsBootstrap, agent_name_for_lineage, root_team_key_for_lineage
+from obs_agent.lineage import (
+    ObsBootstrap,
+    agent_name_for_lineage,
+    format_root_display_name,
+    root_team_key_for_lineage,
+)
 from obs_agent.queueing import QueuedMessage
 from obs_agent.runner import DoneEvent, TextEvent, TurnEndEvent
 from obs_agent.telegram import (
@@ -1569,7 +1574,7 @@ class TestTopicScheduling:
         assert f"from={from_local}" in summary
         assert f"until={until_local}" in summary
 
-    async def test_reply_wake_schedule_consumes_attempts_while_route_is_busy(self, config):
+    async def test_reply_wake_schedule_does_not_consume_attempts_while_route_is_busy(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=79131)
         state = bot._get_state(route)
@@ -1585,14 +1590,14 @@ class TestTopicScheduling:
         with patch("obs_agent.telegram.time.time", return_value=1000.0):
             assert await bot._execute_topic_schedule(record=record, trigger_kind="interval") is False
             first = bot._topic_schedules_by_id[record.schedule_id]
-            assert first.run_count == 1
+            assert first.run_count == 0
             assert first.enabled is True
             assert first.next_run_at == 1001.0
 
         with patch("obs_agent.telegram.time.time", return_value=1001.0):
             assert await bot._execute_topic_schedule(record=first, trigger_kind="interval") is False
             second = bot._topic_schedules_by_id[record.schedule_id]
-            assert second.run_count == 2
+            assert second.run_count == 0
             assert second.enabled is True
             assert second.next_run_at == 1002.0
 
@@ -1600,10 +1605,39 @@ class TestTopicScheduling:
             assert await bot._execute_topic_schedule(record=second, trigger_kind="interval") is False
 
         final = bot._topic_schedules_by_id[record.schedule_id]
-        assert final.run_count == 3
-        assert final.enabled is False
-        assert final.next_run_at is None
+        assert final.run_count == 0
+        assert final.enabled is True
+        assert final.next_run_at == 1003.0
         state.last_bot.send_message.assert_not_awaited()
+
+    async def test_reply_wake_schedule_deleted_during_run_stays_deleted(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=79132)
+        state = bot._get_state(route)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+
+        record = create_reply_wake_schedule(route)
+        record.next_run_at = 0.0
+        bot._register_topic_schedule(record)
+
+        async def _run_and_delete(*args, **kwargs):
+            bot._delete_topic_schedule(record.schedule_id)
+            return _RunOutcome(assistant_text="ok")
+
+        with patch.object(
+            bot,
+            "_run_and_send",
+            new=AsyncMock(side_effect=_run_and_delete),
+        ), patch.object(bot, "_send_system_message", new=AsyncMock()), patch(
+            "obs_agent.telegram.time.time", return_value=1000.0
+        ):
+            assert await bot._execute_topic_schedule(record=record, trigger_kind="interval") is True
+
+        assert record.schedule_id not in bot._topic_schedules_by_id
+        assert bot._state_store.load_snapshot().topic_schedules == []
 
     async def test_overlap_validation_removed_allows_free_coexistence(self, config):
         """Overlap validation was removed — schedules freely coexist.
@@ -2647,11 +2681,14 @@ class TestCommands:
             members=members,
             mode="tree",
         )
-        assert '- <a href="https://t.me/c/67890/111/111">Root</a>' in html_text
-        assert '&nbsp;&nbsp;- <a href="https://t.me/c/67890/321/321">Branch</a> (current)' in html_text
-        assert '&nbsp;&nbsp;&nbsp;&nbsp;- <a href="https://t.me/c/67890/333/333">Child</a>' in html_text
-        assert 'https://t.me/c/67890/444/444' in html_text
-        assert 'Sibling' in html_text
+        root_display = format_root_display_name(team_name, "Root")
+        assert html_text.startswith(
+            f'<b><a href="https://t.me/c/67890/111">{root_display}</a></b>\n\n'
+        )
+        assert "- Branch (current)" in html_text
+        assert "\u00A0\u00A0\u00A0\u00A0- <a href=\"https://t.me/c/67890/333\">Child</a>" in html_text
+        assert "https://t.me/c/67890/444" in html_text
+        assert "- <a href=\"https://t.me/c/67890/555\">Sibling</a>" in html_text
         await bot.shutdown()
 
     async def test_tree_ancestors_and_descendants_filters(
@@ -2715,8 +2752,8 @@ class TestCommands:
             members=members,
             mode="ancestors",
         )
-        assert "Root" in ancestors_html
-        assert "Branch" in ancestors_html
+        assert format_root_display_name(team_name, "Root") in ancestors_html
+        assert "<b>Branch</b> (current)" in ancestors_html
         assert "Child" not in ancestors_html
 
         descendants_html = bot._render_tree_html(
@@ -2726,7 +2763,7 @@ class TestCommands:
             members=members,
             mode="descendants",
         )
-        assert "Branch" in descendants_html
+        assert descendants_html.startswith("<b>Branch</b> (current)\n\n")
         assert "Child" in descendants_html
         assert "Grandchild" in descendants_html
         assert "Sibling" not in descendants_html
