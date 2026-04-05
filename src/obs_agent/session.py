@@ -29,12 +29,12 @@ logger = logging.getLogger("obs_agent.session")
 ensure_raw_uuid_patch()
 
 _DEFAULT_SDK_ENV: dict[str, str] = {
-    # Disable optional background/product traffic in Claude Code subprocesses.
-    # This reduces daemon fragility from non-essential SDK side-channels.
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     # Disable background tasks (skill auto-improvement, magic docs, plugin autoupdate).
     # The skill_improvement_apply feature crashes headless SDK sessions.
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    # NOTE: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC was here until 2026-04-04.
+    # Removed because it disables GrowthBook, which gates 1h prompt cache TTL.
+    # See Drafts/2026-04/cache-analysis/query-source-investigation.md
 }
 def _on_cli_stderr(line: str) -> None:
     """Capture stderr output from the Claude Code CLI subprocess.
