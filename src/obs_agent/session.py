@@ -32,6 +32,14 @@ _DEFAULT_SDK_ENV: dict[str, str] = {
     # Disable background tasks (skill auto-improvement, magic docs, plugin autoupdate).
     # The skill_improvement_apply feature crashes headless SDK sessions.
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    # Suppress git status from the system prompt and git instructions from
+    # Bash tool description.  Git status is memoized per-CLI-process; when the
+    # worktree changes mid-session (agent edits files), forks recompute it and
+    # get a different dynamic system prompt → cache miss on the entire prefix
+    # past the ~48K static portion.  Spike-verified: 53% → 92% fork cache hit.
+    # Git commands (status, commit, log) via Bash still work normally.
+    # See Drafts/2026-04/cache-analysis/ and CC utils/gitSettings.ts:13-18.
+    "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
     # NOTE: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC was here until 2026-04-04.
     # Removed because it disables GrowthBook, which gates 1h prompt cache TTL.
     # See Drafts/2026-04/cache-analysis/query-source-investigation.md
