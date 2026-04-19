@@ -51,6 +51,16 @@ def create_default_app() -> FastAPI:
     bootstrap_runtime_env(mutate_argv=False)
     config = OBSConfig.from_env()
     config.validate()
+
+    # Start cache-normalizing proxy before any CC sessions
+    from obs_agent.cache_proxy_lifecycle import should_attempt_proxy_start, start_cache_proxy
+    if should_attempt_proxy_start(cache_proxy_enabled=config.cache_proxy_enabled):
+        proxy_proc = start_cache_proxy(config.cache_proxy_port)
+        if proxy_proc is None:
+            logger.warning(
+                "Cache proxy failed to start — sessions will use direct Anthropic API"
+            )
+
     return create_app(config)
 
 

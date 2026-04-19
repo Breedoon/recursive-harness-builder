@@ -81,6 +81,16 @@ def main() -> None:
     _configure_logging()
     config = OBSConfig.from_env()
     config.validate()
+
+    # Start cache-normalizing proxy before any CC sessions
+    from obs_agent.cache_proxy_lifecycle import should_attempt_proxy_start, start_cache_proxy
+    if should_attempt_proxy_start(cache_proxy_enabled=config.cache_proxy_enabled):
+        proxy_proc = start_cache_proxy(config.cache_proxy_port)
+        if proxy_proc is None:
+            logging.getLogger("obs_agent.cache_proxy").warning(
+                "Cache proxy failed to start — sessions will use direct Anthropic API"
+            )
+
     asyncio.run(run_telegram_bot(config))
 
 

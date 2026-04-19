@@ -133,6 +133,15 @@ class SessionManager:
             **self._sdk_env_overrides,
         }
 
+        # Route CC API traffic through the cache-normalizing proxy when enabled.
+        # Forks inherit env from the parent CC process, so this propagates
+        # automatically to all fork chains without explicit fork handling.
+        from obs_agent.cache_proxy_lifecycle import should_use_proxy
+        if should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled):
+            effective_env["ANTHROPIC_BASE_URL"] = (
+                f"http://127.0.0.1:{self.config.cache_proxy_port}"
+            )
+
         options = ClaudeAgentOptions(
             model=self.config.model,
             hooks=hook_matchers,

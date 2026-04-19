@@ -315,3 +315,21 @@ def eval_vault() -> Path:
 def eval_config(eval_vault: Path) -> OBSConfig:
     """OBSConfig for eval tests: real vault clone, daemon port 7833."""
     return OBSConfig(vault_path=eval_vault, daemon_port=7833)
+
+
+# ---------------------------------------------------------------------------
+# Register cache proxy fixtures as a pytest plugin so fixtures are discovered.
+# conftest_cache_proxy.py defines proxy, proxy_port, test_project, etc.
+# Must add tests/ to sys.path first since pytest doesn't auto-add it.
+# ---------------------------------------------------------------------------
+import sys as _sys
+_tests_dir = str(Path(__file__).resolve().parent)
+if _tests_dir not in _sys.path:
+    _sys.path.insert(0, _tests_dir)
+
+try:
+    import conftest_cache_proxy  # noqa: F401
+    pytest_plugins = ["conftest_cache_proxy"]
+except ImportError:
+    # conftest_cache_proxy is only present in the cache-proxy worktree
+    pass

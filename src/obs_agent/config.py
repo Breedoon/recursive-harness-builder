@@ -49,6 +49,10 @@ class OBSConfig:
     context_window_estimate_tokens: int = 1_000_000
     context_probe_claude_cli: bool = False
 
+    # Cache proxy
+    cache_proxy_port: int = 18923
+    cache_proxy_enabled: bool = True
+
     # Telegram
     telegram_bot_token: str | None = None
     telegram_bot_tokens: list[str] = field(default_factory=list)
@@ -97,6 +101,10 @@ class OBSConfig:
             kwargs["context_window_estimate_tokens"] = int(context_est)
         if probe_cli := os.environ.get("OBS_CONTEXT_PROBE_CLAUDE_CLI"):
             kwargs["context_probe_claude_cli"] = probe_cli.strip().lower() in {"1", "true", "yes", "on"}
+        if proxy_port := os.environ.get("OBS_CACHE_PROXY_PORT"):
+            kwargs["cache_proxy_port"] = int(proxy_port)
+        if proxy_enabled := os.environ.get("OBS_CACHE_PROXY_ENABLED"):
+            kwargs["cache_proxy_enabled"] = proxy_enabled.strip().lower() in {"1", "true", "yes", "on"}
         raw_tokens = (os.environ.get("OBS_TELEGRAM_BOT_TOKENS") or "").strip()
         if raw_tokens:
             kwargs["telegram_bot_tokens"] = [
