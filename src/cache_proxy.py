@@ -2,18 +2,19 @@ from __future__ import annotations
 
 """Cache-normalizing proxy for Claude Code API requests.
 
-Intercepts POST /v1/messages requests and applies 7 idempotent normalization
+Intercepts POST /v1/messages requests and applies 6 idempotent normalization
 rules to maximize prompt cache hits across session restarts and forks.
-All other requests are forwarded unmodified.
+All other requests are forwarded unmodified. CC's native cache_control
+placement is left untouched — cache_control is not part of the cache key
+(it's a breakpoint hint only), so normalizing it is unnecessary.
 
 Normalizations (applied in order):
 1. Billing header: replaced with fixed value
 2. String→list: bare-string user content converted to list format
 3. Skill listing: pinned to messages[0].content[0]
 4. Dynamic system-reminders: stripped (except skill listing + CLAUDE.md)
-5. Cache control: ephemeral markers added to all user messages
-6. Tool sorting: tools[] sorted alphabetically by name
-7. Metadata: session-specific IDs normalized
+5. Tool sorting: tools[] sorted alphabetically by name
+6. Metadata: session-specific IDs normalized
 
 Usage:
     python cache_proxy.py [port]  # default: 18923
@@ -52,7 +53,7 @@ stats = {
     "requests": 0,
     "skill_moved": 0, "skill_ok": 0, "skill_missing": 0,
     "billing_normalized": 0, "strings_converted": 0,
-    "reminders_stripped": 0, "cc_added": 0,
+    "reminders_stripped": 0,
     "tools_sorted": 0, "metadata_normalized": 0,
     "errors": 0,
 }
@@ -222,54 +223,6 @@ def strip_dynamic_reminders(body: dict) -> int:
     return count
 
 
-def normalize_cache_control(body: dict) -> int:
-    """Rule 5: Normalize cache_control on the last N user messages.
-
-    CC only places cache_control on the very last user message. When a new
-    turn arrives, the previous message loses its marker, and the cached
-    segment can never be matched again. Adding to recent user messages creates
-    stable cache breakpoints.
-
-    Constraints:
-    - The API allows a maximum of 4 cache_control blocks total (across
-      system + messages). System prompt uses 1, so we use at most 3 on
-      user messages.
-    - Normalizes existing cache_control blocks to strip explicit TTL.
-      CC may add {"type": "ephemeral", "ttl": "1h"} to some blocks. The API
-      rejects mixed TTLs. By stripping TTL, we let the server determine TTL
-      uniformly based on the account's eligibility.
-    """
-    MAX_USER_CC_BLOCKS = 3  # API limit is 4 total; 1 reserved for system
-    messages = body.get("messages", [])
-    count = 0
-    canonical_cc = {"type": "ephemeral"}
-
-    # First: strip ALL existing cache_control from user message content blocks
-    for msg in messages:
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if isinstance(block, dict) and "cache_control" in block:
-                del block["cache_control"]
-                count += 1
-
-    # Then: add cache_control to the last N user messages only
-    user_msgs = [m for m in messages if m.get("role") == "user"
-                 and isinstance(m.get("content"), list) and m["content"]]
-    target_msgs = user_msgs[-MAX_USER_CC_BLOCKS:]
-    for msg in target_msgs:
-        last_block = msg["content"][-1]
-        if isinstance(last_block, dict):
-            last_block["cache_control"] = canonical_cc
-            count += 1
-
-    stats["cc_added"] += count
-    return count
-
-
 def normalize_tool_order(body: dict) -> int:
     """Rule 6: Sort tool definitions alphabetically by name.
 
@@ -309,10 +262,14 @@ def normalize_metadata(body: dict) -> int:
 
 
 def normalize_request(body: dict) -> tuple[dict, dict]:
-    """Apply all 7 normalizations to a request body in spec order.
+    """Apply all 6 normalizations to a request body in spec order.
 
     Order: billing → strings → skill listing → strip reminders →
-           cache_control → tool sorting → metadata
+           tool sorting → metadata
+
+    cache_control is deliberately left untouched — it's not part of the cache
+    key (confirmed via spike), and CC's native placement is sufficient.
+    See spikes/cache_control_breakpoint_report.md for details.
 
     Returns (modified_body, info_dict) with details of what was normalized.
     """
@@ -331,19 +288,16 @@ def normalize_request(body: dict) -> tuple[dict, dict]:
     # 4. Strip dynamic system-reminders (after skill listing is pinned)
     info["reminders"] = strip_dynamic_reminders(body)
 
-    # 5. Add cache_control to all user messages
-    info["cache_control"] = normalize_cache_control(body)
-
-    # 6. Sort tool definitions
+    # 5. Sort tool definitions
     info["tools"] = normalize_tool_order(body)
 
-    # 7. Normalize metadata
+    # 6. Normalize metadata
     info["metadata"] = normalize_metadata(body)
 
     # Determine overall action label
     actions_taken = [
         info["billing"], info["strings"], info["reminders"],
-        info["cache_control"], info["tools"], info["metadata"],
+        info["tools"], info["metadata"],
     ]
     if skill_info.get("action") == "moved" or any(actions_taken):
         info["action"] = "normalized"
@@ -483,7 +437,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 f"(billing={info.get('billing', 0)} strings={info.get('strings', 0)} "
                 f"skill={info.get('skill', {}).get('action', '?')} "
                 f"reminders={info.get('reminders', 0)} "
-                f"cc={info.get('cache_control', 0)} "
                 f"tools={info.get('tools', 0)} "
                 f"meta={info.get('metadata', 0)})")
 
@@ -594,7 +547,7 @@ def main():
     log(f"logs: {LOG_DIR}")
     log(f"save_bodies: {SAVE_BODIES}")
     log(f"normalizations: billing, string→list, skill position, "
-        f"strip reminders, cache_control, tool sort, metadata")
+        f"strip reminders, tool sort, metadata (cache_control: passthrough)")
     log(f"Set ANTHROPIC_BASE_URL=http://localhost:{port}")
 
     try:

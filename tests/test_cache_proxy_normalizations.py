@@ -408,18 +408,10 @@ async def test_normalization_idempotency(proxy_with_bodies: int, test_project: P
                     f"{label}: msg[{i}] has string content, should be list"
                 )
 
-        # Rule 5: last block of each user message has cache_control
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "user":
-                content = msg.get("content", [])
-                if content and isinstance(content, list):
-                    last_block = content[-1]
-                    if isinstance(last_block, dict):
-                        assert "cache_control" in last_block, (
-                            f"{label}: msg[{i}] last block missing cache_control"
-                        )
+        # cache_control: NOT checked — proxy leaves CC's native placement untouched.
+        # See spikes/cache_control_breakpoint_report.md
 
-        # Rule 6: tools sorted alphabetically
+        # Rule 5: tools sorted alphabetically
         tools = body.get("tools", [])
         if tools:
             tool_names = [t.get("name", "") for t in tools]
@@ -428,7 +420,7 @@ async def test_normalization_idempotency(proxy_with_bodies: int, test_project: P
                 f"{next(a for a, b in zip(tool_names, sorted(tool_names)) if a != b)}"
             )
 
-        # Rule 7: metadata session ID normalized
+        # Rule 6: metadata session ID normalized
         metadata = body.get("metadata", {})
         uid = metadata.get("user_id", "")
         if uid and "_session_" in uid:
@@ -455,19 +447,32 @@ async def test_normalization_idempotency(proxy_with_bodies: int, test_project: P
 
     print("  Cross-request structural consistency verified ✓")
 
-    # Byte-level identity of the shared prefix: the messages that exist in
-    # both requests (body2 has an extra turn appended, so body1's messages
-    # are a prefix of body2's). Serialize the shared prefix from both and
-    # compare byte-for-byte.
+    # Byte-level identity of the shared prefix (excluding cache_control).
+    # cache_control moves between turns (CC places it on the last user msg),
+    # but it's not part of the cache key — confirmed via spike. We strip it
+    # before comparison to verify the actual content prefix matches.
+    def strip_cc(msgs):
+        """Deep-copy messages and remove all cache_control keys for comparison."""
+        import copy
+        cleaned = copy.deepcopy(msgs)
+        for msg in cleaned:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "cache_control" in block:
+                        del block["cache_control"]
+        return cleaned
+
     msgs1 = body1.get("messages", [])
     msgs2 = body2.get("messages", [])
     shared_len = len(msgs1)  # body1 has fewer messages (turn 1 only)
 
     if shared_len > 0 and len(msgs2) >= shared_len:
-        prefix1 = json.dumps(msgs1[:shared_len], sort_keys=True)
-        prefix2 = json.dumps(msgs2[:shared_len], sort_keys=True)
+        prefix1 = json.dumps(strip_cc(msgs1[:shared_len]), sort_keys=True)
+        prefix2 = json.dumps(strip_cc(msgs2[:shared_len]), sort_keys=True)
         assert prefix1 == prefix2, (
-            f"Shared message prefix is NOT byte-identical across requests. "
+            f"Shared message prefix is NOT byte-identical across requests "
+            f"(cache_control excluded). "
             f"Prefix length: {shared_len} messages. "
             f"First diff at char {next((i for i, (a, b) in enumerate(zip(prefix1, prefix2)) if a != b), '?')}"
         )
@@ -497,8 +502,7 @@ async def test_agent_self_fork_via_sdk(proxy: int, test_project: Path):
     - Rule 2: skill listing position (CC regenerates on fork startup)
     - Rule 3: system-reminders from tool results
     - Rule 4: string demotion of older messages
-    - Rule 5: cache_control propagation
-    - Rule 6: tool reordering
+    - Rule 5: tool reordering
 
     Verification:
     - Parent does 4 turns of agent-like work (read, write, bash, analysis)

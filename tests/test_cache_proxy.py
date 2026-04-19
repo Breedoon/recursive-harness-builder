@@ -474,84 +474,12 @@ class TestStripDynamicReminders:
 # ── Rule 5: Cache Control ────────────────────────────────────────────────
 
 
-class TestNormalizeCacheControl:
-    def test_adds_cache_control_to_user_message(self):
-        body = _make_body(messages=[
-            _user_msg([_text_block("hello")]),
-        ])
-        count = cache_proxy.normalize_cache_control(body)
-        assert count == 1
-        assert body["messages"][0]["content"][-1]["cache_control"] == {"type": "ephemeral"}
-
-    def test_no_ttl_in_cache_control(self):
-        """Verify no TTL is set — the API determines TTL based on account eligibility."""
-        body = _make_body(messages=[_user_msg([_text_block("hello")])])
-        cache_proxy.normalize_cache_control(body)
-        cc = body["messages"][0]["content"][-1]["cache_control"]
-        assert "ttl" not in cc
-        assert cc == {"type": "ephemeral"}
-
-    def test_already_has_cache_control(self):
-        body = _make_body(messages=[
-            _user_msg([_text_block("hello", cache_control={"type": "ephemeral"})]),
-        ])
-        cache_proxy.normalize_cache_control(body)
-        # After normalization, the block should still have cache_control
-        cc = body["messages"][0]["content"][-1].get("cache_control")
-        assert cc == {"type": "ephemeral"}
-
-    def test_idempotent(self):
-        body = _make_body(messages=[_user_msg([_text_block("hello")])])
-        cache_proxy.normalize_cache_control(body)
-        body_copy = copy.deepcopy(body)
-        cache_proxy.normalize_cache_control(body)
-        # Body should be identical after applying twice
-        assert body == body_copy
-
-    def test_adds_to_all_user_messages(self):
-        body = _make_body(messages=[
-            _user_msg([_text_block("first")]),
-            _assistant_msg("reply"),
-            _user_msg([_text_block("second")]),
-            _user_msg([_text_block("third")]),
-        ])
-        count = cache_proxy.normalize_cache_control(body)
-        assert count == 3
-        for msg in body["messages"]:
-            if msg["role"] == "user":
-                assert "cache_control" in msg["content"][-1]
-
-    def test_skips_assistant_messages(self):
-        body = _make_body(messages=[_assistant_msg([_text_block("hi")])])
-        count = cache_proxy.normalize_cache_control(body)
-        assert count == 0
-
-    def test_skips_empty_content_list(self):
-        body = _make_body(messages=[_user_msg([])])
-        count = cache_proxy.normalize_cache_control(body)
-        assert count == 0
-
-    def test_skips_non_dict_last_block(self):
-        body = _make_body(messages=[{"role": "user", "content": ["just a string"]}])
-        count = cache_proxy.normalize_cache_control(body)
-        assert count == 0
-
-    def test_adds_to_last_block_of_multi_block_content(self):
-        body = _make_body(messages=[
-            _user_msg([_text_block("first"), _text_block("second")]),
-        ])
-        cache_proxy.normalize_cache_control(body)
-        # Only last block should have cache_control
-        assert "cache_control" not in body["messages"][0]["content"][0]
-        assert "cache_control" in body["messages"][0]["content"][1]
-
-    def test_stats_updated(self):
-        body = _make_body(messages=[_user_msg([_text_block("a")])])
-        cache_proxy.normalize_cache_control(body)
-        assert cache_proxy.stats["cc_added"] == 1
+# ── Rule 5 (cache_control) was removed — CC's native placement is sufficient.
+# See spikes/cache_control_breakpoint_report.md for the spike that confirmed
+# cache_control is not part of the cache key and doesn't need normalization.
 
 
-# ── Rule 6: Tool Sorting ─────────────────────────────────────────────────
+# ── Rule 5: Tool Sorting ─────────────────────────────────────────────────
 
 
 class TestNormalizeToolOrder:
@@ -689,7 +617,7 @@ class TestNormalizeMetadata:
 
 class TestNormalizeRequest:
     def test_applies_all_rules(self):
-        """A body with all normalizable aspects gets all 7 rules applied."""
+        """A body with all normalizable aspects gets all 6 rules applied."""
         body = _make_body(
             system=[_billing_block()],
             messages=[
@@ -724,14 +652,14 @@ class TestNormalizeRequest:
         # Rule 4: dynamic reminders stripped
         assert info["reminders"] >= 1
 
-        # Rule 5: cache_control added
-        assert info["cache_control"] >= 1
+        # cache_control: not touched (CC handles natively)
+        assert "cache_control" not in info
 
-        # Rule 6: tools sorted
+        # Rule 5: tools sorted
         assert info["tools"] >= 1
         assert result_body["tools"][0]["name"] == "a_tool"
 
-        # Rule 7: metadata normalized
+        # Rule 6: metadata normalized
         assert info["metadata"] >= 1
         assert result_body["metadata"]["user_id"] == "user_x_session_0"
 
