@@ -7,6 +7,7 @@ rules to maximize prompt cache hits across session restarts and forks.
 All other requests are forwarded unmodified. CC's native cache_control
 placement is left untouched — cache_control is not part of the cache key
 (it's a breakpoint hint only), so normalizing it is unnecessary.
+See spikes/cache_control_breakpoint_report.md for details.
 
 Normalizations (applied in order):
 1. Billing header: replaced with fixed value

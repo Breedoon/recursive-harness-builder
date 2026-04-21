@@ -987,7 +987,7 @@ class TestNormalizeRequest:
             system=[{"type": "text", "text": cache_proxy.FIXED_BILLING_HEADER}],
             messages=[
                 _user_msg([
-                    _text_block("hello", cache_control={"type": "ephemeral"}),
+                    _text_block("hello"),
                 ]),
             ],
             tools=[
@@ -1043,7 +1043,7 @@ class TestNormalizeRequest:
         """Action should be 'normalized' if ANY rule fires."""
         # Only tools need sorting, everything else is clean
         body = _make_body(
-            messages=[_user_msg([_text_block("hello", cache_control={"type": "ephemeral"})])],
+            messages=[_user_msg([_text_block("hello")])],
             tools=[{"name": "b"}, {"name": "a"}],
         )
         _, info = cache_proxy.normalize_request(body)
@@ -1052,7 +1052,7 @@ class TestNormalizeRequest:
     def test_action_not_found_when_nothing_to_do(self):
         """When there's nothing to normalize and no skill listing found."""
         body = _make_body(
-            messages=[_user_msg([_text_block("hello", cache_control={"type": "ephemeral"})])],
+            messages=[_user_msg([_text_block("hello")])],
         )
         _, info = cache_proxy.normalize_request(body)
         assert info["skill"]["action"] == "not_found"
