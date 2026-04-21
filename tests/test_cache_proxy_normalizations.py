@@ -29,6 +29,7 @@ import pytest
 
 from conftest_cache_proxy import (
     BULK_TEXT,
+    TEST_LOG_DIR,
     TEST_MODEL,
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -293,7 +294,7 @@ async def test_string_to_list_normalization(
         )
 
     # ── Verify Rule 4 fired: inspect pre/post bodies for string→list conversion ──
-    body_dir = Path("/tmp/cache-proxy-log/bodies/")
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
     assert body_dir.exists(), "Body directory not found — SAVE_BODIES may not be active"
 
     pre_files = sorted(body_dir.glob("req*_pre.json"))
@@ -377,7 +378,7 @@ async def test_normalization_idempotency(proxy_with_bodies: int, test_project: P
     time.sleep(0.5)
 
     # Read saved request bodies — check structural invariants on post bodies
-    body_dir = Path("/tmp/cache-proxy-log/bodies/")
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
     assert body_dir.exists(), "Body directory not found — SAVE_BODIES may not be active"
 
     post_files = sorted(body_dir.glob("req*_post.json"))
@@ -753,3 +754,744 @@ async def test_minimal_option_fork_path(proxy: int, test_project: Path):
         f"baseline={baseline:,}, classification={classification}"
     )
     assert_cache_hit(fork_cr, prev_total, baseline, "minimal-option fork path")
+
+
+# ── Test 7: Git status divergence normalized ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_git_status_divergence_normalized(
+    proxy_with_bodies: int, test_project: Path
+):
+    """Fork from a git repo with dirty working tree still hits cache.
+
+    The gitStatus section in sys[2] changes when the working tree changes
+    between parent and fork process startup. Rule 5 (normalize_git_status)
+    replaces the gitStatus section with a fixed placeholder.
+
+    The SDK's CC CLI subprocess includes gitStatus in the system prompt
+    when cwd is a git repository. We test this by:
+    1. Make test_project a git repo with dirty working tree
+    2. Run a parent session (CC includes gitStatus with dirty files)
+    3. Add more dirty files (different git status)
+    4. Fork — proxy normalizes gitStatus, enabling cache hit
+
+    If CC doesn't include gitStatus (SDK may skip it), we verify the
+    normalization fired on post-normalization bodies and fall back to
+    confirming the proxy's structural invariants.
+
+    Verification:
+    - Fork's first turn classified as HIT (if CC includes gitStatus)
+    - Post-normalization bodies verified for normalization invariants
+    """
+    import subprocess as sp
+
+    # Initialize test_project as a git repo with some committed + dirty files
+    sp.run(["git", "init"], cwd=test_project, capture_output=True, check=True)
+    sp.run(["git", "add", "CLAUDE.md", "hello.py"], cwd=test_project,
+           capture_output=True, check=True)
+    sp.run(
+        ["git", "commit", "-m", "init", "--no-gpg-sign"],
+        cwd=test_project, capture_output=True, check=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "t@t",
+             "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "t@t"},
+    )
+    # Leave data/ untracked so gitStatus shows dirty
+    print(f"\n  Test project git repo: {test_project}")
+
+    # ── Parent ──
+    opts = make_sdk_options(test_project, proxy_with_bodies)
+    parent = ClaudeSDKClient(opts)
+    await parent.connect()
+    parent_sid = None
+    usage_rows = []
+    try:
+        sid, u1 = await run_turn(
+            parent,
+            f"Reference document:\n\n{BULK_TEXT}\n\nReply with exactly: READY",
+        )
+        if sid:
+            parent_sid = sid
+        usage_rows.append(u1)
+
+        sid, u2 = await run_turn(parent, "Reply with exactly: ACK2")
+        if sid:
+            parent_sid = sid
+        usage_rows.append(u2)
+    finally:
+        await parent.disconnect()
+
+    assert parent_sid, "Failed to get parent session ID"
+    print(f"  Parent session: {parent_sid}")
+    for i, u in enumerate(usage_rows, 1):
+        print(f"    Turn {i}: {fmt_usage(u)}")
+
+    # ── Add more untracked files to change git status before forking ──
+    (test_project / "newfile_untracked_1.txt").write_text("new content 1\n")
+    (test_project / "newfile_untracked_2.txt").write_text("new content 2\n")
+
+    # ── Fork ──
+    fork_opts = make_sdk_options(
+        test_project, proxy_with_bodies, resume=parent_sid, fork_session=True
+    )
+    fork = ClaudeSDKClient(fork_opts)
+    await fork.connect()
+    try:
+        fork_sid, fork_usage = await run_turn(
+            fork, "Reply with exactly: FORK_DIRTY_GIT"
+        )
+    finally:
+        await fork.disconnect()
+
+    assert fork_sid, "Failed to get fork session ID"
+    print(f"  Fork session: {fork_sid}")
+    print(f"  Fork usage: {fmt_usage(fork_usage)}")
+
+    # ── Verify: check post-normalization bodies ──
+    time.sleep(0.5)
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
+    post_files = sorted(body_dir.glob("req*_post.json"))
+
+    # Check if any body has gitStatus (CC may not include it via SDK)
+    git_normalized_count = 0
+    for pf in post_files:
+        body = json.loads(pf.read_text())
+        system = body.get("system", [])
+        for i, block in enumerate(system):
+            text = block.get("text", "")
+            if "gitStatus: normalized" in text:
+                git_normalized_count += 1
+                print(f"  {pf.name} sys[{i}]: gitStatus normalized ✓")
+            elif "gitStatus:" in text:
+                # gitStatus present but NOT normalized — this would be a bug
+                print(f"  {pf.name} sys[{i}]: gitStatus NOT normalized ✗")
+                assert False, (
+                    f"gitStatus present but not normalized in {pf.name} sys[{i}]"
+                )
+
+    if git_normalized_count > 0:
+        print(f"  ✓ Git status normalization fired on {git_normalized_count} requests")
+    else:
+        print("  ⚠ No gitStatus in system prompt — SDK may not include it. "
+              "Verifying fork cache hit without gitStatus normalization.")
+
+    # ── Verify cache hit ──
+    parent_rows = extract_usage(parent_sid)
+    if parent_rows:
+        parent_crs = [r["cr"] for r in parent_rows]
+        baseline = compute_baseline(parent_crs)
+        prev_total = parent_rows[-1]["tot"]
+
+        fork_turn = extract_fork_first_turn(fork_sid)
+        if fork_turn:
+            classification = classify_cache_hit(fork_turn["cr"], prev_total, baseline)
+            print(
+                f"  Fork: cr={fork_turn['cr']:,}, prev_total={prev_total:,}, "
+                f"baseline={baseline:,}, classification={classification}"
+            )
+            assert_cache_hit(
+                fork_turn["cr"], prev_total, baseline,
+                "git status divergence fork"
+            )
+        else:
+            # Fall back to proxy log
+            proxy_entries = get_proxy_usage_for_turns()
+            if len(proxy_entries) >= 3:
+                fork_entry = proxy_entries[-1]
+                parent_entry = proxy_entries[-2]
+                fork_cr = fork_entry.get("cr", 0)
+                prev_tot = parent_entry.get("tot", 0)
+                baseline_entries = [e.get("cr", 0) for e in proxy_entries[:-1]]
+                baseline = compute_baseline(baseline_entries)
+                assert_cache_hit(fork_cr, prev_tot, baseline,
+                                 "git status divergence fork (proxy log)")
+            else:
+                pytest.skip("Not enough proxy entries to verify cache hit")
+    else:
+        pytest.skip("Could not extract parent usage from JSONL")
+
+
+# ── Test 8: CLAUDE.md modification between parent and fork (xfail) ────
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    reason="CLAUDE.md modification between parent and fork causes cache miss — "
+           "known limitation (CLAUDE.md is re-read from disk on fork startup, "
+           "producing different content in the system-reminder injection). "
+           "May XPASS via SDK because the SDK's minimal CC subprocess doesn't "
+           "always inject CLAUDE.md as a system-reminder.",
+    strict=False,  # Expected: FAIL in production CC, XPASS via SDK
+)
+async def test_claudemd_modification_causes_cache_miss(
+    proxy: int, test_project: Path
+):
+    """Modifying CLAUDE.md between parent and fork should break cache.
+
+    This documents a known limitation: the proxy preserves CLAUDE.md content
+    (it's the static system-reminder at msg[0]), but if the file changes on
+    disk between parent start and fork start, the fork process re-reads it
+    and injects different content. The prefix diverges at that point.
+
+    This test is xfail — it documents the limitation rather than blocking CI.
+    The fix (injecting CLAUDE.md via OBS system prompt) is tracked separately.
+
+    NOTE: This test XPASSes in the SDK test environment because the SDK's
+    minimal CC subprocess does not inject CLAUDE.md as a <system-reminder>
+    block. In production CC (full CLI), CLAUDE.md IS injected, so modifying
+    it between parent and fork WILL cause a cache miss. The xfail with
+    strict=False accommodates both behaviors.
+    """
+    original_claudemd = (test_project / "CLAUDE.md").read_text()
+
+    # ── Parent with original CLAUDE.md ──
+    opts = make_sdk_options(test_project, proxy)
+    parent = ClaudeSDKClient(opts)
+    await parent.connect()
+    parent_sid = None
+    usage_rows = []
+    try:
+        sid, u1 = await run_turn(
+            parent,
+            f"Reference:\n\n{BULK_TEXT}\n\nReply with exactly: READY",
+        )
+        if sid:
+            parent_sid = sid
+        usage_rows.append(u1)
+
+        sid, u2 = await run_turn(parent, "Reply with exactly: ACK2")
+        if sid:
+            parent_sid = sid
+        usage_rows.append(u2)
+    finally:
+        await parent.disconnect()
+
+    assert parent_sid, "Failed to get parent session ID"
+    print(f"\n  Parent session: {parent_sid}")
+
+    # ── Modify CLAUDE.md ──
+    (test_project / "CLAUDE.md").write_text(
+        original_claudemd + "\n\n## New Section Added After Parent Started\n\n"
+        "This content was not present when the parent session started. "
+        "The fork process will re-read this file and inject different content "
+        "into its API request, breaking the cache prefix.\n"
+    )
+
+    # ── Fork with modified CLAUDE.md ──
+    fork_opts = make_sdk_options(
+        test_project, proxy, resume=parent_sid, fork_session=True
+    )
+    fork = ClaudeSDKClient(fork_opts)
+    await fork.connect()
+    try:
+        fork_sid, fork_usage = await run_turn(
+            fork, "Reply with exactly: FORK_MODIFIED_CLAUDEMD"
+        )
+    finally:
+        await fork.disconnect()
+
+    assert fork_sid, "Failed to get fork session ID"
+    print(f"  Fork session: {fork_sid}")
+    print(f"  Fork usage: {fmt_usage(fork_usage)}")
+
+    # ── Verify cache HIT (this should FAIL — that's the point of xfail) ──
+    parent_rows = extract_usage(parent_sid)
+    if parent_rows:
+        parent_crs = [r["cr"] for r in parent_rows]
+        baseline = compute_baseline(parent_crs)
+        prev_total = parent_rows[-1]["tot"]
+
+        fork_turn = extract_fork_first_turn(fork_sid)
+        if fork_turn:
+            classification = classify_cache_hit(fork_turn["cr"], prev_total, baseline)
+            print(
+                f"  Fork: cr={fork_turn['cr']:,}, prev_total={prev_total:,}, "
+                f"classification={classification} (expect MISS)"
+            )
+            # This assert should FAIL → xfail catches it
+            assert_cache_hit(
+                fork_turn["cr"], prev_total, baseline,
+                "CLAUDE.md modified fork"
+            )
+    else:
+        # If we can't get usage data, we can't verify — skip
+        pytest.skip("Could not extract parent usage")
+
+
+# ── Test 9: Raw-HTTP git status normalization verification ─────────────
+
+
+def test_git_status_normalization_via_raw_http(proxy_with_bodies: int):
+    """Verify normalize_git_status() fires on real HTTP traffic.
+
+    The SDK's CC subprocess doesn't include gitStatus in sys[2], so
+    SDK-based tests (Test 7) can't exercise the normalization rule.
+
+    This test bypasses the SDK entirely: sends a raw POST /v1/messages
+    with a hand-crafted system prompt containing gitStatus, and verifies
+    the post-normalization body has 'gitStatus: normalized'.
+
+    Two requests with DIFFERENT gitStatus content should produce
+    IDENTICAL post-normalization system prompts (proving normalization
+    eliminates the divergence).
+
+    NOTE: This is NOT a live API test — we send to the proxy but use a
+    non-existent API key so the upstream call fails. We only care about
+    the proxy's normalization of the request body, not the API response.
+    We use SAVE_BODIES mode to inspect what the proxy actually sent.
+    """
+    import httpx as httpx_client
+
+    proxy_url = f"http://localhost:{proxy_with_bodies}"
+
+    # Realistic system prompt with gitStatus at the end of sys[2]
+    sys_block_0 = "x-anthropic-billing-header: cc_version=abc123; cc_entrypoint=sdk-py; cch=def456;"
+    sys_block_1 = "You are Claude, an AI assistant made by Anthropic."
+    sys_block_2_template = (
+        "Environment info:\n"
+        " - Platform: darwin\n"
+        " - Shell: zsh\n"
+        " - OS Version: Darwin 23.4.0\n\n"
+        "gitStatus: This is the git status at the start of the conversation.\n"
+        "Current branch: main\n\n"
+        "Status:\n{status_lines}"
+    )
+
+    # Two different git statuses (simulating parent vs fork)
+    status_a = (
+        ' M .obsidian/workspace.json\n'
+        '?? untracked_file_a.txt\n'
+    )
+    status_b = (
+        ' M .obsidian/workspace.json\n'
+        '?? untracked_file_a.txt\n'
+        '?? untracked_file_b.txt\n'
+        '?? untracked_file_c.txt\n'
+    )
+
+    def make_body(status_lines: str) -> dict:
+        return {
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "system": [
+                {"type": "text", "text": sys_block_0},
+                {"type": "text", "text": sys_block_1},
+                {"type": "text", "text": sys_block_2_template.format(status_lines=status_lines)},
+            ],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Reply with: OK"}]},
+            ],
+        }
+
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
+
+    # Clear old bodies
+    if body_dir.exists():
+        for f in body_dir.iterdir():
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    # Send request A (git status A) — will fail upstream (bad key) but
+    # proxy normalizes before forwarding, and SAVE_BODIES captures it
+    with httpx_client.Client(timeout=30) as client:
+        try:
+            client.post(
+                f"{proxy_url}/v1/messages",
+                json=make_body(status_a),
+                headers={
+                    "x-api-key": "sk-test-not-a-real-key",
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+            )
+        except Exception:
+            pass  # Upstream failure expected with fake key
+
+    time.sleep(0.3)
+
+    # Send request B (git status B — different!)
+    with httpx_client.Client(timeout=30) as client:
+        try:
+            client.post(
+                f"{proxy_url}/v1/messages",
+                json=make_body(status_b),
+                headers={
+                    "x-api-key": "sk-test-not-a-real-key",
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+            )
+        except Exception:
+            pass
+
+    time.sleep(0.3)
+
+    # ── Verify post-normalization bodies ──
+    post_files = sorted(body_dir.glob("req*_post.json"))
+    assert len(post_files) >= 2, (
+        f"Expected ≥2 post-normalization bodies, got {len(post_files)}. "
+        f"Body dir contents: {list(body_dir.iterdir()) if body_dir.exists() else 'missing'}"
+    )
+
+    # Both should have gitStatus normalized
+    normalized_systems = []
+    for pf in post_files[-2:]:  # last 2 requests (ours)
+        body = json.loads(pf.read_text())
+        system = body.get("system", [])
+        assert len(system) >= 3, f"{pf.name}: expected ≥3 system blocks, got {len(system)}"
+
+        sys2_text = system[2].get("text", "")
+        assert "gitStatus: normalized" in sys2_text, (
+            f"{pf.name}: sys[2] does not contain 'gitStatus: normalized'. "
+            f"Got: ...{sys2_text[-200:]}"
+        )
+        # Should NOT contain the original status lines
+        assert "untracked_file_a.txt" not in sys2_text, (
+            f"{pf.name}: sys[2] still contains original git status content"
+        )
+        print(f"  {pf.name}: gitStatus normalized ✓")
+        normalized_systems.append(json.dumps(system, sort_keys=True))
+
+    # The two post-normalization system prompts should be IDENTICAL
+    # (proving that different gitStatus inputs produce the same output)
+    assert normalized_systems[0] == normalized_systems[1], (
+        "Post-normalization system prompts differ between requests with "
+        "different gitStatus content. The normalization should make them identical."
+    )
+    print("  ✓ Two different gitStatus inputs → identical post-normalization system prompts")
+
+    # Also verify billing header was normalized
+    body_a = json.loads(post_files[-2].read_text())
+    sys0_text = body_a["system"][0].get("text", "")
+    assert "cch=0" in sys0_text, (
+        f"Billing header not normalized: {sys0_text[:100]}"
+    )
+    print("  ✓ Billing header normalized")
+
+
+# ── Test 10: Raw-HTTP billing header normalization ──────────────────────
+
+
+def test_billing_header_normalization_via_raw_http(proxy_with_bodies: int):
+    """Verify normalize_billing_header() produces identical output for different inputs.
+
+    Two requests with DIFFERENT billing header values (different cch hash,
+    different cc_version) should produce IDENTICAL post-normalization system[0]
+    blocks. This proves the proxy eliminates per-process billing header divergence.
+
+    Raw-HTTP approach: sends to proxy with fake API key, inspects SAVE_BODIES output.
+    """
+    import httpx as httpx_client
+
+    proxy_url = f"http://localhost:{proxy_with_bodies}"
+
+    def make_body(cch: str, cc_version: str) -> dict:
+        return {
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "system": [
+                {
+                    "type": "text",
+                    "text": f"x-anthropic-billing-header: cc_version={cc_version}; "
+                            f"cc_entrypoint=sdk-py; cch={cch};",
+                },
+                {"type": "text", "text": "You are Claude."},
+            ],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Reply: OK"}]},
+            ],
+        }
+
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
+    if body_dir.exists():
+        for f in body_dir.iterdir():
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    headers = {
+        "x-api-key": "sk-test-not-a-real-key",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+    # Request A: one set of billing values
+    with httpx_client.Client(timeout=30) as client:
+        try:
+            client.post(f"{proxy_url}/v1/messages",
+                        json=make_body("abc123hash", "2.1.59-git-deadbeef"),
+                        headers=headers)
+        except Exception:
+            pass
+
+    time.sleep(0.3)
+
+    # Request B: different billing values (simulating different process)
+    with httpx_client.Client(timeout=30) as client:
+        try:
+            client.post(f"{proxy_url}/v1/messages",
+                        json=make_body("xyz789hash", "2.1.112-git-cafebabe"),
+                        headers=headers)
+        except Exception:
+            pass
+
+    time.sleep(0.3)
+
+    # Verify post-normalization
+    post_files = sorted(body_dir.glob("req*_post.json"))
+    assert len(post_files) >= 2, f"Expected ≥2 post files, got {len(post_files)}"
+
+    sys0_texts = []
+    for pf in post_files[-2:]:
+        body = json.loads(pf.read_text())
+        sys0 = body["system"][0]["text"]
+        sys0_texts.append(sys0)
+        assert "cch=0" in sys0, f"{pf.name}: billing header not normalized: {sys0[:100]}"
+        assert "cc_version=0" in sys0, f"{pf.name}: cc_version not normalized: {sys0[:100]}"
+        # Original values should be gone
+        assert "abc123hash" not in sys0, f"{pf.name}: still contains original cch"
+        assert "deadbeef" not in sys0, f"{pf.name}: still contains original cc_version"
+        print(f"  {pf.name}: billing header normalized ✓")
+
+    assert sys0_texts[0] == sys0_texts[1], (
+        "Post-normalization billing headers differ between requests"
+    )
+    print("  ✓ Different billing headers → identical post-normalization")
+
+    # Also verify pre-normalization bodies had the original values
+    pre_files = sorted(body_dir.glob("req*_pre.json"))
+    assert len(pre_files) >= 2
+    pre_a = json.loads(pre_files[-2].read_text())
+    pre_b = json.loads(pre_files[-1].read_text())
+    assert "abc123hash" in pre_a["system"][0]["text"], "Pre-body A missing original cch"
+    assert "xyz789hash" in pre_b["system"][0]["text"], "Pre-body B missing original cch"
+    print("  ✓ Pre-normalization bodies confirmed different")
+
+
+# ── Test 11: Raw-HTTP string→list conversion ────────────────────────────
+
+
+def test_string_to_list_conversion_via_raw_http(proxy_with_bodies: int):
+    """Verify normalize_user_content_structure() converts bare strings to lists.
+
+    Sends a request with user messages in bare-string format (as CC sometimes
+    demotes older messages). Verifies the post-normalization body has all user
+    messages in list format.
+
+    Also sends two requests — one with string content, one with list content
+    for the same text — and verifies their post-normalization messages sections
+    are identical (proving the normalization eliminates the divergence).
+    """
+    import httpx as httpx_client
+
+    proxy_url = f"http://localhost:{proxy_with_bodies}"
+
+    user_text = "This is user message content for testing string to list conversion."
+
+    # Request A: user content as bare string (CC's demoted format)
+    body_string = {
+        "model": "claude-haiku-4-5",
+        "max_tokens": 100,
+        "system": [{"type": "text", "text": "You are Claude."}],
+        "messages": [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": "OK"},
+            {"role": "user", "content": "Follow up question"},
+        ],
+    }
+
+    # Request B: same content but already in list format (CC's normal format)
+    body_list = {
+        "model": "claude-haiku-4-5",
+        "max_tokens": 100,
+        "system": [{"type": "text", "text": "You are Claude."}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": user_text}]},
+            {"role": "assistant", "content": "OK"},
+            {"role": "user", "content": [{"type": "text", "text": "Follow up question"}]},
+        ],
+    }
+
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
+    if body_dir.exists():
+        for f in body_dir.iterdir():
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    headers = {
+        "x-api-key": "sk-test-not-a-real-key",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+    with httpx_client.Client(timeout=30) as client:
+        try:
+            client.post(f"{proxy_url}/v1/messages", json=body_string, headers=headers)
+        except Exception:
+            pass
+
+    time.sleep(0.3)
+
+    with httpx_client.Client(timeout=30) as client:
+        try:
+            client.post(f"{proxy_url}/v1/messages", json=body_list, headers=headers)
+        except Exception:
+            pass
+
+    time.sleep(0.3)
+
+    # Verify post-normalization
+    post_files = sorted(body_dir.glob("req*_post.json"))
+    assert len(post_files) >= 2, f"Expected ≥2 post files, got {len(post_files)}"
+
+    post_a = json.loads(post_files[-2].read_text())
+    post_b = json.loads(post_files[-1].read_text())
+
+    # All user messages in post_a should be list format (converted from string)
+    for i, msg in enumerate(post_a["messages"]):
+        if msg["role"] == "user":
+            assert isinstance(msg["content"], list), (
+                f"post_a msg[{i}]: user content still string after normalization"
+            )
+            assert msg["content"][0]["type"] == "text", (
+                f"post_a msg[{i}]: converted block missing type=text"
+            )
+    print("  ✓ String content converted to list format")
+
+    # Pre-body A should have string content
+    pre_files = sorted(body_dir.glob("req*_pre.json"))
+    pre_a = json.loads(pre_files[-2].read_text())
+    string_found = False
+    for msg in pre_a["messages"]:
+        if msg["role"] == "user" and isinstance(msg["content"], str):
+            string_found = True
+            break
+    assert string_found, "Pre-body A should have at least one string-content user message"
+    print("  ✓ Pre-normalization confirmed string content present")
+
+    # Post-normalization messages should be identical between A and B
+    msgs_a = json.dumps(post_a["messages"], sort_keys=True)
+    msgs_b = json.dumps(post_b["messages"], sort_keys=True)
+    assert msgs_a == msgs_b, (
+        "Post-normalization messages differ between string and list inputs. "
+        "String→list conversion should make them identical."
+    )
+    print("  ✓ String input and list input → identical post-normalization messages")
+
+
+# ── Test 12: Raw-HTTP tool sorting ──────────────────────────────────────
+
+
+def test_tool_sorting_via_raw_http(proxy_with_bodies: int):
+    """Verify normalize_tool_order() sorts tools alphabetically by name.
+
+    Sends two requests with the same tools in DIFFERENT order (simulating
+    non-deterministic readdir across process restarts). Verifies the post-
+    normalization tool arrays are identical and alphabetically sorted.
+    """
+    import httpx as httpx_client
+
+    proxy_url = f"http://localhost:{proxy_with_bodies}"
+
+    tools_a = [
+        {"name": "write", "description": "Write file", "input_schema": {"type": "object"}},
+        {"name": "bash", "description": "Run command", "input_schema": {"type": "object"}},
+        {"name": "read", "description": "Read file", "input_schema": {"type": "object"}},
+        {"name": "glob", "description": "Find files", "input_schema": {"type": "object"}},
+    ]
+
+    # Same tools, different order (simulating different readdir order)
+    tools_b = [
+        {"name": "glob", "description": "Find files", "input_schema": {"type": "object"}},
+        {"name": "read", "description": "Read file", "input_schema": {"type": "object"}},
+        {"name": "bash", "description": "Run command", "input_schema": {"type": "object"}},
+        {"name": "write", "description": "Write file", "input_schema": {"type": "object"}},
+    ]
+
+    def make_body(tools: list) -> dict:
+        return {
+            "model": "claude-haiku-4-5",
+            "max_tokens": 100,
+            "system": [{"type": "text", "text": "You are Claude."}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Reply: OK"}]},
+            ],
+            "tools": tools,
+        }
+
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
+    if body_dir.exists():
+        for f in body_dir.iterdir():
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    headers = {
+        "x-api-key": "sk-test-not-a-real-key",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+    with httpx_client.Client(timeout=30) as client:
+        try:
+            client.post(f"{proxy_url}/v1/messages", json=make_body(tools_a), headers=headers)
+        except Exception:
+            pass
+
+    time.sleep(0.3)
+
+    with httpx_client.Client(timeout=30) as client:
+        try:
+            client.post(f"{proxy_url}/v1/messages", json=make_body(tools_b), headers=headers)
+        except Exception:
+            pass
+
+    time.sleep(0.3)
+
+    # Verify post-normalization
+    post_files = sorted(body_dir.glob("req*_post.json"))
+    assert len(post_files) >= 2, f"Expected ≥2 post files, got {len(post_files)}"
+
+    post_a = json.loads(post_files[-2].read_text())
+    post_b = json.loads(post_files[-1].read_text())
+
+    # Tools should be alphabetically sorted in both
+    names_a = [t["name"] for t in post_a["tools"]]
+    names_b = [t["name"] for t in post_b["tools"]]
+
+    assert names_a == sorted(names_a), (
+        f"Post A tools not sorted: {names_a}"
+    )
+    assert names_b == sorted(names_b), (
+        f"Post B tools not sorted: {names_b}"
+    )
+    print(f"  ✓ Tools sorted alphabetically: {names_a}")
+
+    # Pre-normalization should have original (unsorted) order
+    pre_files = sorted(body_dir.glob("req*_pre.json"))
+    pre_a = json.loads(pre_files[-2].read_text())
+    pre_b = json.loads(pre_files[-1].read_text())
+    pre_names_a = [t["name"] for t in pre_a["tools"]]
+    pre_names_b = [t["name"] for t in pre_b["tools"]]
+    assert pre_names_a != sorted(pre_names_a), (
+        "Pre-body A tools already sorted — test doesn't exercise sorting"
+    )
+    assert pre_names_b != sorted(pre_names_b), (
+        "Pre-body B tools already sorted — test doesn't exercise sorting"
+    )
+    print(f"  ✓ Pre-normalization confirmed unsorted: A={pre_names_a}, B={pre_names_b}")
+
+    # Post-normalization tool arrays should be IDENTICAL
+    tools_json_a = json.dumps(post_a["tools"], sort_keys=True)
+    tools_json_b = json.dumps(post_b["tools"], sort_keys=True)
+    assert tools_json_a == tools_json_b, (
+        "Post-normalization tool arrays differ between requests with different "
+        "tool ordering. Sorting should make them identical."
+    )
+    print("  ✓ Different tool orders → identical post-normalization")

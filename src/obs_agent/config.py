@@ -38,7 +38,7 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "opus[1m]"
+    model: str = "claude-opus-4-6[1m]"
     claude_dir: str = ".claude"
     daemon_host: str = "127.0.0.1"
     daemon_port: int = 7832

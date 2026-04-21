@@ -80,6 +80,9 @@ _SPIKE_PROXY = _PROJECT_ROOT / "spikes" / "cache_normalizing_proxy.py"
 _MAIN_SPIKE_PROXY = Path.home() / "Documents" / "obs" / "spikes" / "cache_normalizing_proxy.py"
 _PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
+# Log directory: matches the production default in src/cache_proxy.py
+TEST_LOG_DIR = str(_PROJECT_ROOT / ".obs-agent" / "cache-proxy-log")
+
 # Proxy port range: pick something unlikely to collide
 _PROXY_PORT_MIN = 18200
 _PROXY_PORT_MAX = 18999
@@ -332,7 +335,7 @@ async def run_turn(client: ClaudeSDKClient, prompt: str) -> tuple[str | None, di
 
 def get_proxy_usage_for_turns(
     start_offset: int = 0,
-    log_path: str | Path = "/tmp/cache-proxy-log/usage.jsonl",
+    log_path: str | Path = os.path.join(TEST_LOG_DIR, "usage.jsonl"),
 ) -> list[dict]:
     """Read proxy usage log entries starting from offset.
 
@@ -361,7 +364,7 @@ def get_proxy_usage_for_turns(
 
 
 def proxy_log_length(
-    log_path: str | Path = "/tmp/cache-proxy-log/usage.jsonl",
+    log_path: str | Path = os.path.join(TEST_LOG_DIR, "usage.jsonl"),
 ) -> int:
     """Return current number of entries in the proxy usage log."""
     return len(read_proxy_usage_log(log_path))
@@ -415,7 +418,7 @@ def fmt_usage(u: dict) -> str:
 # ── Proxy usage log helpers ───────────────────────────────────────────────
 
 
-def read_proxy_usage_log(log_path: str | Path = "/tmp/cache-proxy-log/usage.jsonl") -> list[dict]:
+def read_proxy_usage_log(log_path: str | Path = os.path.join(TEST_LOG_DIR, "usage.jsonl")) -> list[dict]:
     """Read the proxy's structured usage log."""
     path = Path(log_path)
     if not path.exists():
@@ -433,7 +436,7 @@ def read_proxy_usage_log(log_path: str | Path = "/tmp/cache-proxy-log/usage.json
 
 
 def read_proxy_bodies(
-    body_dir: str | Path = "/tmp/cache-proxy-log/bodies/",
+    body_dir: str | Path = os.path.join(TEST_LOG_DIR, "bodies"),
     req_num: int | None = None,
 ) -> tuple[dict | None, dict | None]:
     """Read pre/post normalization request bodies for a specific request.
@@ -489,7 +492,7 @@ def proxy(proxy_port: int, proxy_script: Path) -> Generator[int, None, None]:
     Usage log is cleared at start to avoid cross-test contamination.
     """
     # Clear previous proxy logs
-    log_dir = Path("/tmp/cache-proxy-log")
+    log_dir = Path(TEST_LOG_DIR)
     usage_log = log_dir / "usage.jsonl"
     body_dir = log_dir / "bodies"
     for f in [usage_log]:
@@ -547,7 +550,7 @@ def proxy_with_bodies(proxy_port: int, proxy_script: Path) -> Generator[int, Non
     Sets CACHE_PROXY_SAVE_BODIES=1 env var. The production proxy should check this;
     the spike proxy has SAVE_BODIES=True hardcoded so bodies are always saved there.
     """
-    log_dir = Path("/tmp/cache-proxy-log")
+    log_dir = Path(TEST_LOG_DIR)
     usage_log = log_dir / "usage.jsonl"
     body_dir = log_dir / "bodies"
     for f in [usage_log]:

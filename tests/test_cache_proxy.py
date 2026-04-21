@@ -209,26 +209,31 @@ class TestNormalizeUserContentStructure:
         assert cache_proxy.stats["strings_converted"] == 2
 
 
-# ── Rule 3: Skill Listing Position ───────────────────────────────────────
+# ── Rule 3: Skill Listing Stripping ─────────────────────────────────────
 
 
 class TestNormalizeSkillListing:
-    def test_moves_skill_from_last_to_first(self):
+    def test_strips_skill_from_last_message(self):
         body = _make_body(messages=[
             _user_msg([_text_block("hello")]),
             _user_msg([_text_block("question"), _skill_block()]),
         ])
         result = cache_proxy.normalize_skill_listing(body)
-        assert result["action"] == "moved"
-        # Skill should now be at messages[0].content[0]
-        assert cache_proxy.SKILL_MARKER in body["messages"][0]["content"][0]["text"]
+        assert result["action"] == "stripped"
+        # Skill should be gone, "question" remains
+        assert len(body["messages"]) == 2
+        assert len(body["messages"][1]["content"]) == 1
+        assert body["messages"][1]["content"][0]["text"] == "question"
 
-    def test_already_at_target(self):
+    def test_strips_skill_from_first_message(self):
         body = _make_body(messages=[
             _user_msg([_skill_block(), _text_block("hello")]),
         ])
         result = cache_proxy.normalize_skill_listing(body)
-        assert result["action"] == "already_at_target"
+        assert result["action"] == "stripped"
+        # Skill removed, "hello" remains
+        assert len(body["messages"][0]["content"]) == 1
+        assert body["messages"][0]["content"][0]["text"] == "hello"
 
     def test_idempotent(self):
         body = _make_body(messages=[
@@ -238,7 +243,7 @@ class TestNormalizeSkillListing:
         cache_proxy.normalize_skill_listing(body)
         body_copy = copy.deepcopy(body)
         result = cache_proxy.normalize_skill_listing(body)
-        assert result["action"] == "already_at_target"
+        assert result["action"] == "not_found"
         assert body == body_copy
 
     def test_no_skill_listing(self):
@@ -253,39 +258,38 @@ class TestNormalizeSkillListing:
         result = cache_proxy.normalize_skill_listing(body)
         assert result["action"] == "no_messages"
 
-    def test_skill_in_middle_message(self):
+    def test_strips_skill_in_middle_message(self):
         body = _make_body(messages=[
             _user_msg([_text_block("first")]),
             _user_msg([_skill_block()]),
             _user_msg([_text_block("third")]),
         ])
         result = cache_proxy.normalize_skill_listing(body)
-        assert result["action"] == "moved"
-        assert cache_proxy.SKILL_MARKER in body["messages"][0]["content"][0]["text"]
+        assert result["action"] == "stripped"
         # msg[1] had only skill_block → empty after extraction → removed
-        # Result: 2 messages (first with skill prepended, third)
         assert len(body["messages"]) == 2
+        assert body["messages"][0]["content"][0]["text"] == "first"
+        assert body["messages"][1]["content"][0]["text"] == "third"
 
-    def test_removes_empty_message_after_extraction(self):
-        """If extracting the skill block leaves an empty content array, remove the message."""
+    def test_removes_empty_message_after_stripping(self):
+        """If stripping the skill block leaves an empty content array, remove the message."""
         body = _make_body(messages=[
             _user_msg([_text_block("first")]),
             _user_msg([_skill_block()]),  # Only has skill block
         ])
         cache_proxy.normalize_skill_listing(body)
-        # The second message should be removed (was empty after extraction)
-        # Now we have just one message with skill + "first"
+        # The second message should be removed (was empty after stripping)
         assert len(body["messages"]) == 1
-        assert len(body["messages"][0]["content"]) == 2  # skill + "first"
+        assert body["messages"][0]["content"][0]["text"] == "first"
 
     def test_preserves_other_blocks_in_source_message(self):
-        """If source message had other blocks, they remain after skill extraction."""
+        """If source message had other blocks, they remain after skill stripping."""
         body = _make_body(messages=[
             _user_msg([_text_block("first")]),
             _user_msg([_text_block("other"), _skill_block(), _text_block("more")]),
         ])
         cache_proxy.normalize_skill_listing(body)
-        # Skill moved to msg[0], source msg still has "other" and "more"
+        # Skill stripped from msg[1], "other" and "more" remain
         assert len(body["messages"]) == 2
         src_content = body["messages"][1]["content"]
         assert len(src_content) == 2
@@ -293,7 +297,7 @@ class TestNormalizeSkillListing:
         assert src_content[1]["text"] == "more"
 
     def test_skill_in_assistant_message_ignored(self):
-        """Skill listing in assistant messages should not be moved."""
+        """Skill listing in assistant messages should not be stripped."""
         body = _make_body(messages=[
             _user_msg([_text_block("hello")]),
             _assistant_msg([_skill_block()]),
@@ -301,20 +305,13 @@ class TestNormalizeSkillListing:
         result = cache_proxy.normalize_skill_listing(body)
         assert result["action"] == "not_found"
 
-    def test_stats_updated_moved(self):
+    def test_stats_updated_stripped(self):
         body = _make_body(messages=[
             _user_msg([_text_block("a")]),
             _user_msg([_skill_block()]),
         ])
         cache_proxy.normalize_skill_listing(body)
-        assert cache_proxy.stats["skill_moved"] == 1
-
-    def test_stats_updated_ok(self):
-        body = _make_body(messages=[
-            _user_msg([_skill_block()]),
-        ])
-        cache_proxy.normalize_skill_listing(body)
-        assert cache_proxy.stats["skill_ok"] == 1
+        assert cache_proxy.stats["skill_stripped"] == 1
 
     def test_stats_updated_missing(self):
         body = _make_body(messages=[_user_msg([_text_block("no skill")])])
@@ -330,9 +327,11 @@ class TestIsStrippableSystemReminder:
         block = _dynamic_reminder_block("changed_files")
         assert cache_proxy._is_strippable_system_reminder(block) is True
 
-    def test_skill_listing_not_strippable(self):
+    def test_skill_listing_is_strippable(self):
+        """Skill blocks are strippable — Rule 3 strips them first, but if any
+        remain (edge case), Rule 4 should catch them too."""
         block = _skill_block()
-        assert cache_proxy._is_strippable_system_reminder(block) is False
+        assert cache_proxy._is_strippable_system_reminder(block) is True
 
     def test_claudemd_not_strippable(self):
         block = _claudemd_block()
@@ -367,11 +366,12 @@ class TestIsStrippableSystemReminder:
         assert cache_proxy._is_strippable_system_reminder(block) is True
 
     def test_block_with_both_skill_and_reminder(self):
-        """A block with both skill marker AND system-reminder should NOT be stripped."""
+        """A block with both skill marker AND system-reminder SHOULD be stripped
+        (skill blocks are no longer preserved)."""
         block = _text_block(
             f"<system-reminder>\n{cache_proxy.SKILL_MARKER}\nsome other stuff\n</system-reminder>"
         )
-        assert cache_proxy._is_strippable_system_reminder(block) is False
+        assert cache_proxy._is_strippable_system_reminder(block) is True
 
     def test_block_with_both_claudemd_and_reminder(self):
         """A block with both CLAUDE.md marker AND system-reminder should NOT be stripped."""
@@ -394,14 +394,14 @@ class TestStripDynamicReminders:
         assert len(body["messages"][0]["content"]) == 1
         assert body["messages"][0]["content"][0]["text"] == "hello"
 
-    def test_preserves_skill_listing(self):
+    def test_strips_skill_listing_too(self):
+        """Skill blocks are no longer preserved — they get stripped like other reminders."""
         body = _make_body(messages=[
             _user_msg([_skill_block(), _dynamic_reminder_block()]),
         ])
         count = cache_proxy.strip_dynamic_reminders(body)
-        assert count == 1
-        assert len(body["messages"][0]["content"]) == 1
-        assert cache_proxy.SKILL_MARKER in body["messages"][0]["content"][0]["text"]
+        assert count == 2
+        assert len(body["messages"][0]["content"]) == 0
 
     def test_preserves_claudemd(self):
         body = _make_body(messages=[
@@ -471,7 +471,109 @@ class TestStripDynamicReminders:
         assert cache_proxy.stats["reminders_stripped"] == 2
 
 
-# ── Rule 5: Cache Control ────────────────────────────────────────────────
+# ── Rule 5: Git Status Normalization ─────────────────────────────────────
+
+
+def _system_block_with_git_status(git_status_content="M file.txt\n?? untracked.md"):
+    """Create a sys[2]-like block with a gitStatus section at the end."""
+    return _text_block(
+        "You are an interactive agent that helps users with software engineering tasks.\n"
+        "Use the instructions below.\n\n"
+        "# Environment\n"
+        "Platform: darwin\n\n"
+        f"gitStatus: This is the git status.\nCurrent branch: main\n\nStatus:\n{git_status_content}"
+    )
+
+
+class TestNormalizeGitStatus:
+    def test_normalizes_git_status(self):
+        body = _make_body(system=[
+            _billing_block(),
+            _text_block("Claude Code preamble"),
+            _system_block_with_git_status("M dirty.py\n?? new.md"),
+        ])
+        count = cache_proxy.normalize_git_status(body)
+        assert count == 1
+        assert body["system"][2]["text"].endswith("gitStatus: normalized")
+        assert "dirty.py" not in body["system"][2]["text"]
+
+    def test_idempotent(self):
+        body = _make_body(system=[
+            _billing_block(),
+            _text_block("preamble"),
+            _system_block_with_git_status(),
+        ])
+        cache_proxy.normalize_git_status(body)
+        body_copy = copy.deepcopy(body)
+        count = cache_proxy.normalize_git_status(body)
+        assert count == 0
+        assert body == body_copy
+
+    def test_different_git_status_normalizes_same(self):
+        """Two bodies with different git status should produce identical sys[2]."""
+        body1 = _make_body(system=[
+            _billing_block(), _text_block("p"),
+            _system_block_with_git_status("M file_a.py\n?? untracked_a.md"),
+        ])
+        body2 = _make_body(system=[
+            _billing_block(), _text_block("p"),
+            _system_block_with_git_status("M file_b.py\nM file_c.py\n?? other.md"),
+        ])
+        cache_proxy.normalize_git_status(body1)
+        cache_proxy.normalize_git_status(body2)
+        assert body1["system"][2]["text"] == body2["system"][2]["text"]
+
+    def test_no_system(self):
+        body = _make_body()
+        count = cache_proxy.normalize_git_status(body)
+        assert count == 0
+
+    def test_system_too_short(self):
+        body = _make_body(system=[_billing_block()])
+        count = cache_proxy.normalize_git_status(body)
+        assert count == 0
+
+    def test_system_two_blocks(self):
+        body = _make_body(system=[_billing_block(), _text_block("only two")])
+        count = cache_proxy.normalize_git_status(body)
+        assert count == 0
+
+    def test_no_git_status_in_sys2(self):
+        body = _make_body(system=[
+            _billing_block(),
+            _text_block("preamble"),
+            _text_block("System prompt without any git status section"),
+        ])
+        count = cache_proxy.normalize_git_status(body)
+        assert count == 0
+
+    def test_preserves_content_before_git_status(self):
+        body = _make_body(system=[
+            _billing_block(),
+            _text_block("preamble"),
+            _system_block_with_git_status(),
+        ])
+        original_before = body["system"][2]["text"].split("gitStatus:")[0]
+        cache_proxy.normalize_git_status(body)
+        assert body["system"][2]["text"].startswith(original_before)
+
+    def test_non_text_sys2_ignored(self):
+        body = _make_body(system=[
+            _billing_block(),
+            _text_block("preamble"),
+            {"type": "image", "source": {}},
+        ])
+        count = cache_proxy.normalize_git_status(body)
+        assert count == 0
+
+    def test_stats_updated(self):
+        body = _make_body(system=[
+            _billing_block(),
+            _text_block("preamble"),
+            _system_block_with_git_status(),
+        ])
+        cache_proxy.normalize_git_status(body)
+        assert cache_proxy.stats["git_status_normalized"] == 1
 
 
 # ── Rule 5 (cache_control) was removed — CC's native placement is sufficient.
@@ -479,7 +581,7 @@ class TestStripDynamicReminders:
 # cache_control is not part of the cache key and doesn't need normalization.
 
 
-# ── Rule 5: Tool Sorting ─────────────────────────────────────────────────
+# ── Rule 6: Tool Sorting ─────────────────────────────────────────────────
 
 
 class TestNormalizeToolOrder:
@@ -617,9 +719,13 @@ class TestNormalizeMetadata:
 
 class TestNormalizeRequest:
     def test_applies_all_rules(self):
-        """A body with all normalizable aspects gets all 6 rules applied."""
+        """A body with all normalizable aspects gets all 7 rules applied."""
         body = _make_body(
-            system=[_billing_block()],
+            system=[
+                _billing_block(),
+                _text_block("Claude Code preamble"),
+                _system_block_with_git_status("M dirty.py"),
+            ],
             messages=[
                 _user_msg("bare string user msg"),
                 _assistant_msg("reply"),
@@ -645,21 +751,31 @@ class TestNormalizeRequest:
         # Rule 2: string converted
         assert info["strings"] >= 1
 
-        # Rule 3: skill listing moved to msg[0].content[0]
-        assert info["skill"]["action"] == "moved"
-        assert cache_proxy.SKILL_MARKER in result_body["messages"][0]["content"][0]["text"]
+        # Rule 3: skill listing stripped entirely
+        assert info["skill"]["action"] == "stripped"
+        # No message content should contain the skill marker
+        for msg in result_body["messages"]:
+            if msg.get("role") != "user":
+                continue
+            for block in msg.get("content", []):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    assert cache_proxy.SKILL_MARKER not in block.get("text", "")
 
         # Rule 4: dynamic reminders stripped
         assert info["reminders"] >= 1
 
+        # Rule 5: git status normalized
+        assert info["git_status"] >= 1
+        assert result_body["system"][2]["text"].endswith("gitStatus: normalized")
+
         # cache_control: not touched (CC handles natively)
         assert "cache_control" not in info
 
-        # Rule 5: tools sorted
+        # Rule 6: tools sorted
         assert info["tools"] >= 1
         assert result_body["tools"][0]["name"] == "a_tool"
 
-        # Rule 6: metadata normalized
+        # Rule 7: metadata normalized
         assert info["metadata"] >= 1
         assert result_body["metadata"]["user_id"] == "user_x_session_0"
 
@@ -667,12 +783,11 @@ class TestNormalizeRequest:
         assert info["action"] == "normalized"
 
     def test_already_normalized_body(self):
-        """A body that's already fully normalized should report already_at_target or no changes."""
+        """A body without skill listing and nothing else to normalize."""
         body = _make_body(
             system=[{"type": "text", "text": cache_proxy.FIXED_BILLING_HEADER}],
             messages=[
                 _user_msg([
-                    _skill_block(),
                     _text_block("hello", cache_control={"type": "ephemeral"}),
                 ]),
             ],
@@ -684,8 +799,8 @@ class TestNormalizeRequest:
         )
 
         _, info = cache_proxy.normalize_request(body)
-        # Skill already at target, no other normalizations needed
-        assert info["skill"]["action"] == "already_at_target"
+        # No skill to strip, no other normalizations needed
+        assert info["skill"]["action"] == "not_found"
         assert info["strings"] == 0
         assert info["reminders"] == 0
         assert info["tools"] == 0
@@ -694,7 +809,11 @@ class TestNormalizeRequest:
     def test_idempotent_full(self):
         """Applying normalize_request twice should produce the same result."""
         body = _make_body(
-            system=[_billing_block()],
+            system=[
+                _billing_block(),
+                _text_block("preamble"),
+                _system_block_with_git_status("M file.py"),
+            ],
             messages=[
                 _user_msg("bare string"),
                 _user_msg([_skill_block(), _dynamic_reminder_block(), _text_block("q")]),

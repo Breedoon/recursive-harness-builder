@@ -126,7 +126,7 @@ class TestSessionSettings:
     def test_default_model(self):
         """Default model remains the prod Opus config."""
         cfg = OBSConfig()
-        assert cfg.model == "opus[1m]"
+        assert cfg.model == "claude-opus-4-6[1m]"
 
     def test_model_from_env(self, monkeypatch):
         """OBS_AGENT_MODEL overrides the default session model."""

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Cache-normalizing proxy for Claude Code API requests.
 
-Intercepts POST /v1/messages requests and applies 6 idempotent normalization
+Intercepts POST /v1/messages requests and applies 7 idempotent normalization
 rules to maximize prompt cache hits across session restarts and forks.
 All other requests are forwarded unmodified. CC's native cache_control
 placement is left untouched — cache_control is not part of the cache key
@@ -11,10 +11,11 @@ placement is left untouched — cache_control is not part of the cache key
 Normalizations (applied in order):
 1. Billing header: replaced with fixed value
 2. String→list: bare-string user content converted to list format
-3. Skill listing: pinned to messages[0].content[0]
-4. Dynamic system-reminders: stripped (except skill listing + CLAUDE.md)
-5. Tool sorting: tools[] sorted alphabetically by name
-6. Metadata: session-specific IDs normalized
+3. Skill listing: stripped entirely from all messages
+4. Dynamic system-reminders: stripped (except CLAUDE.md)
+5. Git status: normalized in system prompt to fixed placeholder
+6. Tool sorting: tools[] sorted alphabetically by name
+7. Metadata: session-specific IDs normalized
 
 Usage:
     python cache_proxy.py [port]  # default: 18923
@@ -36,7 +37,11 @@ import httpx
 
 UPSTREAM = "https://api.anthropic.com"
 DEFAULT_PORT = 18923
-LOG_DIR = "/tmp/cache-proxy-log"
+_CODEBASE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR = os.environ.get(
+    "CACHE_PROXY_LOG_DIR",
+    os.path.join(_CODEBASE_ROOT, ".obs-agent", "cache-proxy-log"),
+)
 BODY_DIR = os.path.join(LOG_DIR, "bodies")
 USAGE_LOG = os.path.join(LOG_DIR, "usage.jsonl")
 
@@ -51,9 +56,9 @@ FIXED_BILLING_HEADER = "x-anthropic-billing-header: cc_version=0; cc_entrypoint=
 # Running stats
 stats = {
     "requests": 0,
-    "skill_moved": 0, "skill_ok": 0, "skill_missing": 0,
+    "skill_stripped": 0, "skill_missing": 0,
     "billing_normalized": 0, "strings_converted": 0,
-    "reminders_stripped": 0,
+    "reminders_stripped": 0, "git_status_normalized": 0,
     "tools_sorted": 0, "metadata_normalized": 0,
     "errors": 0,
 }
@@ -105,21 +110,18 @@ def normalize_user_content_structure(body: dict) -> int:
 
 
 def normalize_skill_listing(body: dict) -> dict:
-    """Rule 3: Pin the skill listing block to messages[0].content[0].
+    """Rule 3: Strip the skill listing block entirely from all messages.
 
     CC generates the skill listing once per process and injects it into
-    the latest user message. On restart, it moves to the NEW latest
-    message. Pinning it to msg[0] creates a stable position.
+    the latest user message. On restart/fork, it appears at a different
+    position, causing byte-level prefix divergence and cache misses.
+    Stripping it entirely eliminates this source of divergence.
     """
     messages = body.get("messages", [])
     if not messages:
         return {"action": "no_messages"}
 
-    # Find the skill listing block
-    skill_block = None
-    found_msg_idx = None
-    found_block_idx = None
-
+    # Find and remove the skill listing block
     for msg_idx, msg in enumerate(messages):
         if msg.get("role") != "user":
             continue
@@ -129,48 +131,19 @@ def normalize_skill_listing(body: dict) -> dict:
         for block_idx, block in enumerate(content):
             if isinstance(block, dict) and block.get("type") == "text":
                 if SKILL_MARKER in block.get("text", ""):
-                    skill_block = block
-                    found_msg_idx = msg_idx
-                    found_block_idx = block_idx
-                    break
-        if skill_block is not None:
-            break
+                    # Remove the skill block
+                    content.pop(block_idx)
+                    # Remove empty user messages left after extraction
+                    if len(content) == 0:
+                        messages.pop(msg_idx)
+                    stats["skill_stripped"] += 1
+                    return {
+                        "action": "stripped",
+                        "from": f"msg[{msg_idx}].content[{block_idx}]",
+                    }
 
-    if skill_block is None:
-        stats["skill_missing"] += 1
-        return {"action": "not_found"}
-
-    # Already at target position?
-    if found_msg_idx == 0 and found_block_idx == 0:
-        stats["skill_ok"] += 1
-        return {"action": "already_at_target"}
-
-    # Extract from source
-    messages[found_msg_idx]["content"].pop(found_block_idx)
-
-    # Remove empty user messages (no content left after extraction)
-    src_content = messages[found_msg_idx].get("content")
-    if isinstance(src_content, list) and len(src_content) == 0:
-        messages.pop(found_msg_idx)
-
-    # Insert at messages[0].content[0]
-    if not messages:
-        messages.append({"role": "user", "content": [skill_block]})
-    else:
-        first = messages[0]
-        content = first.get("content")
-        if isinstance(content, list):
-            content.insert(0, skill_block)
-        else:
-            first["content"] = [skill_block]
-
-    stats["skill_moved"] += 1
-    return {
-        "action": "moved",
-        "from": f"msg[{found_msg_idx}].content[{found_block_idx}]",
-        "to": "msg[0].content[0]",
-        "skill_text_len": len(skill_block.get("text", "")),
-    }
+    stats["skill_missing"] += 1
+    return {"action": "not_found"}
 
 
 def _is_strippable_system_reminder(block: dict) -> bool:
@@ -178,17 +151,17 @@ def _is_strippable_system_reminder(block: dict) -> bool:
 
     Returns True for blocks that:
     1. Are text blocks containing <system-reminder> tags
-    2. Are NOT the skill listing (contains SKILL_MARKER)
-    3. Are NOT the CLAUDE.md context (contains CLAUDEMD_MARKER)
+    2. Are NOT the CLAUDE.md context (contains CLAUDEMD_MARKER)
+
+    Note: skill listing blocks are stripped by Rule 3 before this runs,
+    so no need to preserve them here.
     """
     if not isinstance(block, dict) or block.get("type") != "text":
         return False
     text = block.get("text", "")
     if "<system-reminder>" not in text:
         return False
-    # Preserve skill listing and CLAUDE.md context
-    if SKILL_MARKER in text:
-        return False
+    # Preserve CLAUDE.md context
     if CLAUDEMD_MARKER in text:
         return False
     return True
@@ -202,7 +175,8 @@ def strip_dynamic_reminders(body: dict) -> int:
     that changes between turns and aren't persisted in JSONL, creating byte
     divergence when forks reconstruct from JSONL.
 
-    Preserves: skill listing (Rule 3) and CLAUDE.md context injection.
+    Preserves: CLAUDE.md context injection. (Skill listing already
+    stripped by Rule 3 before this runs.)
     """
     messages = body.get("messages", [])
     count = 0
@@ -223,12 +197,38 @@ def strip_dynamic_reminders(body: dict) -> int:
     return count
 
 
+def normalize_git_status(body: dict) -> int:
+    """Rule 5: Normalize git status section in system prompt.
+
+    The gitStatus section in sys[2] contains a snapshot of the working tree
+    at the time the CC process started. Sessions started at different times
+    see different untracked/modified files, creating byte-level divergence
+    that breaks the cache for everything after sys[2] (tools + messages).
+
+    Replaces the gitStatus section (from "gitStatus:" to end of sys[2])
+    with a fixed placeholder.
+    """
+    system = body.get("system")
+    if not system or not isinstance(system, list) or len(system) < 3:
+        return 0
+    block = system[2]
+    if not isinstance(block, dict) or block.get("type") != "text":
+        return 0
+    text = block.get("text", "")
+    new_text = re.sub(r'gitStatus:.*', 'gitStatus: normalized', text, flags=re.DOTALL)
+    if new_text != text:
+        block["text"] = new_text
+        stats["git_status_normalized"] += 1
+        return 1
+    return 0
+
+
 def normalize_tool_order(body: dict) -> int:
     """Rule 6: Sort tool definitions alphabetically by name.
 
     Tool definitions arrive in filesystem readdir order, which is
-    non-deterministic across process restarts. Different order =
-    different bytes = cache miss on the tools section.
+    non-deterministic across process restarts and platforms. Different
+    order = different bytes = cache miss on the tools section.
     """
     tools = body.get("tools")
     if not tools or not isinstance(tools, list):
@@ -262,10 +262,10 @@ def normalize_metadata(body: dict) -> int:
 
 
 def normalize_request(body: dict) -> tuple[dict, dict]:
-    """Apply all 6 normalizations to a request body in spec order.
+    """Apply all 7 normalizations to a request body in spec order.
 
     Order: billing → strings → skill listing → strip reminders →
-           tool sorting → metadata
+           git status → tool sorting → metadata
 
     cache_control is deliberately left untouched — it's not part of the cache
     key (confirmed via spike), and CC's native placement is sufficient.
@@ -281,28 +281,29 @@ def normalize_request(body: dict) -> tuple[dict, dict]:
     # 2. Convert bare string content to list format (before skill listing move)
     info["strings"] = normalize_user_content_structure(body)
 
-    # 3. Move skill listing to fixed position
+    # 3. Strip skill listing entirely
     skill_info = normalize_skill_listing(body)
     info["skill"] = skill_info
 
-    # 4. Strip dynamic system-reminders (after skill listing is pinned)
+    # 4. Strip dynamic system-reminders (after skill listing is stripped)
     info["reminders"] = strip_dynamic_reminders(body)
 
-    # 5. Sort tool definitions
+    # 5. Normalize git status in system prompt
+    info["git_status"] = normalize_git_status(body)
+
+    # 6. Sort tool definitions
     info["tools"] = normalize_tool_order(body)
 
-    # 6. Normalize metadata
+    # 7. Normalize metadata
     info["metadata"] = normalize_metadata(body)
 
     # Determine overall action label
     actions_taken = [
         info["billing"], info["strings"], info["reminders"],
-        info["tools"], info["metadata"],
+        info["git_status"], info["tools"], info["metadata"],
     ]
-    if skill_info.get("action") == "moved" or any(actions_taken):
+    if skill_info.get("action") == "stripped" or any(actions_taken):
         info["action"] = "normalized"
-    elif skill_info.get("action") == "already_at_target":
-        info["action"] = "already_at_target"
     else:
         info["action"] = skill_info.get("action", "unknown")
 
@@ -437,6 +438,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 f"(billing={info.get('billing', 0)} strings={info.get('strings', 0)} "
                 f"skill={info.get('skill', {}).get('action', '?')} "
                 f"reminders={info.get('reminders', 0)} "
+                f"git_status={info.get('git_status', 0)} "
                 f"tools={info.get('tools', 0)} "
                 f"meta={info.get('metadata', 0)})")
 
@@ -546,8 +548,8 @@ def main():
     log(f"upstream: {UPSTREAM}")
     log(f"logs: {LOG_DIR}")
     log(f"save_bodies: {SAVE_BODIES}")
-    log(f"normalizations: billing, string→list, skill position, "
-        f"strip reminders, tool sort, metadata (cache_control: passthrough)")
+    log(f"normalizations: billing, string→list, strip skills, "
+        f"strip reminders, git status, tool sort, metadata (cache_control: passthrough)")
     log(f"Set ANTHROPIC_BASE_URL=http://localhost:{port}")
 
     try:
