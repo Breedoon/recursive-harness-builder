@@ -41,3 +41,4 @@ markers = [
     "telegram_soak: long-running Telegram soak scenarios (around one hour)",
 ]
 testpaths = ["tests"]
+pythonpath = ["src"]
