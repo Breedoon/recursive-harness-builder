@@ -4363,6 +4363,51 @@ class TelegramBot:
                 return None
             await asyncio.sleep(0.1)
 
+    async def _await_jsonl_stability(
+        self,
+        *,
+        session_id: str,
+        stable_duration: float = 1.0,
+        timeout_seconds: float = 10.0,
+    ) -> str | None:
+        """Wait for the parent's JSONL to stop receiving new entries.
+
+        Polls ``_persisted_session_uuids`` every 150 ms and tracks the last
+        UUID seen.  Returns when no new UUIDs appear for *stable_duration*
+        seconds, indicating the parent's streaming response has fully flushed
+        to disk.  A safety *timeout_seconds* prevents infinite blocking (e.g.
+        if the parent is executing a long tool).
+
+        Returns the latest UUID at the point of stability (or timeout).
+        """
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        last_uuid: str | None = None
+        last_change_time = time.monotonic()
+
+        while True:
+            persisted = self._persisted_session_uuids(session_id)
+            current_uuid = persisted[-1] if persisted else None
+
+            if current_uuid != last_uuid:
+                last_uuid = current_uuid
+                last_change_time = time.monotonic()
+
+            # Stable long enough — JSONL has stopped growing.
+            if last_uuid is not None and (time.monotonic() - last_change_time) >= stable_duration:
+                return last_uuid
+
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "[jsonl_stability] timed out after %.1fs for session %s "
+                    "(last_uuid=%s) — proceeding with current head",
+                    timeout_seconds,
+                    session_id,
+                    last_uuid,
+                )
+                return last_uuid
+
+            await asyncio.sleep(0.15)
+
     def _nearest_binding_for_route_message(
         self,
         *,
@@ -8115,6 +8160,29 @@ class TelegramBot:
             if not source_session_id or not source_uuid:
                 raise RuntimeError("Cannot launch ForkTask yet: no mapped head in this topic")
 
+            # Wait for the parent's JSONL to stabilize before copying.
+            # The parent may still be streaming tool_use blocks to JSONL;
+            # copying now would produce a truncated prefix → cache miss.
+            stable_uuid = await self._await_jsonl_stability(
+                session_id=source_session_id,
+            )
+            if stable_uuid and stable_uuid != source_uuid:
+                logger.info(
+                    "[fork_task] JSONL advanced during stability wait: %s → %s",
+                    source_uuid,
+                    stable_uuid,
+                )
+                resolved_uuid, resolved_route, resolved_message_id = (
+                    self._resolve_persisted_fork_source(
+                        session_id=source_session_id,
+                        preferred_uuid=stable_uuid,
+                        preferred_route=source_route,
+                    )
+                )
+                source_uuid = resolved_uuid
+                source_route = resolved_route
+                source_message_id = resolved_message_id
+
         task_id = str(uuid.uuid4())
         description = str(
             args.get("display_name")
@@ -8698,6 +8766,27 @@ class TelegramBot:
                 reply_to_message_id=message.message_id,
             )
             return
+
+        # Wait for the parent's JSONL to stabilize before copying.
+        stable_uuid = await self._await_jsonl_stability(
+            session_id=source_session_id,
+        )
+        if stable_uuid and stable_uuid != source_uuid:
+            logger.info(
+                "[fork_command] JSONL advanced during stability wait: %s → %s",
+                source_uuid,
+                stable_uuid,
+            )
+            resolved_uuid, resolved_route, resolved_message_id = (
+                self._resolve_persisted_fork_source(
+                    session_id=source_session_id,
+                    preferred_uuid=stable_uuid,
+                    preferred_route=source_route,
+                )
+            )
+            source_uuid = resolved_uuid
+            source_route = resolved_route
+            source_message_id = resolved_message_id
 
         lineage_name, topic_name = self._next_topic_alias_and_title(
             state,
