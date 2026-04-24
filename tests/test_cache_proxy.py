@@ -380,6 +380,34 @@ class TestIsStrippableSystemReminder:
         )
         assert cache_proxy._is_strippable_system_reminder(block) is False
 
+    def test_changed_files_containing_claudemd_marker_is_strippable(self):
+        """Bug 1: A changed_files reminder whose diff contains the CLAUDEMD_MARKER
+        string should still be stripped. The marker check should only look at the
+        beginning of the text (where CC places it), not deep in diff content."""
+        diff_content = (
+            "<system-reminder>\n"
+            "changed_files: CLAUDE.md was modified:\n"
+            "--- a/CLAUDE.md\n"
+            "+++ b/CLAUDE.md\n"
+            "@@ -1,5 +1,6 @@\n"
+            f" {cache_proxy.CLAUDEMD_MARKER}\n"
+            " # Some heading\n"
+            "+New line added\n"
+            "</system-reminder>"
+        )
+        block = _text_block(diff_content)
+        assert cache_proxy._is_strippable_system_reminder(block) is True
+
+    def test_real_claudemd_block_still_preserved(self):
+        """The actual CLAUDE.md context block has the marker near the start
+        and should still NOT be stripped after the fix."""
+        block = _text_block(
+            f"<system-reminder>\n{cache_proxy.CLAUDEMD_MARKER}\n"
+            "# Project Instructions\nLong vault content here...\n"
+            "</system-reminder>"
+        )
+        assert cache_proxy._is_strippable_system_reminder(block) is False
+
 
 # ── Rule 4: Strip Dynamic Reminders ──────────────────────────────────────
 

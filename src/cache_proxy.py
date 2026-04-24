@@ -161,8 +161,12 @@ def _is_strippable_system_reminder(block: dict) -> bool:
     text = block.get("text", "")
     if "<system-reminder>" not in text:
         return False
-    # Preserve CLAUDE.md context
-    if CLAUDEMD_MARKER in text:
+    # Preserve CLAUDE.md context — the marker always appears right after
+    # the opening <system-reminder> tag. Full-text search causes false
+    # positives when changed_files diffs contain the marker string (Bug 1).
+    # Check only the prefix: "<system-reminder>\n" (20 chars) + marker.
+    marker_end = 20 + len(CLAUDEMD_MARKER)
+    if CLAUDEMD_MARKER in text[:marker_end]:
         return False
     return True
 
