@@ -408,6 +408,177 @@ class TestIsStrippableSystemReminder:
         )
         assert cache_proxy._is_strippable_system_reminder(block) is False
 
+    def test_claudemd_marker_deep_in_large_diff_is_strippable(self):
+        """Bug 1 regression: A large changed_files diff with the CLAUDEMD_MARKER
+        string appearing hundreds of chars into the text must still be stripped."""
+        large_diff = (
+            "<system-reminder>\n"
+            "changed_files: Multiple files modified:\n"
+            + "--- a/some/file.py\n+++ b/some/file.py\n@@ -100,5 +100,6 @@\n some code\n" * 10
+            + f"--- a/CLAUDE.md\n+++ b/CLAUDE.md\n@@ -1,3 +1,4 @@\n {cache_proxy.CLAUDEMD_MARKER}\n"
+            + " # Heading\n+Added line\n"
+            + "</system-reminder>"
+        )
+        block = _text_block(large_diff)
+        # The marker is deep inside, NOT at the start → should be strippable
+        assert cache_proxy._is_strippable_system_reminder(block) is True
+
+    def test_claudemd_marker_at_exact_boundary(self):
+        """Edge case: marker starting at exactly char 20 (right after '<system-reminder>\\n')
+        should be detected as CLAUDE.md and NOT stripped."""
+        block = _text_block(
+            f"<system-reminder>\n{cache_proxy.CLAUDEMD_MARKER}\nContent\n</system-reminder>"
+        )
+        assert cache_proxy._is_strippable_system_reminder(block) is False
+
+
+# ── Regression: JSONL truncation masking ──────────────────────────────────
+
+
+class TestJSONLTruncationMasking:
+    """Verify proxy normalizations handle truncated/incomplete assistant messages
+    gracefully. When JSONL is copied mid-stream, assistant messages may have
+    incomplete tool_use blocks. The proxy should not crash on these."""
+
+    def test_normalize_request_with_incomplete_tool_use(self):
+        """Assistant message with a tool_use block but no corresponding tool_result.
+        The proxy doesn't touch assistant messages, so this should pass through."""
+        body = _make_body(
+            system=[_billing_block(), _text_block("p"), _system_block_with_git_status()],
+            messages=[
+                _user_msg([_text_block("do something")]),
+                _assistant_msg([
+                    {"type": "text", "text": "I'll help"},
+                    {"type": "tool_use", "id": "toolu_abc", "name": "Bash",
+                     "input": {"command": "ls"}},
+                ]),
+                # No tool_result — truncated JSONL
+            ],
+            tools=[{"name": "Bash", "description": "run commands"}],
+            metadata={"user_id": "user_x_session_abc-123"},
+        )
+        # Should not crash
+        result_body, info = cache_proxy.normalize_request(body)
+        assert info["action"] == "normalized"
+        # Assistant message should be unchanged
+        assert result_body["messages"][1]["role"] == "assistant"
+        assert len(result_body["messages"][1]["content"]) == 2
+
+    def test_normalize_request_with_empty_assistant_content(self):
+        """Assistant message with empty content list (extreme truncation)."""
+        body = _make_body(
+            messages=[
+                _user_msg([_text_block("hello")]),
+                _assistant_msg([]),
+            ],
+        )
+        result_body, info = cache_proxy.normalize_request(body)
+        assert result_body["messages"][1]["content"] == []
+
+    def test_normalize_request_with_partial_thinking_block(self):
+        """Assistant message with a thinking block but no text block (mid-stream)."""
+        body = _make_body(
+            messages=[
+                _user_msg([_text_block("think about this")]),
+                _assistant_msg([
+                    {"type": "thinking", "thinking": "Let me consider...",
+                     "signature": "sig123"},
+                ]),
+            ],
+        )
+        result_body, info = cache_proxy.normalize_request(body)
+        assert result_body["messages"][1]["content"][0]["type"] == "thinking"
+
+    def test_normalize_handles_tool_result_without_tool_use(self):
+        """User message with tool_result but no preceding tool_use (orphaned result).
+        This can happen with truncated JSONL. Proxy should handle gracefully."""
+        body = _make_body(
+            messages=[
+                _user_msg([
+                    {"type": "tool_result", "tool_use_id": "toolu_orphan",
+                     "content": "some result"},
+                ]),
+            ],
+        )
+        result_body, info = cache_proxy.normalize_request(body)
+        # tool_result is not a text block, so it passes through
+        assert result_body["messages"][0]["content"][0]["type"] == "tool_result"
+
+
+# ── Regression: MCP tool count changes ────────────────────────────────────
+
+
+class TestMCPToolCountChanges:
+    """Verify proxy handles requests with varying tool counts gracefully.
+    MCP servers can disconnect/reconnect, changing the tool count (e.g., 96→72).
+    Tool sorting should still work, and normalization shouldn't crash."""
+
+    def test_sort_with_many_tools(self):
+        """Sorting works correctly with a large tool array (simulating full MCP set)."""
+        tools = [{"name": f"tool_{chr(122-i)}", "description": ""} for i in range(50)]
+        body = _make_body(tools=tools)
+        count = cache_proxy.normalize_tool_order(body)
+        assert count == 1
+        names = [t["name"] for t in body["tools"]]
+        assert names == sorted(names)
+
+    def test_sort_with_fewer_tools_after_disconnect(self):
+        """After MCP disconnect, fewer tools are present. Sorting still works."""
+        tools = [{"name": f"tool_{chr(122-i)}", "description": ""} for i in range(30)]
+        body = _make_body(tools=tools)
+        count = cache_proxy.normalize_tool_order(body)
+        assert count == 1
+        names = [t["name"] for t in body["tools"]]
+        assert names == sorted(names)
+
+    def test_different_tool_counts_produce_different_sorted_output(self):
+        """Two requests with different tool counts produce different (but each sorted) output.
+        This is expected — different tool counts = different prefix = cache miss. Not fixable."""
+        tools_full = sorted([
+            {"name": "Read", "description": ""},
+            {"name": "Write", "description": ""},
+            {"name": "Bash", "description": ""},
+            {"name": "tasknotes_query", "description": ""},
+        ], key=lambda t: t["name"])
+        tools_reduced = sorted([
+            {"name": "Read", "description": ""},
+            {"name": "Write", "description": ""},
+            {"name": "Bash", "description": ""},
+            # tasknotes_query missing (MCP disconnected)
+        ], key=lambda t: t["name"])
+
+        body1 = _make_body(tools=tools_full)
+        body2 = _make_body(tools=tools_reduced)
+        cache_proxy.normalize_tool_order(body1)
+        cache_proxy.normalize_tool_order(body2)
+
+        # Both sorted, but different lengths
+        assert len(body1["tools"]) == 4
+        assert len(body2["tools"]) == 3
+        assert [t["name"] for t in body1["tools"]] == ["Bash", "Read", "Write", "tasknotes_query"]
+        assert [t["name"] for t in body2["tools"]] == ["Bash", "Read", "Write"]
+
+    def test_normalize_request_with_no_tools_key(self):
+        """Request without tools key (subagent without MCP) doesn't crash."""
+        body = _make_body(
+            messages=[_user_msg([_text_block("hello")])],
+        )
+        result_body, info = cache_proxy.normalize_request(body)
+        assert info["tools"] == 0
+        assert "tools" not in result_body
+
+    def test_tools_with_duplicate_names_sorted_stably(self):
+        """If two tools have the same name (edge case), sorting is stable."""
+        body = _make_body(tools=[
+            {"name": "tool_a", "description": "version 1"},
+            {"name": "tool_b", "description": ""},
+            {"name": "tool_a", "description": "version 2"},
+        ])
+        cache_proxy.normalize_tool_order(body)
+        # Both tool_a entries should be adjacent
+        names = [t["name"] for t in body["tools"]]
+        assert names == ["tool_a", "tool_a", "tool_b"]
+
 
 # ── Rule 4: Strip Dynamic Reminders ──────────────────────────────────────
 
