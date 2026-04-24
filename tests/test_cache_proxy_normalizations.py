@@ -1495,3 +1495,130 @@ def test_tool_sorting_via_raw_http(proxy_with_bodies: int):
         "tool ordering. Sorting should make them identical."
     )
     print("  ✓ Different tool orders → identical post-normalization")
+
+
+# ── Test: CLAUDEMD_MARKER false positive (Bug 1) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_claudemd_marker_false_positive_in_changed_files(
+    proxy: int, test_project: Path
+):
+    """Bug 1: changed_files diff containing the CLAUDEMD_MARKER string.
+
+    When CC edits a CLAUDE.md file, the changed_files system-reminder
+    includes a diff that contains the CLAUDEMD_MARKER string deep inside.
+    Before the fix, _is_strippable_system_reminder() searched the full text
+    and incorrectly preserved this block (treating it as CLAUDE.md context).
+    The unstripped block then causes cache divergence on fork because the
+    fork doesn't have this dynamic reminder in its JSONL reconstruction.
+
+    With the fix (checking only text[:marker_end]), the changed_files block
+    IS correctly stripped, and the fork gets a cache HIT.
+
+    Verification:
+    - Parent writes the CLAUDEMD_MARKER string into its CLAUDE.md
+    - This triggers a changed_files reminder with the marker in the diff
+    - Fork from parent
+    - Fork's first turn classified as HIT (proxy stripped the reminder)
+    """
+    # Record proxy log offset to isolate this test's entries
+    log_offset = proxy_log_length()
+
+    # ── Set up: CLAUDE.md with marker-containing content ──
+    claudemd = test_project / "CLAUDE.md"
+    claudemd.write_text(
+        "# Test Project\n\n"
+        "As you answer the user's questions, you can use the following context:\n"
+        "This is a test project for cache proxy testing.\n"
+    )
+
+    # ── Parent: build context then edit CLAUDE.md ──
+    opts = make_sdk_options(test_project, proxy)
+    parent = ClaudeSDKClient(opts)
+    await parent.connect()
+    parent_sid = None
+    try:
+        # Turn 1: bulk text to build a large prefix
+        sid, u1 = await run_turn(
+            parent,
+            f"Reference document:\n\n{BULK_TEXT}\n\nReply with exactly: READY",
+        )
+        if sid:
+            parent_sid = sid
+        print(f"\n  Parent turn 1: {fmt_usage(u1)}")
+
+        # Turn 2: edit CLAUDE.md to trigger changed_files with the marker
+        sid, u2 = await run_turn(
+            parent,
+            "Append the line '## New Section' to the end of CLAUDE.md. "
+            "Reply with exactly: EDITED",
+        )
+        if sid:
+            parent_sid = sid
+        print(f"  Parent turn 2: {fmt_usage(u2)}")
+
+        # Turn 3: one more turn so the changed_files reminder persists
+        sid, u3 = await run_turn(
+            parent,
+            "Reply with exactly: ACK3",
+        )
+        if sid:
+            parent_sid = sid
+        print(f"  Parent turn 3: {fmt_usage(u3)}")
+    finally:
+        await parent.disconnect()
+
+    assert parent_sid, "Failed to get parent session ID"
+    print(f"  Parent session: {parent_sid}")
+
+    # ── Fork ──
+    fork_opts = make_sdk_options(
+        test_project, proxy, resume=parent_sid, fork_session=True
+    )
+    fork = ClaudeSDKClient(fork_opts)
+    await fork.connect()
+    try:
+        fork_sid, fork_usage = await run_turn(
+            fork, "Reply with exactly: FORK_CLAUDEMD_BUG1"
+        )
+    finally:
+        await fork.disconnect()
+
+    print(f"  Fork session: {fork_sid}")
+    print(f"  Fork usage: {fmt_usage(fork_usage)}")
+
+    # ── Verify cache hit using proxy log (authoritative source) ──
+    # The fork JSONL may not have flushed assistant entries yet.
+    # The proxy usage log records every API request in real time.
+    time.sleep(0.5)  # allow proxy log flush
+    proxy_entries = get_proxy_usage_for_turns(log_offset)
+    assert len(proxy_entries) >= 4, (
+        f"Expected ≥4 proxy log entries (3+ parent + 1 fork), "
+        f"got {len(proxy_entries)} (offset={log_offset})"
+    )
+
+    # Last entry is the fork's request; second-to-last is parent's last
+    fork_entry = proxy_entries[-1]
+    # Find parent's last substantial entry (skip tiny tool-result-only entries)
+    parent_entries = [e for e in proxy_entries[:-1] if e["tot"] > 1000]
+    assert parent_entries, "No substantial parent entries in proxy log"
+    parent_last = parent_entries[-1]
+
+    fork_cr = fork_entry["cr"]
+    prev_total = parent_last["tot"]
+
+    # Compute baseline from parent cache reads
+    parent_crs = [e["cr"] for e in parent_entries if e["cr"] > 0]
+    baseline = min(parent_crs) if parent_crs else 0
+    print(f"  Baseline: {baseline:,}")
+
+    classification = classify_cache_hit(fork_cr, prev_total, baseline)
+    print(
+        f"  Fork: cr={fork_cr:,}, prev_total={prev_total:,}, "
+        f"classification={classification}"
+    )
+    assert_cache_hit(
+        fork_cr, prev_total, baseline,
+        "CLAUDEMD false positive fork — changed_files with marker should be stripped"
+    )
