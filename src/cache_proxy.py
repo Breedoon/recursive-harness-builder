@@ -38,6 +38,7 @@ import httpx
 
 ANTHROPIC_UPSTREAM = "https://api.anthropic.com"
 CLI_PROXY_UPSTREAM = os.environ.get("CLI_PROXY_BASE_URL", "http://127.0.0.1:8317")
+CLI_PROXY_API_KEY = os.environ.get("CLI_PROXY_API_KEY", "sk-anything")
 DEFAULT_PORT = 18923
 _CODEBASE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.environ.get(
@@ -402,6 +403,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Don't request compression — we need to parse SSE for usage stats.
         # This adds ~10KB/response overhead but makes SSE parsing reliable.
         h["accept-encoding"] = "identity"
+        # CLIProxyAPI requires sk-prefixed API key; swap Anthropic key when routing there
+        if upstream == CLI_PROXY_UPSTREAM:
+            h["x-api-key"] = CLI_PROXY_API_KEY
         return h
 
     def _handle_health(self):
