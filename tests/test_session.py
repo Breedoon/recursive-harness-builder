@@ -150,7 +150,9 @@ class TestCreateOptions:
     def test_includes_default_sdk_hardening_env(self, config):
         mgr = SessionManager(config=config)
         options = mgr.create_options()
-        assert options.env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+        # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC was removed on 2026-04-04
+        # (breaks GrowthBook / 1h cache TTL). Verify it is NOT set.
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in options.env
 
     def test_set_sdk_env_overrides_filters_empty_values(self, config):
         mgr = SessionManager(config=config)
