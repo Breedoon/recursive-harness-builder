@@ -4,8 +4,6 @@ Provides in-process MCP tools that the Claude Agent SDK exposes to the model.
 Current task orchestration primitives: ``AgentTask`` (with ``fork`` mode),
 ``AgentTaskOutput``, and ``AgentTaskStop``.
 
-Compatibility aliases are preserved for ``ForkTask*`` names.
-
 See decisions D018 (forking as core primitive).
 """
 
@@ -205,7 +203,7 @@ def create_obs_tools(
     (closure over daemon state).
 
     hook_state is optional. When provided, transport-owned task tools such as
-    ``ForkTask`` can delegate launch behavior through hook_state callbacks.
+    ``AgentTask`` can delegate launch behavior through hook_state callbacks.
     """
 
     def _current_obs_bootstrap():
@@ -230,6 +228,29 @@ def create_obs_tools(
         default_fork: bool,
     ) -> dict:
         prompt = str(args.get("prompt", "")).strip()
+        prompt_file = str(args.get("prompt_file", "")).strip()
+
+        # --- prompt_file resolution ---
+        if prompt and prompt_file:
+            return _error_result(
+                f"Cannot launch {tool_name}: prompt and prompt_file are mutually exclusive. Provide one, not both."
+            )
+        if prompt_file:
+            try:
+                file_path = Path(prompt_file)
+                if str(prompt_file).startswith("~"):
+                    file_path = file_path.expanduser()
+                elif not file_path.is_absolute():
+                    file_path = config.vault_path / file_path
+                file_content = file_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return _error_result(f"Cannot launch {tool_name}: prompt_file not found: {file_path}")
+            except PermissionError:
+                return _error_result(f"Cannot launch {tool_name}: permission denied reading prompt_file: {file_path}")
+            except Exception as exc:
+                return _error_result(f"Cannot launch {tool_name}: cannot read prompt_file: {exc}")
+            prompt = file_content.strip()
+
         # display_name is the canonical param. alias/description/name are
         # deprecated fallbacks. This is the human-readable label, NOT the
         # machine agent_name (computed from lineage by agent_name_for_lineage).
@@ -247,11 +268,80 @@ def create_obs_tools(
                 fork = _coerce_bool_arg(args.get("fork"), name="fork")
             except ValueError:
                 return _error_result(f"Cannot launch {tool_name}: fork must be true or false")
+        # Model selection — "inherit" or empty means use parent's model.
+        model_raw = str(args.get("model", "")).strip()
+        model: str | None = None
+        if model_raw and model_raw.lower() != "inherit":
+            model = model_raw
+            if fork:
+                logger.warning(
+                    "%s: model='%s' with fork=true will cause a full cache miss. "
+                    "The fork's value comes from KV cache reuse which requires the same model.",
+                    tool_name,
+                    model,
+                )
+        # --- inherit_schedules ---
+        inherit_schedules = True
+        if "inherit_schedules" in args:
+            try:
+                inherit_schedules = _coerce_bool_arg(args.get("inherit_schedules"), name="inherit_schedules")
+            except ValueError:
+                return _error_result(f"Cannot launch {tool_name}: inherit_schedules must be true or false")
+
+        # --- env passthrough ---
+        env_override: dict[str, str] | None = None
+        env_raw = args.get("env")
+        if env_raw:
+            try:
+                env_override = json.loads(env_raw) if isinstance(env_raw, str) else env_raw
+            except (json.JSONDecodeError, TypeError) as exc:
+                return _error_result(f"Cannot launch {tool_name}: env must be a valid JSON object: {exc}")
+            if not isinstance(env_override, dict):
+                return _error_result(f"Cannot launch {tool_name}: env must be a JSON object (dict), got {type(env_override).__name__}")
+
+        # --- temperature ---
+        temperature: float | None = None
+        temperature_raw = args.get("temperature")
+        if temperature_raw is not None and str(temperature_raw).strip():
+            try:
+                temperature = float(temperature_raw)
+            except (TypeError, ValueError):
+                return _error_result(f"Cannot launch {tool_name}: temperature must be a number (e.g. '0', '0.5', '1')")
+            if temperature < 0 or temperature > 2:
+                return _error_result(f"Cannot launch {tool_name}: temperature must be between 0 and 2")
+
+        # --- hooks ---
+        user_hooks: dict[str, str] | None = None
+        hooks_raw = args.get("hooks")
+        if hooks_raw:
+            try:
+                user_hooks = json.loads(hooks_raw) if isinstance(hooks_raw, str) else hooks_raw
+            except (json.JSONDecodeError, TypeError) as exc:
+                return _error_result(f"Cannot launch {tool_name}: hooks must be a valid JSON object: {exc}")
+            if not isinstance(user_hooks, dict):
+                return _error_result(
+                    f"Cannot launch {tool_name}: hooks must be a JSON object, got {type(user_hooks).__name__}"
+                )
+            for event_name, spec in user_hooks.items():
+                if not isinstance(spec, str) or "::" not in spec:
+                    return _error_result(
+                        f"Cannot launch {tool_name}: hooks['{event_name}'] must be "
+                        f"'file_path::function_name', got: {spec!r}"
+                    )
+
+        # --- inherit_hooks ---
+        inherit_hooks = False
+        if "inherit_hooks" in args:
+            try:
+                inherit_hooks = _coerce_bool_arg(args.get("inherit_hooks"), name="inherit_hooks")
+            except ValueError:
+                return _error_result(f"Cannot launch {tool_name}: inherit_hooks must be true or false")
+
         # Kept for internal/future use — not exposed in MCP schema but still processed if passed
         timeout_ms_raw = args.get("timeout_ms")
         max_turns_raw = args.get("max_turns")
         if not prompt:
-            return _error_result(f"Cannot launch {tool_name}: prompt is required")
+            return _error_result(f"Cannot launch {tool_name}: prompt or prompt_file is required")
 
         if run_in_background is not None:
             try:
@@ -288,7 +378,7 @@ def create_obs_tools(
             effective_session_id = get_session_id()
             if not effective_session_id and hook_state is not None:
                 effective_session_id = hook_state.session_id
-            return await hook_state.fork_task_launcher({
+            payload: dict[str, Any] = {
                 "session_id": effective_session_id,
                 "prompt": prompt,
                 "description": description,
@@ -297,53 +387,23 @@ def create_obs_tools(
                 "timeout_ms": timeout_ms,
                 "max_turns": max_turns,
                 "fork": fork,
+                "model": model,
                 "team_name": team_name,
                 "agent_name": agent_name,
                 "task_tool_name": tool_name,
                 "tool_use_id": hook_state.current_tool_use_id,
-            })
+                "inherit_schedules": inherit_schedules,
+                "env": env_override,
+                "temperature": temperature,
+                "hooks": user_hooks,
+                "inherit_hooks": inherit_hooks,
+            }
+            if prompt_file:
+                payload["prompt_file"] = prompt_file
+            return await hook_state.fork_task_launcher(payload)
         except Exception as exc:
             logger.exception("%s launch failed", tool_name)
             return _error_result(f"{tool_name} failed: {type(exc).__name__}: {exc}")
-
-    @tool(
-        "ForkTask",
-        "Compatibility alias for AgentTask with fork=true.",
-        {
-            "prompt": {
-                "type": "string",
-                "description": "Full task prompt for the forked child session",
-            },
-            "display_name": {
-                "type": "string",
-                "description": "Human-readable name for the child agent (used in topic titles and lineage).",
-            },
-            "alias": {
-                "type": "string",
-                "description": "Deprecated: use display_name.",
-            },
-            "description": {
-                "type": "string",
-                "description": "Deprecated: use display_name.",
-            },
-            "resume": {
-                "type": "string",
-                "description": "Optional agentId to resume an existing fork task",
-            },
-            # run_in_background: hardcoded true, not exposed in MCP schema
-            # timeout_ms and max_turns: kept for internal/future use — not exposed in MCP schema
-            "name": {
-                "type": "string",
-                "description": "Deprecated: use display_name.",
-            },
-            "team_name": {
-                "type": "string",
-                "description": "Optional team/task-list name for flat team env bootstrap.",
-            },
-        },
-    )
-    async def fork_task(args: dict) -> dict:
-        return await _launch_task(args, tool_name="ForkTask", default_fork=True)
 
     @tool(
         "AgentTask",
@@ -351,9 +411,19 @@ def create_obs_tools(
         "Set fork=true to continue from current session head, or fork=false to start "
         "a fresh child session in the new topic.",
         {
+            "type": "object",
+            "properties": {
             "prompt": {
                 "type": "string",
-                "description": "Full task prompt for the child session",
+                "description": "Full task prompt for the child session. Mutually exclusive with prompt_file.",
+            },
+            "prompt_file": {
+                "type": "string",
+                "description": (
+                    "Path to a file containing the prompt. Vault-relative by default, "
+                    "absolute paths (/...) and ~/paths supported. "
+                    "Mutually exclusive with prompt — provide one, not both."
+                ),
             },
             "display_name": {
                 "type": "string",
@@ -377,6 +447,19 @@ def create_obs_tools(
             },
             # run_in_background: hardcoded true, not exposed in MCP schema
             # timeout_ms and max_turns: kept for internal/future use — not exposed in MCP schema
+            "model": {
+                "type": "string",
+                "description": (
+                    "Model for the child session. Accepts shorthands (claude, gpt, gemini) "
+                    "which resolve to the latest tier, or full names (gpt-5.5, gemini-2.5-pro). "
+                    "Append a context suffix like [1m] or [200k] to control the context window "
+                    "(default: 1m). 'inherit' or omitted = use the same model as the current "
+                    "session. WARNING: setting a model different from the parent when fork=true "
+                    "causes a full cache miss — the fork's value comes from KV cache reuse, which "
+                    "requires the same model. Only override the model with fork=true if you have "
+                    "been explicitly instructed to do so."
+                ),
+            },
             "name": {
                 "type": "string",
                 "description": "Deprecated: use display_name.",
@@ -385,6 +468,53 @@ def create_obs_tools(
                 "type": "string",
                 "description": "Optional team/task-list name for flat team env bootstrap.",
             },
+            "inherit_schedules": {
+                "type": "string",
+                "description": (
+                    "Whether the child agent inherits the parent's schedules. "
+                    "Default 'true'. Set to 'false' to prevent schedule inheritance."
+                ),
+            },
+            "env": {
+                "type": "string",
+                "description": (
+                    "JSON object of environment variable overrides for the child session. "
+                    "These are merged into the child's SDK env overrides, e.g. "
+                    '\'{"SOME_VAR": "value"}\'. User-provided env vars take precedence '
+                    "over auto-configured ones."
+                ),
+            },
+            "temperature": {
+                "type": "string",
+                "description": (
+                    "Temperature for the child session (e.g. '0', '0.5', '1'). "
+                    "WARNING: setting temperature requires disabling extended thinking — "
+                    "the Anthropic API rejects temperature != 1 when thinking is enabled. "
+                    "This trades reasoning quality for determinism. If both temperature "
+                    "and env.CLAUDE_CODE_EXTRA_BODY are provided, temperature takes precedence."
+                ),
+            },
+            "hooks": {
+                "type": "string",
+                "description": (
+                    "JSON object mapping hook event names to Python function specs. "
+                    "Each value must be 'file_path::function_name'. The function is "
+                    "dynamically loaded and called with (hook_input, tool_use_id, context). "
+                    "Hook functions run AFTER built-in OBS guards. Errors in hooks are "
+                    "logged but never crash the session. "
+                    'Example: \'{"PreToolUse": "procedures/hooks/guard.py::check_access"}\''
+                ),
+            },
+            "inherit_hooks": {
+                "type": "string",
+                "description": (
+                    "Whether the child agent inherits its parent's hooks. "
+                    "Default 'false'. Set to 'true' to propagate the parent session's "
+                    "hooks to the child."
+                ),
+            },
+            },
+            "required": ["display_name"],
         },
     )
     async def agent_task(args: dict) -> dict:
@@ -422,27 +552,6 @@ def create_obs_tools(
             return _error_result(f"{tool_name} failed: {type(exc).__name__}: {exc}")
 
     @tool(
-        "ForkTaskOutput",
-        "Compatibility alias for AgentTaskOutput (task_id, block, timeout).",
-        {
-            "task_id": {
-                "type": "string",
-                "description": "The agentId/task handle returned by ForkTask",
-            },
-            "block": {
-                "type": "boolean",
-                "description": "Whether to wait for completion",
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Maximum wait time in milliseconds",
-            },
-        },
-    )
-    async def fork_task_output(args: dict) -> dict:
-        return await _task_output(args, tool_name="ForkTaskOutput")
-
-    @tool(
         "AgentTaskOutput",
         "Inspect a running or completed AgentTask using TaskOutput-style "
         "parameters. Use task_id, block, and timeout.",
@@ -477,23 +586,6 @@ def create_obs_tools(
         except Exception as exc:
             logger.exception("%s failed", tool_name)
             return _error_result(f"{tool_name} failed: {type(exc).__name__}: {exc}")
-
-    @tool(
-        "ForkTaskStop",
-        "Compatibility alias for AgentTaskStop.",
-        {
-            "task_id": {
-                "type": "string",
-                "description": "The agentId/task handle returned by ForkTask",
-            },
-            "shell_id": {
-                "type": "string",
-                "description": "Deprecated alias for task_id, matching TaskStop.",
-            },
-        },
-    )
-    async def fork_task_stop(args: dict) -> dict:
-        return await _task_stop(args, tool_name="ForkTaskStop")
 
     @tool(
         "AgentTaskStop",
@@ -1372,6 +1464,34 @@ def create_obs_tools(
             "tool_use_result": result,
         }
 
+    @tool(
+        "PlaceholderTool",
+        "A placeholder tool whose behavior is defined by hooks. "
+        "Call this tool when instructed by the system or a procedure. "
+        "A pre-tool-use hook intercepts the call and provides the actual implementation.",
+        {
+            "action": {
+                "type": "string",
+                "description": "The action to perform.",
+            },
+            "input": {
+                "type": "string",
+                "description": "Free-form input for the action.",
+            },
+        },
+    )
+    async def placeholder_tool(args: dict) -> dict:
+        action = str(args.get("action", "")).strip()
+        tool_input = str(args.get("input", "")).strip()
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"PlaceholderTool executed: action={action!r}, input={tool_input!r}",
+                }
+            ],
+        }
+
     server = create_sdk_mcp_server(
         "obs-agent",
         tools=[
@@ -1383,13 +1503,11 @@ def create_obs_tools(
             cron_delete,
             send_inbox_message,
             read_inbox,
-            fork_task,
-            fork_task_output,
-            fork_task_stop,
             session_info,
             context_info,
             session_lineage,
             search_team,
+            placeholder_tool,
         ],
     )
     return server
