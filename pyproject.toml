@@ -39,6 +39,8 @@ markers = [
     "telegram: Telegram-specific eval scenarios (require OBS_TELEGRAM_BOT_USERNAME)",
     "telegram_smoke: dense live Telegram smoke scenarios for fast dev-loop validation",
     "telegram_soak: long-running Telegram soak scenarios (around one hour)",
+    "real_get_client: opt out of the autouse get_client mock (for tests that test client lifecycle)",
+    "serial: tests that must run in isolation (e.g. stops/restarts external services)",
 ]
 testpaths = ["tests"]
 pythonpath = ["src"]

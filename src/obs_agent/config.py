@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +18,110 @@ _DEFAULT_TELEGRAM_TRANSCRIPTION_SCRIPT = (
     Path("/Users/breedoon/Documents/PATH/transcription/transcribe.sh")
 )
 _DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no expiry for now
+
+# ---------------------------------------------------------------------------
+# Model resolution
+# ---------------------------------------------------------------------------
+
+# Shorthand → full model name. When the user passes a shorthand like "claude"
+# or "gpt", we resolve it to the latest/best model in that tier.  More specific
+# strings (e.g. "gpt-5.4") pass through unchanged.  Maintained as a flat dict;
+# update when new models are released.
+MODEL_RESOLUTION: dict[str, str] = {
+    # Anthropic tiers
+    "claude": "claude-opus-4-6",
+    "claude-opus": "claude-opus-4-6",
+    "claude-sonnet": "claude-sonnet-4-6",
+    "claude-haiku": "claude-haiku-4-5",
+    # OpenAI tiers
+    "gpt": "gpt-5.4",
+    "gpt-pro": "gpt-5.4",
+    "openai": "gpt-5.4",
+    "chatgpt": "gpt-5.4",
+    # Google tiers
+    "gemini": "gemini-2.5-pro",
+    "gemini-pro": "gemini-2.5-pro",
+    "gemini-flash": "gemini-2.5-flash",
+}
+
+# Regex for context-window suffix: [1m], [200k], [128k], etc.
+_CONTEXT_SUFFIX_RE = re.compile(r"\[(\d+)([mk])\]$", re.IGNORECASE)
+
+_DEFAULT_CONTEXT_TOKENS = 1_000_000
+
+
+def resolve_model(shorthand: str) -> str:
+    """Resolve a shorthand model name to its full identifier.
+
+    If *shorthand* matches a key in MODEL_RESOLUTION, return the resolved name.
+    Otherwise return *shorthand* unchanged (assumed to be a full model name).
+    The lookup is case-insensitive.  A context suffix like ``[1m]`` is stripped
+    before lookup and re-appended to the resolved name.
+    """
+    clean, ctx_tokens = parse_context_suffix(shorthand)
+    resolved = MODEL_RESOLUTION.get(clean.lower().strip(), clean.strip())
+    # Re-append the original suffix if one was present
+    if clean != shorthand.strip():
+        suffix = shorthand.strip()[len(clean):]
+        return resolved + suffix
+    return resolved
+
+
+def parse_context_suffix(model_str: str) -> tuple[str, int]:
+    """Split a model string into (clean_model, context_tokens).
+
+    Examples
+    --------
+    >>> parse_context_suffix("claude-opus-4-6[1m]")
+    ('claude-opus-4-6', 1000000)
+    >>> parse_context_suffix("gpt-5.4[200k]")
+    ('gpt-5.4', 200000)
+    >>> parse_context_suffix("gemini-2.5-pro")
+    ('gemini-2.5-pro', 1000000)
+    """
+    m = _CONTEXT_SUFFIX_RE.search(model_str)
+    if not m:
+        return model_str.strip(), _DEFAULT_CONTEXT_TOKENS
+    value = int(m.group(1))
+    unit = m.group(2).lower()
+    tokens = value * 1_000_000 if unit == "m" else value * 1_000
+    clean = model_str[: m.start()].strip()
+    return clean, tokens
+
+
+def compaction_threshold(context_tokens: int) -> int:
+    """Return the compaction-trigger token count for a given context window.
+
+    Reverse-engineered from Anthropic's Claude Code behaviour:
+      - 200 000 tokens → fires at ~167 000  (≈83.5 %)
+      - 1 000 000 tokens → fires at ~920 000 (≈92.0 %)
+
+    The percentage scales linearly from 83.5 % at 200 K to 92.0 % at 1 M,
+    clamped at those bounds.  A safety floor of 10 000 tokens below the window
+    is enforced so compaction always has room to work.
+    """
+    if context_tokens <= 0:
+        return 0
+    # Linear interpolation between two known data-points
+    low_ctx, low_pct = 200_000, 0.835
+    high_ctx, high_pct = 1_000_000, 0.920
+    if context_tokens <= low_ctx:
+        pct = low_pct
+    elif context_tokens >= high_ctx:
+        pct = high_pct
+    else:
+        ratio = (context_tokens - low_ctx) / (high_ctx - low_ctx)
+        pct = low_pct + ratio * (high_pct - low_pct)
+    threshold = int(context_tokens * pct)
+    # Ensure at least 10 K headroom
+    return min(threshold, context_tokens - 10_000)
+
+
+def is_claude_model(model: str) -> bool:
+    """Return True if *model* is an Anthropic Claude model."""
+    clean = model.split("[")[0].strip().lower()
+    return clean.startswith("claude") or resolve_model(clean).startswith("claude")
+
 
 IMMUTABLE_PATTERNS: list[str] = [
     "Misc/Meeting Notes",
@@ -39,6 +144,10 @@ class OBSConfig:
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
     model: str = "claude-opus-4-6[1m]"
+    # Shorthand default model used when OBS_AGENT_MODEL is not set.
+    # Resolved via MODEL_RESOLUTION (e.g. "claude" → "claude-opus-4-6").
+    # Change this to e.g. "gpt" to make root sessions default to GPT.
+    default_model: str = "claude"
     claude_dir: str = ".claude"
     daemon_host: str = "127.0.0.1"
     daemon_port: int = 7832
@@ -52,6 +161,10 @@ class OBSConfig:
     # Cache proxy
     cache_proxy_port: int = 18923
     cache_proxy_enabled: bool = True
+
+    # CLI proxy (CLIProxyAPI — routes non-Anthropic models)
+    cli_proxy_base_url: str = "http://127.0.0.1:8317"
+    cli_proxy_api_key: str = "sk-anything"  # Must match api-keys in cliproxyapi.conf
 
     # Telegram
     telegram_bot_token: str | None = None
@@ -83,8 +196,19 @@ class OBSConfig:
 
         if vault := os.environ.get("OBS_VAULT_PATH"):
             kwargs["vault_path"] = Path(vault)
+        if default_model := os.environ.get("OBS_DEFAULT_MODEL"):
+            kwargs["default_model"] = default_model.strip()
         if model := os.environ.get("OBS_AGENT_MODEL") or os.environ.get("OBS_MODEL"):
             kwargs["model"] = model.strip()
+        else:
+            # No explicit model env var — derive from default_model via resolution.
+            # resolve_model handles shorthand lookup and preserves any context suffix.
+            dm = kwargs.get("default_model", "claude")
+            resolved = resolve_model(dm)
+            # If the resolved model has no context suffix, append [1m] (platform default).
+            if not _CONTEXT_SUFFIX_RE.search(resolved):
+                resolved += "[1m]"
+            kwargs["model"] = resolved
         if host := os.environ.get("OBS_DAEMON_HOST"):
             kwargs["daemon_host"] = host
         if port := os.environ.get("OBS_DAEMON_PORT"):
@@ -105,6 +229,10 @@ class OBSConfig:
             kwargs["cache_proxy_port"] = int(proxy_port)
         if proxy_enabled := os.environ.get("OBS_CACHE_PROXY_ENABLED"):
             kwargs["cache_proxy_enabled"] = proxy_enabled.strip().lower() in {"1", "true", "yes", "on"}
+        if cli_proxy_url := os.environ.get("OBS_CLI_PROXY_BASE_URL"):
+            kwargs["cli_proxy_base_url"] = cli_proxy_url.strip()
+        if cli_proxy_key := os.environ.get("OBS_CLI_PROXY_API_KEY"):
+            kwargs["cli_proxy_api_key"] = cli_proxy_key.strip()
         raw_tokens = (os.environ.get("OBS_TELEGRAM_BOT_TOKENS") or "").strip()
         if raw_tokens:
             kwargs["telegram_bot_tokens"] = [

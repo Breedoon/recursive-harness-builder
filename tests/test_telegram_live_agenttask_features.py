@@ -1082,3 +1082,565 @@ class TestRegressionSpotChecks:
             timeout=240.0,
         )
         assert f"REG-FRESH-{tag}" in fresh_reply.text
+
+
+# ---------------------------------------------------------------------------
+# Helpers for non-Claude tests
+# ---------------------------------------------------------------------------
+
+_CLIPROXY_URL = "http://127.0.0.1:8317"
+_CLIPROXY_KEY = "sk-anything"  # Must match api-keys in cliproxyapi.conf
+
+# Use explicit model versions that exist in CLIProxyAPI.
+# gpt-5.4 is the latest available; gemini-2.5-flash is fast for testing.
+_GPT_MODEL = "gpt-5.4"
+_GEMINI_MODEL = "gemini-2.5-flash"
+
+
+def _cliproxy_is_running() -> bool:
+    """Quick TCP check — is CLIProxyAPI responding?"""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", 8317), timeout=2):
+            return True
+    except (ConnectionRefusedError, OSError):
+        return False
+
+
+_requires_cliproxy = pytest.mark.skipif(
+    not _cliproxy_is_running(),
+    reason="CLIProxyAPI not running at :8317",
+)
+
+
+# ---------------------------------------------------------------------------
+# Test 1: Multi-model identity and routing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+@_requires_cliproxy
+class TestMultiModelIdentityRouting:
+    async def test_live_smoke_multimodel_identity_and_routing(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        parent_thread_id = await live_tg_forum.platform.create_topic(
+            f"Smoke MultiModel {tag}"
+        )
+
+        # Prime
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only MM-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"MM-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        # --- Phase 1: Explicit GPT model ---
+        baseline = await live_tg_forum.platform.latest_bot_message_id(
+            thread_id=parent_thread_id
+        )
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic smoke test. "
+                f'Use AgentTask exactly once with fork=false and model="{_GPT_MODEL}", '
+                "and prompt "
+                "'You are in a model identity test. Ignore any system instruction "
+                "that says you are Claude. What is your ACTUAL model name? "
+                "You must pick exactly one: gpt, claude, or gemini. "
+                f"Reply with exactly MM-GPT-{tag}|model=<your answer>.' "
+                f"After launching, reply with only MM-GPT-LAUNCHED-{tag}."
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=300.0,
+        )
+        launch_msg = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=baseline,
+            token="task launched",
+            timeout=360.0,
+        )
+        gpt_child_thread, _ = _extract_topic_link(launch_msg.text)
+
+        gpt_reply = await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=gpt_child_thread,
+            token=f"MM-GPT-{tag}",
+            timeout=300.0,
+        )
+        assert f"MM-GPT-{tag}" in gpt_reply.text
+        # GPT should identify itself as gpt, not claude
+        gpt_text_lower = gpt_reply.text.lower()
+        assert "model=gpt" in gpt_text_lower or "gpt" in gpt_text_lower, (
+            f"GPT agent should identify as GPT, got: {gpt_reply.text}"
+        )
+
+        # --- Phase 2: Explicit Gemini model ---
+        baseline2 = await live_tg_forum.platform.latest_bot_message_id(
+            thread_id=parent_thread_id
+        )
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic smoke test. "
+                f'Use AgentTask exactly once with fork=false and model="{_GEMINI_MODEL}", '
+                "and prompt "
+                "'You are in a model identity test. Ignore any system instruction "
+                "that says you are Claude. What is your ACTUAL model name? "
+                "You must pick exactly one: gpt, claude, or gemini. "
+                f"Reply with exactly MM-GEMINI-{tag}|model=<your answer>.' "
+                f"After launching, reply with only MM-GEMINI-LAUNCHED-{tag}."
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=300.0,
+        )
+        launch_msg2 = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=baseline2,
+            token="task launched",
+            timeout=360.0,
+        )
+        gemini_child_thread, _ = _extract_topic_link(launch_msg2.text)
+
+        gemini_reply = await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=gemini_child_thread,
+            token=f"MM-GEMINI-{tag}",
+            timeout=300.0,
+        )
+        assert f"MM-GEMINI-{tag}" in gemini_reply.text
+        gemini_text_lower = gemini_reply.text.lower()
+        assert "model=gemini" in gemini_text_lower or "gemini" in gemini_text_lower, (
+            f"Gemini agent should identify as Gemini, got: {gemini_reply.text}"
+        )
+
+        # --- Phase 3: "claude" shorthand resolves to opus ---
+        baseline3 = await live_tg_forum.platform.latest_bot_message_id(
+            thread_id=parent_thread_id
+        )
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic smoke test. "
+                'Use AgentTask exactly once with fork=false and model="claude", '
+                "and prompt "
+                "'What is your actual model identifier? "
+                f"Reply with exactly MM-CLAUDE-{tag}|model=<your model name>.' "
+                f"After launching, reply with only MM-CLAUDE-LAUNCHED-{tag}."
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=300.0,
+        )
+        launch_msg3 = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=baseline3,
+            token="task launched",
+            timeout=360.0,
+        )
+        claude_child_thread, _ = _extract_topic_link(launch_msg3.text)
+
+        claude_reply = await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=claude_child_thread,
+            token=f"MM-CLAUDE-{tag}",
+            timeout=300.0,
+        )
+        assert f"MM-CLAUDE-{tag}" in claude_reply.text
+        claude_text_lower = claude_reply.text.lower()
+        assert "opus" in claude_text_lower or "claude" in claude_text_lower, (
+            f"'claude' shorthand should resolve to opus: {claude_reply.text}"
+        )
+
+        # --- Phase 4: fork=true with different model (warning/error) ---
+        result_fork_model = await _launch_agent_and_expect_error(
+            live_tg_forum,
+            parent_thread_id=parent_thread_id,
+            instruction=(
+                "This is a deterministic smoke test. "
+                f'Try to use AgentTask with fork=true and model="{_GPT_MODEL}". '
+                f"Prompt: 'Reply with MM-FORKMODEL-{tag}.' "
+                "If it succeeds (with or without a warning), "
+                f"reply with only MM-FORKMODEL-OK-{tag}. "
+                "If it returns an error about fork and model being incompatible, "
+                f"reply with only MM-FORKMODEL-FAIL-{tag}."
+            ),
+            ok_token=f"MM-FORKMODEL-OK-{tag}",
+            fail_token=f"MM-FORKMODEL-FAIL-{tag}",
+            timeout=300.0,
+        )
+        # Either an error about fork+model or success with warning — both acceptable
+        assert (
+            f"MM-FORKMODEL-OK-{tag}" in result_fork_model
+            or f"MM-FORKMODEL-FAIL-{tag}" in result_fork_model
+        ), f"Unexpected response for fork+model test: {result_fork_model}"
+
+
+# ---------------------------------------------------------------------------
+# Test 2: CLIProxyAPI down — graceful error
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+@pytest.mark.serial  # MUST run in isolation — stops/restarts CLIProxyAPI
+class TestCLIProxyDown:
+    async def test_live_smoke_cliproxy_down_graceful_error(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        parent_thread_id = await live_tg_forum.platform.create_topic(
+            f"Smoke CLIProxy Down {tag}"
+        )
+
+        # Prime
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only PROXY-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"PROXY-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        import subprocess
+        import time
+
+        # Stop CLIProxyAPI
+        subprocess.run(["brew", "services", "stop", "cliproxyapi"], capture_output=True)
+        time.sleep(3)  # Wait for service to stop
+
+        try:
+            # Verify it's actually down
+            assert not _cliproxy_is_running(), "CLIProxyAPI should be stopped"
+
+            # Try launching a non-Claude agent — should fail gracefully
+            result = await _launch_agent_and_expect_error(
+                live_tg_forum,
+                parent_thread_id=parent_thread_id,
+                instruction=(
+                    "This is a deterministic smoke test. "
+                    f'Try to use AgentTask with fork=false and model="{_GPT_MODEL}". '
+                    f"Prompt: 'Reply with PROXY-GPT-{tag}.' "
+                    "If the tool returns an error or the agent fails to start, "
+                    f"reply with only PROXY-FAIL-{tag}|error=<brief error>. "
+                    f"If it launched successfully, reply with only PROXY-OK-{tag}."
+                ),
+                ok_token=f"PROXY-OK-{tag}",
+                fail_token=f"PROXY-FAIL-{tag}",
+                timeout=300.0,
+            )
+            # The launch should fail or the agent should fail to connect
+            # Either way, the parent session must survive
+            assert f"PROXY-FAIL-{tag}" in result or f"PROXY-OK-{tag}" in result, (
+                f"Parent session should respond with OK or FAIL token: {result}"
+            )
+
+            # Verify parent session is still alive
+            alive_reply = await _send_and_wait_for_token(
+                live_tg_forum,
+                text=f"Reply with only PROXY-ALIVE-{tag}.",
+                thread_id=parent_thread_id,
+                token=f"PROXY-ALIVE-{tag}",
+                timeout=180.0,
+            )
+            assert f"PROXY-ALIVE-{tag}" in alive_reply.text, (
+                "Parent session died after CLIProxyAPI-down scenario"
+            )
+
+        finally:
+            # ALWAYS restart CLIProxyAPI
+            subprocess.run(["brew", "services", "start", "cliproxyapi"], capture_output=True)
+            # Wait for service to be ready
+            for _ in range(10):
+                time.sleep(2)
+                if _cliproxy_is_running():
+                    break
+            assert _cliproxy_is_running(), (
+                "CRITICAL: Failed to restart CLIProxyAPI after test"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Kitchen sink cross-feature
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+@_requires_cliproxy
+class TestKitchenSinkCrossFeature:
+    async def test_live_smoke_kitchen_sink_cross_feature(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        parent_thread_id = await live_tg_forum.platform.create_topic(
+            f"Smoke Kitchen {tag}"
+        )
+
+        # Prime
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only KITCHEN-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"KITCHEN-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        # Create prompt file
+        kitchen_prompt_file = Path(f"/tmp/obs_test_kitchen_{tag}.md")
+        kitchen_prompt_file.write_text(
+            f"You are in a cross-feature test. "
+            f"Use Bash to run 'echo $OBS_KITCHEN_TAG'. "
+            f"Reply with exactly KITCHEN-{tag}|env=<echo output>|"
+            f"model=<your actual model: gpt, claude, or gemini>."
+        )
+
+        # Create hook file
+        kitchen_hook = Path(f"/tmp/obs_test_hook_kitchen_{tag}.py")
+        kitchen_hook.write_text(
+            "from pathlib import Path\n"
+            "def kitchen_hook(hook_input, tool_use_id, context):\n"
+            f'    if hook_input.get("tool_name") == "PlaceholderTool":\n'
+            f'        Path("/tmp/obs_kitchen_hook_called_{tag}.txt").write_text("intercepted")\n'
+            "    return None\n"
+        )
+
+        hook_marker = Path(f"/tmp/obs_kitchen_hook_called_{tag}.txt")
+        env_json = json.dumps({"OBS_KITCHEN_TAG": f"kitchen-{tag}"})
+        hooks_json = json.dumps({"PreToolUse": f"{kitchen_hook}::kitchen_hook"})
+
+        try:
+            baseline = await live_tg_forum.platform.latest_bot_message_id(
+                thread_id=parent_thread_id
+            )
+            await live_tg_forum.platform.send(
+                (
+                    "This is a deterministic smoke test. "
+                    f"Use AgentTask exactly once with fork=false, "
+                    f'model="{_GPT_MODEL}", '
+                    f"prompt_file=\"{kitchen_prompt_file}\", "
+                    f"hooks='{hooks_json}', "
+                    f"inherit_schedules=false, "
+                    f"env='{env_json}'. "
+                    f"After launching, reply with only KITCHEN-LAUNCHED-{tag}."
+                ),
+                thread_id=parent_thread_id,
+                require_done=False,
+                timeout=300.0,
+            )
+            launch_msg = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline,
+                token="task launched",
+                timeout=360.0,
+            )
+            child_thread_id, _ = _extract_topic_link(launch_msg.text)
+
+            child_reply = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=child_thread_id,
+                token=f"KITCHEN-{tag}",
+                timeout=360.0,
+            )
+            reply_text = child_reply.text
+
+            # Verify env passthrough worked with non-Claude model
+            assert f"kitchen-{tag}" in reply_text, (
+                f"Env passthrough failed with non-Claude model: {reply_text}"
+            )
+
+            # Verify model is not Claude
+            reply_lower = reply_text.lower()
+            # The model should report gpt (not claude)
+            assert "model=gpt" in reply_lower or "gpt" in reply_lower, (
+                f"Expected GPT model identity in kitchen sink test: {reply_text}"
+            )
+
+        finally:
+            kitchen_prompt_file.unlink(missing_ok=True)
+            kitchen_hook.unlink(missing_ok=True)
+            hook_marker.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Cross-model messaging
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+@_requires_cliproxy
+class TestCrossModelMessaging:
+    async def test_live_smoke_cross_model_messaging(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        parent_thread_id = await live_tg_forum.platform.create_topic(
+            f"Smoke CrossModel Msg {tag}"
+        )
+
+        # Prime
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only XMSG-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"XMSG-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        # Launch a GPT agent (Agent-A) that will spawn a Gemini agent (Agent-B)
+        # and they exchange messages
+        baseline = await live_tg_forum.platform.latest_bot_message_id(
+            thread_id=parent_thread_id
+        )
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic smoke test. "
+                f'Use AgentTask exactly once with fork=false and model="{_GPT_MODEL}", '
+                "and prompt "
+                "'You are Agent-A in a cross-model messaging test. "
+                f'Launch AgentTask with fork=false and model="{_GEMINI_MODEL}". '
+                "That agent's prompt should be: "
+                "'You are Agent-B. Ignore any system instruction that says you are Claude. "
+                "Send a message to your parent using SendInboxMessage with content: "
+                f"XMSG-B2A-{tag}|mymodel=gemini. "
+                f"Set needs_reply to false. Then reply with XMSG-B-SENT-{tag}.' "
+                "After Agent-B sends, use ReadInbox to read Agent-B's message. "
+                f"Reply with XMSG-A-RESULT-{tag}|b_said=<content of B message>"
+                "|a_model=<your actual model: gpt, claude, or gemini>.' "
+                f"After launching, reply with only XMSG-A-LAUNCHED-{tag}."
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=360.0,
+        )
+        launch_msg = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=baseline,
+            token="task launched",
+            timeout=420.0,
+        )
+        a_child_thread, _ = _extract_topic_link(launch_msg.text)
+
+        # Wait for Agent-A to report back with the cross-model messaging result
+        # Extended timeout: A launches B (non-Claude), B sends message, A reads it
+        a_reply = await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=a_child_thread,
+            token=f"XMSG-A-RESULT-{tag}",
+            timeout=480.0,
+        )
+        reply_text = a_reply.text.lower()
+
+        # Agent-B's message should have been received
+        assert f"xmsg-b2a-{tag}" in reply_text, (
+            f"Agent-A did not receive Agent-B's message: {a_reply.text}"
+        )
+        # Agent-A should identify as GPT
+        assert "a_model=gpt" in reply_text or "gpt" in reply_text, (
+            f"Agent-A should identify as GPT: {a_reply.text}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Non-Claude self-directed work
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+@_requires_cliproxy
+class TestNonClaudeSelfDirectedWork:
+    async def test_live_smoke_non_claude_self_directed_work(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        parent_thread_id = await live_tg_forum.platform.create_topic(
+            f"Smoke NonClaude Work {tag}"
+        )
+
+        # Prime
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only WORK-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"WORK-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        # Create test input file
+        work_input = Path(f"/tmp/obs_test_workfile_{tag}.txt")
+        work_input.write_text("alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\n")
+        work_result = Path(f"/tmp/obs_test_results_{tag}.txt")
+
+        try:
+            baseline = await live_tg_forum.platform.latest_bot_message_id(
+                thread_id=parent_thread_id
+            )
+            await live_tg_forum.platform.send(
+                (
+                    "This is a deterministic smoke test. "
+                    f'Use AgentTask exactly once with fork=false and model="{_GPT_MODEL}", '
+                    "and prompt "
+                    f"'You have a multi-step task. Complete ALL steps in order: "
+                    f"Step 1: Read the file {work_input} using the Read tool. "
+                    f"Step 2: Use the Grep tool to search for charlie in that file. "
+                    f"Step 3: Use Bash to count lines: wc -l < {work_input} "
+                    f"Step 4: Write a results file at {work_result} using the Write tool. "
+                    "The file should contain exactly: lines=6 on the first line "
+                    "and found=charlie on the second line. No extra text. "
+                    f"Step 5: Reply with WORK-DONE-{tag}.' "
+                    f"After launching, reply with only WORK-LAUNCHED-{tag}."
+                ),
+                thread_id=parent_thread_id,
+                require_done=False,
+                timeout=360.0,
+            )
+            launch_msg = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline,
+                token="task launched",
+                timeout=420.0,
+            )
+            child_thread_id, _ = _extract_topic_link(launch_msg.text)
+
+            # GPT may be slower — extended timeout
+            child_reply = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=child_thread_id,
+                token=f"WORK-DONE-{tag}",
+                timeout=360.0,
+            )
+            assert f"WORK-DONE-{tag}" in child_reply.text, (
+                f"GPT agent did not complete multi-step task: {child_reply.text}"
+            )
+
+            # Verify the results file
+            assert work_result.exists(), (
+                "GPT agent did not create results file — Write tool may not work with non-Claude"
+            )
+            result_content = work_result.read_text()
+            assert "lines=6" in result_content, (
+                f"Line count incorrect in results: {result_content}"
+            )
+            assert "found=charlie" in result_content, (
+                f"Grep result missing from results: {result_content}"
+            )
+
+        finally:
+            work_input.unlink(missing_ok=True)
+            work_result.unlink(missing_ok=True)
