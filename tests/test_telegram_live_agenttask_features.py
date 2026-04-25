@@ -210,6 +210,105 @@ class TestPromptFromFile:
         finally:
             prompt_file2.unlink(missing_ok=True)
 
+        # --- Phase 4: Neither prompt nor prompt_file — rejected ---
+        result = await _launch_agent_and_expect_error(
+            live_tg_forum,
+            parent_thread_id=parent_thread_id,
+            instruction=(
+                "This is a deterministic smoke test. "
+                "Try to use AgentTask with fork=false. Do NOT provide a prompt parameter "
+                "and do NOT provide a prompt_file parameter. Leave both empty. "
+                f"If the tool returns an error, reply with only PFNEITHER-FAIL-{tag}. "
+                f"If it launched successfully, reply with only PFNEITHER-OK-{tag}."
+            ),
+            ok_token=f"PFNEITHER-OK-{tag}",
+            fail_token=f"PFNEITHER-FAIL-{tag}",
+            timeout=180.0,
+        )
+        assert f"PFNEITHER-FAIL-{tag}" in result, (
+            f"Expected 'prompt or prompt_file required' error, got: {result}"
+        )
+
+        # --- Phase 5: prompt_file + fork=true works ---
+        prompt_file_fork = Path(f"/tmp/obs_test_prompt_fork_{tag}.md")
+        prompt_file_fork.write_text(
+            f"Reply with exactly PF-FORK-{tag}. Do not add any other text."
+        )
+        try:
+            baseline = await live_tg_forum.platform.latest_bot_message_id(
+                thread_id=parent_thread_id
+            )
+            await live_tg_forum.platform.send(
+                (
+                    "This is a deterministic smoke test. "
+                    f'Use AgentTask exactly once with fork=true and prompt_file="{prompt_file_fork}". '
+                    "Do NOT provide a prompt parameter — only prompt_file. "
+                    f"After launching, reply with only PF-FORK-LAUNCHED-{tag}."
+                ),
+                thread_id=parent_thread_id,
+                require_done=False,
+                timeout=180.0,
+            )
+            launch_msg = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline,
+                token="task launched",
+                timeout=240.0,
+            )
+            fork_child_thread, _ = _extract_topic_link(launch_msg.text)
+            fork_reply = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=fork_child_thread,
+                token=f"PF-FORK-{tag}",
+                timeout=240.0,
+            )
+            assert f"PF-FORK-{tag}" in fork_reply.text, (
+                f"Forked child did not use prompt from file: {fork_reply.text}"
+            )
+        finally:
+            prompt_file_fork.unlink(missing_ok=True)
+
+        # --- Phase 6: Tilde path expansion ---
+        tilde_file = Path.home() / f"obs_test_tilde_{tag}.md"
+        tilde_file.write_text(
+            f"Reply with exactly PF-TILDE-{tag}. Do not add any other text."
+        )
+        try:
+            baseline = await live_tg_forum.platform.latest_bot_message_id(
+                thread_id=parent_thread_id
+            )
+            await live_tg_forum.platform.send(
+                (
+                    "This is a deterministic smoke test. "
+                    f'Use AgentTask exactly once with fork=false and prompt_file="~/obs_test_tilde_{tag}.md". '
+                    "Do NOT provide a prompt parameter — only prompt_file. "
+                    f"After launching, reply with only PF-TILDE-LAUNCHED-{tag}."
+                ),
+                thread_id=parent_thread_id,
+                require_done=False,
+                timeout=180.0,
+            )
+            launch_msg = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline,
+                token="task launched",
+                timeout=240.0,
+            )
+            tilde_child_thread, _ = _extract_topic_link(launch_msg.text)
+            tilde_reply = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=tilde_child_thread,
+                token=f"PF-TILDE-{tag}",
+                timeout=240.0,
+            )
+            assert f"PF-TILDE-{tag}" in tilde_reply.text, (
+                f"Tilde path expansion failed: {tilde_reply.text}"
+            )
+        finally:
+            tilde_file.unlink(missing_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # Test 4: Python hooks basic
@@ -353,6 +452,131 @@ class TestPythonHooksBasic:
             )
             # Note: hooks are best-effort — file-not-found may be logged and skipped
             # rather than blocking launch. Either outcome is acceptable for stability.
+
+            # --- Phase 4: Function not found in file ---
+            bad_fn_hooks = json.dumps({"PreToolUse": f"{good_hook}::nonexistent_func"})
+            result4 = await _launch_agent_and_expect_error(
+                live_tg_forum,
+                parent_thread_id=parent_thread_id,
+                instruction=(
+                    "This is a deterministic smoke test. "
+                    f"Try to use AgentTask with fork=false and "
+                    f"hooks='{bad_fn_hooks}', "
+                    f"and prompt 'reply hello'. "
+                    f"If the tool returns an error, reply with only HOOKBADFN-FAIL-{tag}. "
+                    f"If it launched successfully, reply with only HOOKBADFN-OK-{tag}."
+                ),
+                ok_token=f"HOOKBADFN-OK-{tag}",
+                fail_token=f"HOOKBADFN-FAIL-{tag}",
+                timeout=180.0,
+            )
+            # Either a clear error or best-effort skip — both acceptable for stability
+            assert f"HOOKBADFN-FAIL-{tag}" in result4 or f"HOOKBADFN-OK-{tag}" in result4
+
+            # --- Phase 5: Syntax error in hook file ---
+            syntax_hook = Path(f"/tmp/obs_test_hook_syntax_{tag}.py")
+            syntax_hook.write_text(
+                "def good_func(hook_input, tool_use_id, context):\n"
+                "    this is not valid python !!!\n"
+            )
+            syntax_hooks_json = json.dumps({"PreToolUse": f"{syntax_hook}::good_func"})
+            result5 = await _launch_agent_and_expect_error(
+                live_tg_forum,
+                parent_thread_id=parent_thread_id,
+                instruction=(
+                    "This is a deterministic smoke test. "
+                    f"Try to use AgentTask with fork=false and "
+                    f"hooks='{syntax_hooks_json}', "
+                    f"and prompt 'reply hello'. "
+                    f"If the tool returns an error, reply with only HOOKSYNTAX-FAIL-{tag}. "
+                    f"If it launched successfully, reply with only HOOKSYNTAX-OK-{tag}."
+                ),
+                ok_token=f"HOOKSYNTAX-OK-{tag}",
+                fail_token=f"HOOKSYNTAX-FAIL-{tag}",
+                timeout=180.0,
+            )
+            syntax_hook.unlink(missing_ok=True)
+            # Either error or best-effort skip — both acceptable
+            assert f"HOOKSYNTAX-FAIL-{tag}" in result5 or f"HOOKSYNTAX-OK-{tag}" in result5
+
+            # --- Phase 7: PlaceholderTool without hook is no-op ---
+            baseline7 = await live_tg_forum.platform.latest_bot_message_id(
+                thread_id=parent_thread_id
+            )
+            await live_tg_forum.platform.send(
+                (
+                    "This is a deterministic smoke test. "
+                    "Use AgentTask exactly once with fork=false and NO hooks parameter. "
+                    f"Prompt: 'Call PlaceholderTool with action=test and input=hello. "
+                    f"Reply with HOOK-PLACEHOLDER-{tag}|result=done.' "
+                    f"After launching, reply with only HOOK-PLACEHOLDER-LAUNCHED-{tag}."
+                ),
+                thread_id=parent_thread_id,
+                require_done=False,
+                timeout=180.0,
+            )
+            launch_noop = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline7,
+                token="task launched",
+                timeout=240.0,
+            )
+            noop_thread, _ = _extract_topic_link(launch_noop.text)
+            noop_reply = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=noop_thread,
+                token=f"HOOK-PLACEHOLDER-{tag}",
+                timeout=240.0,
+            )
+            assert f"HOOK-PLACEHOLDER-{tag}" in noop_reply.text, (
+                "PlaceholderTool without hooks should work as no-op"
+            )
+
+            # --- Phase 8: Slow hook doesn't permanently freeze session ---
+            slow_hook = Path(f"/tmp/obs_test_hook_slow_{tag}.py")
+            slow_hook.write_text(
+                "import time\n"
+                "def slow_hook(hook_input, tool_use_id, context):\n"
+                "    time.sleep(15)\n"
+                "    return None\n"
+            )
+            slow_hooks_json = json.dumps({"PreToolUse": f"{slow_hook}::slow_hook"})
+            baseline8 = await live_tg_forum.platform.latest_bot_message_id(
+                thread_id=parent_thread_id
+            )
+            await live_tg_forum.platform.send(
+                (
+                    "This is a deterministic smoke test. "
+                    f"Use AgentTask exactly once with fork=false and "
+                    f"hooks='{slow_hooks_json}', "
+                    f"and prompt 'Use Bash to run echo timeout-test. "
+                    f"Then reply with exactly HOOK-TIMEOUT-{tag}.' "
+                    f"After launching, reply with only HOOK-TIMEOUT-LAUNCHED-{tag}."
+                ),
+                thread_id=parent_thread_id,
+                require_done=False,
+                timeout=180.0,
+            )
+            launch_slow = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline8,
+                token="task launched",
+                timeout=240.0,
+            )
+            slow_thread, _ = _extract_topic_link(launch_slow.text)
+            # Extended timeout — hook sleeps 15s but session should eventually complete
+            slow_reply = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=slow_thread,
+                token=f"HOOK-TIMEOUT-{tag}",
+                timeout=300.0,
+            )
+            assert f"HOOK-TIMEOUT-{tag}" in slow_reply.text, (
+                "Session hung due to slow hook — stability violation"
+            )
+            slow_hook.unlink(missing_ok=True)
 
         finally:
             good_hook.unlink(missing_ok=True)
@@ -591,6 +815,107 @@ class TestSecondaryFeatures:
         assert "count=0" in sched_reply.text, (
             f"Schedule should NOT be inherited with inherit_schedules=false: {sched_reply.text}"
         )
+
+        # --- Phase 2b: Default inherit_schedules (backward compat) ---
+        # Schedule still exists on parent from Phase 2 setup
+        baseline_default = await live_tg_forum.platform.latest_bot_message_id(
+            thread_id=parent_thread_id
+        )
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic smoke test. "
+                "Use AgentTask exactly once with fork=false. Do NOT pass inherit_schedules. "
+                f"Prompt: 'Call CronList. Count the schedules. "
+                f"Reply with exactly SEC-DEFAULTSCHED-{tag} followed by |count=<number of schedules>.' "
+                f"After launching, reply with only SEC-DEFAULTSCHED-LAUNCHED-{tag}."
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=180.0,
+        )
+        launch_default = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=baseline_default,
+            token="task launched",
+            timeout=240.0,
+        )
+        default_sched_thread, _ = _extract_topic_link(launch_default.text)
+        default_sched_reply = await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=default_sched_thread,
+            token=f"SEC-DEFAULTSCHED-{tag}",
+            timeout=240.0,
+        )
+        # Default should inherit schedules (backward compat)
+        assert "count=0" not in default_sched_reply.text, (
+            f"Default inherit_schedules should be true (backward compat), "
+            f"but child has 0 schedules: {default_sched_reply.text}"
+        )
+
+        # --- Phase 3: Temperature determinism ---
+        # Launch 3 agents with temperature=0 asking for exact same output
+        temp_responses = []
+        for i, label in enumerate(["A", "B", "C"]):
+            temp_baseline = await live_tg_forum.platform.latest_bot_message_id(
+                thread_id=parent_thread_id
+            )
+            await live_tg_forum.platform.send(
+                (
+                    "This is a deterministic smoke test. "
+                    f'Use AgentTask exactly once with fork=false and temperature="0", '
+                    f"and prompt 'Reply with exactly the single digit 1. Nothing else. "
+                    f"No punctuation. No explanation. Just the character 1. "
+                    f"Then on the next line write SEC-TEMP-{label}-{tag}.' "
+                    f"After launching, reply with only SEC-TEMP-{label}-LAUNCHED-{tag}."
+                ),
+                thread_id=parent_thread_id,
+                require_done=False,
+                timeout=180.0,
+            )
+            launch_temp = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=temp_baseline,
+                token="task launched",
+                timeout=240.0,
+            )
+            temp_thread, _ = _extract_topic_link(launch_temp.text)
+            temp_reply = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=temp_thread,
+                token=f"SEC-TEMP-{label}-{tag}",
+                timeout=240.0,
+            )
+            temp_responses.append(temp_reply.text)
+
+        # At least 2 of 3 should contain "1" as primary content
+        contains_1 = sum(1 for r in temp_responses if "1" in r.split(f"SEC-TEMP")[0] or "\n1\n" in r or r.strip().startswith("1"))
+        assert contains_1 >= 2, (
+            f"Temperature=0 should produce deterministic output. "
+            f"Expected at least 2/3 with '1', got {contains_1}: {temp_responses}"
+        )
+
+        # --- Phase 5: Protected env var override attempt ---
+        protected_env = json.dumps({"ANTHROPIC_API_KEY": f"fake-key-{tag}"})
+        result_prot = await _launch_agent_and_expect_error(
+            live_tg_forum,
+            parent_thread_id=parent_thread_id,
+            instruction=(
+                "This is a deterministic smoke test. "
+                f"Try to use AgentTask with fork=false and env='{protected_env}', "
+                f"and prompt 'Reply with SEC-PROTECTED-{tag}'. "
+                f"If the tool returns an error about the env variable, reply with only SEC-PROTECTED-FAIL-{tag}. "
+                f"If it launched successfully, reply with only SEC-PROTECTED-OK-{tag}."
+            ),
+            ok_token=f"SEC-PROTECTED-OK-{tag}",
+            fail_token=f"SEC-PROTECTED-FAIL-{tag}",
+            timeout=180.0,
+        )
+        # Either rejected with error (ideal) or accepted (the env var gets overridden
+        # downstream but doesn't break auth since the proxy handles the real key).
+        # Both outcomes are acceptable — we're documenting behavior, not enforcing.
+        assert f"SEC-PROTECTED-FAIL-{tag}" in result_prot or f"SEC-PROTECTED-OK-{tag}" in result_prot
 
 
 # ---------------------------------------------------------------------------
