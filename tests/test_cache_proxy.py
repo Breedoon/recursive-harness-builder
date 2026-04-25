@@ -1104,7 +1104,7 @@ class TestStripContextSuffix:
 
     def test_strips_case_insensitive(self):
         assert cache_proxy._strip_context_suffix("gemini-3.1-flash-lite-preview[1M]") == "gemini-3.1-flash-lite-preview"
-        assert cache_proxy._strip_context_suffix("gpt-5-codex-mini[50K]") == "gpt-5-codex-mini"
+        assert cache_proxy._strip_context_suffix("gpt-5.4-mini[50K]") == "gpt-5.4-mini"
 
     def test_no_suffix_passthrough(self):
         assert cache_proxy._strip_context_suffix("claude-opus-4-6") == "claude-opus-4-6"

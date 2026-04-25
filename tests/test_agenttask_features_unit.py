@@ -50,7 +50,7 @@ class TestModelResolution:
         assert resolve_model("gemini-flash") == "gemini-2.5-flash"
 
     def test_explicit_model_passes_through(self):
-        assert resolve_model("gpt-5-codex-mini") == "gpt-5-codex-mini"
+        assert resolve_model("gpt-5.4-mini") == "gpt-5.4-mini"
 
     def test_unknown_model_passes_through(self):
         assert resolve_model("llama-3-70b") == "llama-3-70b"
@@ -65,8 +65,8 @@ class TestModelResolution:
         assert result == "claude-opus-4-6[1m]"
 
     def test_explicit_with_context_suffix_preserved(self):
-        result = resolve_model("gpt-5-codex-mini[200k]")
-        assert result == "gpt-5-codex-mini[200k]"
+        result = resolve_model("gpt-5.4-mini[200k]")
+        assert result == "gpt-5.4-mini[200k]"
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +80,8 @@ class TestContextSuffixParsing:
         assert tokens == 1_000_000
 
     def test_200k_suffix(self):
-        clean, tokens = parse_context_suffix("gpt-5-codex-mini[200k]")
-        assert clean == "gpt-5-codex-mini"
+        clean, tokens = parse_context_suffix("gpt-5.4-mini[200k]")
+        assert clean == "gpt-5.4-mini"
         assert tokens == 200_000
 
     def test_128k_suffix(self):

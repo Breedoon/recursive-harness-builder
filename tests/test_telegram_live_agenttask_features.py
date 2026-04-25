@@ -658,23 +658,24 @@ class TestHooksWithAgentSpawning:
                 ),
                 thread_id=parent_thread_id,
                 require_done=False,
-                timeout=180.0,
+                timeout=300.0,
             )
             launch_msg = await _wait_for_message_after_containing(
                 live_tg_forum,
                 thread_id=parent_thread_id,
                 after_message_id=baseline,
                 token="task launched",
-                timeout=240.0,
+                timeout=360.0,
             )
             child_thread_id, _ = _extract_topic_link(launch_msg.text)
 
-            # Wait for the child to complete (extended timeout for evaluator pattern)
+            # Wait for the child to complete — extended timeout for multi-hop
+            # evaluator pattern: hook→AgentTask→file write→poll→resume
             child_reply = await _wait_for_message_containing(
                 live_tg_forum,
                 thread_id=child_thread_id,
                 token=f"HOOKAGENT-RESULT-{tag}",
-                timeout=360.0,
+                timeout=600.0,
             )
             assert f"HOOKAGENT-RESULT-{tag}" in child_reply.text
 
@@ -745,9 +746,14 @@ class TestSecondaryFeatures:
         )
         child_thread_id, _ = _extract_topic_link(launch_msg.text)
 
-        env_reply = await _wait_for_message_containing(
+        # Get baseline from child thread to skip service messages that echo the prompt
+        child_baseline = await live_tg_forum.platform.latest_bot_message_id(
+            thread_id=child_thread_id
+        )
+        env_reply = await _wait_for_message_after_containing(
             live_tg_forum,
             thread_id=child_thread_id,
+            after_message_id=child_baseline,
             token=f"SEC-ENV-{tag}",
             timeout=240.0,
         )
@@ -1092,8 +1098,8 @@ _CLIPROXY_URL = "http://127.0.0.1:8317"
 _CLIPROXY_KEY = "sk-anything"  # Must match api-keys in cliproxyapi.conf
 
 # Use explicit model versions that exist in CLIProxyAPI.
-# gpt-5-codex-mini is the cheapest GPT; gemini-3.1-flash-lite-preview is cheapest Gemini.
-_GPT_MODEL = "gpt-5-codex-mini"
+# gpt-5.4-mini is the cheapest GPT; gemini-3.1-flash-lite-preview is cheapest Gemini.
+_GPT_MODEL = "gpt-5.4-mini"
 _GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
 
 
