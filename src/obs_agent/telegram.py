@@ -6911,6 +6911,12 @@ class TelegramBot:
         agent_name: str | None = None,
         lineage_name: str | None = None,
         lineage_origin: str | None = None,
+        model: str | None = None,
+        inherit_schedules: bool = True,
+        env_override: dict[str, str] | None = None,
+        temperature: float | None = None,
+        user_hooks: dict[str, str] | None = None,
+        inherit_hooks: bool = False,
     ) -> dict[str, Any]:
         if is_fork:
             if not source_session_id or not source_uuid:
@@ -6962,11 +6968,12 @@ class TelegramBot:
             title=topic_name,
             icon_custom_emoji_id=child_icon,
         )
-        self._inherit_topic_schedules(
-            parent_route=parent_state.route,
-            child_route=child_route,
-            is_fork=is_fork,
-        )
+        if inherit_schedules:
+            self._inherit_topic_schedules(
+                parent_route=parent_state.route,
+                child_route=child_route,
+                is_fork=is_fork,
+            )
         child_lineage: tuple[str, ...] | None = None
         normalized_lineage_name = normalize_lineage_name(lineage_name)
         if normalized_lineage_name:
@@ -7050,12 +7057,36 @@ class TelegramBot:
                         )
         # Clear dropped key if name is being reused (respawn)
         await self._activate_route_session(child_state, child_session_id or None)
-        child_state.session_manager.set_sdk_env_overrides(
-            self._build_team_worker_env(
-                team_name=team_name,
-                agent_name=agent_name,
-            )
+        team_env = self._build_team_worker_env(
+            team_name=team_name,
+            agent_name=agent_name,
         )
+        # Merge user-provided env overrides (from AgentTask env parameter)
+        if env_override:
+            team_env.update(env_override)
+        # Temperature convenience: construct CLAUDE_CODE_EXTRA_BODY.
+        # Temperature takes precedence over env.CLAUDE_CODE_EXTRA_BODY if both provided.
+        if temperature is not None:
+            import json as _json
+            team_env["CLAUDE_CODE_EXTRA_BODY"] = _json.dumps(
+                {"temperature": temperature, "thinking": {"type": "disabled"}}
+            )
+        child_state.session_manager.set_sdk_env_overrides(team_env)
+        # Apply per-session model override. resolve_model handles shorthand
+        # lookup and context suffix preservation.  _build_options in session.py
+        # picks up model_override and injects the right env vars (context window,
+        # compaction threshold, API key) for non-Claude models.
+        if model:
+            from obs_agent.config import resolve_model
+            child_state.session_manager.model_override = resolve_model(model)
+        # --- User hooks ---
+        # Resolve effective hooks: explicit hooks take precedence, then
+        # inheritance from the parent if inherit_hooks is True.
+        effective_hooks = user_hooks
+        if not effective_hooks and inherit_hooks:
+            effective_hooks = parent_state.session_manager.user_hooks
+        if effective_hooks:
+            child_state.session_manager.user_hooks = effective_hooks
         if child_lineage is not None:
             self._prime_obs_bootstrap(
                 child_state,
@@ -7146,6 +7177,7 @@ class TelegramBot:
         is_fork: bool = True,
         team_name: str | None = None,
         agent_name: str | None = None,
+        prompt_file: str | None = None,
     ) -> str:
         lines = ["fork task launched by agent" if is_fork else "agent task launched by agent"]
         lines.append(
@@ -7166,8 +7198,11 @@ class TelegramBot:
             lines.append(f"agent_name: {html.escape(agent_name)}")
         if max_turns is not None:
             lines.append(f"max_turns: {max_turns}")
-        lines.append("prompt:")
-        lines.append(html.escape(prompt))
+        if prompt_file:
+            lines.append(f"prompt_file: {html.escape(prompt_file)}")
+        else:
+            lines.append("prompt:")
+            lines.append(html.escape(prompt))
         return "\n".join(lines)
 
     def _build_fork_task_launch_text(
@@ -8201,6 +8236,13 @@ class TelegramBot:
             if is_fork and source_message_id is not None
             else None
         )
+        prompt_file = str(args.get("prompt_file") or "").strip() or None
+        model = str(args.get("model") or "").strip() or None
+        inherit_schedules = args.get("inherit_schedules", True)
+        env_override: dict[str, str] | None = args.get("env")
+        temperature: float | None = args.get("temperature")
+        user_hooks: dict[str, str] | None = args.get("hooks")
+        inherit_hooks: bool = bool(args.get("inherit_hooks", False))
         child_service_html = self._build_fork_task_child_service_html(
             agent_id=task_id,
             description=description,
@@ -8210,6 +8252,7 @@ class TelegramBot:
             is_fork=is_fork,
             team_name=team_name,
             agent_name=agent_name,
+            prompt_file=prompt_file,
         )
         created = await self._create_child_fork_topic(
             parent_state=state,
@@ -8226,6 +8269,12 @@ class TelegramBot:
             agent_name=agent_name,
             lineage_name=lineage_name,
             lineage_origin="agent_task_fork" if is_fork else "agent_task_fresh",
+            model=model,
+            inherit_schedules=inherit_schedules,
+            env_override=env_override,
+            temperature=temperature,
+            user_hooks=user_hooks,
+            inherit_hooks=inherit_hooks,
         )
         child_route: TelegramRoute = created["child_route"]
         child_service_message_id: int | None = created["child_service_message_id"]

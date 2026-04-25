@@ -181,6 +181,7 @@ class TestResetBehavior:
         assert mgr.last_activity is None
 
 
+@pytest.mark.real_get_client
 class TestClientLifecycle:
     @pytest.mark.asyncio
     async def test_get_client_creates_and_connects(self, config):

@@ -34,13 +34,13 @@ MODEL_RESOLUTION: dict[str, str] = {
     "claude-sonnet": "claude-sonnet-4-6",
     "claude-haiku": "claude-haiku-4-5",
     # OpenAI tiers
-    "gpt": "gpt-5.4",
-    "gpt-pro": "gpt-5.4",
-    "openai": "gpt-5.4",
-    "chatgpt": "gpt-5.4",
+    "gpt": "gpt-5-codex-mini",
+    "gpt-pro": "gpt-5.2-codex",
+    "openai": "gpt-5-codex-mini",
+    "chatgpt": "gpt-5-codex-mini",
     # Google tiers
-    "gemini": "gemini-2.5-pro",
-    "gemini-pro": "gemini-2.5-pro",
+    "gemini": "gemini-3.1-flash-lite-preview",
+    "gemini-pro": "gemini-3.1-pro-preview",
     "gemini-flash": "gemini-2.5-flash",
 }
 
@@ -74,10 +74,10 @@ def parse_context_suffix(model_str: str) -> tuple[str, int]:
     --------
     >>> parse_context_suffix("claude-opus-4-6[1m]")
     ('claude-opus-4-6', 1000000)
-    >>> parse_context_suffix("gpt-5.4[200k]")
-    ('gpt-5.4', 200000)
-    >>> parse_context_suffix("gemini-2.5-pro")
-    ('gemini-2.5-pro', 1000000)
+    >>> parse_context_suffix("gpt-5-codex-mini[200k]")
+    ('gpt-5-codex-mini', 200000)
+    >>> parse_context_suffix("gemini-3.1-flash-lite-preview")
+    ('gemini-3.1-flash-lite-preview', 1000000)
     """
     m = _CONTEXT_SUFFIX_RE.search(model_str)
     if not m:

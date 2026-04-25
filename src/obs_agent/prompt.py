@@ -41,7 +41,7 @@ def build_obs_platform_appendix() -> str:
     """Return OBS-specific runtime instructions appended to every session."""
     return (
         "OBS platform notes:\n"
-        "- Native Task and ForkTask are disabled in this environment. "
+        "- Native Task is disabled in this environment. "
         "Use AgentTask to launch subagents, AgentTaskOutput to inspect them, and "
         "AgentTaskStop to stop or interrupt them.\n"
         "- Teams are enabled by default for all agents in the same lineage tree. "

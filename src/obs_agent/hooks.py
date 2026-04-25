@@ -12,6 +12,9 @@ See decisions D018, D022.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import inspect
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Awaitable
@@ -41,7 +44,7 @@ _READ_TOOLS = {"Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch"}
 _BLOCKED_FILE_PATTERNS = [".env"]
 
 # Native delegation tools are blocked so orchestration is forced through
-# OBS-managed AgentTask/ForkTask tooling.
+# OBS-managed AgentTask tooling.
 _BLOCKED_NATIVE_TASK_TOOLS = {"Task", "TaskStop"}  # TaskOutput allowed (read-only, useful for background bash)
 
 # Native team inbox tools are blocked so worker messaging is forced through
@@ -565,6 +568,138 @@ def _make_stop_check(state: HookState) -> CheckFn:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic user hook loading
+# ---------------------------------------------------------------------------
+
+_log = logging.getLogger(__name__)
+
+
+def load_hook_function(file_path: str, function_name: str) -> Callable:
+    """Dynamically load a Python function from a file path.
+
+    Uses ``importlib.util.spec_from_file_location`` — the standard pattern
+    for loading arbitrary Python files (same as pytest/pluggy).
+
+    Raises on all failure modes with clear messages so the caller can
+    decide how to handle (log + skip, or fail fast).
+    """
+    path = Path(file_path).expanduser().resolve()
+
+    if not path.suffix == ".py":
+        raise ValueError(f"Hook file must be a .py file, got: {path}")
+    if not path.exists():
+        raise FileNotFoundError(f"Hook file not found: {path}")
+
+    module_name = f"_obs_user_hook_{path.stem}_{id(path)}"
+    spec = importlib.util.spec_from_file_location(module_name, str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot create module spec from: {path}")
+
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except SyntaxError as exc:
+        raise SyntaxError(f"Syntax error in hook file {path}: {exc}") from exc
+    except Exception as exc:
+        raise ImportError(f"Error loading hook file {path}: {exc}") from exc
+
+    func = getattr(module, function_name, None)
+    if func is None:
+        available = [
+            n for n in dir(module)
+            if callable(getattr(module, n, None)) and not n.startswith("_")
+        ]
+        raise AttributeError(
+            f"Function '{function_name}' not found in {path}. "
+            f"Available: {available}"
+        )
+
+    if not callable(func):
+        raise TypeError(f"'{function_name}' in {path} is not callable")
+
+    # Lenient signature validation: at least 2 params (hook_input, tool_use_id)
+    try:
+        sig = inspect.signature(func)
+        params = [
+            p for p in sig.parameters.values()
+            if p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        if len(params) < 2:
+            # Check for **kwargs which would accept anything
+            has_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+            if not has_var_keyword:
+                _log.warning(
+                    "Hook function '%s' has %d positional params, expected ≥2 "
+                    "(hook_input, tool_use_id). Signature: %s",
+                    function_name, len(params), sig,
+                )
+    except (ValueError, TypeError):
+        pass  # Can't introspect — proceed anyway
+
+    return func
+
+
+def _make_user_hook_check(user_fn: Callable, state: "HookState") -> "CheckFn":
+    """Wrap a user-provided hook function into a CheckFn for HookPipeline.
+
+    The wrapper:
+    - Enriches context with ``context["obs"]`` containing agent launch
+      capabilities from HookState
+    - Handles both sync and async user functions
+    - Catches ALL exceptions and returns None (never crashes the session)
+    - Validates return type loosely (dict or None accepted)
+    """
+
+    async def _user_check(
+        hook_input: HookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput | None:
+        try:
+            # Enrich context with OBS capabilities
+            enriched_context: dict[str, Any] = dict(context) if context else {}
+            enriched_context["obs"] = {
+                "launch_agent": state.fork_task_launcher,
+                "agent_output": state.fork_task_outputter,
+                "agent_stop": state.fork_task_stopper,
+                "session_id": state.session_id,
+            }
+
+            result = user_fn(hook_input, tool_use_id, enriched_context)
+            if inspect.isawaitable(result):
+                result = await result
+
+            # Validate return type loosely
+            if result is None:
+                return None
+            if isinstance(result, dict):
+                return result
+
+            _log.warning(
+                "User hook '%s' returned %s (expected dict or None), treating as None",
+                getattr(user_fn, "__name__", "<unknown>"),
+                type(result).__name__,
+            )
+            return None
+
+        except Exception:
+            _log.warning(
+                "User hook '%s' raised an exception (swallowed for stability)",
+                getattr(user_fn, "__name__", "<unknown>"),
+                exc_info=True,
+            )
+            return None
+
+    return _user_check
+
+
+# ---------------------------------------------------------------------------
 # Factory: build hook matchers for ClaudeAgentOptions
 # ---------------------------------------------------------------------------
 
@@ -572,11 +707,18 @@ def _make_stop_check(state: HookState) -> CheckFn:
 def create_hook_matchers(
     config: OBSConfig,
     state: HookState,
+    *,
+    user_hooks: dict[str, str] | None = None,
 ) -> dict[str, list[HookMatcher]]:
     """Build hook matcher dict ready for ClaudeAgentOptions(hooks=...).
 
-    PreToolUse pipeline: interrupt check -> native/immutable guard -> queue check
-    PostToolUse pipeline: queue check
+    PreToolUse pipeline: interrupt check -> native/immutable guard -> queue check -> [user hook]
+    PostToolUse pipeline: queue check -> [user hook]
+
+    If *user_hooks* is provided (mapping of event name to
+    ``"file_path::function_name"``), the user-supplied check is appended
+    **after** OBS built-in guards so it cannot bypass them.  Loading failures
+    are logged and silently skipped — they never prevent session startup.
     """
     interrupt_check = _make_interrupt_check(state)
     immutable_check = _make_immutable_check(config)
@@ -584,10 +726,32 @@ def create_hook_matchers(
     notification_check = _make_notification_check(state)
     stop_check = _make_stop_check(state)
 
-    pre_tool_pipeline = HookPipeline([interrupt_check, immutable_check, queue_check])
-    post_tool_pipeline = HookPipeline([queue_check])
-    notification_pipeline = HookPipeline([notification_check])
-    stop_pipeline = HookPipeline([stop_check])
+    # --- resolve user hooks (best-effort, never crash) ---
+    _resolved_user_checks: dict[str, CheckFn] = {}
+    for event_name, spec in (user_hooks or {}).items():
+        try:
+            if "::" not in spec:
+                _log.warning("Invalid user hook spec for %s (missing '::'): %s", event_name, spec)
+                continue
+            fpath, fname = spec.rsplit("::", 1)
+            fn = load_hook_function(fpath, fname)
+            _resolved_user_checks[event_name] = _make_user_hook_check(fn, state)
+        except Exception:
+            _log.warning(
+                "Failed to load user hook for %s from '%s' — skipping",
+                event_name, spec, exc_info=True,
+            )
+
+    def _pipeline(builtin: list[CheckFn], event: str) -> HookPipeline:
+        checks = list(builtin)
+        if event in _resolved_user_checks:
+            checks.append(_resolved_user_checks[event])
+        return HookPipeline(checks)
+
+    pre_tool_pipeline = _pipeline([interrupt_check, immutable_check, queue_check], "PreToolUse")
+    post_tool_pipeline = _pipeline([queue_check], "PostToolUse")
+    notification_pipeline = _pipeline([notification_check], "Notification")
+    stop_pipeline = _pipeline([stop_check], "Stop")
 
     return {
         "PreToolUse": [
@@ -600,10 +764,10 @@ def create_hook_matchers(
             HookMatcher(matcher=None, hooks=[notification_pipeline]),
         ],
         "SubagentStart": [
-            HookMatcher(matcher=None, hooks=[notification_pipeline]),
+            HookMatcher(matcher=None, hooks=[_pipeline([notification_check], "SubagentStart")]),
         ],
         "SubagentStop": [
-            HookMatcher(matcher=None, hooks=[notification_pipeline]),
+            HookMatcher(matcher=None, hooks=[_pipeline([notification_check], "SubagentStop")]),
         ],
         "Stop": [
             HookMatcher(matcher=None, hooks=[stop_pipeline]),

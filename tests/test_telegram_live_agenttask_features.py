@@ -1092,9 +1092,9 @@ _CLIPROXY_URL = "http://127.0.0.1:8317"
 _CLIPROXY_KEY = "sk-anything"  # Must match api-keys in cliproxyapi.conf
 
 # Use explicit model versions that exist in CLIProxyAPI.
-# gpt-5.4 is the latest available; gemini-2.5-flash is fast for testing.
-_GPT_MODEL = "gpt-5.4"
-_GEMINI_MODEL = "gemini-2.5-flash"
+# gpt-5-codex-mini is the cheapest GPT; gemini-3.1-flash-lite-preview is cheapest Gemini.
+_GPT_MODEL = "gpt-5-codex-mini"
+_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
 
 
 def _cliproxy_is_running() -> bool:

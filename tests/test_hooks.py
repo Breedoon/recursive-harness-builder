@@ -28,6 +28,8 @@ from obs_agent.hooks import (
     _make_stop_check,
     _make_queue_check,
     create_hook_matchers,
+    load_hook_function,
+    _make_user_hook_check,
 )
 from obs_agent.queueing import QueuedMessage
 
@@ -871,3 +873,223 @@ class TestCreateHookMatchers:
         event = state.status_queue.get_nowait()
         assert event.type == "notification"
         assert event.summary == "notification: TaskCompleted"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic User Hook Loading Tests
+# ---------------------------------------------------------------------------
+
+
+class TestLoadHookFunction:
+    """Tests for load_hook_function — dynamic Python function loading."""
+
+    def test_loads_valid_function(self, tmp_path):
+        """Loads a simple function from a temp .py file."""
+        hook_file = tmp_path / "my_hook.py"
+        hook_file.write_text(
+            "def my_check(hook_input, tool_use_id, context):\n"
+            "    return {'decision': 'allow'}\n"
+        )
+        func = load_hook_function(str(hook_file), "my_check")
+        assert callable(func)
+        assert func.__name__ == "my_check"
+        # Verify it actually works
+        result = func({}, None, {})
+        assert result == {"decision": "allow"}
+
+    def test_file_not_found(self, tmp_path):
+        """Raises FileNotFoundError for nonexistent file."""
+        with pytest.raises(FileNotFoundError, match="Hook file not found"):
+            load_hook_function(str(tmp_path / "nonexistent.py"), "fn")
+
+    def test_function_not_found_lists_available(self, tmp_path):
+        """Raises AttributeError listing available functions when target not found."""
+        hook_file = tmp_path / "hook.py"
+        hook_file.write_text(
+            "def alpha():\n    pass\n"
+            "def beta():\n    pass\n"
+        )
+        with pytest.raises(AttributeError, match="Available:.*alpha.*beta"):
+            load_hook_function(str(hook_file), "nonexistent")
+
+    def test_non_py_file_rejected(self, tmp_path):
+        """Raises ValueError for non-.py files."""
+        txt_file = tmp_path / "hook.txt"
+        txt_file.write_text("def fn(): pass")
+        with pytest.raises(ValueError, match="must be a .py file"):
+            load_hook_function(str(txt_file), "fn")
+
+    def test_syntax_error_in_file(self, tmp_path):
+        """Raises SyntaxError for files with syntax errors."""
+        bad_file = tmp_path / "bad.py"
+        bad_file.write_text("def broken(\n")
+        with pytest.raises(SyntaxError, match="Syntax error"):
+            load_hook_function(str(bad_file), "broken")
+
+    def test_not_callable_rejected(self, tmp_path):
+        """Raises TypeError if the name resolves to a non-callable."""
+        hook_file = tmp_path / "hook.py"
+        hook_file.write_text("NOT_A_FUNC = 42\n")
+        with pytest.raises(TypeError, match="is not callable"):
+            load_hook_function(str(hook_file), "NOT_A_FUNC")
+
+    def test_lenient_signature_one_param_loads(self, tmp_path):
+        """Loads function with only 1 parameter (warns but doesn't fail)."""
+        hook_file = tmp_path / "hook.py"
+        hook_file.write_text("def one_param(x):\n    return None\n")
+        func = load_hook_function(str(hook_file), "one_param")
+        assert callable(func)
+
+    def test_kwargs_function_accepted(self, tmp_path):
+        """Function with **kwargs doesn't trigger signature warning."""
+        hook_file = tmp_path / "hook.py"
+        hook_file.write_text("def flex(**kwargs):\n    return None\n")
+        func = load_hook_function(str(hook_file), "flex")
+        assert callable(func)
+
+    def test_import_error_in_file(self, tmp_path):
+        """Raises ImportError for files that fail during import."""
+        bad_file = tmp_path / "bad_import.py"
+        bad_file.write_text("import nonexistent_module_xyz_12345\n")
+        with pytest.raises(ImportError, match="Error loading hook file"):
+            load_hook_function(str(bad_file), "fn")
+
+    def test_path_resolution_works(self, tmp_path):
+        """Path resolution (expanduser, resolve) works for valid paths."""
+        hook_file = tmp_path / "hook.py"
+        hook_file.write_text("def fn(a, b, c):\n    return None\n")
+        func = load_hook_function(str(hook_file), "fn")
+        assert callable(func)
+
+
+class TestMakeUserHookCheck:
+    """Tests for _make_user_hook_check — async wrapper with enriched context."""
+
+    @pytest.mark.asyncio
+    async def test_sync_hook_returns_correctly(self):
+        """Synchronous user hook returns its dict result."""
+        def sync_hook(hook_input, tool_use_id, context):
+            return {"decision": "allow"}
+
+        state = HookState()
+        check = _make_user_hook_check(sync_hook, state)
+        result = await check({"tool_name": "Read"}, "tu-1", {})
+        assert result == {"decision": "allow"}
+
+    @pytest.mark.asyncio
+    async def test_async_hook_returns_correctly(self):
+        """Async user hook returns its dict result."""
+        async def async_hook(hook_input, tool_use_id, context):
+            return {"decision": "deny"}
+
+        state = HookState()
+        check = _make_user_hook_check(async_hook, state)
+        result = await check({"tool_name": "Write"}, "tu-2", {})
+        assert result == {"decision": "deny"}
+
+    @pytest.mark.asyncio
+    async def test_exception_swallowed_returns_none(self):
+        """Exception in user hook is caught, returns None (never crashes)."""
+        def exploding_hook(hook_input, tool_use_id, context):
+            raise RuntimeError("kaboom!")
+
+        state = HookState()
+        check = _make_user_hook_check(exploding_hook, state)
+        result = await check({"tool_name": "Bash"}, "tu-3", {})
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_bad_return_type_treated_as_none(self):
+        """Non-dict, non-None return treated as None with warning."""
+        def bad_return_hook(hook_input, tool_use_id, context):
+            return "this is not a dict"
+
+        state = HookState()
+        check = _make_user_hook_check(bad_return_hook, state)
+        result = await check({"tool_name": "Read"}, "tu-4", {})
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_none_return_passes_through(self):
+        """Hook returning None passes through correctly (no opinion)."""
+        def noop_hook(hook_input, tool_use_id, context):
+            return None
+
+        state = HookState()
+        check = _make_user_hook_check(noop_hook, state)
+        result = await check({"tool_name": "Read"}, "tu-5", {})
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_context_enriched_with_obs_capabilities(self):
+        """Context dict is enriched with obs.launch_agent, agent_output, agent_stop, session_id."""
+        received_context = {}
+
+        def capture_hook(hook_input, tool_use_id, context):
+            received_context.update(context)
+            return None
+
+        launcher = AsyncMock(return_value={"agentId": "test"})
+        outputter = AsyncMock(return_value={"output": "test"})
+        stopper = AsyncMock(return_value={"stopped": True})
+
+        state = HookState(
+            session_id="sess-123",
+            fork_task_launcher=launcher,
+            fork_task_outputter=outputter,
+            fork_task_stopper=stopper,
+        )
+        check = _make_user_hook_check(capture_hook, state)
+        await check({"tool_name": "Read"}, "tu-6", {"signal": None})
+
+        assert "obs" in received_context
+        obs = received_context["obs"]
+        assert obs["launch_agent"] is launcher
+        assert obs["agent_output"] is outputter
+        assert obs["agent_stop"] is stopper
+        assert obs["session_id"] == "sess-123"
+
+    @pytest.mark.asyncio
+    async def test_context_obs_none_when_state_fields_none(self):
+        """When HookState fields are None, context['obs'] values are None (not crash)."""
+        received_context = {}
+
+        def capture_hook(hook_input, tool_use_id, context):
+            received_context.update(context)
+            return None
+
+        state = HookState()  # All launchers default to None
+        check = _make_user_hook_check(capture_hook, state)
+        await check({"tool_name": "Read"}, "tu-7", {})
+
+        assert "obs" in received_context
+        obs = received_context["obs"]
+        assert obs["launch_agent"] is None
+        assert obs["agent_output"] is None
+        assert obs["agent_stop"] is None
+        assert obs["session_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_original_context_not_mutated(self):
+        """The wrapper creates a copy of context — original is not mutated."""
+        original_context = {"signal": None}
+
+        def noop_hook(hook_input, tool_use_id, context):
+            return None
+
+        state = HookState(session_id="sess-x")
+        check = _make_user_hook_check(noop_hook, state)
+        await check({"tool_name": "Read"}, "tu-8", original_context)
+
+        assert "obs" not in original_context  # Original untouched
+
+    @pytest.mark.asyncio
+    async def test_async_exception_swallowed(self):
+        """Async hook that raises is also caught and swallowed."""
+        async def async_explode(hook_input, tool_use_id, context):
+            raise ValueError("async kaboom!")
+
+        state = HookState()
+        check = _make_user_hook_check(async_explode, state)
+        result = await check({"tool_name": "Bash"}, "tu-9", {})
+        assert result is None

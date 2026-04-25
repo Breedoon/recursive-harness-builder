@@ -75,6 +75,15 @@ class SessionManager:
         self._connected: bool = False
         self._lock = asyncio.Lock()
         self._sdk_env_overrides: dict[str, str] = {}
+        # Per-session model override.  When set, takes precedence over
+        # ``self.config.model`` in ``_build_options``.  Used by AgentTask to
+        # give child sessions a different model without mutating the shared
+        # OBSConfig instance.
+        self.model_override: str | None = None
+        # Per-session user hooks.  Mapping of hook event name to
+        # ``"file_path::function_name"`` spec.  Threaded to
+        # ``create_hook_matchers`` at session creation time.
+        self.user_hooks: dict[str, str] | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -121,17 +130,36 @@ class SessionManager:
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with hooks, MCP tools, and resume."""
+        from obs_agent.config import compaction_threshold, is_claude_model, parse_context_suffix
 
-        hook_matchers = create_hook_matchers(self.config, self.hook_state)
+        hook_matchers = create_hook_matchers(self.config, self.hook_state, user_hooks=self.user_hooks)
 
         # Create MCP tool server with session_id getter closure and hook_state
         # for background fork result delivery
         tool_server = create_obs_tools(self.config, lambda: self._session_id, hook_state=self.hook_state)
 
+        effective_model = self.model_override or self.config.model
+
         effective_env = {
             **_DEFAULT_SDK_ENV,
             **self._sdk_env_overrides,
         }
+
+        # When a model override is active, inject context window and compaction
+        # settings so the CC CLI subprocess behaves correctly for the model.
+        if self.model_override:
+            _clean, ctx_tokens = parse_context_suffix(self.model_override)
+            compact_at = compaction_threshold(ctx_tokens)
+            effective_env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = str(ctx_tokens)
+            # CLAUDE_AUTOCOMPACT_PCT_OVERRIDE controls when CC triggers compaction.
+            # Express the threshold as a percentage of the context window (0-100).
+            if ctx_tokens > 0:
+                pct = int(round(compact_at / ctx_tokens * 100))
+                effective_env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(pct)
+            # For non-Claude models, set the API key to the CLI proxy key so CC
+            # authenticates against CLIProxyAPI (the cache proxy forwards it).
+            if not is_claude_model(self.model_override):
+                effective_env["ANTHROPIC_API_KEY"] = self.config.cli_proxy_api_key
 
         # Route CC API traffic through the cache-normalizing proxy when enabled.
         # Forks inherit env from the parent CC process, so this propagates
@@ -143,7 +171,7 @@ class SessionManager:
             )
 
         options = ClaudeAgentOptions(
-            model=self.config.model,
+            model=effective_model,
             hooks=hook_matchers,
             mcp_servers={"obs-agent": tool_server},
             cwd=str(self.config.vault_path),

@@ -5,8 +5,34 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# Prevent real Claude Code CLI subprocess spawning in unit tests.
+#
+# Tests that mock ConversationRunner still hit SessionManager.get_client()
+# which calls ClaudeSDKClient.connect() → launches a real CLI subprocess.
+# These subprocesses fail (nested session detection) but their
+# ThreadedChildWatcher threads accumulate across tests and eventually
+# hang the test suite.  Patching get_client for affected tests prevents
+# subprocess spawning entirely.
+# Tests that explicitly test get_client behavior (e.g., TestClientLifecycle)
+# should mark themselves with @pytest.mark.real_get_client to opt out.
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _mock_session_get_client(request):
+    """Prevent SessionManager.get_client from spawning real CLI processes.
+
+    Skipped for tests marked with ``@pytest.mark.real_get_client``.
+    """
+    if request.node.get_closest_marker("real_get_client"):
+        yield
+    else:
+        with patch("obs_agent.session.SessionManager.get_client", new_callable=AsyncMock):
+            yield
 
 # ---------------------------------------------------------------------------
 # Load .env file for credentials (Telegram API keys, session, etc.)

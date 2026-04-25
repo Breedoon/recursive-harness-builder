@@ -113,7 +113,7 @@ def summarize_tool_use(tool_name: str, tool_input: dict) -> str:
         query = tool_input.get("query", "")
         return _truncate(f"WebSearch: '{query}'") if query else "WebSearch"
 
-    if tool_name in {"ForkTask", "AgentTask"}:
+    if tool_name == "AgentTask":
         description = tool_input.get("description", "")
         prompt = tool_input.get("prompt", "")
         resume = tool_input.get("resume")
@@ -134,14 +134,14 @@ def summarize_tool_use(tool_name: str, tool_input: dict) -> str:
             summary = f"{summary} max_turns={max_turns}"
         return _truncate(summary)
 
-    if tool_name in {"ForkTaskOutput", "AgentTaskOutput"}:
+    if tool_name == "AgentTaskOutput":
         task_id = tool_input.get("task_id", "")
         block = tool_input.get("block")
         if task_id:
             return _truncate(f"{tool_name}: {task_id} block={block}")
         return tool_name
 
-    if tool_name in {"ForkTaskStop", "AgentTaskStop"}:
+    if tool_name == "AgentTaskStop":
         task_id = tool_input.get("task_id", "")
         if task_id:
             return _truncate(f"{tool_name}: {task_id}")

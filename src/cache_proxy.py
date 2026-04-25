@@ -32,10 +32,12 @@ import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
 
 import httpx
 
-UPSTREAM = "https://api.anthropic.com"
+ANTHROPIC_UPSTREAM = "https://api.anthropic.com"
+CLI_PROXY_UPSTREAM = os.environ.get("CLI_PROXY_BASE_URL", "http://127.0.0.1:8317")
 DEFAULT_PORT = 18923
 _CODEBASE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.environ.get(
@@ -61,7 +63,30 @@ stats = {
     "reminders_stripped": 0, "git_status_normalized": 0,
     "tools_sorted": 0, "metadata_normalized": 0,
     "errors": 0,
+    "routed_anthropic": 0, "routed_cli_proxy": 0,
 }
+
+
+# ── Model routing ────────────────────────────────────────────────────────
+
+_CONTEXT_SUFFIX_RE = re.compile(r'\[\d+[mk]\]$', re.IGNORECASE)
+
+
+def _strip_context_suffix(model: str) -> str:
+    """Strip [1m], [200k], etc. context-window suffix from model name."""
+    return _CONTEXT_SUFFIX_RE.sub('', model)
+
+
+def _resolve_upstream(model: str) -> str:
+    """Determine upstream URL based on model name.
+
+    Claude models → Anthropic API (direct, no CLIProxyAPI dependency).
+    Everything else → CLIProxyAPI (local proxy for GPT, Gemini, etc.).
+    """
+    clean = _strip_context_suffix(model)
+    if clean.startswith("claude"):
+        return ANTHROPIC_UPSTREAM
+    return CLI_PROXY_UPSTREAM
 
 
 # ── Normalization steps ──────────────────────────────────────────────────
@@ -164,7 +189,7 @@ def _is_strippable_system_reminder(block: dict) -> bool:
     # Preserve CLAUDE.md context — the marker always appears right after
     # the opening <system-reminder> tag. Full-text search causes false
     # positives when changed_files diffs contain the marker string (Bug 1).
-    # Check only the prefix: "<system-reminder>\n" (20 chars) + marker.
+    # Check only the prefix: "<system-reminder>\n" (18 chars) + marker.
     marker_end = 20 + len(CLAUDEMD_MARKER)
     if CLAUDEMD_MARKER in text[:marker_end]:
         return False
@@ -368,12 +393,12 @@ def parse_sse_usage(sse_chunks: list[bytes]) -> dict:
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
-    def _upstream_headers(self) -> dict:
+    def _upstream_headers(self, upstream: str = ANTHROPIC_UPSTREAM) -> dict:
         h = {}
         for k, v in self.headers.items():
             if k.lower() not in ("host", "content-length", "accept-encoding"):
                 h[k] = v
-        h["host"] = "api.anthropic.com"
+        h["host"] = urlparse(upstream).netloc
         # Don't request compression — we need to parse SSE for usage stats.
         # This adds ~10KB/response overhead but makes SSE parsing reliable.
         h["accept-encoding"] = "identity"
@@ -391,8 +416,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _forward_simple(self, method: str):
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else b""
-        headers = self._upstream_headers()
-        url = UPSTREAM + self.path
+        headers = self._upstream_headers(ANTHROPIC_UPSTREAM)
+        url = ANTHROPIC_UPSTREAM + self.path
 
         try:
             with httpx.Client(timeout=120) as client:
@@ -415,9 +440,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         is_streaming = False
         norm_action = "error"
+        upstream = ANTHROPIC_UPSTREAM  # default; overridden after model extraction
         try:
             data = json.loads(raw_body)
             is_streaming = data.get("stream", False)
+
+            # Determine upstream based on model
+            raw_model = data.get("model") or ""
+            upstream = _resolve_upstream(raw_model)
+            if upstream == ANTHROPIC_UPSTREAM:
+                stats["routed_anthropic"] += 1
+            else:
+                stats["routed_cli_proxy"] += 1
+
+            # Strip context-window suffix from model before sending upstream
+            clean_model = _strip_context_suffix(raw_model)
+            if clean_model != raw_model:
+                data["model"] = clean_model
 
             # Save pre-normalization body
             if SAVE_BODIES:
@@ -438,7 +477,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     json.dump(data, f, indent=2)
 
             norm_action = info["action"]
-            log(f"REQ#{stats['requests']}: {norm_action} "
+            route_label = "anthropic" if upstream == ANTHROPIC_UPSTREAM else "cli-proxy"
+            log(f"REQ#{stats['requests']}: {norm_action} model={clean_model} route={route_label} "
                 f"(billing={info.get('billing', 0)} strings={info.get('strings', 0)} "
                 f"skill={info.get('skill', {}).get('action', '?')} "
                 f"reminders={info.get('reminders', 0)} "
@@ -452,9 +492,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             stats["errors"] += 1
             is_streaming = b'"stream":true' in raw_body or b'"stream": true' in raw_body
 
-        headers = self._upstream_headers()
+        headers = self._upstream_headers(upstream)
         headers["content-length"] = str(len(body))
-        url = UPSTREAM + self.path
+        url = upstream + self.path
 
         timeout = httpx.Timeout(connect=30, read=600, write=30, pool=30)
         try:
@@ -549,7 +589,8 @@ def main():
 
     server = ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
     log(f"listening on :{port}")
-    log(f"upstream: {UPSTREAM}")
+    log(f"upstream (claude): {ANTHROPIC_UPSTREAM}")
+    log(f"upstream (other):  {CLI_PROXY_UPSTREAM}")
     log(f"logs: {LOG_DIR}")
     log(f"save_bodies: {SAVE_BODIES}")
     log(f"normalizations: billing, string→list, strip skills, "

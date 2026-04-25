@@ -50,7 +50,7 @@ class TestModelResolution:
         assert resolve_model("gemini-flash") == "gemini-2.5-flash"
 
     def test_explicit_model_passes_through(self):
-        assert resolve_model("gpt-5.4") == "gpt-5.4"
+        assert resolve_model("gpt-5-codex-mini") == "gpt-5-codex-mini"
 
     def test_unknown_model_passes_through(self):
         assert resolve_model("llama-3-70b") == "llama-3-70b"
@@ -65,8 +65,8 @@ class TestModelResolution:
         assert result == "claude-opus-4-6[1m]"
 
     def test_explicit_with_context_suffix_preserved(self):
-        result = resolve_model("gpt-5.4[200k]")
-        assert result == "gpt-5.4[200k]"
+        result = resolve_model("gpt-5-codex-mini[200k]")
+        assert result == "gpt-5-codex-mini[200k]"
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +80,8 @@ class TestContextSuffixParsing:
         assert tokens == 1_000_000
 
     def test_200k_suffix(self):
-        clean, tokens = parse_context_suffix("gpt-5.4[200k]")
-        assert clean == "gpt-5.4"
+        clean, tokens = parse_context_suffix("gpt-5-codex-mini[200k]")
+        assert clean == "gpt-5-codex-mini"
         assert tokens == 200_000
 
     def test_128k_suffix(self):
@@ -90,8 +90,8 @@ class TestContextSuffixParsing:
         assert tokens == 128_000
 
     def test_no_suffix_defaults_to_1m(self):
-        clean, tokens = parse_context_suffix("gemini-2.5-pro")
-        assert clean == "gemini-2.5-pro"
+        clean, tokens = parse_context_suffix("gemini-3.1-flash-lite-preview")
+        assert clean == "gemini-3.1-flash-lite-preview"
         assert tokens == 1_000_000
 
     def test_uppercase_suffix(self):
@@ -168,7 +168,7 @@ class TestIsClaudeModel:
         assert is_claude_model("gpt-5.5") is False
 
     def test_gemini_is_not_claude(self):
-        assert is_claude_model("gemini-2.5-pro") is False
+        assert is_claude_model("gemini-3.1-flash-lite-preview") is False
 
     def test_claude_with_suffix_is_claude(self):
         assert is_claude_model("claude-opus-4-6[1m]") is True

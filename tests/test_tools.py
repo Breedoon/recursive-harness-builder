@@ -49,8 +49,8 @@ def skill_config(skill_vault):
     return OBSConfig(vault_path=Path(skill_vault))
 
 
-class TestForkTaskTool:
-    def test_create_obs_tools_registers_fork_task(self, monkeypatch, skill_config):
+class TestAgentTaskTools:
+    def test_create_obs_tools_registers_tools(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
@@ -68,14 +68,16 @@ class TestForkTaskTool:
             "CronDelete",
             "SendInboxMessage",
             "ReadInbox",
-            "ForkTask",
-            "ForkTaskOutput",
-            "ForkTaskStop",
             "session_info",
             "context_info",
             "session_lineage",
             "search_team",
+            "PlaceholderTool",
         ]
+        # ForkTask tools should NOT be registered (retired)
+        assert "ForkTask" not in tool_names
+        assert "ForkTaskOutput" not in tool_names
+        assert "ForkTaskStop" not in tool_names
 
     def test_send_inbox_message_schema_marks_only_recipient_and_content_required(
         self,
@@ -111,20 +113,20 @@ class TestForkTaskTool:
         assert "limit" in schema["properties"]
 
     @pytest.mark.asyncio
-    async def test_fork_task_requires_prompt(self, monkeypatch, skill_config):
+    async def test_agent_task_requires_prompt(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
-        handler = _tool_handler(captured["tools"], "ForkTask")
+        handler = _tool_handler(captured["tools"], "AgentTask")
 
         result = await handler({"description": "No prompt"})
 
         assert result["is_error"] is True
-        assert "prompt is required" in result["content"][0]["text"]
+        assert "prompt" in result["content"][0]["text"] and "required" in result["content"][0]["text"]
 
     @pytest.mark.asyncio
-    async def test_fork_task_allows_missing_session_id_when_transport_handles_context(self, monkeypatch, skill_config):
+    async def test_agent_task_allows_missing_session_id_when_transport_handles_context(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
@@ -133,7 +135,7 @@ class TestForkTaskTool:
             return_value={"content": [{"type": "text", "text": "ok"}]}
         )
         create_obs_tools(skill_config, lambda: None, hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTask")
+        handler = _tool_handler(captured["tools"], "AgentTask")
 
         result = await handler({"prompt": "Do work"})
 
@@ -141,12 +143,12 @@ class TestForkTaskTool:
         state.fork_task_launcher.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_fork_task_requires_transport_launcher(self, monkeypatch, skill_config):
+    async def test_agent_task_requires_transport_launcher(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
-        handler = _tool_handler(captured["tools"], "ForkTask")
+        handler = _tool_handler(captured["tools"], "AgentTask")
 
         result = await handler({"prompt": "Do work"})
 
@@ -154,14 +156,14 @@ class TestForkTaskTool:
         assert "does not provide task orchestration" in result["content"][0]["text"]
 
     @pytest.mark.asyncio
-    async def test_fork_task_validates_timeout_ms(self, monkeypatch, skill_config):
+    async def test_agent_task_validates_timeout_ms(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
         state = HookState()
         state.fork_task_launcher = AsyncMock()
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTask")
+        handler = _tool_handler(captured["tools"], "AgentTask")
 
         result = await handler({"prompt": "Do work", "timeout_ms": "abc"})
 
@@ -170,14 +172,14 @@ class TestForkTaskTool:
         state.fork_task_launcher.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_fork_task_accepts_string_run_in_background_true(self, monkeypatch, skill_config):
+    async def test_agent_task_accepts_string_run_in_background_true(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
         state = HookState()
         state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTask")
+        handler = _tool_handler(captured["tools"], "AgentTask")
 
         result = await handler({"prompt": "Do work", "run_in_background": "true"})
 
@@ -185,7 +187,7 @@ class TestForkTaskTool:
         state.fork_task_launcher.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_fork_task_launches_via_transport_callback(self, monkeypatch, skill_config):
+    async def test_agent_task_launches_via_transport_callback(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
@@ -195,13 +197,13 @@ class TestForkTaskTool:
                 "content": [
                     {
                         "type": "text",
-                        "text": "ForkTask launched successfully.\nagentId: task-123\noutput_file: /tmp/task-123.jsonl\ntelegram_topic: https://t.me/c/1/2",
+                        "text": "AgentTask launched successfully.\nagentId: task-123\noutput_file: /tmp/task-123.jsonl\ntelegram_topic: https://t.me/c/1/2",
                     }
                 ]
             }
         )
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTask")
+        handler = _tool_handler(captured["tools"], "AgentTask")
 
         result = await handler(
             {
@@ -209,6 +211,7 @@ class TestForkTaskTool:
                 "description": "Audit",
                 "timeout_ms": 5000,
                 "max_turns": 12,
+                "fork": "true",
             }
         )
 
@@ -222,13 +225,19 @@ class TestForkTaskTool:
                 "timeout_ms": 5000,
                 "max_turns": 12,
                 "fork": True,
+                "model": None,
                 "team_name": None,
                 "agent_name": None,
-                "task_tool_name": "ForkTask",
+                "task_tool_name": "AgentTask",
                 "tool_use_id": None,
+                "inherit_schedules": True,
+                "env": None,
+                "temperature": None,
+                "hooks": None,
+                "inherit_hooks": False,
             }
         )
-        assert "ForkTask launched successfully." in result["content"][0]["text"]
+        assert "AgentTask launched successfully." in result["content"][0]["text"]
         assert "agentId: task-123" in result["content"][0]["text"]
         assert "telegram_topic: https://t.me/c/1/2" in result["content"][0]["text"]
 
@@ -256,14 +265,14 @@ class TestForkTaskTool:
         assert launch_args["description"] == "child-researcher"
 
     @pytest.mark.asyncio
-    async def test_fork_task_treats_false_resume_as_missing(self, monkeypatch, skill_config):
+    async def test_agent_task_treats_false_resume_as_missing(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
         state = HookState()
         state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTask")
+        handler = _tool_handler(captured["tools"], "AgentTask")
 
         result = await handler({"prompt": "Do work", "resume": "false"})
 
@@ -314,14 +323,14 @@ class TestForkTaskTool:
         assert launch_args["description"] == "worker-a"
 
     @pytest.mark.asyncio
-    async def test_fork_task_validates_max_turns(self, monkeypatch, skill_config):
+    async def test_agent_task_validates_max_turns(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
         state = HookState()
         state.fork_task_launcher = AsyncMock()
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTask")
+        handler = _tool_handler(captured["tools"], "AgentTask")
 
         result = await handler({"prompt": "Do work", "max_turns": "abc"})
         assert result["is_error"] is True
@@ -333,7 +342,7 @@ class TestForkTaskTool:
         state.fork_task_launcher.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_fork_task_surfaces_launcher_errors(self, monkeypatch, skill_config):
+    async def test_agent_task_surfaces_launcher_errors(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
@@ -344,15 +353,15 @@ class TestForkTaskTool:
 
         state.fork_task_launcher = fail_launcher
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTask")
+        handler = _tool_handler(captured["tools"], "AgentTask")
 
         result = await handler({"prompt": "Do work"})
 
         assert result["is_error"] is True
-        assert result["content"][0]["text"] == "ForkTask failed: RuntimeError: launch exploded"
+        assert result["content"][0]["text"] == "AgentTask failed: RuntimeError: launch exploded"
 
     @pytest.mark.asyncio
-    async def test_fork_task_output_delegates(self, monkeypatch, skill_config):
+    async def test_agent_task_output_delegates(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
@@ -361,7 +370,7 @@ class TestForkTaskTool:
             return_value={"content": [{"type": "text", "text": "<retrieval_status>completed</retrieval_status>"}]}
         )
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTaskOutput")
+        handler = _tool_handler(captured["tools"], "AgentTaskOutput")
 
         result = await handler({"task_id": "task-123", "block": False, "timeout": 1})
 
@@ -371,12 +380,12 @@ class TestForkTaskTool:
         assert "<retrieval_status>completed</retrieval_status>" in result["content"][0]["text"]
 
     @pytest.mark.asyncio
-    async def test_fork_task_output_validates_args(self, monkeypatch, skill_config):
+    async def test_agent_task_output_validates_args(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
-        handler = _tool_handler(captured["tools"], "ForkTaskOutput")
+        handler = _tool_handler(captured["tools"], "AgentTaskOutput")
 
         result = await handler({"task_id": "", "block": False, "timeout": 1})
         assert result["is_error"] is True
@@ -391,7 +400,7 @@ class TestForkTaskTool:
         assert "timeout must be an integer" in result["content"][0]["text"]
 
     @pytest.mark.asyncio
-    async def test_fork_task_output_accepts_string_bool(self, monkeypatch, skill_config):
+    async def test_agent_task_output_accepts_string_bool(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
@@ -400,7 +409,7 @@ class TestForkTaskTool:
             return_value={"content": [{"type": "text", "text": "<retrieval_status>completed</retrieval_status>"}]}
         )
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTaskOutput")
+        handler = _tool_handler(captured["tools"], "AgentTaskOutput")
 
         result = await handler({"task_id": "task-123", "block": "true", "timeout": "1"})
 
@@ -410,7 +419,7 @@ class TestForkTaskTool:
         assert "<retrieval_status>completed</retrieval_status>" in result["content"][0]["text"]
 
     @pytest.mark.asyncio
-    async def test_fork_task_stop_delegates(self, monkeypatch, skill_config):
+    async def test_agent_task_stop_delegates(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
@@ -419,7 +428,7 @@ class TestForkTaskTool:
             return_value={"content": [{"type": "text", "text": "{\"task_id\":\"task-123\"}"}]}
         )
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTaskStop")
+        handler = _tool_handler(captured["tools"], "AgentTaskStop")
 
         result = await handler({"task_id": "task-123"})
 
@@ -429,7 +438,7 @@ class TestForkTaskTool:
         assert "\"task_id\":\"task-123\"" in result["content"][0]["text"]
 
     @pytest.mark.asyncio
-    async def test_fork_task_stop_accepts_shell_id_alias(self, monkeypatch, skill_config):
+    async def test_agent_task_stop_accepts_shell_id_alias(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
@@ -438,7 +447,7 @@ class TestForkTaskTool:
             return_value={"content": [{"type": "text", "text": "{\"task_id\":\"task-123\"}"}]}
         )
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "ForkTaskStop")
+        handler = _tool_handler(captured["tools"], "AgentTaskStop")
 
         result = await handler({"shell_id": "task-123"})
 
@@ -448,12 +457,12 @@ class TestForkTaskTool:
         assert "\"task_id\":\"task-123\"" in result["content"][0]["text"]
 
     @pytest.mark.asyncio
-    async def test_fork_task_stop_requires_task_id(self, monkeypatch, skill_config):
+    async def test_agent_task_stop_requires_task_id(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
-        handler = _tool_handler(captured["tools"], "ForkTaskStop")
+        handler = _tool_handler(captured["tools"], "AgentTaskStop")
 
         result = await handler({})
 
@@ -1409,3 +1418,373 @@ class TestCronTools:
         # CronDelete is now blocked for agents — either "id is required" or "disabled"
         assert ("id is required" in result["content"][0]["text"]
                 or "disabled for agents" in result["content"][0]["text"])
+
+
+class TestPromptFile:
+    """Tests for the prompt_file parameter on AgentTask."""
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_vault_relative(self, monkeypatch, skill_config, tmp_path):
+        """Vault-relative path resolves correctly and file content becomes the prompt."""
+        from obs_agent.tools import create_obs_tools
+
+        # Write a prompt file inside the vault
+        prompt_path = skill_config.vault_path / "procedures" / "research.md"
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text("Search the codebase for bugs", encoding="utf-8")
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt_file": "procedures/research.md"})
+
+        assert result["content"][0]["text"] == "ok"
+        state.fork_task_launcher.assert_awaited_once()
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == "Search the codebase for bugs"
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_absolute_path(self, monkeypatch, skill_config, tmp_path):
+        """Absolute path is used as-is without vault prefix."""
+        from obs_agent.tools import create_obs_tools
+
+        prompt_path = tmp_path / "external" / "task.md"
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text("External task content", encoding="utf-8")
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt_file": str(prompt_path)})
+
+        assert result["content"][0]["text"] == "ok"
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == "External task content"
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_tilde_path(self, monkeypatch, skill_config, tmp_path):
+        """Tilde paths get expanded to user home directory."""
+        from obs_agent.tools import create_obs_tools
+
+        # Create a file under a fake home
+        home_file = tmp_path / "docs" / "task.md"
+        home_file.parent.mkdir(parents=True, exist_ok=True)
+        home_file.write_text("Home dir task", encoding="utf-8")
+
+        # Monkeypatch expanduser to use tmp_path as home
+        original_expanduser = Path.expanduser
+
+        def fake_expanduser(self):
+            s = str(self)
+            if s.startswith("~"):
+                return Path(str(tmp_path) + s[1:])
+            return original_expanduser(self)
+
+        monkeypatch.setattr(Path, "expanduser", fake_expanduser)
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt_file": "~/docs/task.md"})
+
+        assert result["content"][0]["text"] == "ok"
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == "Home dir task"
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_not_found_returns_error(self, monkeypatch, skill_config):
+        """Missing file returns a clear error without crashing."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt_file": "nonexistent/file.md"})
+
+        assert result["is_error"] is True
+        assert "prompt_file not found" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_prompt_file_both_rejected(self, monkeypatch, skill_config):
+        """Providing both prompt and prompt_file is rejected."""
+        from obs_agent.tools import create_obs_tools
+
+        # Create a valid file so the error isn't about file-not-found
+        prompt_path = skill_config.vault_path / "task.md"
+        prompt_path.write_text("file content", encoding="utf-8")
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "inline prompt", "prompt_file": "task.md"})
+
+        assert result["is_error"] is True
+        assert "mutually exclusive" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_neither_prompt_nor_prompt_file_errors(self, monkeypatch, skill_config):
+        """Providing neither prompt nor prompt_file returns an error."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"display_name": "No prompt agent"})
+
+        assert result["is_error"] is True
+        assert "prompt or prompt_file is required" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_path_in_payload(self, monkeypatch, skill_config):
+        """The prompt_file path is included in the launch payload for service message display."""
+        from obs_agent.tools import create_obs_tools
+
+        prompt_path = skill_config.vault_path / "procedures" / "audit.md"
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        prompt_path.write_text("Audit the vault", encoding="utf-8")
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt_file": "procedures/audit.md"})
+
+        assert result["content"][0]["text"] == "ok"
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt_file"] == "procedures/audit.md"
+        assert launch_args["prompt"] == "Audit the vault"
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_whitespace_stripped(self, monkeypatch, skill_config):
+        """File content with leading/trailing whitespace is stripped."""
+        from obs_agent.tools import create_obs_tools
+
+        prompt_path = skill_config.vault_path / "padded.md"
+        prompt_path.write_text("\n\n  Do the thing  \n\n", encoding="utf-8")
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt_file": "padded.md"})
+
+        assert result["content"][0]["text"] == "ok"
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == "Do the thing"
+
+    @pytest.mark.asyncio
+    async def test_prompt_file_empty_file_errors(self, monkeypatch, skill_config):
+        """An empty file (whitespace-only) is treated as no prompt."""
+        from obs_agent.tools import create_obs_tools
+
+        prompt_path = skill_config.vault_path / "empty.md"
+        prompt_path.write_text("   \n  \n  ", encoding="utf-8")
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt_file": "empty.md"})
+
+        assert result["is_error"] is True
+        assert "prompt or prompt_file is required" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
+
+
+class TestHooksParameter:
+    """Tests for hooks and inherit_hooks parameter validation on AgentTask."""
+
+    @pytest.mark.asyncio
+    async def test_hooks_invalid_json_returns_error(self, monkeypatch, skill_config):
+        """Invalid JSON string for hooks is rejected with a clear error."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "test", "hooks": "{not valid json"})
+
+        assert result["is_error"] is True
+        assert "hooks must be a valid JSON object" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hooks_non_dict_json_returns_error(self, monkeypatch, skill_config):
+        """Valid JSON that is not a dict (e.g. a list) is rejected."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "test", "hooks": '["a", "b"]'})
+
+        assert result["is_error"] is True
+        assert "hooks must be a JSON object, got list" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hooks_entry_missing_separator_returns_error(self, monkeypatch, skill_config):
+        """Hook spec missing '::' separator is rejected with a clear error."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler(
+            {"prompt": "test", "hooks": '{"PreToolUse": "path/to/file.py"}'}
+        )
+
+        assert result["is_error"] is True
+        assert "hooks['PreToolUse']" in result["content"][0]["text"]
+        assert "file_path::function_name" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hooks_valid_format_passes_through(self, monkeypatch, skill_config):
+        """Valid hooks dict in file.py::function_name format passes validation."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler(
+            {
+                "prompt": "test",
+                "hooks": '{"PreToolUse": "guard.py::check_access", "PostToolUse": "log.py::log_result"}',
+            }
+        )
+
+        assert result.get("is_error") is not True
+        state.fork_task_launcher.assert_awaited_once()
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["hooks"] == {
+            "PreToolUse": "guard.py::check_access",
+            "PostToolUse": "log.py::log_result",
+        }
+
+    @pytest.mark.asyncio
+    async def test_hooks_entry_non_string_value_returns_error(self, monkeypatch, skill_config):
+        """Hook spec with a non-string value (e.g. int) is rejected."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler(
+            {"prompt": "test", "hooks": '{"PreToolUse": 42}'}
+        )
+
+        assert result["is_error"] is True
+        assert "hooks['PreToolUse']" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_inherit_hooks_true_coercion(self, monkeypatch, skill_config):
+        """String 'true' is coerced to boolean True for inherit_hooks."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "test", "inherit_hooks": "true"})
+
+        assert result.get("is_error") is not True
+        state.fork_task_launcher.assert_awaited_once()
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["inherit_hooks"] is True
+
+    @pytest.mark.asyncio
+    async def test_inherit_hooks_false_coercion(self, monkeypatch, skill_config):
+        """String 'false' is coerced to boolean False for inherit_hooks."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "test", "inherit_hooks": "false"})
+
+        assert result.get("is_error") is not True
+        state.fork_task_launcher.assert_awaited_once()
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["inherit_hooks"] is False
+
+    @pytest.mark.asyncio
+    async def test_inherit_hooks_invalid_string_returns_error(self, monkeypatch, skill_config):
+        """Non-boolean string for inherit_hooks is rejected."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock()
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "test", "inherit_hooks": "maybe"})
+
+        assert result["is_error"] is True
+        assert "inherit_hooks must be true or false" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()

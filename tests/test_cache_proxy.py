@@ -1090,3 +1090,48 @@ class TestParseSSEUsage:
         chunk = b"data: not valid json\n\n"
         usage = cache_proxy.parse_sse_usage([chunk])
         assert usage == {}
+
+
+# ── Model Routing ────────────────────────────────────────────────────────
+
+
+class TestStripContextSuffix:
+    def test_strips_1m(self):
+        assert cache_proxy._strip_context_suffix("claude-opus-4-6[1m]") == "claude-opus-4-6"
+
+    def test_strips_200k(self):
+        assert cache_proxy._strip_context_suffix("gpt-5.5[200k]") == "gpt-5.5"
+
+    def test_strips_case_insensitive(self):
+        assert cache_proxy._strip_context_suffix("gemini-3.1-flash-lite-preview[1M]") == "gemini-3.1-flash-lite-preview"
+        assert cache_proxy._strip_context_suffix("gpt-5-codex-mini[50K]") == "gpt-5-codex-mini"
+
+    def test_no_suffix_passthrough(self):
+        assert cache_proxy._strip_context_suffix("claude-opus-4-6") == "claude-opus-4-6"
+
+    def test_empty_string(self):
+        assert cache_proxy._strip_context_suffix("") == ""
+
+
+class TestResolveUpstream:
+    def test_claude_routes_to_anthropic(self):
+        assert cache_proxy._resolve_upstream("claude-opus-4-6") == cache_proxy.ANTHROPIC_UPSTREAM
+
+    def test_claude_with_suffix_routes_to_anthropic(self):
+        assert cache_proxy._resolve_upstream("claude-opus-4-6[1m]") == cache_proxy.ANTHROPIC_UPSTREAM
+
+    def test_claude_shorthand_routes_to_anthropic(self):
+        assert cache_proxy._resolve_upstream("claude") == cache_proxy.ANTHROPIC_UPSTREAM
+
+    def test_gpt_routes_to_cli_proxy(self):
+        assert cache_proxy._resolve_upstream("gpt-5.5") == cache_proxy.CLI_PROXY_UPSTREAM
+
+    def test_gemini_routes_to_cli_proxy(self):
+        assert cache_proxy._resolve_upstream("gemini-3.1-flash-lite-preview[1m]") == cache_proxy.CLI_PROXY_UPSTREAM
+
+    def test_empty_string_routes_to_cli_proxy(self):
+        # Empty model string is non-Claude, goes to CLI proxy
+        assert cache_proxy._resolve_upstream("") == cache_proxy.CLI_PROXY_UPSTREAM
+
+    def test_unknown_model_routes_to_cli_proxy(self):
+        assert cache_proxy._resolve_upstream("deepseek-v4") == cache_proxy.CLI_PROXY_UPSTREAM
