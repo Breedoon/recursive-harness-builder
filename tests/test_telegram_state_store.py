@@ -476,6 +476,216 @@ def test_state_store_delete_route_and_bindings(tmp_path):
     store.close()
 
 
+def test_model_override_roundtrip(tmp_path):
+    """model_override persists through save/restore cycle."""
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    store.upsert_route_state(
+        chat_id=-2001,
+        thread_id=100,
+        session_id="sid-gpt",
+        topic_title="GPT Session",
+        topic_icon_custom_emoji_id=None,
+        child_fork_count=0,
+        child_fork_base_title=None,
+        notify_on_completion=True,
+        last_inbound_message_id=1,
+        model_override="gpt-5-codex-mini",
+    )
+
+    snapshot = store.load_snapshot()
+    assert len(snapshot.route_states) == 1
+    assert snapshot.route_states[0].model_override == "gpt-5-codex-mini"
+    store.close()
+
+
+def test_user_hooks_json_roundtrip(tmp_path):
+    """user_hooks_json persists through save/restore cycle."""
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    hooks_json = '{"PreToolUse": "guards/check.py::validate_tool"}'
+    store.upsert_route_state(
+        chat_id=-2002,
+        thread_id=101,
+        session_id="sid-hooks",
+        topic_title="Hooks Session",
+        topic_icon_custom_emoji_id=None,
+        child_fork_count=0,
+        child_fork_base_title=None,
+        notify_on_completion=True,
+        last_inbound_message_id=2,
+        user_hooks_json=hooks_json,
+    )
+
+    snapshot = store.load_snapshot()
+    assert len(snapshot.route_states) == 1
+    assert snapshot.route_states[0].user_hooks_json == hooks_json
+    import json
+    parsed = json.loads(snapshot.route_states[0].user_hooks_json)
+    assert parsed == {"PreToolUse": "guards/check.py::validate_tool"}
+    store.close()
+
+
+def test_model_override_and_hooks_null_roundtrip(tmp_path):
+    """None values for model_override and user_hooks_json persist correctly."""
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    store.upsert_route_state(
+        chat_id=-2003,
+        thread_id=102,
+        session_id="sid-claude",
+        topic_title="Claude Session",
+        topic_icon_custom_emoji_id=None,
+        child_fork_count=0,
+        child_fork_base_title=None,
+        notify_on_completion=True,
+        last_inbound_message_id=3,
+        # model_override and user_hooks_json default to None
+    )
+
+    snapshot = store.load_snapshot()
+    assert len(snapshot.route_states) == 1
+    assert snapshot.route_states[0].model_override is None
+    assert snapshot.route_states[0].user_hooks_json is None
+    store.close()
+
+
+def test_model_override_update_preserves_value(tmp_path):
+    """Updating a route state preserves model_override on upsert."""
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    store.upsert_route_state(
+        chat_id=-2004,
+        thread_id=103,
+        session_id="sid-update",
+        topic_title="Update Test",
+        topic_icon_custom_emoji_id=None,
+        child_fork_count=0,
+        child_fork_base_title=None,
+        notify_on_completion=True,
+        last_inbound_message_id=4,
+        model_override="gemini-3.1-flash-lite-preview",
+    )
+    # Update fork count but keep the same model_override
+    store.upsert_route_state(
+        chat_id=-2004,
+        thread_id=103,
+        session_id="sid-update",
+        topic_title="Update Test",
+        topic_icon_custom_emoji_id=None,
+        child_fork_count=2,
+        child_fork_base_title="Update Test",
+        notify_on_completion=True,
+        last_inbound_message_id=5,
+        model_override="gemini-3.1-flash-lite-preview",
+    )
+
+    snapshot = store.load_snapshot()
+    assert len(snapshot.route_states) == 1
+    assert snapshot.route_states[0].child_fork_count == 2
+    assert snapshot.route_states[0].model_override == "gemini-3.1-flash-lite-preview"
+    store.close()
+
+
+def test_schema_migration_adds_columns(tmp_path):
+    """Schema migration adds model_override and user_hooks_json to existing DBs."""
+    db_path = tmp_path / "telegram-state.sqlite3"
+    # Create a DB with the old schema (no model_override/user_hooks_json columns)
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS route_state (
+            route_key TEXT PRIMARY KEY,
+            chat_id INTEGER NOT NULL,
+            thread_id INTEGER,
+            session_id TEXT,
+            topic_title TEXT,
+            topic_icon_custom_emoji_id TEXT,
+            child_fork_count INTEGER NOT NULL DEFAULT 0,
+            child_fork_base_title TEXT,
+            notify_on_completion INTEGER NOT NULL DEFAULT 1,
+            last_inbound_message_id INTEGER,
+            agent_lineage_json TEXT,
+            pending_obs_bootstrap TEXT,
+            updated_at REAL
+        )
+    """)
+    # Insert a row using the old schema
+    conn.execute(
+        "INSERT INTO route_state (route_key, chat_id, thread_id, session_id, "
+        "topic_title, child_fork_count, notify_on_completion, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("-2005:104", -2005, 104, "sid-old-schema", "Old Schema", 0, 1, 1.0),
+    )
+    conn.commit()
+    conn.close()
+
+    # Now open with TelegramStateStore — migration should add the columns
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    snapshot = store.load_snapshot()
+    assert len(snapshot.route_states) == 1
+    assert snapshot.route_states[0].session_id == "sid-old-schema"
+    assert snapshot.route_states[0].model_override is None
+    assert snapshot.route_states[0].user_hooks_json is None
+
+    # Now upsert with the new fields — should work on the migrated schema
+    store.upsert_route_state(
+        chat_id=-2005,
+        thread_id=104,
+        session_id="sid-old-schema",
+        topic_title="Old Schema",
+        topic_icon_custom_emoji_id=None,
+        child_fork_count=0,
+        child_fork_base_title=None,
+        notify_on_completion=True,
+        last_inbound_message_id=None,
+        model_override="gpt-5-codex-mini",
+        user_hooks_json='{"PreToolUse": "hook.py::fn"}',
+    )
+
+    snapshot = store.load_snapshot()
+    assert snapshot.route_states[0].model_override == "gpt-5-codex-mini"
+    assert snapshot.route_states[0].user_hooks_json == '{"PreToolUse": "hook.py::fn"}'
+    store.close()
+
+
+def test_existing_roundtrip_includes_new_fields(tmp_path):
+    """The existing comprehensive roundtrip test's route_state has None for new fields."""
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    # Use the same pattern as the existing roundtrip test but verify new fields
+    store.upsert_route_state(
+        chat_id=-2006,
+        thread_id=105,
+        session_id="sid-compat",
+        topic_title="Compat Test",
+        topic_icon_custom_emoji_id=None,
+        child_fork_count=0,
+        child_fork_base_title=None,
+        notify_on_completion=True,
+        last_inbound_message_id=None,
+    )
+
+    snapshot = store.load_snapshot()
+    route = snapshot.route_states[0]
+    # New fields default to None when not passed
+    assert route.model_override is None
+    assert route.user_hooks_json is None
+    store.close()
+
+
 def test_state_store_delete_team_worker_by_task(tmp_path):
     db_path = tmp_path / "telegram-state.sqlite3"
     store = TelegramStateStore(db_path)
