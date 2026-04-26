@@ -27,6 +27,8 @@ class PersistedRouteState:
     last_inbound_message_id: int | None
     agent_lineage: tuple[str, ...] | None = None
     pending_obs_bootstrap: str | None = None
+    model_override: str | None = None
+    user_hooks_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +191,8 @@ class TelegramStateStore:
                 last_inbound_message_id INTEGER,
                 agent_lineage_json TEXT,
                 pending_obs_bootstrap TEXT,
+                model_override TEXT,
+                user_hooks_json TEXT,
                 updated_at REAL NOT NULL
             );
 
@@ -348,6 +352,16 @@ class TelegramStateStore:
             column="pending_obs_bootstrap",
             declaration="TEXT",
         )
+        self._ensure_column_exists(
+            table="route_state",
+            column="model_override",
+            declaration="TEXT",
+        )
+        self._ensure_column_exists(
+            table="route_state",
+            column="user_hooks_json",
+            declaration="TEXT",
+        )
         # Completion summaries are now always-on across all topic types.
         conn.execute(
             """
@@ -396,7 +410,9 @@ class TelegramStateStore:
                 notify_on_completion,
                 last_inbound_message_id,
                 agent_lineage_json,
-                pending_obs_bootstrap
+                pending_obs_bootstrap,
+                model_override,
+                user_hooks_json
             FROM route_state
             ORDER BY updated_at ASC
             """
@@ -535,6 +551,16 @@ class TelegramStateStore:
                 pending_obs_bootstrap=(
                     str(row["pending_obs_bootstrap"])
                     if row["pending_obs_bootstrap"]
+                    else None
+                ),
+                model_override=(
+                    str(row["model_override"])
+                    if row["model_override"]
+                    else None
+                ),
+                user_hooks_json=(
+                    str(row["user_hooks_json"])
+                    if row["user_hooks_json"]
                     else None
                 ),
             )
@@ -729,6 +755,8 @@ class TelegramStateStore:
         last_inbound_message_id: int | None,
         agent_lineage: tuple[str, ...] | None = None,
         pending_obs_bootstrap: str | None = None,
+        model_override: str | None = None,
+        user_hooks_json: str | None = None,
     ) -> None:
         conn = self._require_conn()
         now = time.time()
@@ -748,8 +776,10 @@ class TelegramStateStore:
                 last_inbound_message_id,
                 agent_lineage_json,
                 pending_obs_bootstrap,
+                model_override,
+                user_hooks_json,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(route_key) DO UPDATE SET
                 session_id=excluded.session_id,
                 topic_title=excluded.topic_title,
@@ -760,6 +790,8 @@ class TelegramStateStore:
                 last_inbound_message_id=excluded.last_inbound_message_id,
                 agent_lineage_json=excluded.agent_lineage_json,
                 pending_obs_bootstrap=excluded.pending_obs_bootstrap,
+                model_override=excluded.model_override,
+                user_hooks_json=excluded.user_hooks_json,
                 updated_at=excluded.updated_at
             """,
             (
@@ -782,6 +814,8 @@ class TelegramStateStore:
                     else None
                 ),
                 pending_obs_bootstrap,
+                model_override,
+                user_hooks_json,
                 now,
             ),
         )

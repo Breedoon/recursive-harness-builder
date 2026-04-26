@@ -1463,6 +1463,13 @@ class TelegramBot:
             if isinstance(state.child_fork_base_title, str) and state.child_fork_base_title
             else None
         )
+        # Serialize user_hooks dict to JSON for persistence
+        user_hooks_json: str | None = None
+        if state.session_manager.user_hooks:
+            try:
+                user_hooks_json = json.dumps(state.session_manager.user_hooks, ensure_ascii=True)
+            except (TypeError, ValueError):
+                user_hooks_json = None
         self._state_store.upsert_route_state(
             chat_id=route.chat_id,
             thread_id=route.thread_id,
@@ -1475,6 +1482,8 @@ class TelegramBot:
             last_inbound_message_id=last_inbound,
             agent_lineage=state.agent_lineage,
             pending_obs_bootstrap=state.pending_obs_bootstrap,
+            model_override=state.session_manager.model_override,
+            user_hooks_json=user_hooks_json,
         )
 
     def _restore_state_from_store(self) -> None:
@@ -1498,6 +1507,14 @@ class TelegramBot:
             state.notify_on_completion = entry.notify_on_completion
             state.agent_lineage = entry.agent_lineage
             state.pending_obs_bootstrap = entry.pending_obs_bootstrap
+            # Restore model_override and user_hooks for non-Claude sessions
+            if entry.model_override:
+                state.session_manager.model_override = entry.model_override
+            if entry.user_hooks_json:
+                try:
+                    state.session_manager.user_hooks = json.loads(entry.user_hooks_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
             restored_bootstrap = None
             if state.agent_lineage is None and entry.pending_obs_bootstrap:
                 try:
