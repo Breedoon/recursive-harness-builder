@@ -151,6 +151,7 @@ class SessionManager:
             _clean, ctx_tokens = parse_context_suffix(self.model_override)
             compact_at = compaction_threshold(ctx_tokens)
             effective_env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = str(ctx_tokens)
+            effective_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx_tokens)
             # CLAUDE_AUTOCOMPACT_PCT_OVERRIDE controls when CC triggers compaction.
             # Express the threshold as a percentage of the context window (0-100).
             if ctx_tokens > 0:

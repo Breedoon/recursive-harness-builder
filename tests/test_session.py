@@ -154,6 +154,15 @@ class TestCreateOptions:
         # (breaks GrowthBook / 1h cache TTL). Verify it is NOT set.
         assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in options.env
 
+    def test_model_override_sets_context_window_envs(self, config):
+        mgr = SessionManager(config=config)
+        mgr.model_override = "gpt-5.4-mini"
+        options = mgr.create_options()
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "92"
+        assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+
     def test_set_sdk_env_overrides_filters_empty_values(self, config):
         mgr = SessionManager(config=config)
         mgr.set_sdk_env_overrides({"A": "1", "B": "", "": "x"})
