@@ -16,6 +16,7 @@ Normalizations (applied in order):
 5. Git status: normalized in system prompt to fixed placeholder
 6. Tool sorting: tools[] sorted alphabetically by name
 7. Metadata: session-specific IDs normalized
+8. Tool schema sanitization: array types get ``items`` added (non-Claude only)
 
 Usage:
     python cache_proxy.py [port]  # default: 18923
@@ -65,6 +66,7 @@ stats = {
     "tools_sorted": 0, "metadata_normalized": 0,
     "errors": 0,
     "routed_anthropic": 0, "routed_cli_proxy": 0,
+    "schemas_sanitized": 0,
 }
 
 
@@ -291,6 +293,70 @@ def normalize_metadata(body: dict) -> int:
     return 0
 
 
+def _fix_array_items_recursive(schema: dict) -> int:
+    """Recursively add ``items: {}`` to array schemas missing it.
+
+    OpenAI requires ``items`` on every array-typed schema node.
+    Anthropic doesn't care.  This walks the full JSON Schema tree.
+    """
+    if not isinstance(schema, dict):
+        return 0
+
+    count = 0
+
+    # Direct array type without items
+    if schema.get("type") == "array" and "items" not in schema:
+        schema["items"] = {}
+        count += 1
+
+    # Recurse into nested schema keywords
+    for key in ("properties", "patternProperties"):
+        props = schema.get(key)
+        if isinstance(props, dict):
+            for prop_schema in props.values():
+                count += _fix_array_items_recursive(prop_schema)
+
+    for key in ("items", "additionalItems", "contains", "not",
+                "if", "then", "else", "additionalProperties"):
+        sub = schema.get(key)
+        if isinstance(sub, dict):
+            count += _fix_array_items_recursive(sub)
+
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        variants = schema.get(key)
+        if isinstance(variants, list):
+            for variant in variants:
+                count += _fix_array_items_recursive(variant)
+
+    return count
+
+
+def sanitize_tool_schemas_for_openai(body: dict) -> int:
+    """Sanitize tool schemas for OpenAI API compatibility.
+
+    OpenAI rejects array schemas without ``items``.  Anthropic accepts them.
+    Walk all tool input_schemas recursively and fix missing ``items``.
+
+    Only call this for non-Claude model requests.
+    """
+    tools = body.get("tools")
+    if not tools or not isinstance(tools, list):
+        return 0
+
+    count = 0
+    for tool in tools:
+        schema = tool.get("input_schema")
+        if isinstance(schema, dict):
+            fixed = _fix_array_items_recursive(schema)
+            if fixed:
+                tool_name = tool.get("name", "?")
+                log(f"SCHEMA-FIX: {tool_name} — added items to {fixed} array(s)")
+                count += fixed
+    if count:
+        stats["schemas_sanitized"] += count
+    return count
+
+
 def normalize_request(body: dict) -> tuple[dict, dict]:
     """Apply all 7 normalizations to a request body in spec order.
 
@@ -472,6 +538,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             # Apply all normalizations
             data, info = normalize_request(data)
+
+            # Sanitize tool schemas for non-Claude models (OpenAI compat)
+            if upstream != ANTHROPIC_UPSTREAM:
+                info["schema_sanitized"] = sanitize_tool_schemas_for_openai(data)
+
             body = json.dumps(data, separators=(",", ":")).encode()
 
             # Save post-normalization body
@@ -488,7 +559,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 f"reminders={info.get('reminders', 0)} "
                 f"git_status={info.get('git_status', 0)} "
                 f"tools={info.get('tools', 0)} "
-                f"meta={info.get('metadata', 0)})")
+                f"meta={info.get('metadata', 0)} "
+                f"schema={info.get('schema_sanitized', 0)})")
 
         except Exception as e:
             log(f"normalize error, passing through: {e}")

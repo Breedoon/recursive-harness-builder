@@ -1135,3 +1135,215 @@ class TestResolveUpstream:
 
     def test_unknown_model_routes_to_cli_proxy(self):
         assert cache_proxy._resolve_upstream("deepseek-v4") == cache_proxy.CLI_PROXY_UPSTREAM
+
+
+# ── Rule 8: Tool schema sanitization (non-Claude only) ─────────────────
+
+
+class TestFixArrayItemsRecursive:
+    """Unit tests for _fix_array_items_recursive."""
+
+    def test_array_without_items_gets_fixed(self):
+        schema = {"type": "array"}
+        count = cache_proxy._fix_array_items_recursive(schema)
+        assert count == 1
+        assert schema["items"] == {}
+
+    def test_array_with_items_untouched(self):
+        schema = {"type": "array", "items": {"type": "string"}}
+        original = copy.deepcopy(schema)
+        count = cache_proxy._fix_array_items_recursive(schema)
+        assert count == 0
+        assert schema == original
+
+    def test_non_array_type_untouched(self):
+        schema = {"type": "string"}
+        count = cache_proxy._fix_array_items_recursive(schema)
+        assert count == 0
+        assert "items" not in schema
+
+    def test_nested_in_properties(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array"},
+                "name": {"type": "string"},
+            },
+        }
+        count = cache_proxy._fix_array_items_recursive(schema)
+        assert count == 1
+        assert schema["properties"]["tags"]["items"] == {}
+        assert "items" not in schema["properties"]["name"]
+
+    def test_nested_in_anyof(self):
+        """Exact reproduction of the tasknotes_update_task blockedBy schema."""
+        schema = {
+            "anyOf": [
+                {"type": "array"},
+                {"type": "null"},
+            ],
+        }
+        count = cache_proxy._fix_array_items_recursive(schema)
+        assert count == 1
+        assert schema["anyOf"][0]["items"] == {}
+        assert "items" not in schema["anyOf"][1]
+
+    def test_deeply_nested(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "outer": {
+                    "type": "object",
+                    "properties": {
+                        "inner": {
+                            "oneOf": [
+                                {"type": "array"},
+                                {"type": "null"},
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        count = cache_proxy._fix_array_items_recursive(schema)
+        assert count == 1
+        assert schema["properties"]["outer"]["properties"]["inner"]["oneOf"][0]["items"] == {}
+
+    def test_multiple_arrays_fixed(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "a": {"type": "array"},
+                "b": {"type": "array"},
+                "c": {"type": "array", "items": {"type": "number"}},
+            },
+        }
+        count = cache_proxy._fix_array_items_recursive(schema)
+        assert count == 2
+        assert schema["properties"]["a"]["items"] == {}
+        assert schema["properties"]["b"]["items"] == {}
+        assert schema["properties"]["c"]["items"] == {"type": "number"}
+
+    def test_non_dict_input(self):
+        assert cache_proxy._fix_array_items_recursive("not a dict") == 0
+        assert cache_proxy._fix_array_items_recursive(42) == 0
+        assert cache_proxy._fix_array_items_recursive(None) == 0
+
+    def test_idempotent(self):
+        schema = {"anyOf": [{"type": "array"}, {"type": "null"}]}
+        cache_proxy._fix_array_items_recursive(schema)
+        schema_after_first = copy.deepcopy(schema)
+        count = cache_proxy._fix_array_items_recursive(schema)
+        assert count == 0
+        assert schema == schema_after_first
+
+
+class TestSanitizeToolSchemas:
+    """Unit tests for sanitize_tool_schemas_for_openai."""
+
+    def test_exact_tasknotes_update_task_schema(self):
+        """The exact schema that breaks GPT sessions."""
+        body = {
+            "tools": [
+                {
+                    "name": "tasknotes_update_task",
+                    "input_schema": {
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "id": {"type": "string"},
+                            "blockedBy": {
+                                "anyOf": [
+                                    {"type": "array"},
+                                    {"type": "null"},
+                                ],
+                            },
+                            "title": {"type": "string"},
+                        },
+                        "required": ["id"],
+                    },
+                }
+            ]
+        }
+        count = cache_proxy.sanitize_tool_schemas_for_openai(body)
+        assert count == 1
+        blocked_by = body["tools"][0]["input_schema"]["properties"]["blockedBy"]
+        assert blocked_by["anyOf"][0]["items"] == {}
+        assert blocked_by["anyOf"][1] == {"type": "null"}
+
+    def test_clean_tools_untouched(self):
+        body = {
+            "tools": [
+                {
+                    "name": "read_file",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "lines": {"type": "array", "items": {"type": "integer"}},
+                        },
+                    },
+                }
+            ]
+        }
+        original = copy.deepcopy(body)
+        count = cache_proxy.sanitize_tool_schemas_for_openai(body)
+        assert count == 0
+        assert body == original
+
+    def test_no_tools(self):
+        assert cache_proxy.sanitize_tool_schemas_for_openai({}) == 0
+        assert cache_proxy.sanitize_tool_schemas_for_openai({"tools": []}) == 0
+        assert cache_proxy.sanitize_tool_schemas_for_openai({"tools": None}) == 0
+
+    def test_multiple_tools_with_mixed_schemas(self):
+        body = {
+            "tools": [
+                {
+                    "name": "tool_a",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"arr": {"type": "array"}},
+                    },
+                },
+                {
+                    "name": "tool_b",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                    },
+                },
+                {
+                    "name": "tool_c",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "items": {
+                                "anyOf": [
+                                    {"type": "array"},
+                                    {"type": "null"},
+                                ]
+                            }
+                        },
+                    },
+                },
+            ]
+        }
+        count = cache_proxy.sanitize_tool_schemas_for_openai(body)
+        assert count == 2  # tool_a.arr + tool_c.items.anyOf[0]
+
+    def test_stats_incremented(self):
+        body = {
+            "tools": [
+                {
+                    "name": "test",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"x": {"type": "array"}},
+                    },
+                }
+            ]
+        }
+        cache_proxy.sanitize_tool_schemas_for_openai(body)
+        assert cache_proxy.stats["schemas_sanitized"] == 1
