@@ -686,6 +686,119 @@ def test_existing_roundtrip_includes_new_fields(tmp_path):
     store.close()
 
 
+def test_model_override_empty_hooks_dict(tmp_path):
+    """Empty hooks dict '{}' persists correctly (not treated as None)."""
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    store.upsert_route_state(
+        chat_id=-3001, thread_id=200, session_id="sid-empty-hooks",
+        topic_title="Empty Hooks", topic_icon_custom_emoji_id=None,
+        child_fork_count=0, child_fork_base_title=None,
+        notify_on_completion=True, last_inbound_message_id=1,
+        user_hooks_json="{}",
+    )
+
+    snapshot = store.load_snapshot()
+    assert snapshot.route_states[0].user_hooks_json == "{}"
+    import json
+    assert json.loads(snapshot.route_states[0].user_hooks_json) == {}
+    store.close()
+
+
+def test_model_override_with_context_suffix(tmp_path):
+    """Model with context suffix like 'gpt-5-codex-mini[1m]' persists correctly."""
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    store.upsert_route_state(
+        chat_id=-3002, thread_id=201, session_id="sid-suffix",
+        topic_title="Suffix Model", topic_icon_custom_emoji_id=None,
+        child_fork_count=0, child_fork_base_title=None,
+        notify_on_completion=True, last_inbound_message_id=1,
+        model_override="gpt-5-codex-mini[1m]",
+    )
+
+    snapshot = store.load_snapshot()
+    assert snapshot.route_states[0].model_override == "gpt-5-codex-mini[1m]"
+    store.close()
+
+
+def test_model_override_inherit_value(tmp_path):
+    """'inherit' as model_override value persists correctly."""
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    store.upsert_route_state(
+        chat_id=-3003, thread_id=202, session_id="sid-inherit",
+        topic_title="Inherit Model", topic_icon_custom_emoji_id=None,
+        child_fork_count=0, child_fork_base_title=None,
+        notify_on_completion=True, last_inbound_message_id=1,
+        model_override="inherit",
+    )
+
+    snapshot = store.load_snapshot()
+    assert snapshot.route_states[0].model_override == "inherit"
+    store.close()
+
+
+def test_hooks_multi_event_json_roundtrip(tmp_path):
+    """Complex hooks JSON with multiple event types roundtrips correctly."""
+    import json
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    hooks = {
+        "PreToolUse": "guards/check.py::validate",
+        "PostToolUse": "hooks/log.py::log_result",
+        "Stop": "hooks/cleanup.py::on_stop",
+    }
+    hooks_json = json.dumps(hooks)
+    store.upsert_route_state(
+        chat_id=-3004, thread_id=203, session_id="sid-multi-hooks",
+        topic_title="Multi Hooks", topic_icon_custom_emoji_id=None,
+        child_fork_count=0, child_fork_base_title=None,
+        notify_on_completion=True, last_inbound_message_id=1,
+        user_hooks_json=hooks_json,
+    )
+
+    snapshot = store.load_snapshot()
+    parsed = json.loads(snapshot.route_states[0].user_hooks_json)
+    assert parsed == hooks
+    store.close()
+
+
+def test_model_override_overwrite_on_upsert(tmp_path):
+    """Upsert with a different model_override replaces the old value."""
+    db_path = tmp_path / "telegram-state.sqlite3"
+    store = TelegramStateStore(db_path)
+    store.initialize()
+
+    store.upsert_route_state(
+        chat_id=-3005, thread_id=204, session_id="sid-overwrite",
+        topic_title="Overwrite", topic_icon_custom_emoji_id=None,
+        child_fork_count=0, child_fork_base_title=None,
+        notify_on_completion=True, last_inbound_message_id=1,
+        model_override="gpt-5-codex-mini",
+    )
+    store.upsert_route_state(
+        chat_id=-3005, thread_id=204, session_id="sid-overwrite",
+        topic_title="Overwrite", topic_icon_custom_emoji_id=None,
+        child_fork_count=0, child_fork_base_title=None,
+        notify_on_completion=True, last_inbound_message_id=2,
+        model_override="gemini-3.1-flash-lite-preview",
+    )
+
+    snapshot = store.load_snapshot()
+    assert snapshot.route_states[0].model_override == "gemini-3.1-flash-lite-preview"
+    assert snapshot.route_states[0].last_inbound_message_id == 2
+    store.close()
+
+
 def test_state_store_delete_team_worker_by_task(tmp_path):
     db_path = tmp_path / "telegram-state.sqlite3"
     store = TelegramStateStore(db_path)
