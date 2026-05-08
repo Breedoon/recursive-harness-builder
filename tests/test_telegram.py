@@ -928,6 +928,26 @@ class TestBackgroundPoller:
         assert "<session_id>" not in prompt
         assert prompt.strip().endswith("hello")
 
+    async def test_prime_obs_bootstrap_preserves_agent_task_env_overrides(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=223)
+        state = bot._get_state(route, topic_title="Alpha")
+        assert state is not None
+        state.session_manager.set_sdk_env_overrides({"AF_SERVICE_WRITE_FILE": "/tmp/report.md"})
+
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root", "Alpha"),
+            origin="agent_task_fresh",
+            is_fork=False,
+            session_id="sid-child",
+        )
+
+        env = state.session_manager.sdk_env_overrides
+        assert env["AF_SERVICE_WRITE_FILE"] == "/tmp/report.md"
+        assert env["CLAUDE_CODE_TEAM_NAME"].endswith("-root")
+        assert state.hook_state.sdk_env_overrides["AF_SERVICE_WRITE_FILE"] == "/tmp/report.md"
+
     async def test_run_and_send_injects_pending_child_bootstrap_even_when_fork_session_has_parent_head(
         self,
         config,

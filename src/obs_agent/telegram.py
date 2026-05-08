@@ -2195,12 +2195,14 @@ class TelegramBot:
             parent_agent_name=parent_agent_name,
             parent_display_name=parent_display_name,
         )
-        state.session_manager.set_sdk_env_overrides(
-            self._build_team_worker_env(
+        bootstrap_env = {
+            **state.session_manager.sdk_env_overrides,
+            **self._build_team_worker_env(
                 team_name=resolved_team_name,
                 agent_name=resolved_agent_name,
-            )
-        )
+            ),
+        }
+        state.session_manager.set_sdk_env_overrides(bootstrap_env)
         self._upsert_team_projection_config(
             team_name=resolved_team_name,
             agent_name=resolved_agent_name,
