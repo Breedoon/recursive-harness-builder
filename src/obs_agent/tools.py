@@ -229,12 +229,9 @@ def create_obs_tools(
     ) -> dict:
         prompt = str(args.get("prompt", "")).strip()
         prompt_file = str(args.get("prompt_file", "")).strip()
+        prompt_file_content = ""
 
         # --- prompt_file resolution ---
-        if prompt and prompt_file:
-            return _error_result(
-                f"Cannot launch {tool_name}: prompt and prompt_file are mutually exclusive. Provide one, not both."
-            )
         if prompt_file:
             try:
                 file_path = Path(prompt_file)
@@ -249,7 +246,7 @@ def create_obs_tools(
                 return _error_result(f"Cannot launch {tool_name}: permission denied reading prompt_file: {file_path}")
             except Exception as exc:
                 return _error_result(f"Cannot launch {tool_name}: cannot read prompt_file: {exc}")
-            prompt = file_content.strip()
+            prompt_file_content = file_content.strip()
 
         # display_name is the canonical param. alias/description/name are
         # deprecated fallbacks. This is the human-readable label, NOT the
@@ -340,7 +337,7 @@ def create_obs_tools(
         # Kept for internal/future use — not exposed in MCP schema but still processed if passed
         timeout_ms_raw = args.get("timeout_ms")
         max_turns_raw = args.get("max_turns")
-        if not prompt:
+        if not prompt and not prompt_file_content:
             return _error_result(f"Cannot launch {tool_name}: prompt or prompt_file is required")
 
         if run_in_background is not None:
@@ -400,6 +397,7 @@ def create_obs_tools(
             }
             if prompt_file:
                 payload["prompt_file"] = prompt_file
+                payload["prompt_file_content"] = prompt_file_content
             return await hook_state.fork_task_launcher(payload)
         except Exception as exc:
             logger.exception("%s launch failed", tool_name)
@@ -415,14 +413,13 @@ def create_obs_tools(
             "properties": {
             "prompt": {
                 "type": "string",
-                "description": "Full task prompt for the child session. Mutually exclusive with prompt_file.",
+                "description": "Full task prompt for the child session. May be combined with prompt_file.",
             },
             "prompt_file": {
                 "type": "string",
                 "description": (
-                    "Path to a file containing the prompt. Vault-relative by default, "
-                    "absolute paths (/...) and ~/paths supported. "
-                    "Mutually exclusive with prompt — provide one, not both."
+                    "Path to a file containing additional prompt context. Vault-relative by default, "
+                    "absolute paths (/...) and ~/paths supported. May be combined with prompt."
                 ),
             },
             "display_name": {

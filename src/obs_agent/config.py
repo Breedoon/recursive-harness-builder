@@ -31,7 +31,9 @@ MODEL_RESOLUTION: dict[str, str] = {
     # Anthropic tiers
     "claude": "claude-opus-4-6",
     "claude-opus": "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-6",
     "claude-sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
     "claude-haiku": "claude-haiku-4-5",
     # OpenAI tiers
     "gpt": "gpt-5.4-mini",

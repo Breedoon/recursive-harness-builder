@@ -31,9 +31,11 @@ class TestModelResolution:
 
     def test_claude_sonnet_shorthand(self):
         assert resolve_model("claude-sonnet") == "claude-sonnet-4-6"
+        assert resolve_model("sonnet") == "claude-sonnet-4-6"
 
     def test_claude_haiku_shorthand(self):
         assert resolve_model("claude-haiku") == "claude-haiku-4-5"
+        assert resolve_model("haiku") == "claude-haiku-4-5"
 
     def test_gpt_shorthand_resolves_to_latest(self):
         resolved = resolve_model("gpt")

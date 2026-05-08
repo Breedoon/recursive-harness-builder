@@ -14,6 +14,7 @@ import json
 import os
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -33,6 +34,61 @@ from tests.test_telegram_live_smoke import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _find_jsonl_with_user_markers(markers: tuple[str, ...]) -> Path | None:
+    projects_root = Path.home() / ".claude" / "projects"
+    for path in sorted(projects_root.glob("*/*.jsonl"), key=_safe_mtime, reverse=True):
+        user_text = "\n".join(_jsonl_user_texts(path))
+        if all(marker in user_text for marker in markers):
+            return path
+    return None
+
+
+async def _wait_for_jsonl_with_user_markers(
+    markers: tuple[str, ...],
+    *,
+    timeout: float = 120.0,
+) -> Path:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        path = _find_jsonl_with_user_markers(markers)
+        if path is not None:
+            return path
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("child JSONL with combined prompt context and lineage not found")
+        await asyncio.sleep(1.0)
+
+
+def _jsonl_user_texts(path: Path) -> list[str]:
+    texts: list[str] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry: dict[str, Any] = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") != "user":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+    return texts
+
 
 async def _launch_agent_and_get_child_thread(
     harness: _LiveForumHarness,
@@ -186,27 +242,66 @@ class TestPromptFromFile:
             f"Expected file-not-found error, got: {result}"
         )
 
-        # --- Phase 3: Both prompt and prompt_file — rejected ---
+        # --- Phase 3: Both prompt and prompt_file are combined ---
         prompt_file2 = Path(f"/tmp/obs_test_prompt2_{tag}.md")
-        prompt_file2.write_text("dummy")
+        prompt_file2.write_text(
+            f"The required file token is PF-COMBINED-FILE-{tag}."
+        )
         try:
-            result = await _launch_agent_and_expect_error(
-                live_tg_forum,
-                parent_thread_id=parent_thread_id,
-                instruction=(
+            baseline = await live_tg_forum.platform.latest_bot_message_id(
+                thread_id=parent_thread_id
+            )
+            await live_tg_forum.platform.send(
+                (
                     "This is a deterministic smoke test. "
-                    f'Try to use AgentTask with fork=false, prompt="hello", '
-                    f'and prompt_file="{prompt_file2}". '
-                    f"If the tool returns an error, reply with only PFBOTH-FAIL-{tag}. "
-                    f"If it launched successfully, reply with only PFBOTH-OK-{tag}."
+                    f'Use AgentTask exactly once with fork=false, prompt_file="{prompt_file2}", '
+                    f"and prompt 'Reply with exactly PF-COMBINED-INLINE-{tag} "
+                    f"and PF-COMBINED-FILE-{tag} if both inline prompt and prompt_file context are visible.' "
+                    f"After launching, reply with only PFBOTH-LAUNCHED-{tag}."
                 ),
-                ok_token=f"PFBOTH-OK-{tag}",
-                fail_token=f"PFBOTH-FAIL-{tag}",
+                thread_id=parent_thread_id,
+                require_done=False,
                 timeout=180.0,
             )
-            assert f"PFBOTH-FAIL-{tag}" in result, (
-                f"Expected mutual exclusion error, got: {result}"
+            launch_msg = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline,
+                token="task launched",
+                timeout=240.0,
             )
+            combined_child_thread_id, _ = _extract_topic_link(launch_msg.text)
+            await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=launch_msg.message_id,
+                token=f"PFBOTH-LAUNCHED-{tag}",
+                timeout=240.0,
+            )
+            child_reply = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=combined_child_thread_id,
+                token=f"PF-COMBINED-INLINE-{tag}",
+                timeout=240.0,
+            )
+            assert f"PF-COMBINED-FILE-{tag}" in child_reply.text, (
+                f"Child did not see prompt_file context separately from inline prompt: {child_reply.text}"
+            )
+            required_jsonl_markers = (
+                f'<prompt_file_context path="{prompt_file2}">',
+                f"PF-COMBINED-FILE-{tag}",
+                f"PF-COMBINED-INLINE-{tag}",
+                "<obs-bootstrap",
+                "<obs-lineage>",
+            )
+            output_file = await _wait_for_jsonl_with_user_markers(
+                required_jsonl_markers,
+                timeout=120.0,
+            )
+            assert output_file.exists(), f"child JSONL output file missing: {output_file}"
+            user_text = "\n".join(_jsonl_user_texts(output_file))
+            for marker in required_jsonl_markers:
+                assert marker in user_text
         finally:
             prompt_file2.unlink(missing_ok=True)
 

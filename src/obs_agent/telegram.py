@@ -272,6 +272,8 @@ class _ForkTaskRecord:
     child_route: TelegramRoute
     child_session_id: str
     prompt: str
+    prompt_file: str | None = None
+    prompt_file_content: str | None = None
     description: str | None = None
     timeout_ms: int | None = None
     max_turns: int | None = None
@@ -7217,10 +7219,30 @@ class TelegramBot:
             lines.append(f"max_turns: {max_turns}")
         if prompt_file:
             lines.append(f"prompt_file: {html.escape(prompt_file)}")
-        else:
+        if prompt:
             lines.append("prompt:")
             lines.append(html.escape(prompt))
         return "\n".join(lines)
+
+    @staticmethod
+    def _compose_prompt_file_context(
+        *,
+        prompt: str,
+        prompt_file: str | None,
+        prompt_file_content: str | None,
+    ) -> str:
+        if not prompt_file_content:
+            return prompt
+        file_block = "\n".join(
+            [
+                f'<prompt_file_context path="{html.escape(prompt_file or "")}">',
+                html.escape(prompt_file_content),
+                "</prompt_file_context>",
+            ]
+        )
+        if prompt:
+            return f"{file_block}\n\n{prompt}"
+        return file_block
 
     def _build_fork_task_launch_text(
         self,
@@ -7713,6 +7735,8 @@ class TelegramBot:
             or record.parent_source_uuid
         )
         record.prompt = wake_prompt
+        record.prompt_file = None
+        record.prompt_file_content = None
         record.status = "launched"
         record.error = None
         record.terminal_request = None
@@ -8254,6 +8278,7 @@ class TelegramBot:
             else None
         )
         prompt_file = str(args.get("prompt_file") or "").strip() or None
+        prompt_file_content = str(args.get("prompt_file_content") or "").strip() or None
         model = str(args.get("model") or "").strip() or None
         inherit_schedules = args.get("inherit_schedules", True)
         env_override: dict[str, str] | None = args.get("env")
@@ -8334,6 +8359,8 @@ class TelegramBot:
             child_route=child_route,
             child_session_id=created["child_session_id"],
             prompt=prompt,
+            prompt_file=prompt_file,
+            prompt_file_content=prompt_file_content,
             description=description,
             timeout_ms=timeout_ms,
             max_turns=max_turns,
@@ -8426,7 +8453,11 @@ class TelegramBot:
             )
         try:
             async with child_lock:
-                child_prompt = record.prompt
+                child_prompt = self._compose_prompt_file_context(
+                    prompt=record.prompt,
+                    prompt_file=record.prompt_file,
+                    prompt_file_content=record.prompt_file_content,
+                )
                 if record.max_turns is not None:
                     child_prompt = (
                         f"(System: complete this task in at most {record.max_turns} turns.)\n\n"

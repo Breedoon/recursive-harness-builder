@@ -1446,7 +1446,7 @@ class TestPromptFile:
         assert result["content"][0]["text"] == "ok"
         state.fork_task_launcher.assert_awaited_once()
         launch_args = state.fork_task_launcher.await_args.args[0]
-        assert launch_args["prompt"] == "Search the codebase for bugs"
+        assert launch_args["prompt_file_content"] == "Search the codebase for bugs"
 
     @pytest.mark.asyncio
     async def test_prompt_file_absolute_path(self, monkeypatch, skill_config, tmp_path):
@@ -1469,7 +1469,7 @@ class TestPromptFile:
 
         assert result["content"][0]["text"] == "ok"
         launch_args = state.fork_task_launcher.await_args.args[0]
-        assert launch_args["prompt"] == "External task content"
+        assert launch_args["prompt_file_content"] == "External task content"
 
     @pytest.mark.asyncio
     async def test_prompt_file_tilde_path(self, monkeypatch, skill_config, tmp_path):
@@ -1504,7 +1504,7 @@ class TestPromptFile:
 
         assert result["content"][0]["text"] == "ok"
         launch_args = state.fork_task_launcher.await_args.args[0]
-        assert launch_args["prompt"] == "Home dir task"
+        assert launch_args["prompt_file_content"] == "Home dir task"
 
     @pytest.mark.asyncio
     async def test_prompt_file_not_found_returns_error(self, monkeypatch, skill_config):
@@ -1524,25 +1524,29 @@ class TestPromptFile:
         state.fork_task_launcher.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_prompt_and_prompt_file_both_rejected(self, monkeypatch, skill_config):
-        """Providing both prompt and prompt_file is rejected."""
+    async def test_prompt_and_prompt_file_both_passed_separately(self, monkeypatch, skill_config):
+        """Providing both prompt and prompt_file preserves them as separate payload fields."""
         from obs_agent.tools import create_obs_tools
 
-        # Create a valid file so the error isn't about file-not-found
         prompt_path = skill_config.vault_path / "task.md"
         prompt_path.write_text("file content", encoding="utf-8")
 
         captured = _capture_tools(monkeypatch)
         state = HookState()
-        state.fork_task_launcher = AsyncMock()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
         handler = _tool_handler(captured["tools"], "AgentTask")
 
         result = await handler({"prompt": "inline prompt", "prompt_file": "task.md"})
 
-        assert result["is_error"] is True
-        assert "mutually exclusive" in result["content"][0]["text"]
-        state.fork_task_launcher.assert_not_awaited()
+        assert result["content"][0]["text"] == "ok"
+        state.fork_task_launcher.assert_awaited_once()
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == "inline prompt"
+        assert launch_args["prompt_file"] == "task.md"
+        assert launch_args["prompt_file_content"] == "file content"
 
     @pytest.mark.asyncio
     async def test_neither_prompt_nor_prompt_file_errors(self, monkeypatch, skill_config):
@@ -1583,7 +1587,7 @@ class TestPromptFile:
         assert result["content"][0]["text"] == "ok"
         launch_args = state.fork_task_launcher.await_args.args[0]
         assert launch_args["prompt_file"] == "procedures/audit.md"
-        assert launch_args["prompt"] == "Audit the vault"
+        assert launch_args["prompt_file_content"] == "Audit the vault"
 
     @pytest.mark.asyncio
     async def test_prompt_file_whitespace_stripped(self, monkeypatch, skill_config):
@@ -1605,7 +1609,7 @@ class TestPromptFile:
 
         assert result["content"][0]["text"] == "ok"
         launch_args = state.fork_task_launcher.await_args.args[0]
-        assert launch_args["prompt"] == "Do the thing"
+        assert launch_args["prompt_file_content"] == "Do the thing"
 
     @pytest.mark.asyncio
     async def test_prompt_file_empty_file_errors(self, monkeypatch, skill_config):
@@ -1626,6 +1630,27 @@ class TestPromptFile:
         assert result["is_error"] is True
         assert "prompt or prompt_file is required" in result["content"][0]["text"]
         state.fork_task_launcher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prompt_only_payload_unchanged(self, monkeypatch, skill_config):
+        """Prompt-only launch still sends the prompt without prompt_file fields."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "inline only"})
+
+        assert result["content"][0]["text"] == "ok"
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == "inline only"
+        assert "prompt_file" not in launch_args
+        assert "prompt_file_content" not in launch_args
 
 
 class TestHooksParameter:
