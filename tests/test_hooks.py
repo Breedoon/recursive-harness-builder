@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 import pytest
 
 from obs_agent.config import OBSConfig
+from obs_agent.lineage import build_obs_bootstrap_xml
 from obs_agent.hooks import (
     on_pre_tool_use,
     on_stop,
@@ -1048,6 +1049,48 @@ class TestMakeUserHookCheck:
         assert obs["agent_output"] is outputter
         assert obs["agent_stop"] is stopper
         assert obs["session_id"] == "sess-123"
+        assert obs["sdk_env_overrides"] == {}
+        assert obs["bootstrap"] is None
+
+    @pytest.mark.asyncio
+    async def test_context_enriched_with_sdk_env_overrides_and_bootstrap(self, tmp_path):
+        """Hooks can read SDK env overrides and bootstrap identity from context['obs']."""
+        received_context = {}
+
+        def capture_hook(hook_input, tool_use_id, context):
+            received_context.update(context)
+            return None
+
+        bootstrap_xml = build_obs_bootstrap_xml(
+            lineage=("Root", "Worker"),
+            origin="agent_task_fresh",
+            is_fork=False,
+            session_id=None,
+            root_team_key="2026-03-31-10-00-root",
+            agent_name="aaaaaaaaaa-worker",
+        )
+        state = HookState(
+            pending_obs_bootstrap_xml=bootstrap_xml,
+            sdk_env_overrides={
+                "CLAUDE_CODE_TEAM_NAME": "2026-03-31-10-00-root",
+                "CLAUDE_CODE_AGENT_NAME": "aaaaaaaaaa-worker",
+            },
+            vault_path=tmp_path,
+        )
+        check = _make_user_hook_check(capture_hook, state)
+        await check({"tool_name": "Read", "session_id": "sid-live"}, "tu-7", {})
+
+        obs = received_context["obs"]
+        assert obs["session_id"] == "sid-live"
+        assert obs["sdk_env_overrides"] == {
+            "CLAUDE_CODE_TEAM_NAME": "2026-03-31-10-00-root",
+            "CLAUDE_CODE_AGENT_NAME": "aaaaaaaaaa-worker",
+        }
+        assert obs["bootstrap"]["lineage"] == ["Root", "Worker"]
+        assert obs["bootstrap"]["session_id"] == "sid-live"
+        assert obs["bootstrap"]["root_team_key"] == "2026-03-31-10-00-root"
+        assert obs["bootstrap"]["agent_name"] == "aaaaaaaaaa-worker"
+        assert obs["bootstrap"]["xml"] == bootstrap_xml
 
     @pytest.mark.asyncio
     async def test_context_obs_none_when_state_fields_none(self):
@@ -1068,6 +1111,8 @@ class TestMakeUserHookCheck:
         assert obs["agent_output"] is None
         assert obs["agent_stop"] is None
         assert obs["session_id"] is None
+        assert obs["sdk_env_overrides"] == {}
+        assert obs["bootstrap"] is None
 
     @pytest.mark.asyncio
     async def test_original_context_not_mutated(self):

@@ -8,6 +8,7 @@ from obs_agent.lineage import (
     build_obs_bootstrap_xml,
     extract_obs_bootstrap_xml,
     find_latest_obs_bootstrap_in_jsonl,
+    obs_bootstrap_to_dict,
     parse_obs_bootstrap_xml,
     root_team_key_for_lineage,
 )
@@ -43,6 +44,33 @@ def test_bootstrap_round_trip_and_projection(tmp_path):
         team_key=root_team_key_for_lineage(lineage),
     )
     assert parsed.parent_display_name == "Child Topic"
+
+
+def test_obs_bootstrap_to_dict_matches_session_lineage_payload() -> None:
+    lineage = ("Root", "Worker")
+    xml = build_obs_bootstrap_xml(
+        lineage=lineage,
+        origin="agent_task_fresh",
+        is_fork=False,
+        session_id=None,
+        root_team_key="2026-03-31-10-00-root",
+        agent_name="aaaaaaaaaa-worker",
+    )
+    bootstrap = parse_obs_bootstrap_xml(xml)
+
+    payload = obs_bootstrap_to_dict(bootstrap, session_id="sid-live", include_xml=True)
+
+    assert payload["lineage"] == ["Root", "Worker"]
+    assert payload["lineage_length"] == 2
+    assert payload["session_id"] == "sid-live"
+    assert payload["root_team_key"] == "2026-03-31-10-00-root"
+    assert payload["agent_name"] == "aaaaaaaaaa-worker"
+    assert payload["path"] == "Root/Worker"
+    assert payload["agent_names"] == [
+        "2026-03-31-10-00-root",
+        agent_name_for_lineage(lineage, team_key="2026-03-31-10-00-root"),
+    ]
+    assert payload["xml"] == xml
 
 
 def test_latest_bootstrap_wins_when_scanning_jsonl(tmp_path):

@@ -109,6 +109,8 @@ class SessionManager:
             for key, value in (env or {}).items()
             if str(key).strip() and str(value).strip()
         }
+        self.hook_state.sdk_env_overrides = dict(self._sdk_env_overrides)
+        self.hook_state.vault_path = self.config.vault_path
 
     @property
     def sdk_env_overrides(self) -> dict[str, str]:
@@ -144,6 +146,8 @@ class SessionManager:
             **_DEFAULT_SDK_ENV,
             **self._sdk_env_overrides,
         }
+        self.hook_state.sdk_env_overrides = dict(self._sdk_env_overrides)
+        self.hook_state.vault_path = self.config.vault_path
 
         # When a model override is active, inject context window and compaction
         # settings so the CC CLI subprocess behaves correctly for the model.

@@ -29,6 +29,7 @@ from obs_agent.lineage import (
     agent_name_for_lineage,
     lineage_fingerprint,
     normalize_lineage_name,
+    obs_bootstrap_to_dict,
     parse_obs_bootstrap_xml,
     slugify_projection_label,
 )
@@ -1280,33 +1281,11 @@ def create_obs_tools(
         bootstrap = _current_obs_bootstrap()
         if bootstrap is None:
             return _error_result("Cannot use session_lineage: no OBS bootstrap found for current session")
-        payload: dict[str, Any] = {
-            "lineage": list(bootstrap.lineage),
-            "lineage_length": len(bootstrap.lineage),
-            "origin": bootstrap.origin,
-            "is_fork": bootstrap.is_fork,
-            "session_id": bootstrap.session_id or get_session_id(),
-            "agent_id": bootstrap.agent_id,
-            "parent_session_id": bootstrap.parent_session_id,
-            "root_team_key": bootstrap.root_team_key,
-            "agent_name": bootstrap.agent_name,
-            "parent_agent_name": bootstrap.parent_agent_name,
-            "parent_display_name": bootstrap.parent_display_name,
-            "path": "/".join(bootstrap.lineage),
-        }
-        # Compute agent_names for each node in the lineage
-        agent_names = []
-        for i in range(len(bootstrap.lineage)):
-            sub = bootstrap.lineage[: i + 1]
-            agent_names.append(
-                agent_name_for_lineage(
-                    sub,
-                    team_key=bootstrap.root_team_key,
-                )
-            )
-        payload["agent_names"] = agent_names
-        if include_xml:
-            payload["xml"] = bootstrap.raw_xml
+        payload = obs_bootstrap_to_dict(
+            bootstrap,
+            session_id=get_session_id(),
+            include_xml=include_xml,
+        )
         return {
             "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=True)}],
             "tool_use_result": payload,

@@ -298,6 +298,56 @@ def parse_obs_bootstrap_xml(xml_text: str) -> ObsBootstrap:
     )
 
 
+def obs_bootstrap_to_dict(
+    bootstrap: ObsBootstrap,
+    *,
+    session_id: str | None = None,
+    include_xml: bool = False,
+) -> dict[str, Any]:
+    """Return the JSON-serializable session_lineage payload for a bootstrap."""
+    payload: dict[str, Any] = {
+        "lineage": list(bootstrap.lineage),
+        "lineage_length": len(bootstrap.lineage),
+        "origin": bootstrap.origin,
+        "is_fork": bootstrap.is_fork,
+        "session_id": bootstrap.session_id or session_id,
+        "agent_id": bootstrap.agent_id,
+        "parent_session_id": bootstrap.parent_session_id,
+        "root_team_key": bootstrap.root_team_key,
+        "agent_name": bootstrap.agent_name,
+        "parent_agent_name": bootstrap.parent_agent_name,
+        "parent_display_name": bootstrap.parent_display_name,
+        "path": "/".join(bootstrap.lineage),
+    }
+    payload["agent_names"] = [
+        agent_name_for_lineage(
+            bootstrap.lineage[: i + 1],
+            team_key=bootstrap.root_team_key,
+        )
+        for i in range(len(bootstrap.lineage))
+    ]
+    if include_xml:
+        payload["xml"] = bootstrap.raw_xml
+    return payload
+
+
+def resolve_obs_bootstrap(
+    *,
+    pending_xml: str | None = None,
+    session_id: str | None = None,
+    cwd: str | Path | None = None,
+) -> ObsBootstrap | None:
+    """Resolve the current bootstrap from pending XML, then session JSONL."""
+    if pending_xml:
+        try:
+            return parse_obs_bootstrap_xml(pending_xml)
+        except Exception:
+            pass
+    if not session_id or cwd is None:
+        return None
+    return find_latest_obs_bootstrap_for_session(session_id=session_id, cwd=cwd)
+
+
 def _message_text_blocks(content: Any) -> Iterable[str]:
     if isinstance(content, str):
         yield content

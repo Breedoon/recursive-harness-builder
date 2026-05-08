@@ -28,6 +28,7 @@ from claude_agent_sdk.types import (
     SyncHookJSONOutput,
 )
 
+from obs_agent.lineage import obs_bootstrap_to_dict, resolve_obs_bootstrap
 from obs_agent.queueing import coerce_queued_message
 
 if TYPE_CHECKING:
@@ -232,6 +233,8 @@ class HookState:
     inbox_recipient_validator: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     inbox_message_notifier: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None
     stop_event_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    sdk_env_overrides: dict[str, str] = field(default_factory=dict)
+    vault_path: Path | None = None
     current_tool_use_id: str | None = None
     schedule_run_active: bool = False
     execution_active: bool = False
@@ -266,6 +269,8 @@ class HookState:
         self.pause_queue_delivery = False
         self.session_id = None
         self.last_result_data = None
+        self.sdk_env_overrides = {}
+        self.vault_path = None
         self.current_tool_use_id = None
         self.schedule_run_active = False
         self.execution_active = False
@@ -645,6 +650,51 @@ def load_hook_function(file_path: str, function_name: str) -> Callable:
     return func
 
 
+# Mapping from user-facing name → HookState attribute.
+# Add new capabilities here — they'll be automatically exposed in context["obs"].
+_OBS_CONTEXT_FIELDS: dict[str, str] = {
+    # Agent lifecycle
+    "launch_agent": "fork_task_launcher",
+    "agent_output": "fork_task_outputter",
+    "agent_stop": "fork_task_stopper",
+    # Scheduling
+    "cron_creator": "cron_creator",
+    "cron_lister": "cron_lister",
+    "cron_deleter": "cron_deleter",
+    # Messaging
+    "inbox_message_notifier": "inbox_message_notifier",
+    "inbox_recipient_validator": "inbox_recipient_validator",
+    # Session
+    "session_id": "session_id",
+}
+
+
+def _build_obs_context(
+    state: "HookState",
+    hook_input: HookInput | None = None,
+) -> dict[str, Any]:
+    """Build the context["obs"] dict from HookState using the field mapping."""
+    obs_context = {key: getattr(state, attr, None) for key, attr in _OBS_CONTEXT_FIELDS.items()}
+    session_id = obs_context.get("session_id")
+    if not session_id and hook_input is not None:
+        input_session_id = hook_input.get("session_id")
+        if isinstance(input_session_id, str) and input_session_id.strip():
+            session_id = input_session_id.strip()
+            obs_context["session_id"] = session_id
+    obs_context["sdk_env_overrides"] = dict(state.sdk_env_overrides)
+    bootstrap = resolve_obs_bootstrap(
+        pending_xml=state.pending_obs_bootstrap_xml,
+        session_id=session_id,
+        cwd=state.vault_path,
+    )
+    obs_context["bootstrap"] = (
+        obs_bootstrap_to_dict(bootstrap, session_id=session_id, include_xml=True)
+        if bootstrap is not None
+        else None
+    )
+    return obs_context
+
+
 def _make_user_hook_check(user_fn: Callable, state: "HookState") -> "CheckFn":
     """Wrap a user-provided hook function into a CheckFn for HookPipeline.
 
@@ -664,12 +714,7 @@ def _make_user_hook_check(user_fn: Callable, state: "HookState") -> "CheckFn":
         try:
             # Enrich context with OBS capabilities
             enriched_context: dict[str, Any] = dict(context) if context else {}
-            enriched_context["obs"] = {
-                "launch_agent": state.fork_task_launcher,
-                "agent_output": state.fork_task_outputter,
-                "agent_stop": state.fork_task_stopper,
-                "session_id": state.session_id,
-            }
+            enriched_context["obs"] = _build_obs_context(state, hook_input)
 
             result = user_fn(hook_input, tool_use_id, enriched_context)
             if inspect.isawaitable(result):

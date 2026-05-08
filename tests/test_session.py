@@ -147,6 +147,17 @@ class TestCreateOptions:
         assert options.env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert options.env["CLAUDE_CODE_TASK_LIST_ID"] == "team-alpha"
 
+    def test_exposes_sdk_env_overrides_to_hook_state(self, config):
+        state = HookState()
+        mgr = SessionManager(config=config, hook_state=state)
+        mgr.set_sdk_env_overrides({"CLAUDE_CODE_TEAM_NAME": "team-alpha"})
+        assert state.sdk_env_overrides == {"CLAUDE_CODE_TEAM_NAME": "team-alpha"}
+        assert state.vault_path == config.vault_path
+
+        mgr.create_options()
+        assert state.sdk_env_overrides == {"CLAUDE_CODE_TEAM_NAME": "team-alpha"}
+        assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in state.sdk_env_overrides
+
     def test_includes_default_sdk_hardening_env(self, config):
         mgr = SessionManager(config=config)
         options = mgr.create_options()
