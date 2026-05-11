@@ -141,6 +141,7 @@ class SessionManager:
         tool_server = create_obs_tools(self.config, lambda: self._session_id, hook_state=self.hook_state)
 
         effective_model = self.model_override or self.config.model
+        self.hook_state.effective_model = effective_model
 
         effective_env = {
             **_DEFAULT_SDK_ENV,

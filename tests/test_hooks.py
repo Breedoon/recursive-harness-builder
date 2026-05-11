@@ -726,6 +726,30 @@ class TestHookStateStatusQueue:
         got = state.status_queue.get_nowait()
         assert got is event
 
+    def test_reset_clears_runtime_snapshot_fields(self):
+        state = HookState(
+            sdk_env_overrides={"A": "B"},
+            vault_path=Path("/tmp"),
+            effective_model="claude-opus-4-6[1m]",
+            current_tool_use_id="tu",
+            schedule_run_active=True,
+            execution_active=True,
+            triggered_schedule_id="sched",
+            active_schedule={"id": "sched"},
+            pending_obs_bootstrap_xml="<obs-bootstrap/>",
+        )
+
+        state.reset()
+
+        assert state.sdk_env_overrides == {}
+        assert state.vault_path is None
+        assert state.effective_model is None
+        assert state.current_tool_use_id is None
+        assert state.schedule_run_active is False
+        assert state.execution_active is False
+        assert state.triggered_schedule_id is None
+        assert state.active_schedule is None
+
 
 class TestCheckNotification:
     """_make_notification_check mirrors hook notifications into status queue."""
@@ -776,6 +800,9 @@ class TestCheckStop:
     async def test_stop_event_notifies_transport(self):
         state = HookState()
         state.stop_event_notifier = AsyncMock()
+        state.current_tool_use_id = "tu-stop"
+        state.triggered_schedule_id = "sched-stop"
+        state.active_schedule = {"id": "sched-stop"}
         check = _make_stop_check(state)
 
         result = await check(_make_stop_input(), None, _EMPTY_CONTEXT)
@@ -786,6 +813,9 @@ class TestCheckStop:
         assert payload["session_id"] == "test-session"
         assert payload["schedule_run_active"] is False
         assert payload["execution_active"] is False
+        assert payload["current_tool_use_id"] == "tu-stop"
+        assert payload["triggered_schedule_id"] == "sched-stop"
+        assert payload["active_schedule"] == {"id": "sched-stop"}
 
 
 class TestCreateHookMatchers:
@@ -1039,6 +1069,12 @@ class TestMakeUserHookCheck:
             fork_task_launcher=launcher,
             fork_task_outputter=outputter,
             fork_task_stopper=stopper,
+            current_tool_use_id="tu-existing",
+            schedule_run_active=True,
+            execution_active=True,
+            triggered_schedule_id="sched-123",
+            active_schedule={"id": "sched-123", "description": "test schedule"},
+            effective_model="claude-opus-4-6[1m]",
         )
         check = _make_user_hook_check(capture_hook, state)
         await check({"tool_name": "Read"}, "tu-6", {"signal": None})
@@ -1049,6 +1085,18 @@ class TestMakeUserHookCheck:
         assert obs["agent_output"] is outputter
         assert obs["agent_stop"] is stopper
         assert obs["session_id"] == "sess-123"
+        assert obs["runtime"] == {
+            "schedule_run_active": True,
+            "execution_active": True,
+            "current_tool_use_id": "tu-existing",
+        }
+        assert obs["schedule"] == {
+            "triggered_schedule_id": "sched-123",
+            "active_schedule": {"id": "sched-123", "description": "test schedule"},
+        }
+        assert obs["triggered_schedule_id"] == "sched-123"
+        assert obs["active_schedule"] == {"id": "sched-123", "description": "test schedule"}
+        assert obs["effective_model"] == "claude-opus-4-6[1m]"
         assert obs["sdk_env_overrides"] == {}
         assert obs["bootstrap"] is None
 
@@ -1093,6 +1141,57 @@ class TestMakeUserHookCheck:
         assert obs["bootstrap"]["xml"] == bootstrap_xml
 
     @pytest.mark.asyncio
+    async def test_context_exposes_pre_tool_use_id_immediately(self):
+        received_context = {}
+
+        def capture_hook(hook_input, tool_use_id, context):
+            received_context.update(context)
+            return None
+
+        state = HookState()
+        check = _make_user_hook_check(capture_hook, state)
+        await check(_make_pre_tool_use_input(), "tu-live", {})
+
+        assert received_context["obs"]["runtime"]["current_tool_use_id"] == "tu-live"
+
+    @pytest.mark.asyncio
+    async def test_context_uses_safe_snapshot_provider(self):
+        received_context = {}
+
+        def capture_hook(hook_input, tool_use_id, context):
+            received_context.update(context)
+            return None
+
+        def snapshot_provider(**kwargs):
+            assert kwargs["session_id"] == "sid-live"
+            assert kwargs["tool_use_id"] == "tu-snapshot"
+            return {
+                "route": {"chat_id": 123, "thread_id": 456},
+                "team": {"team_name": "root", "agent_name": "worker", "lineage": ["Root", "Worker"]},
+                "session": {"session_id": "sid-live", "head_uuid": "uuid-1"},
+                "topic": {"title": "Worker"},
+                "effective_model": "gpt-5.4-mini[200k]",
+                "unsafe": {"secret": "not exposed"},
+            }
+
+        state = HookState(context_snapshot_provider=snapshot_provider)
+        check = _make_user_hook_check(capture_hook, state)
+        await check({"tool_name": "Read", "session_id": "sid-live"}, "tu-snapshot", {})
+
+        obs = received_context["obs"]
+        assert obs["snapshot"] == {
+            "route": {"chat_id": 123, "thread_id": 456},
+            "team": {"team_name": "root", "agent_name": "worker", "lineage": ["Root", "Worker"]},
+            "session": {"session_id": "sid-live", "head_uuid": "uuid-1"},
+            "topic": {"title": "Worker"},
+            "effective_model": "gpt-5.4-mini[200k]",
+        }
+        assert obs["route"] == {"chat_id": 123, "thread_id": 456}
+        assert obs["team"]["agent_name"] == "worker"
+        assert obs["effective_model"] == "gpt-5.4-mini[200k]"
+        assert "unsafe" not in obs["snapshot"]
+
+    @pytest.mark.asyncio
     async def test_context_obs_none_when_state_fields_none(self):
         """When HookState fields are None, context['obs'] values are None (not crash)."""
         received_context = {}
@@ -1111,6 +1210,17 @@ class TestMakeUserHookCheck:
         assert obs["agent_output"] is None
         assert obs["agent_stop"] is None
         assert obs["session_id"] is None
+        assert obs["runtime"] == {
+            "schedule_run_active": False,
+            "execution_active": False,
+            "current_tool_use_id": None,
+        }
+        assert obs["schedule"] == {
+            "triggered_schedule_id": None,
+            "active_schedule": None,
+        }
+        assert obs["snapshot"] is None
+        assert obs["effective_model"] is None
         assert obs["sdk_env_overrides"] == {}
         assert obs["bootstrap"] is None
 

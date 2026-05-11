@@ -127,6 +127,13 @@ class TestCreateOptions:
         options = mgr.create_options()
         assert options.model == "haiku"
 
+    def test_exposes_effective_model_to_hook_state(self, config):
+        state = HookState()
+        mgr = SessionManager(config=config, hook_state=state)
+        mgr.model_override = "gpt-5.4-mini[200k]"
+        mgr.create_options()
+        assert state.effective_model == "gpt-5.4-mini[200k]"
+
     def test_passes_hook_state_to_obs_tools(self, config):
         state = HookState()
         mgr = SessionManager(config=config, hook_state=state)

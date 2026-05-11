@@ -1183,6 +1183,81 @@ class TestBackgroundPoller:
 
 
 class TestTopicScheduling:
+    async def test_hook_context_snapshot_provider_exposes_route_topic_team_and_model(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=70)
+        state = bot._get_state(route, topic_title="Root - Worker")
+        assert state is not None
+        state.session_manager.set_session_id("sid-worker")
+        state.session_manager.model_override = "gpt-5.4-mini[200k]"
+        state.agent_lineage = ("Root", "Worker")
+        state.session_manager.set_sdk_env_overrides(
+            {
+                "CLAUDE_CODE_TEAM_NAME": "root-team",
+                "CLAUDE_CODE_AGENT_NAME": "worker-agent",
+            }
+        )
+        bot._session_heads["sid-worker"] = "uuid-head"
+
+        snapshot = state.hook_state.context_snapshot_provider()
+
+        assert snapshot["route"] == {"chat_id": 67890, "thread_id": 70}
+        assert snapshot["topic"]["title"] == "Root - Worker"
+        assert snapshot["session"] == {"session_id": "sid-worker", "head_uuid": "uuid-head"}
+        assert snapshot["team"] == {
+            "team_name": "root-team",
+            "agent_name": "worker-agent",
+            "lineage": ["Root", "Worker"],
+        }
+        assert snapshot["effective_model"] == "gpt-5.4-mini[200k]"
+
+    async def test_execute_schedule_sets_runtime_schedule_context(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=71)
+        state = bot._get_state(route, topic_title="Scheduled")
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=100))
+        state.last_bot = fake_bot
+        record = _TopicScheduleRecord(
+            schedule_id="sched-runtime",
+            route=route,
+            description="runtime context",
+            schedule_mode="interval",
+            cron_expr=None,
+            trigger_kind="interval",
+            interval_seconds=10,
+            prompt="run",
+            max_runs=1,
+            next_run_at=0,
+        )
+        bot._register_topic_schedule(record)
+        seen: dict[str, object] = {}
+
+        async def fake_run_and_send(**kwargs):
+            seen["schedule_run_active"] = state.hook_state.schedule_run_active
+            seen["triggered_schedule_id"] = state.hook_state.triggered_schedule_id
+            seen["active_schedule"] = dict(state.hook_state.active_schedule or {})
+            seen["triggered_kwarg"] = kwargs["triggered_schedule_id"]
+            return _RunOutcome(assistant_text="ok")
+
+        with patch.object(bot, "_run_and_send", side_effect=fake_run_and_send), patch.object(
+            bot,
+            "_send_system_message",
+            new_callable=AsyncMock,
+        ):
+            ran = await bot._execute_topic_schedule(record=record, trigger_kind="interval")
+
+        assert ran is True
+        assert seen["schedule_run_active"] is True
+        assert seen["triggered_schedule_id"] == "sched-runtime"
+        assert seen["triggered_kwarg"] == "sched-runtime"
+        assert seen["active_schedule"]["id"] == "sched-runtime"
+        assert seen["active_schedule"]["description"] == "runtime context"
+        assert state.hook_state.schedule_run_active is False
+        assert state.hook_state.triggered_schedule_id is None
+        assert state.hook_state.active_schedule is None
+
     async def test_default_schedule_is_seeded_from_settings_on_new_route(self, config):
         settings_path = config.vault_path / ".claude" / "settings.json"
         settings_path.write_text(

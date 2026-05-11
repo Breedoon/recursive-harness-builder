@@ -233,11 +233,15 @@ class HookState:
     inbox_recipient_validator: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     inbox_message_notifier: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None
     stop_event_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    context_snapshot_provider: Callable[..., dict[str, Any] | None] | None = None
     sdk_env_overrides: dict[str, str] = field(default_factory=dict)
     vault_path: Path | None = None
+    effective_model: str | None = None
     current_tool_use_id: str | None = None
     schedule_run_active: bool = False
     execution_active: bool = False
+    triggered_schedule_id: str | None = None
+    active_schedule: dict[str, Any] | None = None
     pending_obs_bootstrap_xml: str | None = None  # set by telegram.py when bootstrap is primed
 
     def reset(self) -> None:
@@ -271,9 +275,12 @@ class HookState:
         self.last_result_data = None
         self.sdk_env_overrides = {}
         self.vault_path = None
+        self.effective_model = None
         self.current_tool_use_id = None
         self.schedule_run_active = False
         self.execution_active = False
+        self.triggered_schedule_id = None
+        self.active_schedule = None
 
 
 class HookPipeline:
@@ -565,6 +572,11 @@ def _make_stop_check(state: HookState) -> CheckFn:
             "hook_input": dict(hook_input),
             "schedule_run_active": bool(state.schedule_run_active),
             "execution_active": bool(state.execution_active),
+            "current_tool_use_id": state.current_tool_use_id,
+            "triggered_schedule_id": state.triggered_schedule_id,
+            "active_schedule": (
+                dict(state.active_schedule) if isinstance(state.active_schedule, dict) else None
+            ),
         }
         await notifier(payload)
         return None
@@ -651,7 +663,8 @@ def load_hook_function(file_path: str, function_name: str) -> Callable:
 
 
 # Mapping from user-facing name → HookState attribute.
-# Add new capabilities here — they'll be automatically exposed in context["obs"].
+# Keep this list intentionally small: user hooks receive only vetted callables
+# and safe snapshot data, not a generic public tool registry.
 _OBS_CONTEXT_FIELDS: dict[str, str] = {
     # Agent lifecycle
     "launch_agent": "fork_task_launcher",
@@ -668,12 +681,32 @@ _OBS_CONTEXT_FIELDS: dict[str, str] = {
     "session_id": "session_id",
 }
 
+_SAFE_SNAPSHOT_KEYS = {
+    "route",
+    "team",
+    "session",
+    "topic",
+    "effective_model",
+}
+
+
+def _safe_snapshot_dict(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    snapshot = {
+        key: value[key]
+        for key in _SAFE_SNAPSHOT_KEYS
+        if key in value
+    }
+    return snapshot or None
+
 
 def _build_obs_context(
     state: "HookState",
     hook_input: HookInput | None = None,
+    tool_use_id: str | None = None,
 ) -> dict[str, Any]:
-    """Build the context["obs"] dict from HookState using the field mapping."""
+    """Build context["obs"] with vetted callables and safe runtime snapshots."""
     obs_context = {key: getattr(state, attr, None) for key, attr in _OBS_CONTEXT_FIELDS.items()}
     session_id = obs_context.get("session_id")
     if not session_id and hook_input is not None:
@@ -681,7 +714,52 @@ def _build_obs_context(
         if isinstance(input_session_id, str) and input_session_id.strip():
             session_id = input_session_id.strip()
             obs_context["session_id"] = session_id
+
+    current_tool_use_id = state.current_tool_use_id
+    if (
+        hook_input is not None
+        and hook_input.get("hook_event_name") in {"PreToolUse", "PostToolUse"}
+        and tool_use_id
+    ):
+        current_tool_use_id = tool_use_id
+
+    obs_context["runtime"] = {
+        "schedule_run_active": bool(state.schedule_run_active),
+        "execution_active": bool(state.execution_active),
+        "current_tool_use_id": current_tool_use_id,
+    }
+    obs_context["schedule"] = {
+        "triggered_schedule_id": state.triggered_schedule_id,
+        "active_schedule": dict(state.active_schedule) if isinstance(state.active_schedule, dict) else None,
+    }
+    obs_context["triggered_schedule_id"] = state.triggered_schedule_id
+    obs_context["active_schedule"] = (
+        dict(state.active_schedule) if isinstance(state.active_schedule, dict) else None
+    )
+    obs_context["effective_model"] = state.effective_model
     obs_context["sdk_env_overrides"] = dict(state.sdk_env_overrides)
+
+    snapshot_provider = state.context_snapshot_provider
+    snapshot = None
+    if snapshot_provider is not None:
+        try:
+            snapshot = snapshot_provider(
+                session_id=session_id,
+                hook_input=hook_input,
+                tool_use_id=tool_use_id,
+            )
+        except TypeError:
+            snapshot = snapshot_provider()
+        snapshot = _safe_snapshot_dict(snapshot)
+    obs_context["snapshot"] = snapshot
+    if snapshot:
+        for key, value in snapshot.items():
+            obs_context.setdefault(key, value)
+        if obs_context.get("effective_model") is None:
+            obs_context["effective_model"] = snapshot.get("effective_model")
+    if obs_context.get("effective_model") is None:
+        obs_context["effective_model"] = state.effective_model
+
     bootstrap = resolve_obs_bootstrap(
         pending_xml=state.pending_obs_bootstrap_xml,
         session_id=session_id,
@@ -714,7 +792,7 @@ def _make_user_hook_check(user_fn: Callable, state: "HookState") -> "CheckFn":
         try:
             # Enrich context with OBS capabilities
             enriched_context: dict[str, Any] = dict(context) if context else {}
-            enriched_context["obs"] = _build_obs_context(state, hook_input)
+            enriched_context["obs"] = _build_obs_context(state, hook_input, tool_use_id)
 
             result = user_fn(hook_input, tool_use_id, enriched_context)
             if inspect.isawaitable(result):

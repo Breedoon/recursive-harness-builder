@@ -1843,6 +1843,8 @@ class TelegramBot:
         hook_state.inbox_recipient_validator = self._make_inbox_recipient_validator(route)
         hook_state.inbox_message_notifier = self._make_inbox_message_notifier(route)
         hook_state.stop_event_notifier = self._make_stop_event_notifier(route)
+        hook_state.context_snapshot_provider = self._make_context_snapshot_provider(route)
+        hook_state.vault_path = self._config.vault_path
         return state
 
     def _get_state(
@@ -1954,6 +1956,12 @@ class TelegramBot:
 
         return _notify
 
+    def _make_context_snapshot_provider(self, route: TelegramRoute):
+        def _snapshot(**_: Any) -> dict[str, Any]:
+            return self._build_hook_context_snapshot(route)
+
+        return _snapshot
+
     def _is_authorized(self, user_id: int) -> bool:
         # SECURITY: empty allowed list = NO ONE can use the bot (deny by default)
         allowed = self._config.telegram_allowed_user_ids
@@ -1977,6 +1985,58 @@ class TelegramBot:
         if state is None:
             return self._default_topic_title(route)
         return self._current_topic_base(state)
+
+    def _build_hook_context_snapshot(self, route: TelegramRoute) -> dict[str, Any]:
+        state = self._get_state(route, create=False)
+        route_payload: dict[str, Any] = {
+            "chat_id": route.chat_id,
+            "thread_id": route.thread_id,
+        }
+        topic_metadata = self._topic_metadata_for_route(route)
+        topic_title = (
+            state.topic_title
+            if state is not None and state.topic_title
+            else topic_metadata.title
+            or self._default_topic_title(route)
+        )
+        topic_payload: dict[str, Any] = {"title": topic_title}
+        if topic_metadata.icon_custom_emoji_id:
+            topic_payload["icon_custom_emoji_id"] = topic_metadata.icon_custom_emoji_id
+        session_payload: dict[str, Any] = {
+            "session_id": state.session_id if state is not None else None,
+        }
+        if state is not None:
+            head = self._session_heads.get(state.session_id or "")
+            if head:
+                session_payload["head_uuid"] = head
+        team_payload: dict[str, Any] | None = None
+        if state is not None:
+            projection = self._state_inbox_projection(state)
+            if projection is not None:
+                lineage = state.agent_lineage
+                bootstrap = None
+                if state.pending_obs_bootstrap:
+                    try:
+                        bootstrap = parse_obs_bootstrap_xml(state.pending_obs_bootstrap)
+                    except Exception:
+                        bootstrap = None
+                if not lineage and bootstrap is not None and bootstrap.lineage:
+                    lineage = bootstrap.lineage
+                team_payload = {
+                    "team_name": projection[0],
+                    "agent_name": projection[1],
+                    "lineage": list(lineage or ()),
+                }
+        effective_model = None
+        if state is not None:
+            effective_model = state.session_manager.model_override or self._config.model
+        return {
+            "route": route_payload,
+            "team": team_payload,
+            "session": session_payload,
+            "topic": topic_payload,
+            "effective_model": effective_model or self._config.model,
+        }
 
     def _next_auto_child_alias(self, state: TelegramSessionState) -> str:
         base = self._current_topic_base(state)
@@ -2842,6 +2902,8 @@ class TelegramBot:
                     time.time() + _SCHEDULE_STOP_SUPPRESS_SECONDS
                 )
                 state.hook_state.schedule_run_active = True
+                state.hook_state.triggered_schedule_id = record.schedule_id
+                state.hook_state.active_schedule = self._schedule_summary_payload(record)
                 try:
                     outcome = await self._run_and_send(
                         state=state,
@@ -2859,6 +2921,8 @@ class TelegramBot:
                         run_succeeded = True
                 finally:
                     state.hook_state.schedule_run_active = False
+                    state.hook_state.triggered_schedule_id = None
+                    state.hook_state.active_schedule = None
         except Exception as exc:
             now_after = time.time()
             run_failed = True
