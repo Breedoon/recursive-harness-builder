@@ -2047,3 +2047,159 @@ class TestNonClaudeForkInheritance:
 
         # Fork reply is a bonus check — proxy log is the real proof
         # (Non-Claude models may not follow exact format instructions)
+
+
+# ---------------------------------------------------------------------------
+# Hook runtime/schedule context during scheduled run
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+class TestHookScheduleContext:
+    """Verify that user hooks receive runtime, schedule, and snapshot context
+    when running inside a scheduled (CronCreate) execution."""
+
+    async def test_live_hook_context_during_scheduled_run(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        parent_thread_id = await live_tg_forum.platform.create_topic(
+            f"Hook Sched Ctx {tag}"
+        )
+
+        # Prime the parent session
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only HSC-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"HSC-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        # Create hook file that captures obs context during scheduled runs
+        marker_path = Path(f"/tmp/obs_hook_sched_ctx_{tag}.json")
+        calls_path = Path(f"/tmp/obs_hook_sched_calls_{tag}.jsonl")
+        hook_path = Path(f"/tmp/obs_hook_sched_capture_{tag}.py")
+
+        hook_path.write_text(
+            "import json\n"
+            "from pathlib import Path\n"
+            f"MARKER = Path({str(marker_path)!r})\n"
+            f"CALLS = Path({str(calls_path)!r})\n"
+            "\n"
+            "def capture(hook_input, tool_use_id, context):\n"
+            "    obs = context.get('obs', {})\n"
+            "    payload = {\n"
+            "        'runtime': obs.get('runtime'),\n"
+            "        'schedule': obs.get('schedule'),\n"
+            "        'snapshot': obs.get('snapshot'),\n"
+            "        'effective_model': obs.get('effective_model'),\n"
+            "        'tool_name': hook_input.get('tool_name'),\n"
+            "        'tool_use_id': tool_use_id,\n"
+            "    }\n"
+            "    with CALLS.open('a', encoding='utf-8') as f:\n"
+            "        f.write(json.dumps(payload, default=str) + '\\n')\n"
+            "    rt = obs.get('runtime') or {}\n"
+            "    sc = obs.get('schedule') or {}\n"
+            "    if rt.get('schedule_run_active') and sc.get('triggered_schedule_id'):\n"
+            "        MARKER.write_text(json.dumps(payload, default=str), encoding='utf-8')\n"
+            "    return None\n"
+        )
+
+        hooks_json = json.dumps({"PreToolUse": f"{hook_path}::capture"})
+        sched_token = f"HSC-FIRED-{tag}"
+        created_token = f"HSC-CREATED-{tag}"
+
+        try:
+            child_thread_id = await _launch_agent_and_get_child_thread(
+                live_tg_forum,
+                parent_thread_id=parent_thread_id,
+                fork=False,
+                prompt=(
+                    "This is a deterministic hook context test. "
+                    "Call CronCreate exactly once with "
+                    "schedule_mode='interval', cron='* * * * *', "
+                    "interval_seconds=5, reset_session=false, max_runs=1, "
+                    f"description='HSC-{tag}', "
+                    f"prompt='This is a deterministic hook context test. "
+                    f"Use Bash to run: echo {tag}. "
+                    f"Reply with only {sched_token}.', "
+                    "from='', until='', inherit='none', run_mode=''. "
+                    f"After CronCreate, reply with only {created_token}."
+                ),
+                launch_token=f"HSC-LAUNCHED-{tag}",
+                extra_params=f"hooks='{hooks_json}'",
+                timeout=240.0,
+            )
+
+            # Wait for the child to confirm schedule creation
+            await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=child_thread_id,
+                token=created_token,
+                timeout=240.0,
+            )
+
+            # Wait for the scheduled run to produce its reply
+            await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=child_thread_id,
+                token=sched_token,
+                timeout=180.0,
+            )
+
+            # Wait for the hook marker file to appear
+            deadline = asyncio.get_running_loop().time() + 30
+            while asyncio.get_running_loop().time() < deadline:
+                if marker_path.exists():
+                    break
+                await asyncio.sleep(0.5)
+
+            calls_text = (
+                calls_path.read_text(encoding="utf-8")
+                if calls_path.exists()
+                else "<no hook calls recorded>"
+            )
+            assert marker_path.exists(), (
+                f"Hook marker not written during scheduled run.\n"
+                f"Hook calls log:\n{calls_text}\n"
+                + live_tg_forum.failure_context()
+            )
+
+            data = json.loads(marker_path.read_text(encoding="utf-8"))
+
+            # Verify runtime context
+            runtime = data["runtime"]
+            assert runtime["schedule_run_active"] is True, f"Expected active: {data}"
+            assert runtime["execution_active"] is True, f"Expected executing: {data}"
+            assert runtime.get("current_tool_use_id"), f"Missing tool_use_id: {data}"
+
+            # Verify schedule context
+            schedule = data["schedule"]
+            assert schedule["triggered_schedule_id"], f"Missing schedule id: {data}"
+            active = schedule["active_schedule"]
+            assert active is not None, f"Missing active_schedule: {data}"
+            assert f"HSC-{tag}" in active.get("description", ""), (
+                f"Wrong schedule description: {data}"
+            )
+
+            # Verify snapshot context
+            snapshot = data["snapshot"]
+            assert snapshot is not None, f"Missing snapshot: {data}"
+            assert "route" in snapshot, f"Missing route in snapshot: {data}"
+            assert snapshot["route"]["thread_id"] == child_thread_id, (
+                f"Wrong thread_id: {data}"
+            )
+            assert snapshot.get("topic", {}).get("title"), (
+                f"Missing topic title: {data}"
+            )
+
+            # Verify effective model is present
+            assert data.get("effective_model"), f"Missing effective_model: {data}"
+
+        finally:
+            hook_path.unlink(missing_ok=True)
+            marker_path.unlink(missing_ok=True)
+            calls_path.unlink(missing_ok=True)
