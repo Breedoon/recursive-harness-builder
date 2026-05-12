@@ -52,21 +52,49 @@ _CONTEXT_SUFFIX_RE = re.compile(r"\[(\d+)([mk])\]$", re.IGNORECASE)
 _DEFAULT_CONTEXT_TOKENS = 1_000_000
 
 
+def _context_suffix_for_tokens(context_tokens: int) -> str:
+    if context_tokens % 1_000_000 == 0:
+        return f"[{context_tokens // 1_000_000}m]"
+    if context_tokens % 1_000 == 0:
+        return f"[{context_tokens // 1_000}k]"
+    return f"[{context_tokens}k]"
+
+
+def split_context_suffix(model_str: str) -> tuple[str, int | None]:
+    """Split a model string into (clean_model, explicit_context_tokens)."""
+    m = _CONTEXT_SUFFIX_RE.search(model_str)
+    if not m:
+        return model_str.strip(), None
+    value = int(m.group(1))
+    unit = m.group(2).lower()
+    tokens = value * 1_000_000 if unit == "m" else value * 1_000
+    clean = model_str[: m.start()].strip()
+    return clean, tokens
+
+
 def resolve_model(shorthand: str) -> str:
     """Resolve a shorthand model name to its full identifier.
 
-    If *shorthand* matches a key in MODEL_RESOLUTION, return the resolved name.
-    Otherwise return *shorthand* unchanged (assumed to be a full model name).
-    The lookup is case-insensitive.  A context suffix like ``[1m]`` is stripped
-    before lookup and re-appended to the resolved name.
+    Model identity and context window are intentionally separate.  Shorthands
+    resolve on the clean model name, then any explicit context suffix is
+    reattached.  Default context is added later at the Claude Code boundary.
     """
-    clean, ctx_tokens = parse_context_suffix(shorthand)
+    clean, ctx_tokens = split_context_suffix(shorthand)
     resolved = MODEL_RESOLUTION.get(clean.lower().strip(), clean.strip())
-    # Re-append the original suffix if one was present
-    if clean != shorthand.strip():
-        suffix = shorthand.strip()[len(clean):]
-        return resolved + suffix
+    if ctx_tokens is not None:
+        return resolved + _context_suffix_for_tokens(ctx_tokens)
     return resolved
+
+
+def normalize_model_for_claude_code(
+    model_str: str,
+    *,
+    default_context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+) -> str:
+    """Resolve model identity and ensure Claude Code receives a context suffix."""
+    resolved = resolve_model(model_str)
+    clean, ctx_tokens = split_context_suffix(resolved)
+    return clean + _context_suffix_for_tokens(ctx_tokens or default_context_tokens)
 
 
 def parse_context_suffix(model_str: str) -> tuple[str, int]:
@@ -81,14 +109,8 @@ def parse_context_suffix(model_str: str) -> tuple[str, int]:
     >>> parse_context_suffix("gemini-3.1-flash-lite-preview")
     ('gemini-3.1-flash-lite-preview', 1000000)
     """
-    m = _CONTEXT_SUFFIX_RE.search(model_str)
-    if not m:
-        return model_str.strip(), _DEFAULT_CONTEXT_TOKENS
-    value = int(m.group(1))
-    unit = m.group(2).lower()
-    tokens = value * 1_000_000 if unit == "m" else value * 1_000
-    clean = model_str[: m.start()].strip()
-    return clean, tokens
+    clean, ctx_tokens = split_context_suffix(model_str)
+    return clean, ctx_tokens or _DEFAULT_CONTEXT_TOKENS
 
 
 def compaction_threshold(context_tokens: int) -> int:
@@ -145,7 +167,7 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "claude-opus-4-6[1m]"
+    model: str = "claude-opus-4-6"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
     # Resolved via MODEL_RESOLUTION (e.g. "claude" → "claude-opus-4-6").
     # Change this to e.g. "gpt" to make root sessions default to GPT.
@@ -201,16 +223,10 @@ class OBSConfig:
         if default_model := os.environ.get("OBS_DEFAULT_MODEL"):
             kwargs["default_model"] = default_model.strip()
         if model := os.environ.get("OBS_AGENT_MODEL") or os.environ.get("OBS_MODEL"):
-            kwargs["model"] = model.strip()
+            kwargs["model"] = resolve_model(model.strip())
         else:
-            # No explicit model env var — derive from default_model via resolution.
-            # resolve_model handles shorthand lookup and preserves any context suffix.
             dm = kwargs.get("default_model", "claude")
-            resolved = resolve_model(dm)
-            # If the resolved model has no context suffix, append [1m] (platform default).
-            if not _CONTEXT_SUFFIX_RE.search(resolved):
-                resolved += "[1m]"
-            kwargs["model"] = resolved
+            kwargs["model"] = resolve_model(dm)
         if host := os.environ.get("OBS_DAEMON_HOST"):
             kwargs["daemon_host"] = host
         if port := os.environ.get("OBS_DAEMON_PORT"):

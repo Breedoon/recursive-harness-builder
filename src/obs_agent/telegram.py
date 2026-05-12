@@ -7093,11 +7093,10 @@ class TelegramBot:
                 {"temperature": temperature, "thinking": {"type": "disabled"}}
             )
         child_state.session_manager.set_sdk_env_overrides(team_env)
-        # Apply per-session model override. resolve_model handles shorthand
-        # lookup and context suffix preservation.  _build_options in session.py
-        # picks up model_override and injects the right env vars (context window,
-        # compaction threshold, API key) for non-Claude models.
-        if model:
+        # Apply per-session model override. "inherit" or omitted keeps the
+        # child's effective model on the parent's/configured model; explicit
+        # shorthands/full names are normalized at the Claude Code boundary.
+        if model and model.lower() != "inherit":
             from obs_agent.config import resolve_model
             child_state.session_manager.model_override = resolve_model(model)
         # --- User hooks ---

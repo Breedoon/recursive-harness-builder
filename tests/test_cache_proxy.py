@@ -1113,6 +1113,16 @@ class TestStripContextSuffix:
         assert cache_proxy._strip_context_suffix("") == ""
 
 
+class TestNormalizeModelName:
+    def test_resolves_claude_shorthands(self):
+        assert cache_proxy._normalize_model_name("sonnet") == "claude-sonnet-4-6"
+        assert cache_proxy._normalize_model_name("haiku[1m]") == "claude-haiku-4-5"
+
+    def test_resolves_non_claude_shorthands(self):
+        assert cache_proxy._normalize_model_name("gpt") == "gpt-5.4-mini"
+        assert cache_proxy._normalize_model_name("gpt[200k]") == "gpt-5.4-mini"
+
+
 class TestResolveUpstream:
     def test_claude_routes_to_anthropic(self):
         assert cache_proxy._resolve_upstream("claude-opus-4-6") == cache_proxy.ANTHROPIC_UPSTREAM
@@ -1122,6 +1132,10 @@ class TestResolveUpstream:
 
     def test_claude_shorthand_routes_to_anthropic(self):
         assert cache_proxy._resolve_upstream("claude") == cache_proxy.ANTHROPIC_UPSTREAM
+
+    def test_anthropic_tier_shorthands_route_to_anthropic(self):
+        assert cache_proxy._resolve_upstream("sonnet") == cache_proxy.ANTHROPIC_UPSTREAM
+        assert cache_proxy._resolve_upstream("haiku[1m]") == cache_proxy.ANTHROPIC_UPSTREAM
 
     def test_gpt_routes_to_cli_proxy(self):
         assert cache_proxy._resolve_upstream("gpt-5.5") == cache_proxy.CLI_PROXY_UPSTREAM

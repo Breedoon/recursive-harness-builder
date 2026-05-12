@@ -132,7 +132,12 @@ class SessionManager:
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with hooks, MCP tools, and resume."""
-        from obs_agent.config import compaction_threshold, is_claude_model, parse_context_suffix
+        from obs_agent.config import (
+            compaction_threshold,
+            is_claude_model,
+            normalize_model_for_claude_code,
+            parse_context_suffix,
+        )
 
         hook_matchers = create_hook_matchers(self.config, self.hook_state, user_hooks=self.user_hooks)
 
@@ -140,7 +145,7 @@ class SessionManager:
         # for background fork result delivery
         tool_server = create_obs_tools(self.config, lambda: self._session_id, hook_state=self.hook_state)
 
-        effective_model = self.model_override or self.config.model
+        effective_model = normalize_model_for_claude_code(self.model_override or self.config.model)
 
         effective_env = {
             **_DEFAULT_SDK_ENV,
@@ -149,22 +154,17 @@ class SessionManager:
         self.hook_state.sdk_env_overrides = dict(self._sdk_env_overrides)
         self.hook_state.vault_path = self.config.vault_path
 
-        # When a model override is active, inject context window and compaction
-        # settings so the CC CLI subprocess behaves correctly for the model.
-        if self.model_override:
-            _clean, ctx_tokens = parse_context_suffix(self.model_override)
-            compact_at = compaction_threshold(ctx_tokens)
-            effective_env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = str(ctx_tokens)
-            effective_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx_tokens)
-            # CLAUDE_AUTOCOMPACT_PCT_OVERRIDE controls when CC triggers compaction.
-            # Express the threshold as a percentage of the context window (0-100).
-            if ctx_tokens > 0:
-                pct = int(round(compact_at / ctx_tokens * 100))
-                effective_env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(pct)
-            # For non-Claude models, set the API key to the CLI proxy key so CC
-            # authenticates against CLIProxyAPI (the cache proxy forwards it).
-            if not is_claude_model(self.model_override):
-                effective_env["ANTHROPIC_API_KEY"] = self.config.cli_proxy_api_key
+        _clean_model, ctx_tokens = parse_context_suffix(effective_model)
+        compact_at = compaction_threshold(ctx_tokens)
+        effective_env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = str(ctx_tokens)
+        effective_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx_tokens)
+        if ctx_tokens > 0:
+            pct = int(round(compact_at / ctx_tokens * 100))
+            effective_env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(pct)
+        # For non-Claude models, set the API key to the CLI proxy key so CC
+        # authenticates against CLIProxyAPI (the cache proxy forwards it).
+        if not is_claude_model(effective_model):
+            effective_env["ANTHROPIC_API_KEY"] = self.config.cli_proxy_api_key
 
         # Route CC API traffic through the cache-normalizing proxy when enabled.
         # Forks inherit env from the parent CC process, so this propagates

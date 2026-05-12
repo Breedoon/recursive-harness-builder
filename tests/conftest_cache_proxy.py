@@ -62,11 +62,21 @@ if _ENV_FILE.exists():
                 os.environ[_key] = _val
 
 # ---------------------------------------------------------------------------
-# Unset CLAUDECODE before any SDK import — SDK refuses to run inside CC.
-# Must happen at module level, before pytest collects tests that import SDK.
+# Unset Claude Code runtime/proxy env before any SDK import.
+#
+# The tests intentionally launch their own SDK clients through their own cache
+# proxy.  When run from inside OBS/Claude Code, the parent process may already
+# have ANTHROPIC_BASE_URL pointed at an OBS proxy and ANTHROPIC_API_KEY set to
+# the local CLIProxyAPI dummy key (sk-anything).  If inherited, Claude models
+# route to Anthropic with the dummy key instead of the user's OAuth credentials.
+# Clearing these lets Claude Code use its normal OAuth auth path while the per-
+# test options below set the test proxy base URL explicitly.
 # ---------------------------------------------------------------------------
 os.environ.pop("CLAUDECODE", None)
 os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+os.environ.pop("ANTHROPIC_BASE_URL", None)
+if os.environ.get("ANTHROPIC_API_KEY") == "sk-anything":
+    os.environ.pop("ANTHROPIC_API_KEY", None)
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient  # noqa: E402
 
