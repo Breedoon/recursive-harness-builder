@@ -13,8 +13,10 @@ from obs_agent.config import (
     MODEL_RESOLUTION,
     compaction_threshold,
     is_claude_model,
+    normalize_model_for_claude_code,
     parse_context_suffix,
     resolve_model,
+    split_context_suffix,
 )
 
 
@@ -69,6 +71,25 @@ class TestModelResolution:
     def test_explicit_with_context_suffix_preserved(self):
         result = resolve_model("gpt-5.4-mini[200k]")
         assert result == "gpt-5.4-mini[200k]"
+
+    def test_resolution_does_not_add_default_context_suffix(self):
+        assert resolve_model("gpt") == "gpt-5.4-mini"
+        assert resolve_model("claude") == "claude-opus-4-6"
+
+
+class TestModelContextBoundary:
+    def test_split_context_suffix_reports_explicit_context_only(self):
+        assert split_context_suffix("gpt-5.4-mini") == ("gpt-5.4-mini", None)
+        assert split_context_suffix("gpt-5.4-mini[200k]") == ("gpt-5.4-mini", 200_000)
+
+    def test_claude_code_boundary_adds_default_1m_suffix(self):
+        assert normalize_model_for_claude_code("gpt") == "gpt-5.4-mini[1m]"
+        assert normalize_model_for_claude_code("claude") == "claude-opus-4-6[1m]"
+        assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
+
+    def test_claude_code_boundary_preserves_explicit_context_suffix(self):
+        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.4-mini[200k]"
+        assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
 
 # ---------------------------------------------------------------------------

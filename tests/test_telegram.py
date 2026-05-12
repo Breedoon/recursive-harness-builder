@@ -4065,7 +4065,10 @@ class TestForkTaskRuntime:
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=333))
         assert child_state is not None
         assert child_state.session_id is None
-        child_env = child_state.session_manager.create_options().env
+        child_options = child_state.session_manager.create_options()
+        assert child_options.model == "claude-opus-4-6[1m]"
+        child_env = child_options.env
+        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
         assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == unique_team
@@ -4073,6 +4076,162 @@ class TestForkTaskRuntime:
         # Agent name should be computed (hash-prefix + slug), not raw alias
         assert "fresh-child" in child_env["CLAUDE_CODE_AGENT_NAME"].lower(), \
             f"Agent name env var should contain 'fresh-child', got: {child_env['CLAUDE_CODE_AGENT_NAME']}"
+        await bot.shutdown()
+
+    async def test_launch_agent_task_explicit_shorthand_model_gets_1m_at_sdk_boundary(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.last_bot = MagicMock()
+        state.last_bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=334))
+        state.last_bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=930), MagicMock(message_id=931), MagicMock(message_id=932)]
+        )
+        state.session_manager.set_session_id("sid-root")
+
+        with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock):
+            await bot._launch_fork_task(
+                route=route,
+                args={
+                    "prompt": "Start fresh and report model context",
+                    "description": "GPT child",
+                    "fork": False,
+                    "model": "gpt",
+                    "task_tool_name": "AgentTask",
+                },
+            )
+
+        child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=334))
+        assert child_state is not None
+        assert child_state.session_manager.model_override == "gpt-5.4-mini"
+        child_options = child_state.session_manager.create_options()
+        assert child_options.model == "gpt-5.4-mini[1m]"
+        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert child_options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "92"
+        assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+        await bot.shutdown()
+
+    async def test_launch_agent_task_explicit_context_model_preserves_context_at_sdk_boundary(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.last_bot = MagicMock()
+        state.last_bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=335))
+        state.last_bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=940), MagicMock(message_id=941), MagicMock(message_id=942)]
+        )
+        state.session_manager.set_session_id("sid-root")
+
+        with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock):
+            await bot._launch_fork_task(
+                route=route,
+                args={
+                    "prompt": "Start fresh and report model context",
+                    "description": "Small GPT child",
+                    "fork": False,
+                    "model": "gpt[200k]",
+                    "task_tool_name": "AgentTask",
+                },
+            )
+
+        child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=335))
+        assert child_state is not None
+        assert child_state.session_manager.model_override == "gpt-5.4-mini[200k]"
+        child_options = child_state.session_manager.create_options()
+        assert child_options.model == "gpt-5.4-mini[200k]"
+        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+        assert child_options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "84"
+        await bot.shutdown()
+
+    async def test_launch_agent_task_inherit_model_keeps_parent_identity_and_adds_1m(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        config.model = "gpt-5.4-mini"
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.last_bot = MagicMock()
+        state.last_bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=336))
+        state.last_bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=950), MagicMock(message_id=951), MagicMock(message_id=952)]
+        )
+        state.session_manager.set_session_id("sid-root")
+
+        with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock):
+            await bot._launch_fork_task(
+                route=route,
+                args={
+                    "prompt": "Inherit model",
+                    "description": "Inherited child",
+                    "fork": False,
+                    "model": "inherit",
+                    "task_tool_name": "AgentTask",
+                },
+            )
+
+        child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=336))
+        assert child_state is not None
+        assert child_state.session_manager.model_override is None
+        child_options = child_state.session_manager.create_options()
+        assert child_options.model == "gpt-5.4-mini[1m]"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        await bot.shutdown()
+
+    async def test_scheduled_run_uses_route_model_context_semantics(
+        self,
+        config,
+    ):
+        config.model = "gpt-5.4-mini"
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=337)
+        state = bot._get_state(route)
+        assert state is not None
+        state.last_bot = MagicMock()
+        state.last_bot.send_message = AsyncMock(side_effect=[MagicMock(message_id=960), MagicMock(message_id=961)])
+        state.session_manager.set_session_id("sid-root")
+        record = _TopicScheduleRecord(
+            schedule_id="schedule-model-context",
+            route=route,
+            description="Model context",
+            schedule_mode="interval",
+            cron_expr=None,
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="Report context",
+            max_runs=1,
+            next_run_at=0,
+        )
+        run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="DONE"))
+
+        with patch.object(bot, "_run_and_send", run_mock):
+            await bot._execute_topic_schedule(record=record, trigger_kind="interval")
+
+        options = state.session_manager.create_options()
+        assert options.model == "gpt-5.4-mini[1m]"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        run_text = run_mock.await_args.kwargs["user_text"]
+        assert run_text.startswith("(System: scheduled execution.)")
         await bot.shutdown()
 
     async def test_launch_agent_task_registers_named_team_workers_for_peer_discovery(

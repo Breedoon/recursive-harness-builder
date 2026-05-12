@@ -80,7 +80,7 @@ def test_test_profile_maps_prefixed_env_and_sets_haiku(monkeypatch, tmp_path: Pa
     )
 
     assert profile == "test"
-    assert OBSConfig.from_env().model == "haiku"
+    assert OBSConfig.from_env().model == "claude-haiku-4-5"
     assert bootstrap_runtime_env(
         argv=["--test"],
         env_path=env_path,
@@ -152,5 +152,5 @@ def test_legacy_profile_keys_are_not_mapped(monkeypatch, tmp_path: Path) -> None
         mutate_argv=False,
     )
 
-    assert OBSConfig.from_env().model == "haiku"
+    assert OBSConfig.from_env().model == "claude-haiku-4-5"
     assert "OBS_TELEGRAM_BOT_TOKEN" not in os.environ

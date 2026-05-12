@@ -121,11 +121,11 @@ class TestCreateOptions:
         assert options.mcp_servers is not None
         assert "obs-agent" in options.mcp_servers
 
-    def test_uses_configured_model(self, config):
+    def test_uses_configured_model_with_default_1m_context_at_sdk_boundary(self, config):
         config.model = "haiku"
         mgr = SessionManager(config=config)
         options = mgr.create_options()
-        assert options.model == "haiku"
+        assert options.model == "claude-haiku-4-5[1m]"
 
     def test_exposes_effective_model_to_hook_state(self, config):
         state = HookState()
@@ -172,14 +172,51 @@ class TestCreateOptions:
         # (breaks GrowthBook / 1h cache TTL). Verify it is NOT set.
         assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in options.env
 
-    def test_model_override_sets_context_window_envs(self, config):
+    def test_root_configured_gpt_sets_1m_context_window_envs(self, config):
+        config.model = "gpt-5.4-mini"
         mgr = SessionManager(config=config)
-        mgr.model_override = "gpt-5.4-mini"
         options = mgr.create_options()
+        assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "92"
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+
+    def test_model_override_sets_default_1m_context_window_envs(self, config):
+        mgr = SessionManager(config=config)
+        mgr.model_override = "gpt-5.4-mini"
+        options = mgr.create_options()
+        assert options.model == "gpt-5.4-mini[1m]"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "92"
+        assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+
+    def test_explicit_context_override_sets_matching_envs(self, config):
+        mgr = SessionManager(config=config)
+        mgr.model_override = "gpt-5.4-mini[200k]"
+        options = mgr.create_options()
+        assert options.model == "gpt-5.4-mini[200k]"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+        assert options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "84"
+        assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+
+    def test_inherited_model_uses_parent_config_context_envs_without_override(self, config):
+        config.model = "gpt-5.4-mini"
+        mgr = SessionManager(config=config)
+        options = mgr.create_options()
+        assert mgr.model_override is None
+        assert options.model == "gpt-5.4-mini[1m]"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+
+    def test_claude_root_also_receives_1m_context_env_without_proxy_key(self, config):
+        config.model = "claude-opus-4-6"
+        mgr = SessionManager(config=config)
+        options = mgr.create_options()
+        assert options.model == "claude-opus-4-6[1m]"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert "ANTHROPIC_API_KEY" not in options.env
 
     def test_set_sdk_env_overrides_filters_empty_values(self, config):
         mgr = SessionManager(config=config)
@@ -219,6 +256,50 @@ class TestClientLifecycle:
         assert client is mock_client
         assert mgr._connected is True
         mock_client.connect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_client_passes_root_gpt_1m_context_options_to_sdk(self, config):
+        config.model = "gpt-5.4-mini"
+        mgr = SessionManager(config=config)
+        captured = {}
+        mock_client = AsyncMock()
+
+        def make_client(options):
+            captured["options"] = options
+            return mock_client
+
+        with patch("obs_agent.session.ClaudeSDKClient", side_effect=make_client):
+            client = await mgr.get_client()
+
+        assert client is mock_client
+        options = captured["options"]
+        assert options.model == "gpt-5.4-mini[1m]"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "92"
+        assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+
+    @pytest.mark.asyncio
+    async def test_get_client_passes_explicit_200k_context_options_to_sdk(self, config):
+        mgr = SessionManager(config=config)
+        mgr.model_override = "gpt[200k]"
+        captured = {}
+        mock_client = AsyncMock()
+
+        def make_client(options):
+            captured["options"] = options
+            return mock_client
+
+        with patch("obs_agent.session.ClaudeSDKClient", side_effect=make_client):
+            client = await mgr.get_client()
+
+        assert client is mock_client
+        options = captured["options"]
+        assert options.model == "gpt-5.4-mini[200k]"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+        assert options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "84"
+        assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
     @pytest.mark.asyncio
     async def test_get_client_reuses_connected_client_within_window(self, config):

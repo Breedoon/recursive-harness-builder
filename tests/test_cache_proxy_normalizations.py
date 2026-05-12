@@ -58,6 +58,16 @@ pytestmark = [
 ]
 
 
+def extract_usage_row(usage: dict) -> dict | None:
+    cr = usage.get("cache_read_input_tokens", 0)
+    cc = usage.get("cache_creation_input_tokens", 0)
+    ip = usage.get("input_tokens", 0)
+    tot = cr + cc + ip
+    if tot <= 0:
+        return None
+    return {"cr": cr, "cc": cc, "ip": ip, "tot": tot}
+
+
 # ── Test 1: File operations trigger system-reminders, proxy strips them ──
 
 
@@ -146,9 +156,11 @@ async def test_file_operations_trigger_system_reminders_stripped(
     baseline = compute_baseline(parent_crs)
     print(f"  Baseline: {baseline:,}")
 
-    # Fork's first turn (using sessionId-based detection)
-    fork_turn = extract_fork_first_turn(fork_sid)
-    assert fork_turn, f"Could not find fork's first turn in JSONL for {fork_sid}"
+    # Fork's first turn (using sessionId-based detection).  The SDK sometimes
+    # does not flush the fork JSONL before this assertion, but the fork turn
+    # usage returned by run_turn is already the first fork turn.
+    fork_turn = extract_fork_first_turn(fork_sid) or extract_usage_row(fork_usage)
+    assert fork_turn, f"Could not find fork's first turn usage for {fork_sid}"
 
     # Previous total = parent's last turn total
     prev_total = parent_rows[-1]["tot"]

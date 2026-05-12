@@ -37,6 +37,12 @@ from urllib.parse import urlparse
 
 import httpx
 
+try:
+    from obs_agent.config import resolve_model as _resolve_obs_model
+except Exception:  # pragma: no cover - keep proxy usable as a standalone script
+    def _resolve_obs_model(model: str) -> str:
+        return model
+
 ANTHROPIC_UPSTREAM = "https://api.anthropic.com"
 CLI_PROXY_UPSTREAM = os.environ.get("CLI_PROXY_BASE_URL", "http://127.0.0.1:8317")
 CLI_PROXY_API_KEY = os.environ.get("CLI_PROXY_API_KEY", "sk-anything")
@@ -80,13 +86,18 @@ def _strip_context_suffix(model: str) -> str:
     return _CONTEXT_SUFFIX_RE.sub('', model)
 
 
+def _normalize_model_name(model: str) -> str:
+    """Resolve OBS shorthand and strip Claude Code's context suffix artifact."""
+    return _strip_context_suffix(_resolve_obs_model(model))
+
+
 def _resolve_upstream(model: str) -> str:
     """Determine upstream URL based on model name.
 
     Claude models → Anthropic API (direct, no CLIProxyAPI dependency).
     Everything else → CLIProxyAPI (local proxy for GPT, Gemini, etc.).
     """
-    clean = _strip_context_suffix(model)
+    clean = _normalize_model_name(model)
     if clean.startswith("claude"):
         return ANTHROPIC_UPSTREAM
     return CLI_PROXY_UPSTREAM
@@ -523,8 +534,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 stats["routed_cli_proxy"] += 1
 
-            # Strip context-window suffix from model before sending upstream
-            clean_model = _strip_context_suffix(raw_model)
+            # Resolve OBS shorthand and strip context-window suffix before sending upstream.
+            clean_model = _normalize_model_name(raw_model)
             if clean_model != raw_model:
                 data["model"] = clean_model
 
