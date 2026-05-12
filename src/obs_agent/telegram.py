@@ -3308,7 +3308,7 @@ class TelegramBot:
                 "agentId": lead_agent_id,
                 "name": "team-lead",
                 "agentType": "team-lead",
-                "model": getattr(self._config, "model", "claude-opus-4-6"),
+                "model": getattr(self._config, "model", "claude-opus-4-7"),
                 "joinedAt": now_ms,
                 "tmuxPaneId": "",
                 "cwd": str(self._config.vault_path),
@@ -3322,7 +3322,7 @@ class TelegramBot:
                 "agentId": worker_agent_id,
                 "name": normalized_agent,
                 "agentType": "general-purpose",
-                "model": getattr(self._config, "model", "claude-opus-4-6"),
+                "model": getattr(self._config, "model", "claude-opus-4-7"),
                 "joinedAt": now_ms,
                 "tmuxPaneId": "in-process",
                 "cwd": str(self._config.vault_path),
@@ -3348,16 +3348,11 @@ class TelegramBot:
         )
         return str(path) if path is not None else None
 
-    def _persisted_session_uuids(self, session_id: str) -> list[str]:
-        path = find_session_jsonl(
-            session_id=session_id,
-            cwd=self._config.vault_path,
-        )
-        if path is None:
-            return []
+    def _persisted_jsonl_uuids(self, path: Path | str) -> list[str]:
+        jsonl_path = Path(path).expanduser()
         uuids: list[str] = []
         try:
-            with path.open("r", encoding="utf-8") as handle:
+            with jsonl_path.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     raw = line.strip()
                     if not raw:
@@ -3374,6 +3369,15 @@ class TelegramBot:
         except OSError:
             return []
         return uuids
+
+    def _persisted_session_uuids(self, session_id: str) -> list[str]:
+        path = find_session_jsonl(
+            session_id=session_id,
+            cwd=self._config.vault_path,
+        )
+        if path is None:
+            return []
+        return self._persisted_jsonl_uuids(path)
 
     def _resolve_persisted_fork_source(
         self,
@@ -4451,26 +4455,36 @@ class TelegramBot:
     async def _await_jsonl_stability(
         self,
         *,
-        session_id: str,
+        session_id: str | None = None,
+        jsonl_path: Path | str | None = None,
         stable_duration: float = 1.0,
         timeout_seconds: float = 10.0,
     ) -> str | None:
-        """Wait for the parent's JSONL to stop receiving new entries.
+        """Wait for a session JSONL to stop receiving new entries.
 
-        Polls ``_persisted_session_uuids`` every 150 ms and tracks the last
-        UUID seen.  Returns when no new UUIDs appear for *stable_duration*
-        seconds, indicating the parent's streaming response has fully flushed
-        to disk.  A safety *timeout_seconds* prevents infinite blocking (e.g.
-        if the parent is executing a long tool).
+        Polls persisted UUIDs every 150 ms and tracks the last UUID seen.
+        Returns when no new UUIDs appear for *stable_duration* seconds,
+        indicating the streaming response has fully flushed to disk.  A safety
+        *timeout_seconds* prevents infinite blocking (e.g. if the source is
+        executing a long tool).
 
-        Returns the latest UUID at the point of stability (or timeout).
+        Exactly one of ``session_id`` or ``jsonl_path`` must be provided.
+        ``jsonl_path`` is read directly so explicit path sources remain
+        disambiguated from global session-id lookup.
         """
+        if bool(session_id) == bool(jsonl_path):
+            raise ValueError("Exactly one of session_id or jsonl_path is required")
+
+        source_label = session_id or str(jsonl_path)
         deadline = time.monotonic() + max(timeout_seconds, 0.0)
         last_uuid: str | None = None
         last_change_time = time.monotonic()
 
         while True:
-            persisted = self._persisted_session_uuids(session_id)
+            if jsonl_path is not None:
+                persisted = self._persisted_jsonl_uuids(jsonl_path)
+            else:
+                persisted = self._persisted_session_uuids(session_id or "")
             current_uuid = persisted[-1] if persisted else None
 
             if current_uuid != last_uuid:
@@ -4483,10 +4497,10 @@ class TelegramBot:
 
             if time.monotonic() >= deadline:
                 logger.warning(
-                    "[jsonl_stability] timed out after %.1fs for session %s "
+                    "[jsonl_stability] timed out after %.1fs for source %s "
                     "(last_uuid=%s) — proceeding with current head",
                     timeout_seconds,
-                    session_id,
+                    source_label,
                     last_uuid,
                 )
                 return last_uuid
@@ -7157,12 +7171,16 @@ class TelegramBot:
                 {"temperature": temperature, "thinking": {"type": "disabled"}}
             )
         child_state.session_manager.set_sdk_env_overrides(team_env)
-        # Apply per-session model override. "inherit" or omitted keeps the
-        # child's effective model on the parent's/configured model; explicit
-        # shorthands/full names are normalized at the Claude Code boundary.
-        if model and model.lower() != "inherit":
-            from obs_agent.config import resolve_model
-            child_state.session_manager.model_override = resolve_model(model)
+        # Apply per-session model override. resolve_model handles shorthand
+        # lookup and context suffix preservation. _build_options in session.py
+        # picks up model_override and injects the right env vars (context window,
+        # compaction threshold, API key) for non-Claude models. When no explicit
+        # model is provided, inherit the parent's effective model instead of
+        # falling back to the shared config default.
+        from obs_agent.config import resolve_model
+        child_state.session_manager.model_override = (
+            resolve_model(model) if model else parent_state.session_manager.effective_model
+        )
         # --- User hooks ---
         # Resolve effective hooks: explicit hooks take precedence, then
         # inheritance from the parent if inherit_hooks is True.
@@ -7262,6 +7280,7 @@ class TelegramBot:
         team_name: str | None = None,
         agent_name: str | None = None,
         prompt_file: str | None = None,
+        prompt_file_content: str | None = None,
     ) -> str:
         lines = ["fork task launched by agent" if is_fork else "agent task launched by agent"]
         lines.append(
@@ -8344,7 +8363,8 @@ class TelegramBot:
         )
         prompt_file = str(args.get("prompt_file") or "").strip() or None
         prompt_file_content = str(args.get("prompt_file_content") or "").strip() or None
-        model = str(args.get("model") or "").strip() or None
+        model_raw = str(args.get("model") or "").strip()
+        model = model_raw if model_raw and model_raw.lower() != "inherit" else None
         inherit_schedules = args.get("inherit_schedules", True)
         env_override: dict[str, str] | None = args.get("env")
         temperature: float | None = args.get("temperature")
@@ -8360,6 +8380,7 @@ class TelegramBot:
             team_name=team_name,
             agent_name=agent_name,
             prompt_file=prompt_file,
+            prompt_file_content=prompt_file_content,
         )
         created = await self._create_child_fork_topic(
             parent_state=state,

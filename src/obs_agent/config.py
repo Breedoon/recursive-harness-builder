@@ -29,17 +29,19 @@ _DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no exp
 # update when new models are released.
 MODEL_RESOLUTION: dict[str, str] = {
     # Anthropic tiers
-    "claude": "claude-opus-4-6",
-    "claude-opus": "claude-opus-4-6",
+    "claude": "claude-opus-4-7",
+    "opus": "claude-opus-4-7",
+    "claude-opus": "claude-opus-4-7",
     "sonnet": "claude-sonnet-4-6",
     "claude-sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5",
     "claude-haiku": "claude-haiku-4-5",
-    # OpenAI tiers
-    "gpt": "gpt-5.4-mini",
-    "gpt-pro": "gpt-5.4",
-    "openai": "gpt-5.4-mini",
-    "chatgpt": "gpt-5.4-mini",
+    # OpenAI tiers – "gpt" resolves to main production model
+    "gpt": "gpt-5.5",
+    "gpt-pro": "gpt-5.5",
+    "gpt-mini": "gpt-5.4-mini",
+    "openai": "gpt-5.5",
+    "chatgpt": "gpt-5.5",
     # Google tiers
     "gemini": "gemini-3.1-flash-lite-preview",
     "gemini-pro": "gemini-3.1-pro-preview",
@@ -91,10 +93,19 @@ def normalize_model_for_claude_code(
     *,
     default_context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
 ) -> str:
-    """Resolve model identity and ensure Claude Code receives a context suffix."""
+    """Resolve model identity and add a context suffix when OBS must override CC.
+
+    Claude Code already knows Claude model context windows and some subscriptions
+    reject explicit long-context suffixes. Preserve explicit suffixes, but only
+    add OBS's default suffix automatically for non-Claude models.
+    """
     resolved = resolve_model(model_str)
     clean, ctx_tokens = split_context_suffix(resolved)
-    return clean + _context_suffix_for_tokens(ctx_tokens or default_context_tokens)
+    if ctx_tokens is not None:
+        return clean + _context_suffix_for_tokens(ctx_tokens)
+    if is_claude_model(clean):
+        return clean
+    return clean + _context_suffix_for_tokens(default_context_tokens)
 
 
 def parse_context_suffix(model_str: str) -> tuple[str, int]:
@@ -102,8 +113,8 @@ def parse_context_suffix(model_str: str) -> tuple[str, int]:
 
     Examples
     --------
-    >>> parse_context_suffix("claude-opus-4-6[1m]")
-    ('claude-opus-4-6', 1000000)
+    >>> parse_context_suffix("claude-opus-4-7[1m]")
+    ('claude-opus-4-7', 1000000)
     >>> parse_context_suffix("gpt-5.4-mini[200k]")
     ('gpt-5.4-mini', 200000)
     >>> parse_context_suffix("gemini-3.1-flash-lite-preview")
@@ -167,9 +178,9 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "claude-opus-4-6"
+    model: str = "claude-opus-4-7"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
-    # Resolved via MODEL_RESOLUTION (e.g. "claude" → "claude-opus-4-6").
+    # Resolved via MODEL_RESOLUTION (e.g. "claude" → "claude-opus-4-7").
     # Change this to e.g. "gpt" to make root sessions default to GPT.
     default_model: str = "claude"
     claude_dir: str = ".claude"

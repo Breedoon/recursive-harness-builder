@@ -126,7 +126,7 @@ class TestSessionSettings:
     def test_default_model(self):
         """Default config stores model identity without context suffix."""
         cfg = OBSConfig()
-        assert cfg.model == "claude-opus-4-6"
+        assert cfg.model == "claude-opus-4-7"
 
     def test_model_from_env_resolves_shorthand_without_context_suffix(self, monkeypatch):
         """OBS_AGENT_MODEL overrides the default session model identity."""
