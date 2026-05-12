@@ -112,6 +112,20 @@ class TestAgentTaskTools:
         assert "agent" in schema["properties"]
         assert "limit" in schema["properties"]
 
+    def test_agent_task_schema_allows_prompt_and_prompt_file_together(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        create_obs_tools(skill_config, lambda: "sid-123")
+
+        tool = next(tool for tool in captured["tools"] if tool.name == "AgentTask")
+        prompt_description = tool.input_schema["properties"]["prompt"]["description"]
+        prompt_file_description = tool.input_schema["properties"]["prompt_file"]["description"]
+        assert "Mutually exclusive" not in prompt_description
+        assert "Mutually exclusive" not in prompt_file_description
+        assert "May be combined" in prompt_description
+        assert "May be combined" in prompt_file_description
+
     @pytest.mark.asyncio
     async def test_agent_task_requires_prompt(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
@@ -141,6 +155,10 @@ class TestAgentTaskTools:
 
         assert result["content"][0]["text"] == "ok"
         state.fork_task_launcher.assert_awaited_once()
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == "Do work"
+        assert "prompt_file" not in launch_args
+        assert "prompt_file_content" not in launch_args
 
     @pytest.mark.asyncio
     async def test_agent_task_requires_transport_launcher(self, monkeypatch, skill_config):
@@ -1446,6 +1464,7 @@ class TestPromptFile:
         assert result["content"][0]["text"] == "ok"
         state.fork_task_launcher.assert_awaited_once()
         launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == ""
         assert launch_args["prompt_file_content"] == "Search the codebase for bugs"
 
     @pytest.mark.asyncio
@@ -1469,6 +1488,7 @@ class TestPromptFile:
 
         assert result["content"][0]["text"] == "ok"
         launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == ""
         assert launch_args["prompt_file_content"] == "External task content"
 
     @pytest.mark.asyncio
@@ -1504,6 +1524,7 @@ class TestPromptFile:
 
         assert result["content"][0]["text"] == "ok"
         launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == ""
         assert launch_args["prompt_file_content"] == "Home dir task"
 
     @pytest.mark.asyncio
@@ -1524,8 +1545,8 @@ class TestPromptFile:
         state.fork_task_launcher.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_prompt_and_prompt_file_both_passed_separately(self, monkeypatch, skill_config):
-        """Providing both prompt and prompt_file preserves them as separate payload fields."""
+    async def test_prompt_and_prompt_file_both_are_combined(self, monkeypatch, skill_config):
+        """Providing both prompt and prompt_file preserves inline prompt and file context separately."""
         from obs_agent.tools import create_obs_tools
 
         prompt_path = skill_config.vault_path / "task.md"
@@ -1587,6 +1608,7 @@ class TestPromptFile:
         assert result["content"][0]["text"] == "ok"
         launch_args = state.fork_task_launcher.await_args.args[0]
         assert launch_args["prompt_file"] == "procedures/audit.md"
+        assert launch_args["prompt"] == ""
         assert launch_args["prompt_file_content"] == "Audit the vault"
 
     @pytest.mark.asyncio
@@ -1609,6 +1631,7 @@ class TestPromptFile:
 
         assert result["content"][0]["text"] == "ok"
         launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["prompt"] == ""
         assert launch_args["prompt_file_content"] == "Do the thing"
 
     @pytest.mark.asyncio
@@ -1630,27 +1653,6 @@ class TestPromptFile:
         assert result["is_error"] is True
         assert "prompt or prompt_file is required" in result["content"][0]["text"]
         state.fork_task_launcher.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_prompt_only_payload_unchanged(self, monkeypatch, skill_config):
-        """Prompt-only launch still sends the prompt without prompt_file fields."""
-        from obs_agent.tools import create_obs_tools
-
-        captured = _capture_tools(monkeypatch)
-        state = HookState()
-        state.fork_task_launcher = AsyncMock(
-            return_value={"content": [{"type": "text", "text": "ok"}]}
-        )
-        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "AgentTask")
-
-        result = await handler({"prompt": "inline only"})
-
-        assert result["content"][0]["text"] == "ok"
-        launch_args = state.fork_task_launcher.await_args.args[0]
-        assert launch_args["prompt"] == "inline only"
-        assert "prompt_file" not in launch_args
-        assert "prompt_file_content" not in launch_args
 
 
 class TestHooksParameter:

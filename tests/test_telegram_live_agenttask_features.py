@@ -42,30 +42,6 @@ def _safe_mtime(path: Path) -> float:
         return 0.0
 
 
-def _find_jsonl_with_user_markers(markers: tuple[str, ...]) -> Path | None:
-    projects_root = Path.home() / ".claude" / "projects"
-    for path in sorted(projects_root.glob("*/*.jsonl"), key=_safe_mtime, reverse=True):
-        user_text = "\n".join(_jsonl_user_texts(path))
-        if all(marker in user_text for marker in markers):
-            return path
-    return None
-
-
-async def _wait_for_jsonl_with_user_markers(
-    markers: tuple[str, ...],
-    *,
-    timeout: float = 120.0,
-) -> Path:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while True:
-        path = _find_jsonl_with_user_markers(markers)
-        if path is not None:
-            return path
-        if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError("child JSONL with combined prompt context and lineage not found")
-        await asyncio.sleep(1.0)
-
-
 def _jsonl_user_texts(path: Path) -> list[str]:
     texts: list[str] = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -88,6 +64,30 @@ def _jsonl_user_texts(path: Path) -> list[str]:
                 if isinstance(part, dict) and isinstance(part.get("text"), str):
                     texts.append(part["text"])
     return texts
+
+
+def _find_jsonl_with_user_markers(markers: tuple[str, ...]) -> Path | None:
+    projects_root = Path.home() / ".claude" / "projects"
+    for path in sorted(projects_root.glob("*/*.jsonl"), key=_safe_mtime, reverse=True):
+        user_text = "\n".join(_jsonl_user_texts(path))
+        if all(marker in user_text for marker in markers):
+            return path
+    return None
+
+
+async def _wait_for_jsonl_with_user_markers(
+    markers: tuple[str, ...],
+    *,
+    timeout: float = 120.0,
+) -> Path:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        path = _find_jsonl_with_user_markers(markers)
+        if path is not None:
+            return path
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("child JSONL with combined prompt context and lineage not found")
+        await asyncio.sleep(1.0)
 
 
 async def _launch_agent_and_get_child_thread(

@@ -749,6 +749,8 @@ class TestBackgroundPoller:
             child_route=child_route,
             child_session_id="sid-child",
             prompt="Old prompt",
+            prompt_file="old.md",
+            prompt_file_content="old file content",
             description="Team Worker",
             team_name="team-alpha",
             agent_name="worker-a",
@@ -791,6 +793,8 @@ class TestBackgroundPoller:
         schedule_mock.assert_awaited_once_with(task_id="task-team", parent_state=child_state)
         assert record.status == "launched"
         assert record.idle_ready is False
+        assert record.prompt_file is None
+        assert record.prompt_file_content is None
         assert "Latest sender: worker-b." in record.prompt
         assert "Latest content preview: poll wake message" in record.prompt
 
@@ -3834,6 +3838,7 @@ class TestForkTaskRuntime:
             side_effect=[service_message, session_marker, confirmation_message]
         )
         state.session_manager.set_session_id("sid-root")
+        state.session_manager.model_override = "gpt-5.5"
         bot._session_heads["sid-root"] = "head-uuid"
         bot._record_message_binding(
             route=route,
@@ -3885,129 +3890,13 @@ class TestForkTaskRuntime:
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=321))
         assert child_state is not None
         assert child_state.notify_on_completion is True
-        await bot.shutdown()
-
-    async def test_launch_agent_task_with_prompt_file_keeps_prompt_and_file_context_separate(
-        self,
-        config,
-        tmp_path,
-    ):
-        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
-        route = TelegramRoute(chat_id=-10067890, thread_id=None)
-        state = bot._get_state(route)
-        assert state is not None
-        state.last_bot = MagicMock()
-        state.last_bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=322))
-        service_message = MagicMock()
-        service_message.message_id = 910
-        session_marker = MagicMock()
-        session_marker.message_id = 911
-        confirmation_message = MagicMock()
-        confirmation_message.message_id = 912
-        state.last_bot.send_message = AsyncMock(
-            side_effect=[service_message, session_marker, confirmation_message]
+        assert child_state.session_manager.model_override == "gpt-5.5"
+        assert child_state.session_manager.create_options().model == "gpt-5.5[1m]"
+        assert (
+            child_state.session_manager.create_options().env["ANTHROPIC_API_KEY"]
+            == config.cli_proxy_api_key
         )
-        state.session_manager.set_session_id("sid-root")
-        bot._session_heads["sid-root"] = "head-uuid"
-
-        child_jsonl = tmp_path / "sid-child.jsonl"
-        child_jsonl.write_text("", encoding="utf-8")
-        fake_task_id = uuid.UUID("33333333-3333-3333-3333-333333333333")
-        fake_child_session_id = uuid.UUID("44444444-4444-4444-4444-444444444444")
-        with patch("obs_agent.telegram.uuid.uuid4", side_effect=[fake_task_id, fake_child_session_id]), patch(
-            "obs_agent.telegram.fork_session_jsonl", return_value="sid-child"
-        ), patch("obs_agent.telegram.find_session_jsonl", return_value=child_jsonl), patch.object(
-            bot, "_execute_fork_task", new_callable=AsyncMock
-        ):
-            launched = await bot._launch_fork_task(
-                route=route,
-                args={
-                    "prompt": "INLINE-TASK",
-                    "prompt_file": "Procedures/check.md",
-                    "prompt_file_content": "FILE-CONTEXT",
-                    "description": "Prompt file combined",
-                    "task_tool_name": "AgentTask",
-                },
-            )
-
-        assert "AgentTask launched successfully." in launched["content"][0]["text"]
-        record = bot._fork_tasks_by_id["33333333-3333-3333-3333-333333333333"]
-        assert record.prompt == "INLINE-TASK"
-        assert record.prompt_file == "Procedures/check.md"
-        assert record.prompt_file_content == "FILE-CONTEXT"
-        send_calls = state.last_bot.send_message.await_args_list
-        service_html = send_calls[0].kwargs["text"]
-        assert "prompt_file: Procedures/check.md" in service_html
-        assert "prompt:\nINLINE-TASK" in service_html
-        assert "FILE-CONTEXT" not in service_html
-        child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=322))
-        assert child_state is not None
-        assert child_state.pending_obs_bootstrap is not None
-        assert "<obs-bootstrap" in child_state.pending_obs_bootstrap
-        assert "Prompt file combined" in child_state.pending_obs_bootstrap
         await bot.shutdown()
-
-    async def test_execute_fork_task_injects_prompt_file_context_before_inline_prompt(self, config):
-        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
-        parent_route = TelegramRoute(chat_id=-10067890, thread_id=None)
-        child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
-        parent_state = bot._get_state(parent_route)
-        child_state = bot._get_state(child_route, topic_title="General - Prompt file")
-        assert parent_state is not None
-        assert child_state is not None
-        fake_bot = MagicMock()
-        fake_bot.send_message = AsyncMock(side_effect=[MagicMock(message_id=930), MagicMock(message_id=931)])
-        fake_bot.edit_message_text = AsyncMock()
-        parent_state.last_bot = fake_bot
-        child_state.last_bot = fake_bot
-        parent_state.session_manager.set_session_id("sid-parent")
-        child_state.session_manager.set_session_id("sid-child")
-        bot._session_heads["sid-parent"] = "parent-current-uuid"
-        bot._session_heads["sid-child"] = "child-final-uuid"
-        parent_state.active_fork_task_ids.add("task-prompt-file")
-        record = _ForkTaskRecord(
-            task_id="task-prompt-file",
-            parent_route=parent_route,
-            parent_session_id_at_launch="sid-parent",
-            parent_source_uuid="parent-source-uuid",
-            child_route=child_route,
-            child_session_id="sid-child",
-            prompt="INLINE-COMMAND",
-            prompt_file="Plans/launch.md",
-            prompt_file_content="FILE-BODY <needs escaping>",
-            description="Prompt File",
-            launch_parent_message_id=901,
-            launch_child_message_id=900,
-            team_name="team-alpha",
-            agent_name="worker-a",
-        )
-        bot._fork_tasks_by_id["task-prompt-file"] = record
-        bot._fork_task_by_child_route[child_route] = "task-prompt-file"
-
-        run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="DONE"))
-        with patch.object(bot, "_run_and_send", run_mock):
-            await bot._execute_fork_task("task-prompt-file")
-
-        run_text = run_mock.await_args.kwargs["user_text"]
-        assert run_text.startswith('<prompt_file_context path="Plans/launch.md">')
-        assert "FILE-BODY &lt;needs escaping&gt;" in run_text
-        assert "</prompt_file_context>\n\nINLINE-COMMAND" in run_text
-        assert record.status == "completed"
-        assert record.idle_ready is True
-        await bot.shutdown()
-
-    async def test_compose_prompt_file_context_supports_file_only_and_prompt_only(self):
-        assert TelegramBot._compose_prompt_file_context(
-            prompt="INLINE-ONLY",
-            prompt_file=None,
-            prompt_file_content=None,
-        ) == "INLINE-ONLY"
-        file_only = TelegramBot._compose_prompt_file_context(
-            prompt="",
-            prompt_file="task.md",
-            prompt_file_content="FILE-ONLY",
-        )
-        assert file_only == '<prompt_file_context path="task.md">\nFILE-ONLY\n</prompt_file_context>'
 
     async def test_launch_super_task_without_fork_creates_fresh_child_session(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -4020,6 +3909,7 @@ class TestForkTaskRuntime:
             side_effect=[MagicMock(message_id=920), MagicMock(message_id=921), MagicMock(message_id=922)]
         )
         state.session_manager.set_session_id("sid-root")
+        state.session_manager.model_override = "gpt-5.5"
 
         # Use a unique team name to avoid collision with stale inbox files
         unique_team = f"team-fresh-{uuid.uuid4().hex[:8]}"
@@ -4065,14 +3955,16 @@ class TestForkTaskRuntime:
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=333))
         assert child_state is not None
         assert child_state.session_id is None
+        assert child_state.session_manager.model_override == "gpt-5.5"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "claude-opus-4-6[1m]"
+        assert child_options.model == "gpt-5.5[1m]"
         child_env = child_options.env
         assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
         assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == unique_team
         assert child_env["CLAUDE_CODE_TEAM_NAME"] == unique_team
+        assert child_env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
         # Agent name should be computed (hash-prefix + slug), not raw alias
         assert "fresh-child" in child_env["CLAUDE_CODE_AGENT_NAME"].lower(), \
             f"Agent name env var should contain 'fresh-child', got: {child_env['CLAUDE_CODE_AGENT_NAME']}"
@@ -4310,6 +4202,36 @@ class TestForkTaskRuntime:
         assert peer_a_obs["topic_thread_id"] == 333
         await bot.shutdown()
 
+    def test_fork_task_prompt_file_context_keeps_inline_prompt_separate(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        child_prompt = bot._compose_prompt_file_context(
+            prompt="Inline instruction",
+            prompt_file="procedures/task.md",
+            prompt_file_content="File context <with markup>",
+        )
+
+        assert '<prompt_file_context path="procedures/task.md">' in child_prompt
+        assert "File context &lt;with markup&gt;" in child_prompt
+        assert child_prompt.endswith("\n\nInline instruction")
+
+    def test_fork_task_child_service_html_shows_prompt_and_prompt_file(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        service_html = bot._build_fork_task_child_service_html(
+            agent_id="task-123",
+            description="Audit",
+            prompt="Inline instruction",
+            source_link=None,
+            prompt_file="procedures/task.md",
+            prompt_file_content="File context",
+        )
+
+        assert "prompt_file: procedures/task.md" in service_html
+        assert "File context" not in service_html
+        assert "prompt:" in service_html
+        assert "Inline instruction" in service_html
+
     def test_build_super_task_lifecycle_html_uses_system_heading_and_cursive_body(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         record = _ForkTaskRecord(
@@ -4430,6 +4352,8 @@ class TestForkTaskRuntime:
             child_route=child_route,
             child_session_id="sid-child",
             prompt="Return SECRET-42",
+            prompt_file="context.md",
+            prompt_file_content="Use this context",
             description="Audit",
             timeout_ms=5000,
             launch_parent_message_id=901,
@@ -4463,7 +4387,12 @@ class TestForkTaskRuntime:
         assert "open child completion" in send_calls[1].kwargs["text"]
         assert "https://t.me/c/67890/321/910" in send_calls[1].kwargs["text"]
         run_text = run_mock.await_args.kwargs["user_text"]
-        assert run_text == "Return SECRET-42"
+        assert run_text == (
+            '<prompt_file_context path="context.md">\n'
+            'Use this context\n'
+            '</prompt_file_context>\n\n'
+            'Return SECRET-42'
+        )
         fake_bot.edit_message_text.assert_awaited_once()
         assert "subtask: fork completed" in fake_bot.edit_message_text.await_args.kwargs["text"]
         assert "return_to_parent: https://t.me/c/67890/911" in fake_bot.edit_message_text.await_args.kwargs["text"]

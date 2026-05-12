@@ -121,11 +121,11 @@ class TestCreateOptions:
         assert options.mcp_servers is not None
         assert "obs-agent" in options.mcp_servers
 
-    def test_uses_configured_model_with_default_1m_context_at_sdk_boundary(self, config):
+    def test_uses_configured_claude_model_without_implicit_long_context_suffix(self, config):
         config.model = "haiku"
         mgr = SessionManager(config=config)
         options = mgr.create_options()
-        assert options.model == "claude-haiku-4-5[1m]"
+        assert options.model == "claude-haiku-4-5"
 
     def test_exposes_effective_model_to_hook_state(self, config):
         state = HookState()
@@ -133,6 +133,13 @@ class TestCreateOptions:
         mgr.model_override = "gpt-5.4-mini[200k]"
         mgr.create_options()
         assert state.effective_model == "gpt-5.4-mini[200k]"
+
+    def test_effective_model_uses_override_when_present(self, config):
+        mgr = SessionManager(config=config)
+        assert mgr.effective_model == config.model
+        mgr.model_override = "gpt-5.5"
+        assert mgr.effective_model == "gpt-5.5"
+        assert mgr.create_options().model == "gpt-5.5[1m]"
 
     def test_passes_hook_state_to_obs_tools(self, config):
         state = HookState()
@@ -210,11 +217,11 @@ class TestCreateOptions:
         assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
 
-    def test_claude_root_also_receives_1m_context_env_without_proxy_key(self, config):
-        config.model = "claude-opus-4-6"
+    def test_claude_root_uses_native_context_without_proxy_key(self, config):
+        config.model = "claude-opus-4-7"
         mgr = SessionManager(config=config)
         options = mgr.create_options()
-        assert options.model == "claude-opus-4-6[1m]"
+        assert options.model == "claude-opus-4-7"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert "ANTHROPIC_API_KEY" not in options.env
 

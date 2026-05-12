@@ -28,3 +28,4 @@ fixture_vault.refresh.meta
 
 # Local runtime state
 .obs-agent/
+worktrees/

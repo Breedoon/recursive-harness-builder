@@ -448,8 +448,9 @@ def create_obs_tools(
             "model": {
                 "type": "string",
                 "description": (
-                    "Model for the child session. Accepts shorthands (claude, gpt, gemini) "
-                    "which resolve to the latest tier, or full names (gpt-5.5, gemini-2.5-pro). "
+                    "Model for the child session. Accepts shorthands "
+                    "(claude, gpt, gemini) which resolve to the latest tier, or full names "
+                    "(gpt-5.5, gemini-2.5-pro). "
                     "Append a context suffix like [1m] or [200k] to control the context window "
                     "(default: 1m). 'inherit' or omitted = use the same model as the current "
                     "session. WARNING: setting a model different from the parent when fork=true "

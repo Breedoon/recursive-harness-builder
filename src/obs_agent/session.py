@@ -117,6 +117,11 @@ class SessionManager:
         """Expose the current per-session SDK env override map."""
         return dict(self._sdk_env_overrides)
 
+    @property
+    def effective_model(self) -> str:
+        """Return the model this session will pass to ClaudeAgentOptions."""
+        return self.model_override or self.config.model
+
     def should_resume(self) -> bool:
         """Decide whether to resume the existing session.
 
@@ -145,7 +150,7 @@ class SessionManager:
         # for background fork result delivery
         tool_server = create_obs_tools(self.config, lambda: self._session_id, hook_state=self.hook_state)
 
-        effective_model = normalize_model_for_claude_code(self.model_override or self.config.model)
+        effective_model = normalize_model_for_claude_code(self.effective_model)
         self.hook_state.effective_model = effective_model
 
         effective_env = {
