@@ -137,7 +137,7 @@ class TestSessionSettings:
     def test_model_from_env_preserves_explicit_context_suffix(self, monkeypatch):
         monkeypatch.setenv("OBS_AGENT_MODEL", "gpt[200k]")
         cfg = OBSConfig.from_env()
-        assert cfg.model == "gpt-5.4-mini[200k]"
+        assert cfg.model == "gpt-5.5[200k]"
 
     def test_default_cache_window(self):
         """Default cache window is effectively non-expiring for now."""

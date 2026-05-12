@@ -4002,9 +4002,9 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=334))
         assert child_state is not None
-        assert child_state.session_manager.model_override == "gpt-5.4-mini"
+        assert child_state.session_manager.model_override == "gpt-5.5"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.4-mini[1m]"
+        assert child_options.model == "gpt-5.5[1m]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert child_options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "92"
@@ -4043,9 +4043,9 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=335))
         assert child_state is not None
-        assert child_state.session_manager.model_override == "gpt-5.4-mini[200k]"
+        assert child_state.session_manager.model_override == "gpt-5.5[200k]"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.4-mini[200k]"
+        assert child_options.model == "gpt-5.5[200k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert child_options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "84"
@@ -4084,7 +4084,7 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=336))
         assert child_state is not None
-        assert child_state.session_manager.model_override is None
+        assert child_state.session_manager.model_override == "gpt-5.4-mini"
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.4-mini[1m]"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"

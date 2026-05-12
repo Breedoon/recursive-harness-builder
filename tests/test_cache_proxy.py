@@ -1119,8 +1119,8 @@ class TestNormalizeModelName:
         assert cache_proxy._normalize_model_name("haiku[1m]") == "claude-haiku-4-5"
 
     def test_resolves_non_claude_shorthands(self):
-        assert cache_proxy._normalize_model_name("gpt") == "gpt-5.4-mini"
-        assert cache_proxy._normalize_model_name("gpt[200k]") == "gpt-5.4-mini"
+        assert cache_proxy._normalize_model_name("gpt") == "gpt-5.5"
+        assert cache_proxy._normalize_model_name("gpt[200k]") == "gpt-5.5"
 
 
 class TestResolveUpstream:
