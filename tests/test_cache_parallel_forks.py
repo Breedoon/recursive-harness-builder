@@ -37,6 +37,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 _tests_dir = str(Path(__file__).resolve().parent)
@@ -685,6 +686,60 @@ def _check_jsonl_completeness(session_id: str) -> dict:
         "has_tool_result": tool_result_count > 0,
         "all_complete": tool_use_count > 0 and truncated_count == 0,
     }
+
+
+def _cliproxy_model_detail_count(model: str) -> int:
+    return len(_cliproxy_model_details(model))
+
+
+def _cliproxy_model_details(model: str) -> list[dict]:
+    req = urllib.request.Request(
+        "http://127.0.0.1:8317/v0/management/usage",
+        headers={"X-Management-Key": "obs-mgmt-key"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        data = json.load(resp)
+    models = data.get("usage", {}).get("apis", {}).get("sk-anything", {}).get("models", {})
+    return models.get(model, {}).get("details", [])
+
+
+async def test_gpt_prefix_replay_caches_through_cli_proxy(proxy, test_project):
+    """Verify GPT requests route through CLIProxyAPI and reuse the prompt cache.
+
+    This is the focused live proof for the production GPT model cache path:
+    Claude Code → cache proxy → CLIProxyAPI → GPT. The cache proxy routes and
+    schema-sanitizes GPT requests; CLIProxyAPI management stats provide the
+    provider-specific `cached_tokens` proof.
+    """
+    model = "gpt-5.4-mini"
+    model_with_context = f"{model}[1m]"
+    cliproxy_start = _cliproxy_model_detail_count(model)
+    proxy_log_start = proxy_log_length()
+
+    opts = make_sdk_options(test_project, proxy, model=model_with_context)
+    client = ClaudeSDKClient(opts)
+    await client.connect()
+    try:
+        sid, _ = await run_turn(client, f"Reference:\n\n{BULK_TEXT}\n\nReply with exactly: GPT_CACHE_A")
+        _, _ = await run_turn(client, "Using the same reference, reply with exactly: GPT_CACHE_B")
+    finally:
+        await client.disconnect()
+
+    proxy_rows = get_proxy_usage_for_turns(start_offset=proxy_log_start)
+    cliproxy_rows = _cliproxy_model_details(model)[cliproxy_start:]
+    print(f"\n  GPT cache session: {sid}")
+    for i, row in enumerate(proxy_rows, 1):
+        print(f"  cache proxy request {i}: {fmt_usage(row)}")
+    for i, row in enumerate(cliproxy_rows, 1):
+        tokens = row.get("tokens", {})
+        print(
+            f"  CLIProxy GPT request {i}: input={tokens.get('input_tokens', 0):,} "
+            f"cached={tokens.get('cached_tokens', 0):,} failed={row.get('failed')}"
+        )
+    assert len(cliproxy_rows) >= 2
+    assert any(row.get("tokens", {}).get("cached_tokens", 0) >= 1024 for row in cliproxy_rows[1:]), (
+        "subsequent GPT request did not show meaningful CLIProxy cached_tokens"
+    )
 
 
 async def test_jsonl_timing_fix_comparative(proxy, test_project):
