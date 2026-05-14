@@ -61,6 +61,11 @@ CLAUDEMD_MARKER = "As you answer the user's questions, you can use the following
 
 SAVE_BODIES = os.environ.get("CACHE_PROXY_SAVE_BODIES", "").lower() in ("1", "true")
 
+# Transient HTTP status codes worth retrying (upstream CLIProxyAPI / GPT API)
+_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 529}
+_MAX_RETRIES = 2
+_RETRY_BACKOFF_BASE = 1.0  # seconds; doubles each retry
+
 # Fixed billing header to replace the per-process/per-turn one
 FIXED_BILLING_HEADER = "x-anthropic-billing-header: cc_version=0; cc_entrypoint=sdk-py; cch=0;"
 
@@ -588,7 +593,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             with httpx.Client(timeout=timeout) as client:
                 if is_streaming:
-                    self._stream_upstream(client, url, body, headers, norm_action)
+                    self._stream_upstream_with_retry(client, url, body,
+                                                     headers, norm_action)
                 else:
                     resp = client.post(url, content=body, headers=headers)
                     self.send_response(resp.status_code)
@@ -615,32 +621,116 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _stream_upstream(self, client: httpx.Client, url: str,
-                         body: bytes, headers: dict, norm_action: str):
-        with client.stream("POST", url, content=body, headers=headers) as resp:
-            self.send_response(resp.status_code)
-            for k, v in resp.headers.multi_items():
-                if k.lower() not in ("transfer-encoding", "connection",
-                                      "content-encoding", "content-length"):
-                    self.send_header(k, v)
-            self.end_headers()
+    def _stream_upstream_with_retry(self, client: httpx.Client, url: str,
+                                     body: bytes, headers: dict,
+                                     norm_action: str):
+        """Stream with retry for transient errors and proper error handling.
 
-            chunks: list[bytes] = []
-            for chunk in resp.iter_raw():
-                self.wfile.write(chunk)
-                self.wfile.flush()
-                chunks.append(chunk)
+        Retry logic: if the upstream returns a retryable status code BEFORE
+        we start streaming to the SDK client, retry up to _MAX_RETRIES times.
+        Once headers are sent to the SDK client, we cannot retry — handle
+        mid-stream errors gracefully instead.
+        """
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                with client.stream("POST", url, content=body,
+                                   headers=headers) as resp:
+                    # Fix 1: Check status before streaming to SDK client.
+                    # For non-2xx, read the full body and return it as a
+                    # non-streaming error so the SDK gets a clean HTTP error.
+                    if resp.status_code >= 400:
+                        error_body = resp.read()
+                        if (resp.status_code in _RETRYABLE_STATUS_CODES
+                                and attempt < _MAX_RETRIES):
+                            delay = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                            log(f"STREAM-RETRY: got {resp.status_code} on "
+                                f"attempt {attempt + 1}/{_MAX_RETRIES + 1}, "
+                                f"retrying in {delay:.1f}s")
+                            time.sleep(delay)
+                            continue
+                        # Non-retryable or exhausted retries — send as
+                        # non-streaming error response.
+                        log(f"STREAM-ERROR: upstream returned "
+                            f"{resp.status_code} (attempt "
+                            f"{attempt + 1}/{_MAX_RETRIES + 1}), "
+                            f"sending as non-streaming error")
+                        self.send_response(resp.status_code)
+                        for k, v in resp.headers.multi_items():
+                            if k.lower() not in (
+                                "transfer-encoding", "connection",
+                                "content-encoding",
+                            ):
+                                self.send_header(k, v)
+                        self.send_header("Content-Length",
+                                         str(len(error_body)))
+                        self.end_headers()
+                        self.wfile.write(error_body)
+                        return
 
-            usage = parse_sse_usage(chunks)
-            if usage:
-                log_usage_entry(norm_action, usage)
-            else:
-                # Log chunk sizes for debugging
-                chunk_info = [len(c) for c in chunks]
-                total_bytes = sum(chunk_info)
-                # Show first 500 bytes of raw response for debugging
-                raw_preview = b"".join(chunks)[:500].decode("utf-8", errors="replace")
-                log(f"STREAM: no usage in {len(chunks)} chunks ({total_bytes} bytes). Preview: {raw_preview[:200]}")
+                    # 2xx — stream normally.
+                    self.send_response(resp.status_code)
+                    for k, v in resp.headers.multi_items():
+                        if k.lower() not in (
+                            "transfer-encoding", "connection",
+                            "content-encoding", "content-length",
+                        ):
+                            self.send_header(k, v)
+                    self.end_headers()
+
+                    # Fix 3: Wrap iter_raw in try/except for mid-stream
+                    # errors.  Headers are already sent so we can't retry,
+                    # but we can log and close cleanly.
+                    chunks: list[bytes] = []
+                    try:
+                        for chunk in resp.iter_raw():
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            chunks.append(chunk)
+                    except Exception as stream_exc:
+                        log(f"STREAM-MID-ERROR: connection dropped after "
+                            f"{len(chunks)} chunks "
+                            f"({sum(len(c) for c in chunks)} bytes): "
+                            f"{stream_exc}")
+                        # Headers already sent — can't send_error().
+                        # Best effort: try to write an SSE error event so
+                        # the SDK sees a clean termination signal.
+                        try:
+                            err_event = (
+                                f'event: error\n'
+                                f'data: {{"type":"error","error":'
+                                f'{{"type":"stream_error","message":'
+                                f'"upstream connection dropped: '
+                                f'{stream_exc}"}}}}\n\n'
+                            ).encode()
+                            self.wfile.write(err_event)
+                            self.wfile.flush()
+                        except Exception:
+                            pass
+                        return
+
+                    usage = parse_sse_usage(chunks)
+                    if usage:
+                        log_usage_entry(norm_action, usage)
+                    else:
+                        chunk_info = [len(c) for c in chunks]
+                        total_bytes = sum(chunk_info)
+                        raw_preview = (b"".join(chunks)[:500]
+                                       .decode("utf-8", errors="replace"))
+                        log(f"STREAM: no usage in {len(chunks)} chunks "
+                            f"({total_bytes} bytes). "
+                            f"Preview: {raw_preview[:200]}")
+                    return
+
+            except Exception as exc:
+                # Connection-level failure (timeout, DNS, refused, etc.)
+                if attempt < _MAX_RETRIES:
+                    delay = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                    log(f"STREAM-RETRY: connection error on attempt "
+                        f"{attempt + 1}/{_MAX_RETRIES + 1}: {exc}, "
+                        f"retrying in {delay:.1f}s")
+                    time.sleep(delay)
+                    continue
+                raise  # Let outer handler send 502
 
     def do_POST(self):
         if "/v1/messages" in self.path:
