@@ -270,14 +270,14 @@ def create_obs_tools(
         model_raw = str(args.get("model", "")).strip()
         model: str | None = None
         if model_raw and model_raw.lower() != "inherit":
-            model = model_raw
             if fork:
-                logger.warning(
-                    "%s: model='%s' with fork=true will cause a full cache miss. "
-                    "The fork's value comes from KV cache reuse which requires the same model.",
-                    tool_name,
-                    model,
+                return _error_result(
+                    f"Cannot launch {tool_name}: cross-model forking is not supported. "
+                    f"When fork=true, the model parameter must be omitted or set to 'inherit' "
+                    f"(got model='{model_raw}'). Use fork=false instead to launch a fresh "
+                    f"session with a different model."
                 )
+            model = model_raw
         # --- inherit_schedules ---
         inherit_schedules = True
         if "inherit_schedules" in args:
@@ -453,10 +453,10 @@ def create_obs_tools(
                     "(gpt-5.5, gemini-2.5-pro). "
                     "Append a context suffix like [1m] or [200k] to control the context window "
                     "(default: 1m). 'inherit' or omitted = use the same model as the current "
-                    "session. WARNING: setting a model different from the parent when fork=true "
-                    "causes a full cache miss — the fork's value comes from KV cache reuse, which "
-                    "requires the same model. Only override the model with fork=true if you have "
-                    "been explicitly instructed to do so."
+                    "session. When fork=true, the model must be omitted or set to 'inherit' — "
+                    "cross-model forking is not supported because the forked JSONL contains "
+                    "conversation turns from the parent's model format. Use fork=false to launch "
+                    "a fresh session with a different model."
                 ),
             },
             "name": {

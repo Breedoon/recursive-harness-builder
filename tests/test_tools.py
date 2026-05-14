@@ -360,6 +360,81 @@ class TestAgentTaskTools:
         state.fork_task_launcher.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_agent_task_rejects_cross_model_fork(self, monkeypatch, skill_config):
+        """fork=true with an explicit non-inherit model must be rejected."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "Do work", "fork": True, "model": "gpt-5.5"})
+
+        assert result["is_error"] is True
+        assert "cross-model forking is not supported" in result["content"][0]["text"]
+        assert "fork=false" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_agent_task_allows_fork_with_inherit_model(self, monkeypatch, skill_config):
+        """fork=true with model='inherit' must be allowed (same as omitting model)."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "Do work", "fork": True, "model": "inherit"})
+
+        assert result["content"][0]["text"] == "ok"
+        state.fork_task_launcher.assert_awaited_once()
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["model"] is None
+        assert launch_args["fork"] is True
+
+    @pytest.mark.asyncio
+    async def test_agent_task_allows_fork_with_no_model(self, monkeypatch, skill_config):
+        """fork=true with model omitted must be allowed (inherits parent model)."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "Do work", "fork": True})
+
+        assert result["content"][0]["text"] == "ok"
+        state.fork_task_launcher.assert_awaited_once()
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["model"] is None
+        assert launch_args["fork"] is True
+
+    @pytest.mark.asyncio
+    async def test_agent_task_allows_different_model_with_fork_false(self, monkeypatch, skill_config):
+        """fork=false with any model must be allowed."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "Do work", "fork": False, "model": "gpt-5.5"})
+
+        assert result["content"][0]["text"] == "ok"
+        state.fork_task_launcher.assert_awaited_once()
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["model"] == "gpt-5.5"
+        assert launch_args["fork"] is False
+
+    @pytest.mark.asyncio
     async def test_agent_task_surfaces_launcher_errors(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
