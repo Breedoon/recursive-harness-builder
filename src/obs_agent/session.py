@@ -85,6 +85,44 @@ class SessionManager:
         # ``create_hook_matchers`` at session creation time.
         self.user_hooks: dict[str, str] | None = None
 
+        # API error recovery state — persists across soft_reset cycles
+        self._consecutive_api_errors: int = 0
+        self._backoff_seconds: float = 0.0
+
+    # -- API error tracking (for synthetic error recovery) --
+
+    _INITIAL_BACKOFF = 30.0
+    _MAX_BACKOFF = 300.0  # 5 minutes cap
+
+    def record_api_error(self) -> int:
+        """Increment consecutive API error count and compute next backoff.
+
+        Returns the updated error count.
+        """
+        self._consecutive_api_errors += 1
+        if self._consecutive_api_errors <= 1:
+            self._backoff_seconds = 0.0
+        elif self._consecutive_api_errors == 2:
+            self._backoff_seconds = self._INITIAL_BACKOFF
+        else:
+            self._backoff_seconds = min(
+                self._backoff_seconds * 2, self._MAX_BACKOFF,
+            )
+        return self._consecutive_api_errors
+
+    def clear_api_errors(self) -> None:
+        """Reset error state after a successful turn."""
+        self._consecutive_api_errors = 0
+        self._backoff_seconds = 0.0
+
+    @property
+    def consecutive_api_errors(self) -> int:
+        return self._consecutive_api_errors
+
+    @property
+    def backoff_seconds(self) -> float:
+        return self._backoff_seconds
+
     @property
     def session_id(self) -> str | None:
         return self._session_id
@@ -322,6 +360,34 @@ class SessionManager:
         """
         await self.disconnect()
         # NOTE: session_id and last_activity are intentionally NOT cleared.
+
+    async def probe_api_health(self) -> bool:
+        """Send a lightweight probe to check if the GPT API is reachable.
+
+        Creates a temporary client, sends a minimal query, and checks
+        for a successful response.  Returns True if the API responds,
+        False on any error.  The probe client is always cleaned up.
+        """
+        try:
+            options = self._build_options()
+            probe_client = ClaudeSDKClient(options)
+            connect_task = asyncio.create_task(probe_client.connect())
+            await asyncio.wait_for(connect_task, timeout=30.0)
+            await probe_client.query("ping")
+            got_response = False
+            async for _msg in probe_client.receive_response():
+                model = getattr(_msg, "model", None)
+                is_api_err = getattr(_msg, "isApiErrorMessage", False)
+                if model == "<synthetic>" or is_api_err is True:
+                    got_response = False
+                    break
+                got_response = True
+                break
+            await probe_client.disconnect()
+            return got_response
+        except Exception:
+            logger.debug("API health probe failed", exc_info=True)
+            return False
 
     async def async_reset(self) -> None:
         """Async reset that also disconnects the client cleanly."""

@@ -229,6 +229,7 @@ class ConversationRunner:
         self._last_message = None  # tracks last SDK message for metrics
         self._last_result_message = None  # latest ResultMessage-like payload
         self._last_assistant_usage: dict | None = None  # latest assistant step usage
+        self._had_synthetic_error = False  # set by _stream_response for recovery
 
     def _refresh_last_result_data(self) -> None:
         """Refresh hook_state.last_result_data from the latest SDK result-like message."""
@@ -273,9 +274,18 @@ class ConversationRunner:
         """Stream one SDK response from ``self._client``, yielding events.
 
         Updates ``self._last_message`` for each message received.
+        Detects synthetic API error messages (model="<synthetic>"
+        or isApiErrorMessage=True) and sets a flag for post-turn
+        recovery in run().
         """
+        self._had_synthetic_error = False
         async for message in self._client.receive_response():
             self._last_message = message
+            # Detect SDK synthetic error messages
+            model = getattr(message, "model", None)
+            is_api_err = getattr(message, "isApiErrorMessage", False)
+            if (isinstance(model, str) and model == "<synthetic>") or is_api_err is True:
+                self._had_synthetic_error = True
             raw_uuid = getattr(message, "_raw_uuid", None)
             message_role = _message_role(message)
             has_text = False
@@ -471,6 +481,59 @@ class ConversationRunner:
         if self._last_message is not None:
             log_result(self._last_message, label="conversation")
             self._refresh_last_result_data()
+
+        # 3b. Synthetic error recovery (API outage handling)
+        if getattr(self, "_had_synthetic_error", False):
+            error_count = self._session_mgr.record_api_error()
+            if error_count >= 2:
+                backoff = self._session_mgr.backoff_seconds
+                logger.warning(
+                    "API error recovery: %d consecutive synthetic errors, "
+                    "backing off %.0fs before soft_reset",
+                    error_count, backoff,
+                )
+                yield StatusEvent(
+                    type="api_degraded",
+                    summary=(
+                        f"GPT API unreachable ({error_count} consecutive errors). "
+                        f"Auto-recovering in {int(backoff)}s..."
+                    ),
+                )
+                await asyncio.sleep(backoff)
+                # Probe API health before resuming
+                logger.info("Probing API health before recovery...")
+                api_healthy = await self._session_mgr.probe_api_health()
+                if not api_healthy:
+                    # Extend backoff and skip this turn
+                    self._session_mgr.record_api_error()
+                    extended_backoff = self._session_mgr.backoff_seconds
+                    logger.warning(
+                        "API probe failed, extending backoff to %.0fs",
+                        extended_backoff,
+                    )
+                    yield StatusEvent(
+                        type="api_degraded",
+                        summary=(
+                            f"API still unreachable. "
+                            f"Will retry in {int(extended_backoff)}s."
+                        ),
+                    )
+                else:
+                    logger.info("API probe succeeded, performing soft_reset")
+                    await self._session_mgr.soft_reset()
+                    yield StatusEvent(
+                        type="api_recovered",
+                        summary="GPT API recovered. Resuming normal operation.",
+                    )
+                # Skip continuations during recovery — defer queued messages
+                self._pending_messages = _drain_queue(
+                    self._hook_state.message_queue
+                )
+                self._session_mgr.touch()
+                yield DoneEvent()
+                return
+        else:
+            self._session_mgr.clear_api_errors()
 
         # 4. Continuation loop: process queued messages inline
         continuation_count = 0
