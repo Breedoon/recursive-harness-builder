@@ -75,6 +75,7 @@ class SessionManager:
         self._connected: bool = False
         self._lock = asyncio.Lock()
         self._sdk_env_overrides: dict[str, str] = {}
+        self._consecutive_api_errors: int = 0
         # Per-session model override.  When set, takes precedence over
         # ``self.config.model`` in ``_build_options``.  Used by AgentTask to
         # give child sessions a different model without mutating the shared
@@ -97,6 +98,15 @@ class SessionManager:
     def touch(self) -> None:
         """Update last_activity to current time."""
         self.last_activity = time.time()
+
+    def record_api_error(self) -> int:
+        """Record a synthetic API error turn. Returns consecutive count."""
+        self._consecutive_api_errors += 1
+        return self._consecutive_api_errors
+
+    def clear_api_error_count(self) -> None:
+        """Reset consecutive API error counter on successful turn."""
+        self._consecutive_api_errors = 0
 
     def set_sdk_env_overrides(self, env: dict[str, str] | None) -> None:
         """Set per-session SDK env overrides for newly created clients.

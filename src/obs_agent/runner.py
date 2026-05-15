@@ -40,6 +40,12 @@ _RECOVERY_PROMPT = (
     "Do not treat this as a new user message or as part of the conversation history."
 )
 
+# Synthetic API error recovery: after this many consecutive turns where the
+# SDK exhausted its internal retries and wrote a synthetic error message,
+# trigger a soft_reset + backoff so the next turn gets a fresh SDK process.
+_SYNTHETIC_ERROR_RESET_THRESHOLD = 2
+_SYNTHETIC_ERROR_BACKOFF_SECONDS = 30
+
 
 # ---------------------------------------------------------------------------
 # Runner event types
@@ -229,6 +235,7 @@ class ConversationRunner:
         self._last_message = None  # tracks last SDK message for metrics
         self._last_result_message = None  # latest ResultMessage-like payload
         self._last_assistant_usage: dict | None = None  # latest assistant step usage
+        self._had_synthetic_error = False  # set by _stream_response on synthetic API error
 
     def _refresh_last_result_data(self) -> None:
         """Refresh hook_state.last_result_data from the latest SDK result-like message."""
@@ -276,6 +283,13 @@ class ConversationRunner:
         """
         async for message in self._client.receive_response():
             self._last_message = message
+            # Detect synthetic API error (SDK exhausted retries, wrote fake message)
+            _model = getattr(message, "model", None)
+            if (
+                (isinstance(_model, str) and _model == "<synthetic>")
+                or getattr(message, "isApiErrorMessage", False) is True
+            ):
+                self._had_synthetic_error = True
             raw_uuid = getattr(message, "_raw_uuid", None)
             message_role = _message_role(message)
             has_text = False
@@ -472,11 +486,35 @@ class ConversationRunner:
             log_result(self._last_message, label="conversation")
             self._refresh_last_result_data()
 
+        # 3b. Synthetic error recovery (408 loop detection)
+        _skip_continuations = False
+        if self._had_synthetic_error:
+            error_count = self._session_mgr.record_api_error()
+            logger.warning(
+                "Synthetic API error detected (consecutive count: %d)",
+                error_count,
+            )
+            if error_count >= _SYNTHETIC_ERROR_RESET_THRESHOLD:
+                logger.warning(
+                    "Consecutive synthetic errors (%d/%d) hit threshold, "
+                    "soft_reset + %ds backoff for recovery",
+                    error_count,
+                    _SYNTHETIC_ERROR_RESET_THRESHOLD,
+                    _SYNTHETIC_ERROR_BACKOFF_SECONDS,
+                )
+                await self._session_mgr.soft_reset()
+                await asyncio.sleep(_SYNTHETIC_ERROR_BACKOFF_SECONDS)
+                _skip_continuations = True
+            self._had_synthetic_error = False
+        else:
+            self._session_mgr.clear_api_error_count()
+
         # 4. Continuation loop: process queued messages inline
         continuation_count = 0
         deferred_pending: list[QueuedMessage] = []
         while (
-            continuation_count < self._config.max_queue_continuations
+            not _skip_continuations
+            and continuation_count < self._config.max_queue_continuations
             and not self._hook_state.pause_queue_delivery
             and not self._hook_state.interrupt_requested
         ):
@@ -510,7 +548,8 @@ class ConversationRunner:
 
         # 5. Background fork wait loop
         while (
-            self._hook_state.background_tasks
+            not _skip_continuations
+            and self._hook_state.background_tasks
             and not self._hook_state.pause_queue_delivery
             and not self._hook_state.interrupt_requested
         ):
