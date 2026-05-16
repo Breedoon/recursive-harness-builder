@@ -95,8 +95,70 @@ class TestAgentTaskTools:
         assert schema["required"] == ["recipient", "content"]
         assert "team_name" in schema["properties"]
         assert "sender" in schema["properties"]
-        assert "needs_reply" in schema["properties"]
-        assert "must_reply" in schema["properties"]
+        assert "needs_reply" not in schema["properties"]
+        assert "must_reply" not in schema["properties"]
+
+    @pytest.mark.asyncio
+    async def test_send_inbox_message_accepts_backend_needs_reply_arg(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
+        send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
+
+        result = await send_handler(
+            {
+                "team_name": "team-alpha",
+                "recipient": "worker-a",
+                "content": "please answer",
+                "sender": "lead",
+                "needs_reply": True,
+            }
+        )
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["success"] is True
+
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
+        assert persisted[-1]["must_reply"] is True
+        assert persisted[-1]["replied"] is False
+
+    @pytest.mark.asyncio
+    async def test_send_inbox_message_accepts_legacy_must_reply_backend_arg(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
+        send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
+
+        result = await send_handler(
+            {
+                "team_name": "team-alpha",
+                "recipient": "worker-a",
+                "content": "please answer",
+                "sender": "lead",
+                "must_reply": True,
+            }
+        )
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["success"] is True
+
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
+        assert persisted[-1]["must_reply"] is True
+        assert persisted[-1]["replied"] is False
 
     def test_read_inbox_schema_has_no_required_fields(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools

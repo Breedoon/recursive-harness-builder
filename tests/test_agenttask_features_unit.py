@@ -82,8 +82,8 @@ class TestModelContextBoundary:
         assert split_context_suffix("gpt-5.4-mini") == ("gpt-5.4-mini", None)
         assert split_context_suffix("gpt-5.4-mini[200k]") == ("gpt-5.4-mini", 200_000)
 
-    def test_claude_code_boundary_adds_default_1m_suffix_for_non_claude(self):
-        assert normalize_model_for_claude_code("gpt") == "gpt-5.5[1m]"
+    def test_claude_code_boundary_adds_default_suffix_for_non_claude(self):
+        assert normalize_model_for_claude_code("gpt") == "gpt-5.5[400k]"
         assert normalize_model_for_claude_code("claude") == "claude-opus-4-7"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
 

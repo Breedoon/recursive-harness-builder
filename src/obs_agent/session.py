@@ -272,10 +272,53 @@ class SessionManager:
             options = self._build_options()
             return await self._connect_client_with_retry(options=options)
 
+    def has_connected_client(self) -> bool:
+        """Return whether this manager currently owns a connected SDK client."""
+        return self._client is not None and self._connected
+
+    async def disconnect_idle_client(self, *, direct_kill: bool = False) -> bool:
+        """Disconnect an idle client while preserving session resume state.
+
+        Returns True when a connected client reference existed and was cleared.
+        """
+        async with self._lock:
+            had_client = self._client is not None and self._connected
+            if direct_kill:
+                await self._direct_kill_client_process_unlocked()
+            else:
+                await self._disconnect_unlocked()
+            return had_client
+
     async def disconnect(self) -> None:
         """Disconnect current client (for daemon shutdown or reconnect)."""
         async with self._lock:
             await self._disconnect_unlocked()
+
+    async def _direct_kill_client_process_unlocked(self) -> None:
+        """Best-effort direct teardown of the owned Claude CLI subprocess."""
+        client = self._client
+        process = getattr(getattr(client, "_transport", None), "_process", None)
+        direct_kill_attempted = False
+        if process is not None and getattr(process, "returncode", None) is None:
+            direct_kill_attempted = True
+            try:
+                process.kill()
+                wait = getattr(process, "wait", None)
+                if wait is not None:
+                    await asyncio.wait_for(wait(), timeout=2.0)
+            except Exception:
+                logger.debug("Error during direct Claude process kill", exc_info=True)
+
+        if direct_kill_attempted and client is not None:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+            except Exception:
+                logger.debug("Error during post-kill client disconnect", exc_info=True)
+            self._connected = False
+            self._client = None
+            return
+
+        await self._disconnect_unlocked()
 
     async def _disconnect_unlocked(self) -> None:
         """Disconnect without acquiring lock (called from within locked context)."""

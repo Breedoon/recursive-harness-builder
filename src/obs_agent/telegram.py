@@ -305,6 +305,13 @@ class _ForkTaskRecord:
 
 
 @dataclass
+class _IdleClaudeProcessCandidate:
+    record: _ForkTaskRecord
+    state: TelegramSessionState
+    idle_at: float
+
+
+@dataclass
 class _TopicScheduleRecord:
     schedule_id: str
     route: TelegramRoute
@@ -1818,6 +1825,148 @@ class TelegramBot:
             title=title,
             icon_custom_emoji_id=icon_custom_emoji_id,
         )
+
+    def _is_fork_task_running(
+        self,
+        record: _ForkTaskRecord,
+        *,
+        completing_task_id: str | None = None,
+    ) -> bool:
+        if record.task_id == completing_task_id:
+            return False
+        task = self._fork_task_tasks.get(record.task_id)
+        if task is not None and not task.done():
+            return True
+        return any(record.task_id in state.active_fork_task_ids for state in self._states_by_route.values())
+
+    def _idle_claude_process_candidates(
+        self,
+        *,
+        completing_task_id: str | None = None,
+        skip_reasons: dict[str, int] | None = None,
+    ) -> list[_IdleClaudeProcessCandidate]:
+        def skip(reason: str) -> None:
+            if skip_reasons is not None:
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
+        candidates: list[_IdleClaudeProcessCandidate] = []
+        for record in self._fork_tasks_by_id.values():
+            if not record.idle_ready:
+                skip("not_idle_ready")
+                continue
+            if not (record.team_name or "").strip() or not (record.agent_name or "").strip():
+                skip("missing_team_or_agent")
+                continue
+            if self._is_fork_task_running(record, completing_task_id=completing_task_id):
+                skip("running")
+                continue
+            child_state = self._states_by_route.get(record.child_route)
+            if child_state is None:
+                skip("missing_child_state")
+                continue
+            if child_state.busy:
+                skip("busy")
+                continue
+            if child_state.hook_state.execution_active:
+                skip("execution_active")
+                continue
+            if not child_state.session_manager.has_connected_client():
+                skip("no_connected_client")
+                continue
+            candidates.append(
+                _IdleClaudeProcessCandidate(
+                    record=record,
+                    state=child_state,
+                    idle_at=record.completed_at or record.created_at,
+                )
+            )
+        candidates.sort(key=lambda candidate: (candidate.idle_at, candidate.record.task_id))
+        return candidates
+
+    async def _prune_idle_claude_processes(
+        self,
+        *,
+        completing_task_id: str | None = None,
+    ) -> int:
+        skip_reasons: dict[str, int] = {}
+        candidates = self._idle_claude_process_candidates(
+            completing_task_id=completing_task_id,
+            skip_reasons=skip_reasons,
+        )
+        cap = self._config.claude_idle_process_cap
+        kill_on_idle = self._config.claude_kill_on_idle
+        mode = "disabled"
+        overage = 0
+        to_prune: list[_IdleClaudeProcessCandidate] = []
+
+        if kill_on_idle:
+            mode = "kill_on_idle"
+            to_prune = candidates
+            overage = len(candidates)
+        elif cap is not None:
+            mode = "cap"
+            overage = len(candidates) - max(cap, 0)
+            if overage > 0:
+                to_prune = candidates[:overage]
+
+        if mode == "disabled":
+            logger.debug(
+                "Claude idle process pruning skipped mode=%s cap=%s kill_on_idle=%s candidates=%d overage=%d skips=%s completing_task_id=%s",
+                mode,
+                cap,
+                kill_on_idle,
+                len(candidates),
+                overage,
+                skip_reasons,
+                completing_task_id,
+            )
+            return 0
+        if not to_prune:
+            logger.info(
+                "Claude idle process pruning skipped mode=%s cap=%s kill_on_idle=%s candidates=%d overage=%d skips=%s completing_task_id=%s",
+                mode,
+                cap,
+                kill_on_idle,
+                len(candidates),
+                overage,
+                skip_reasons,
+                completing_task_id,
+            )
+            return 0
+
+        selected_task_ids = [candidate.record.task_id for candidate in to_prune]
+        pruned = 0
+        prune_skip_reasons: dict[str, int] = {}
+        for candidate in to_prune:
+            if self._is_fork_task_running(candidate.record, completing_task_id=completing_task_id):
+                prune_skip_reasons["became_running"] = prune_skip_reasons.get("became_running", 0) + 1
+                continue
+            if candidate.state.busy:
+                prune_skip_reasons["became_busy"] = prune_skip_reasons.get("became_busy", 0) + 1
+                continue
+            if candidate.state.hook_state.execution_active:
+                prune_skip_reasons["became_execution_active"] = prune_skip_reasons.get("became_execution_active", 0) + 1
+                continue
+            if await candidate.state.session_manager.disconnect_idle_client(direct_kill=True):
+                pruned += 1
+            else:
+                prune_skip_reasons["disconnect_no_client"] = prune_skip_reasons.get("disconnect_no_client", 0) + 1
+
+        logger.info(
+            "Claude idle process pruning mode=%s cap=%s kill_on_idle=%s candidates=%d selected=%d pruned=%d overage=%d skips=%s prune_skips=%s selected_task_ids=%s completing_task_id=%s",
+            mode,
+            cap,
+            kill_on_idle,
+            len(candidates),
+            len(to_prune),
+            pruned,
+            overage,
+            skip_reasons,
+            prune_skip_reasons,
+            selected_task_ids,
+            completing_task_id,
+        )
+        return pruned
 
     def _build_session_state(
         self,
@@ -5986,6 +6135,7 @@ class TelegramBot:
         state.busy = True
         state.hook_state.execution_active = True
         state.last_bot = bot
+        state.hook_state.interrupt_flag = False
         state.hook_state.interrupt_requested = False
         state.hook_state.pause_queue_delivery = False
         run_user_text = user_text
@@ -6069,8 +6219,8 @@ class TelegramBot:
                     bot=bot,
                     text="working",
                     disable_notification=True,
-                    reply_to_message_id=reply_to_message_id,
-                    max_attempts=3,
+                    reply_to_message_id=None,
+                    max_attempts=1,
                 )
             except Exception:
                 logger.debug("Failed to send working marker", exc_info=True)
@@ -8750,6 +8900,7 @@ class TelegramBot:
             # (completed, failed, stopped) so inbox wakes can reach it.
             self._fork_task_by_child_route[record.child_route] = record.task_id
             self._register_team_worker_record(record)
+            await self._prune_idle_claude_processes(completing_task_id=record.task_id)
             if record.wake_requested:
                 try:
                     await self._start_idle_team_worker_wake(
@@ -8928,7 +9079,19 @@ class TelegramBot:
 
         reply_message = message.reply_to_message
         reply_message_id = getattr(reply_message, "message_id", None)
-        if (
+        if isinstance(reply_message_id, int) and self._is_system_message_id(
+            chat_id=route.chat_id,
+            message_id=reply_message_id,
+        ):
+            reply_message_id = None
+        elif (
+            isinstance(reply_message_id, int)
+            and route.thread_id is not None
+            and reply_message_id == route.thread_id
+            and self._message_map.get((route.chat_id, reply_message_id)) is None
+        ):
+            reply_message_id = None
+        elif (
             reply_message_id is not None
             and self._message_map.get((route.chat_id, reply_message_id)) is None
         ):

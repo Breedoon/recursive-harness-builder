@@ -23,5 +23,6 @@ This folder mixes live reference docs and historical planning artifacts.
 ## Testing Docs
 
 - `../CLAUDE.md` (authoritative)
+- `live-test-suite.md` (live Telegram smoke/focused/special organization and parallel smoke runner)
 - `testing-philosophy.md` (historical context + pointers)
 - `.claude/agents/eval-guardian.md` (review/audit policy)

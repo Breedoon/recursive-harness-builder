@@ -9,14 +9,15 @@ from pathlib import Path
 _DEFAULT_LIVE_TEST_VAULT = Path("/tmp/obs-telegram-live-test-vault")
 
 
-def ensure_live_test_vault() -> Path:
-    """Return a persistent minimal vault used by live Telegram tests.
+def ensure_live_test_vault(path: str | Path | None = None) -> Path:
+    """Return a minimal vault used by live Telegram tests.
 
-    The path is stable across runs so external manual testing can attach to the
-    same test workspace.
+    The default path is stable across runs so external manual testing can attach
+    to the same test workspace. Callers that need parallel isolation can pass an
+    explicit path, which takes precedence over the environment override.
     """
 
-    raw = (os.environ.get("OBS_TELEGRAM_LIVE_TEST_VAULT") or "").strip()
+    raw = str(path) if path is not None else (os.environ.get("OBS_TELEGRAM_LIVE_TEST_VAULT") or "").strip()
     vault = (Path(raw).expanduser() if raw else _DEFAULT_LIVE_TEST_VAULT).resolve()
 
     claude_dir = vault / ".claude"

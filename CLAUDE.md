@@ -208,6 +208,10 @@ CLI when explicitly enabled), using a real ephemeral vault clone.
 # Live integration (real HTTP + SDK, no CLI):
 .venv/bin/pytest tests/ -q -m integration --timeout=300
 
+# Parallel live Telegram smoke (separate pytest workers with isolated resources):
+OBS_TEST_TELEGRAM_BOT_USERNAMES=botA,botB OBS_TEST_TELEGRAM_BOT_TOKENS=tokenA,tokenB \
+  .venv/bin/python scripts/run_parallel_live_smoke.py --output-dir /tmp/obs-live-parallel-smoke
+
 # Default eval run (Telegram lane; CLI evals are disabled unless enabled):
 .venv/bin/pytest tests/evals/ -v -m eval --timeout=300
 

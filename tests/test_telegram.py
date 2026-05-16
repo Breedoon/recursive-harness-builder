@@ -155,7 +155,7 @@ class TestTelegramMessageFlow:
         rendered = bot._render_turn_html([TextEvent(text="[Request interrupted by user]")])
         assert rendered == "<u><i>[Request interrupted by user]</i></u>"
 
-    async def test_system_messages_reply_to_user_message(self, config):
+    async def test_received_and_completion_reply_but_working_is_standalone(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         events = [TextEvent(text="done"), TurnEndEvent(), DoneEvent()]
 
@@ -175,8 +175,42 @@ class TestTelegramMessageFlow:
 
         calls = [c.kwargs for c in ctx.bot.send_message.call_args_list]
         assert calls[0]["reply_to_message_id"] == 42
-        assert calls[1]["reply_to_message_id"] == 42
+        assert calls[1]["reply_to_message_id"] is None
         assert calls[-1]["reply_to_message_id"] == 42
+
+    async def test_working_marker_is_standalone_and_single_attempt(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        events = [TextEvent(text="done"), TurnEndEvent(), DoneEvent()]
+        next_message_id = 100
+
+        async def fake_send_system_message(**kwargs):
+            nonlocal next_message_id
+            message = MagicMock()
+            message.message_id = next_message_id
+            next_message_id += 1
+            return message
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                for event in events:
+                    yield event
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+            with patch.object(bot, "_send_system_message", AsyncMock(side_effect=fake_send_system_message)) as send_system:
+                update = _make_update("test", message_id=42)
+                ctx = _make_context()
+                await bot.handle_message(update, ctx)
+
+        system_calls = [c.kwargs for c in send_system.call_args_list]
+        received_call = next(c for c in system_calls if c["text"] == "received")
+        working_call = next(c for c in system_calls if c["text"] == "working")
+        assert received_call["reply_to_message_id"] == 42
+        assert received_call["max_attempts"] == 1
+        assert working_call["reply_to_message_id"] is None
+        assert working_call["max_attempts"] == 1
 
     async def test_assistant_messages_are_mapped_to_jsonl_uuid(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -878,6 +912,54 @@ class TestBackgroundPoller:
         assert "user interrupted your previous response via /stop" in captured_prompt[0]
         assert captured_prompt[0].strip().endswith("hello")
         assert state.hook_state.interrupt_notice_pending is False
+
+    async def test_run_and_send_clears_stale_idle_interrupt_before_new_turn(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        assert state is not None
+        state.hook_state.interrupt_flag = True
+        state.hook_state.interrupt_requested = False
+        state.hook_state.interrupt_notice_pending = True
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=777))
+        interrupt_flags_at_run_start: list[bool] = []
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                interrupt_flags_at_run_start.append(state.hook_state.interrupt_flag)
+                yield TextEvent(text="done")
+                yield TurnEndEvent()
+                yield DoneEvent()
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+            await bot._run_and_send(
+                state=state,
+                user_text="hello after idle stop",
+                bot=fake_bot,
+            )
+
+        assert interrupt_flags_at_run_start == [False]
+        assert state.hook_state.interrupt_notice_pending is False
+
+    async def test_request_route_interrupt_preserves_active_interrupt_flag(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        assert state is not None
+        state.busy = True
+        state.hook_state.execution_active = True
+        state.session_manager._client = MagicMock()
+        state.session_manager._client.interrupt = AsyncMock()
+        state.session_manager._connected = True
+
+        interrupted = await bot._request_route_interrupt(state)
+
+        assert interrupted is True
+        assert state.hook_state.interrupt_flag is True
+        assert state.hook_state.interrupt_requested is True
+        state.session_manager._client.interrupt.assert_awaited_once()
 
     async def test_run_and_send_primes_trunk_lineage_before_first_client_connect(
         self,
@@ -2481,6 +2563,151 @@ class TestForkViaReply:
         assert reply_to_user_message_id == 11
         assert fake_bot.send_message.call_args.kwargs["text"] == "<u><i>can&#x27;t fork from this message</i></u>"
 
+    async def test_fork_command_from_topic_root_reply_uses_current_head(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.set_session_id("sid-root")
+        bot._session_heads["sid-root"] = "head-uuid"
+
+        update = _make_update("/fork", chat_id=67890, message_id=30, thread_id=321)
+        update.effective_message.reply_to_message = SimpleNamespace(
+            message_id=321,
+            message_thread_id=321,
+        )
+        ctx = _make_context()
+        ctx.args = []
+
+        with (
+            patch.object(bot, "_await_jsonl_stability", AsyncMock(return_value="head-uuid")),
+            patch.object(
+                bot,
+                "_create_child_fork_topic",
+                AsyncMock(return_value={"child_link": None}),
+            ) as create_mock,
+            patch.object(
+                bot,
+                "_send_system_html_message",
+                AsyncMock(return_value=[SimpleNamespace(message_id=900)]),
+            ),
+        ):
+            await bot.handle_fork(update, ctx)
+
+        create_mock.assert_awaited_once()
+        kwargs = create_mock.await_args.kwargs
+        assert kwargs["source_session_id"] == "sid-root"
+        assert kwargs["source_uuid"] == "head-uuid"
+        assert kwargs["source_message_id"] is None
+
+    async def test_fork_command_from_system_reply_uses_current_head(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.set_session_id("sid-root")
+        bot._session_heads["sid-root"] = "head-uuid"
+        bot._system_message_ids.add((67890, 700))
+        bot._system_message_routes[(67890, 700)] = route
+
+        update = _make_update("/fork", chat_id=67890, message_id=30, thread_id=321)
+        update.effective_message.reply_to_message = SimpleNamespace(
+            message_id=700,
+            message_thread_id=321,
+        )
+        ctx = _make_context()
+        ctx.args = []
+
+        with (
+            patch.object(bot, "_await_jsonl_stability", AsyncMock(return_value="head-uuid")),
+            patch.object(
+                bot,
+                "_create_child_fork_topic",
+                AsyncMock(return_value={"child_link": None}),
+            ) as create_mock,
+            patch.object(
+                bot,
+                "_send_system_html_message",
+                AsyncMock(return_value=[SimpleNamespace(message_id=900)]),
+            ),
+        ):
+            await bot.handle_fork(update, ctx)
+
+        create_mock.assert_awaited_once()
+        kwargs = create_mock.await_args.kwargs
+        assert kwargs["source_session_id"] == "sid-root"
+        assert kwargs["source_uuid"] == "head-uuid"
+        assert kwargs["source_message_id"] is None
+
+    async def test_fork_command_preserves_explicit_mapped_reply_source(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.set_session_id("sid-root")
+        bot._session_heads["sid-root"] = "head-uuid"
+        bot._message_map[(67890, 5)] = _TelegramMessageBinding(
+            jsonl_uuid="anchor-uuid",
+            session_id="sid-root",
+            role="assistant",
+            route=route,
+        )
+
+        update = _make_update("/fork", chat_id=67890, message_id=30, thread_id=321)
+        update.effective_message.reply_to_message = SimpleNamespace(
+            message_id=5,
+            message_thread_id=321,
+        )
+        ctx = _make_context()
+        ctx.args = []
+
+        with (
+            patch.object(bot, "_await_jsonl_stability", AsyncMock(return_value="anchor-uuid")),
+            patch.object(
+                bot,
+                "_create_child_fork_topic",
+                AsyncMock(return_value={"child_link": None}),
+            ) as create_mock,
+            patch.object(
+                bot,
+                "_send_system_html_message",
+                AsyncMock(return_value=[SimpleNamespace(message_id=900)]),
+            ),
+        ):
+            await bot.handle_fork(update, ctx)
+
+        create_mock.assert_awaited_once()
+        kwargs = create_mock.await_args.kwargs
+        assert kwargs["source_session_id"] == "sid-root"
+        assert kwargs["source_uuid"] == "anchor-uuid"
+        assert kwargs["source_message_id"] == 5
+
+    async def test_fork_command_unknown_non_system_reply_returns_error(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.set_session_id("sid-root")
+        bot._session_heads["sid-root"] = "head-uuid"
+
+        update = _make_update("/fork", chat_id=67890, message_id=30, thread_id=321)
+        update.effective_message.reply_to_message = SimpleNamespace(
+            message_id=999,
+            message_thread_id=321,
+        )
+        ctx = _make_context()
+        ctx.args = []
+
+        with (
+            patch.object(bot, "_send_system_message", new_callable=AsyncMock) as send_mock,
+            patch.object(bot, "_create_child_fork_topic", new_callable=AsyncMock) as create_mock,
+        ):
+            await bot.handle_fork(update, ctx)
+
+        create_mock.assert_not_awaited()
+        send_mock.assert_awaited_once()
+        assert send_mock.await_args.kwargs["text"] == "can't fork from this message"
+
     async def test_pre_sent_receipts_are_not_duplicated_when_processing_media(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         update = _make_update("", message_id=61)
@@ -3891,7 +4118,7 @@ class TestForkTaskRuntime:
         assert child_state is not None
         assert child_state.notify_on_completion is True
         assert child_state.session_manager.model_override == "gpt-5.5"
-        assert child_state.session_manager.create_options().model == "gpt-5.5[1m]"
+        assert child_state.session_manager.create_options().model == "gpt-5.5[400k]"
         assert (
             child_state.session_manager.create_options().env["ANTHROPIC_API_KEY"]
             == config.cli_proxy_api_key
@@ -3957,9 +4184,9 @@ class TestForkTaskRuntime:
         assert child_state.session_id is None
         assert child_state.session_manager.model_override == "gpt-5.5"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[1m]"
+        assert child_options.model == "gpt-5.5[400k]"
         child_env = child_options.env
-        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
         assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == unique_team
@@ -3970,7 +4197,7 @@ class TestForkTaskRuntime:
             f"Agent name env var should contain 'fresh-child', got: {child_env['CLAUDE_CODE_AGENT_NAME']}"
         await bot.shutdown()
 
-    async def test_launch_agent_task_explicit_shorthand_model_gets_1m_at_sdk_boundary(
+    async def test_launch_agent_task_explicit_shorthand_model_gets_400k_at_sdk_boundary(
         self,
         config,
         tmp_path,
@@ -4004,10 +4231,10 @@ class TestForkTaskRuntime:
         assert child_state is not None
         assert child_state.session_manager.model_override == "gpt-5.5"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[1m]"
-        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
-        assert child_options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "92"
+        assert child_options.model == "gpt-5.5[400k]"
+        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "400000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
+        assert child_options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "86"
         assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
         await bot.shutdown()
 

@@ -113,8 +113,10 @@ class TelegramForumPlatform:
         first_message_timeout: float = _DEFAULT_FIRST_MESSAGE_TIMEOUT,
         done_timeout: float = _DEFAULT_DONE_TIMEOUT,
         idle_quiescence_timeout: float = _DEFAULT_IDLE_QUIESCENCE_TIMEOUT,
+        create_isolated_chat: bool = False,
     ) -> None:
         self._chat_id = chat_id
+        self._create_isolated_chat = create_isolated_chat
         self._bot_username = bot_username or os.environ["OBS_TEST_TELEGRAM_BOT_USERNAME"]
         self._bot_token = bot_token or os.environ["OBS_TEST_TELEGRAM_BOT_TOKEN"]
         extra_tokens = os.environ.get("OBS_TELEGRAM_BOT_TOKENS", "").strip()
@@ -152,9 +154,12 @@ class TelegramForumPlatform:
         self._bot_sender_ids = {bot_entity.id}
         await self._discover_additional_bot_sender_ids()
         if self._chat_id is None:
-            self._chat_id = await self._resolve_or_create_forum_chat(
-                primary_bot_entity=bot_entity
-            )
+            if self._create_isolated_chat:
+                self._chat_id = await self._create_forum_chat_with_bots(bot_entity)
+            else:
+                self._chat_id = await self._resolve_or_create_forum_chat(
+                    primary_bot_entity=bot_entity
+                )
         else:
             channel = await self._client.get_entity(self._chat_id)
             if not isinstance(channel, Channel):

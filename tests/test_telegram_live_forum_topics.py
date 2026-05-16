@@ -114,18 +114,33 @@ def _kill_worktree_telegram_daemons(worktree_root: Path) -> None:
         subprocess.run(["kill", str(pid)], check=False)
 
 
-def _start_bot(
+def _flag_is_explicit_false(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _model_env_is_claude(env: dict[str, str]) -> bool:
+    raw_model = env.get("OBS_AGENT_MODEL") or env.get("OBS_MODEL") or env.get("OBS_DEFAULT_MODEL") or "claude"
+    model = raw_model.split("[", 1)[0].strip().lower()
+    return model.startswith("claude") or model in {"haiku", "sonnet", "opus"}
+
+
+def _scrub_inherited_anthropic_env_for_proxy_disabled_claude(env: dict[str, str]) -> None:
+    if not _flag_is_explicit_false(env.get("OBS_CACHE_PROXY_ENABLED")):
+        return
+    if not _model_env_is_claude(env):
+        return
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_BASE_URL", None)
+
+
+def _build_bot_env(
     vault_path: Path,
     temp_root: Path,
     *,
     state_db_path: Path | None = None,
-) -> tuple[subprocess.Popen, Path]:
-    if _kill_existing_daemons_enabled():
-        worktree_root = Path(__file__).resolve().parents[1]
-        _kill_worktree_telegram_daemons(worktree_root)
-        time.sleep(0.5)
-
+) -> dict[str, str]:
     env = os.environ.copy()
+    _scrub_inherited_anthropic_env_for_proxy_disabled_claude(env)
     # Ensure the subprocess imports from this worktree's src/, not the
     # installed (possibly production) package.
     worktree_src = str(Path(__file__).resolve().parents[1] / "src")
@@ -149,6 +164,21 @@ def _start_bot(
     env.setdefault("OBS_TELEGRAM_TYPING_ACTIONS_ENABLED", "0")
     # Native Task* parity harness requires the built-in task tools enabled.
     env.setdefault("CLAUDE_CODE_ENABLE_TASKS", "1")
+    return env
+
+
+def _start_bot(
+    vault_path: Path,
+    temp_root: Path,
+    *,
+    state_db_path: Path | None = None,
+) -> tuple[subprocess.Popen, Path]:
+    if _kill_existing_daemons_enabled():
+        worktree_root = Path(__file__).resolve().parents[1]
+        _kill_worktree_telegram_daemons(worktree_root)
+        time.sleep(0.5)
+
+    env = _build_bot_env(vault_path, temp_root, state_db_path=state_db_path)
 
     log_file = Path(tempfile.mktemp(prefix="obs_tg_forum_", suffix=".log"))
     log_fh = open(log_file, "w")
@@ -360,6 +390,26 @@ def _append_unread_inbox_message(
     inbox_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
 
 
+@dataclass(frozen=True)
+class _LiveForumResources:
+    run_id: str
+    isolated: bool
+    vault_path: Path
+    temp_root: Path
+    state_db_path: Path
+    chat_id: int | None
+
+    def as_metadata(self) -> dict[str, str | int | bool | None]:
+        return {
+            "run_id": self.run_id,
+            "isolated": self.isolated,
+            "vault_path": str(self.vault_path),
+            "temp_root": str(self.temp_root),
+            "state_db_path": str(self.state_db_path),
+            "chat_id": self.chat_id,
+        }
+
+
 @dataclass
 class _LiveForumHarness:
     platform: TelegramForumPlatform
@@ -369,10 +419,30 @@ class _LiveForumHarness:
     bot_username: str
     temp_root: Path | None = None
     state_db_path: Path | None = None
+    resources: _LiveForumResources | None = None
+
+    def resource_metadata(self) -> dict[str, str | int | bool | None]:
+        if self.resources is None:
+            metadata: dict[str, str | int | bool | None] = {
+                "run_id": None,
+                "isolated": False,
+                "vault_path": str(self.vault_path),
+                "temp_root": str(self.temp_root) if self.temp_root is not None else None,
+                "state_db_path": str(self.state_db_path) if self.state_db_path is not None else None,
+                "chat_id": getattr(self.platform, "_chat_id", None),
+            }
+        else:
+            metadata = self.resources.as_metadata()
+        metadata["bot_username"] = self.bot_username
+        metadata["daemon_pid"] = self.proc.pid
+        metadata["log_file"] = str(self.log_file)
+        return metadata
 
     def failure_context(self) -> str:
         return (
-            "\nRecent forum messages:\n"
+            "\nLive forum resources:\n"
+            f"{json.dumps(self.resource_metadata(), sort_keys=True)}\n\n"
+            "Recent forum messages:\n"
             f"{self.platform.format_recent_messages()}\n\n"
             "Bot log tail:\n"
             f"{_read_log_tail(self.log_file)}"
@@ -492,39 +562,243 @@ def _clear_cached_forum_chat_id() -> None:
     _CACHED_FORUM_CHAT_ID = None
 
 
-@pytest_asyncio.fixture
-async def live_tg_forum(tmp_path: Path) -> _LiveForumHarness:
+def _isolated_live_resources_enabled() -> bool:
+    raw = (os.environ.get("OBS_TEST_TELEGRAM_ISOLATED_RESOURCES") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _build_live_forum_resources(
+    tmp_path: Path,
+    *,
+    isolated: bool | None = None,
+    chat_id: int | None = None,
+) -> _LiveForumResources:
+    use_isolated = _isolated_live_resources_enabled() if isolated is None else isolated
+    run_id = f"live-{uuid.uuid4().hex[:8]}"
+    if use_isolated:
+        root = tmp_path / run_id
+        vault_path = ensure_live_test_vault(root / "vault")
+        temp_root = root / "obs-agent-temp"
+        state_db_path = root / "telegram-state.sqlite3"
+    else:
+        vault_path = ensure_live_test_vault()
+        temp_root = tmp_path / "obs-agent-temp"
+        state_db_path = tmp_path / "telegram-state.sqlite3"
+    return _LiveForumResources(
+        run_id=run_id,
+        isolated=use_isolated,
+        vault_path=vault_path,
+        temp_root=temp_root,
+        state_db_path=state_db_path,
+        chat_id=chat_id,
+    )
+
+
+def _write_live_forum_resource_metadata(harness: _LiveForumHarness) -> Path | None:
+    if harness.temp_root is None:
+        return None
+    harness.temp_root.mkdir(parents=True, exist_ok=True)
+    metadata_path = harness.temp_root / "live-forum-resources.json"
+    metadata_path.write_text(
+        json.dumps(harness.resource_metadata(), sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    return metadata_path
+
+
+async def _create_live_forum_harness(
+    tmp_path: Path,
+    *,
+    isolated: bool | None = None,
+    warm: bool = True,
+) -> _LiveForumHarness:
     if not _has_telegram_credentials():
         pytest.skip("Telegram forum credentials not configured in environment")
     os.environ["OBS_TELEGRAM_BOT_TOKENS"] = ",".join(_resolve_sender_tokens())
 
-    vault_path = ensure_live_test_vault()
-    temp_root = tmp_path / "obs-agent-temp"
-    state_db_path = tmp_path / "telegram-state.sqlite3"
-    proc, log_file = _start_bot(vault_path, temp_root, state_db_path=state_db_path)
-    shared_chat_id = await _ensure_cached_forum_chat_id()
-    platform = TelegramForumPlatform(chat_id=shared_chat_id, idle_quiescence_timeout=90.0)
+    resources = _build_live_forum_resources(tmp_path, isolated=isolated)
+    proc, log_file = _start_bot(
+        resources.vault_path,
+        resources.temp_root,
+        state_db_path=resources.state_db_path,
+    )
+    platform = TelegramForumPlatform(
+        chat_id=None if resources.isolated else await _ensure_cached_forum_chat_id(),
+        idle_quiescence_timeout=90.0,
+        create_isolated_chat=resources.isolated,
+    )
     harness = _LiveForumHarness(
         platform=platform,
         proc=proc,
         log_file=log_file,
-        vault_path=vault_path,
+        vault_path=resources.vault_path,
         bot_username=os.environ["OBS_TEST_TELEGRAM_BOT_USERNAME"],
-        temp_root=temp_root,
-        state_db_path=state_db_path,
+        temp_root=resources.temp_root,
+        state_db_path=resources.state_db_path,
+        resources=resources,
     )
     await platform.connect()
     try:
-        await _warm_platform(harness)
+        chat_id = platform._chat_id
+        harness.resources = _LiveForumResources(
+            run_id=resources.run_id,
+            isolated=resources.isolated,
+            vault_path=resources.vault_path,
+            temp_root=resources.temp_root,
+            state_db_path=resources.state_db_path,
+            chat_id=chat_id,
+        )
+        if resources.isolated:
+            platform._chat_id = chat_id
+        _write_live_forum_resource_metadata(harness)
+        if warm:
+            await _warm_platform(harness)
+        return harness
+    except Exception:
+        await platform.close()
+        _stop_bot(proc)
+        raise
+
+
+@pytest_asyncio.fixture
+async def live_tg_forum(tmp_path: Path) -> _LiveForumHarness:
+    harness = await _create_live_forum_harness(tmp_path)
+    try:
         yield harness
     finally:
-        await platform.close()
+        await harness.platform.close()
         _stop_bot(harness.proc)
+
+
+def test_live_forum_resource_builder_isolates_parallel_runs(tmp_path: Path) -> None:
+    first = _build_live_forum_resources(tmp_path, isolated=True)
+    second = _build_live_forum_resources(tmp_path, isolated=True)
+
+    assert first.isolated is True
+    assert second.isolated is True
+    assert first.run_id != second.run_id
+    assert first.vault_path != second.vault_path
+    assert first.temp_root != second.temp_root
+    assert first.state_db_path != second.state_db_path
+    assert str(first.vault_path).startswith(str(tmp_path))
+    assert str(second.vault_path).startswith(str(tmp_path))
+    assert first.vault_path.joinpath("CLAUDE.md").exists()
+    assert second.vault_path.joinpath("CLAUDE.md").exists()
+
+
+def test_live_forum_resource_builder_preserves_shared_default_vault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared_vault = tmp_path / "shared-vault"
+    monkeypatch.setenv("OBS_TELEGRAM_LIVE_TEST_VAULT", str(shared_vault))
+    monkeypatch.delenv("OBS_TEST_TELEGRAM_ISOLATED_RESOURCES", raising=False)
+
+    resources = _build_live_forum_resources(tmp_path)
+
+    assert resources.isolated is False
+    assert resources.vault_path == shared_vault.resolve()
+    assert resources.temp_root == tmp_path / "obs-agent-temp"
+    assert resources.state_db_path == tmp_path / "telegram-state.sqlite3"
+
+
+def test_live_forum_resource_metadata_records_isolation(tmp_path: Path) -> None:
+    resources = _build_live_forum_resources(tmp_path, isolated=True, chat_id=-100123)
+    harness = _LiveForumHarness(
+        platform=type("Platform", (), {"_chat_id": -100123, "format_recent_messages": lambda self: ""})(),
+        proc=type("Proc", (), {"pid": 4321})(),
+        log_file=tmp_path / "bot.log",
+        vault_path=resources.vault_path,
+        bot_username="obs_test_bot",
+        temp_root=resources.temp_root,
+        state_db_path=resources.state_db_path,
+        resources=resources,
+    )
+
+    metadata_path = _write_live_forum_resource_metadata(harness)
+    assert metadata_path == resources.temp_root / "live-forum-resources.json"
+    assert metadata_path is not None
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["isolated"] is True
+    assert metadata["chat_id"] == -100123
+    assert metadata["vault_path"] == str(resources.vault_path)
+    assert metadata["temp_root"] == str(resources.temp_root)
+    assert metadata["state_db_path"] == str(resources.state_db_path)
+    assert metadata["bot_username"] == "obs_test_bot"
+    assert metadata["daemon_pid"] == 4321
+
+
+def test_build_bot_env_scrubs_stale_anthropic_env_for_proxy_disabled_claude(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OBS_TEST_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("OBS_TEST_TELEGRAM_ALLOWED_USERS", "123")
+    monkeypatch.setenv("OBS_CACHE_PROXY_ENABLED", "0")
+    monkeypatch.setenv("OBS_AGENT_MODEL", "claude-haiku-4-5[200k]")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-stale")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:18923")
+
+    env = _build_bot_env(tmp_path / "vault", tmp_path / "temp")
+
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_BASE_URL" not in env
+
+
+def test_build_bot_env_preserves_anthropic_env_when_proxy_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OBS_TEST_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("OBS_TEST_TELEGRAM_ALLOWED_USERS", "123")
+    monkeypatch.setenv("OBS_CACHE_PROXY_ENABLED", "1")
+    monkeypatch.setenv("OBS_AGENT_MODEL", "claude-haiku-4-5[200k]")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-proxy")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:18923")
+
+    env = _build_bot_env(tmp_path / "vault", tmp_path / "temp")
+
+    assert env["ANTHROPIC_API_KEY"] == "sk-proxy"
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:18923"
+
+
+def test_build_bot_env_preserves_claude_process_management_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OBS_TEST_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("OBS_TEST_TELEGRAM_ALLOWED_USERS", "123")
+    monkeypatch.setenv("OBS_CLAUDE_IDLE_PROCESS_CAP", "2")
+    monkeypatch.setenv("OBS_CLAUDE_KILL_ON_IDLE", "1")
+
+    env = _build_bot_env(tmp_path / "vault", tmp_path / "temp")
+
+    assert env["OBS_CLAUDE_IDLE_PROCESS_CAP"] == "2"
+    assert env["OBS_CLAUDE_KILL_ON_IDLE"] == "1"
+    assert env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
+
+
+def test_build_bot_env_preserves_anthropic_env_for_non_claude_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OBS_TEST_TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("OBS_TEST_TELEGRAM_ALLOWED_USERS", "123")
+    monkeypatch.setenv("OBS_CACHE_PROXY_ENABLED", "0")
+    monkeypatch.setenv("OBS_AGENT_MODEL", "gpt-5.5")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-proxy")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:18923")
+
+    env = _build_bot_env(tmp_path / "vault", tmp_path / "temp")
+
+    assert env["ANTHROPIC_API_KEY"] == "sk-proxy"
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:18923"
 
 
 @pytest.mark.integration
 @pytest.mark.telegram
 class TestTelegramLiveForumTopics:
+    @pytest.mark.telegram_core_smoke
     async def test_live_general_and_topic_routes_are_isolated(
         self,
         live_tg_forum: _LiveForumHarness,
@@ -573,6 +847,7 @@ class TestTelegramLiveForumTopics:
         assert "NO" in topic_visibility.text, live_tg_forum.failure_context()
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
 
+    @pytest.mark.telegram_core_smoke
     async def test_live_fork_command_creates_child_topic_and_keeps_parent_session(
         self,
         live_tg_forum: _LiveForumHarness,
@@ -1674,6 +1949,8 @@ class TestTelegramLiveForumTopics:
         assert f"B-DONE-{tag}" in completed_b.text, live_tg_forum.failure_context()
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
 
+    @pytest.mark.telegram_core_smoke
+    @pytest.mark.telegram_parallel
     async def test_live_multi_chat_concurrent_isolation(
         self,
         live_tg_forum: _LiveForumHarness,
@@ -1695,6 +1972,15 @@ class TestTelegramLiveForumTopics:
                 timeout=180.0,
             )
             first_trace, second_trace = await asyncio.gather(first_task, second_task)
+            first_metadata = live_tg_forum.resource_metadata()
+            second_metadata = {
+                "chat_id": second_chat_id,
+                "bot_username": os.environ["OBS_TEST_TELEGRAM_BOT_USERNAME"],
+            }
+            assert first_metadata["chat_id"] != second_metadata["chat_id"], (
+                first_metadata,
+                second_metadata,
+            )
             assert first_token in first_trace.output, live_tg_forum.failure_context()
             assert second_token in second_trace.output, second.format_recent_messages()
             assert second_token not in first_trace.output, live_tg_forum.failure_context()

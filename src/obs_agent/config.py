@@ -213,6 +213,8 @@ class OBSConfig:
     max_buffer_size: int = 10 * 1024 * 1024  # 10 MB SDK JSON buffer limit
     context_window_estimate_tokens: int = 1_000_000
     context_probe_claude_cli: bool = False
+    claude_idle_process_cap: int | None = None
+    claude_kill_on_idle: bool = False
 
     # Cache proxy
     cache_proxy_port: int = 18923
@@ -275,6 +277,10 @@ class OBSConfig:
             kwargs["context_window_estimate_tokens"] = int(context_est)
         if probe_cli := os.environ.get("OBS_CONTEXT_PROBE_CLAUDE_CLI"):
             kwargs["context_probe_claude_cli"] = probe_cli.strip().lower() in {"1", "true", "yes", "on"}
+        if idle_cap := os.environ.get("OBS_CLAUDE_IDLE_PROCESS_CAP"):
+            kwargs["claude_idle_process_cap"] = int(idle_cap)
+        if kill_on_idle := os.environ.get("OBS_CLAUDE_KILL_ON_IDLE"):
+            kwargs["claude_kill_on_idle"] = kill_on_idle.strip().lower() in {"1", "true", "yes", "on"}
         if proxy_port := os.environ.get("OBS_CACHE_PROXY_PORT"):
             kwargs["cache_proxy_port"] = int(proxy_port)
         if proxy_enabled := os.environ.get("OBS_CACHE_PROXY_ENABLED"):

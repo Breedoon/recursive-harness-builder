@@ -178,7 +178,10 @@ async def audit_live_tg_forum(tmp_path: Path) -> _LiveForumHarness:
         else:
             os.environ["OBS_AGENT_MODEL"] = previous_model
 
-    platform = TelegramForumPlatform(idle_quiescence_timeout=90.0)
+    platform = TelegramForumPlatform(
+        idle_quiescence_timeout=90.0,
+        create_isolated_chat=True,
+    )
     harness = _LiveForumHarness(
         platform=platform,
         proc=proc,
@@ -190,7 +193,6 @@ async def audit_live_tg_forum(tmp_path: Path) -> _LiveForumHarness:
     )
     await platform.connect()
     try:
-        platform._chat_id = await platform.create_isolated_forum_chat()
         await _warm_platform(harness)
         yield harness
     finally:

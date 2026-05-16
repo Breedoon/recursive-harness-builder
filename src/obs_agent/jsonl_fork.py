@@ -36,6 +36,44 @@ def _adjacent_metadata(entries: list[dict[str, Any]], first_chain_index: int) ->
     return metadata
 
 
+def _sanitize_thinking_blocks(entry: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``entry`` with ``signature`` stripped from any thinking content blocks.
+
+    Anthropic's API attaches a cryptographic ``signature`` to each ``thinking`` content
+    block. The signature is bound to the original session's request context. When a fork
+    session resends the inherited message history on its first API call, Anthropic rejects
+    with HTTP 400 ``Invalid signature in thinking block``. Stripping ``signature`` (a
+    minimal, narrowly-scoped change) lets the forked session re-issue the message without
+    presenting an invalid signature, while preserving the thinking content itself.
+
+    Non-thinking content blocks (text, tool_use, tool_result, etc.) and non-assistant
+    entries are returned unchanged. The input ``entry`` is not mutated.
+    """
+
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return entry
+    content = message.get("content")
+    if not isinstance(content, list):
+        return entry
+
+    needs_change = any(
+        isinstance(blk, dict) and blk.get("type") == "thinking" and "signature" in blk
+        for blk in content
+    )
+    if not needs_change:
+        return entry
+
+    new_content: list[Any] = []
+    for blk in content:
+        if isinstance(blk, dict) and blk.get("type") == "thinking" and "signature" in blk:
+            new_content.append({k: v for k, v in blk.items() if k != "signature"})
+        else:
+            new_content.append(blk)
+    new_message = {**message, "content": new_content}
+    return {**entry, "message": new_message}
+
+
 def fork_session_jsonl(
     *,
     session_id: str,
@@ -96,6 +134,7 @@ def fork_session_jsonl(
     dest_path = source_path.parent / f"{fork_session_id}.jsonl"
     with dest_path.open("w", encoding="utf-8") as handle:
         for entry in output_entries:
-            handle.write(json.dumps(entry) + "\n")
+            sanitized = _sanitize_thinking_blocks(entry)
+            handle.write(json.dumps(sanitized) + "\n")
 
     return fork_session_id

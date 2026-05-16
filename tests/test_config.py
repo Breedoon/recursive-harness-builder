@@ -161,6 +161,18 @@ class TestSessionSettings:
         cfg = OBSConfig.from_env()
         assert cfg.context_probe_claude_cli is True
 
+    def test_claude_idle_process_management_defaults_off(self):
+        cfg = OBSConfig()
+        assert cfg.claude_idle_process_cap is None
+        assert cfg.claude_kill_on_idle is False
+
+    def test_claude_idle_process_management_from_env(self, monkeypatch):
+        monkeypatch.setenv("OBS_CLAUDE_IDLE_PROCESS_CAP", "20")
+        monkeypatch.setenv("OBS_CLAUDE_KILL_ON_IDLE", "true")
+        cfg = OBSConfig.from_env()
+        assert cfg.claude_idle_process_cap == 20
+        assert cfg.claude_kill_on_idle is True
+
 
 class TestBgForkTimeout:
     """Config provides background fork timeout settings."""

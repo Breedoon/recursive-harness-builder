@@ -1,5 +1,6 @@
 """Tests for obs_agent.session SessionManager behavior."""
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -139,7 +140,7 @@ class TestCreateOptions:
         assert mgr.effective_model == config.model
         mgr.model_override = "gpt-5.5"
         assert mgr.effective_model == "gpt-5.5"
-        assert mgr.create_options().model == "gpt-5.5[1m]"
+        assert mgr.create_options().model == "gpt-5.5[400k]"
 
     def test_passes_hook_state_to_obs_tools(self, config):
         state = HookState()
@@ -422,3 +423,92 @@ class TestClientLifecycle:
         assert mgr.session_id == "sess-42"
         assert mgr._connected is True
         mock_client.connect.assert_called_once()
+
+
+class TestIdleClientPruning:
+    @pytest.mark.asyncio
+    async def test_disconnect_idle_client_preserves_resume_state(self, config):
+        mgr = SessionManager(config=config)
+        mgr.set_session_id("sess-idle")
+        last_activity = mgr.last_activity
+        mock_client = AsyncMock()
+        mgr._client = mock_client
+        mgr._connected = True
+
+        disconnected = await mgr.disconnect_idle_client()
+
+        assert disconnected is True
+        assert mgr.session_id == "sess-idle"
+        assert mgr.last_activity == last_activity
+        assert mgr._client is None
+        assert mgr._connected is False
+        mock_client.disconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_idle_client_direct_kills_running_process(self, config):
+        mgr = SessionManager(config=config)
+        mgr.set_session_id("sess-idle")
+        fake_process = MagicMock()
+        fake_process.returncode = None
+        fake_process.wait = AsyncMock()
+        fake_transport = MagicMock(_process=fake_process)
+        mock_client = AsyncMock()
+        mock_client._transport = fake_transport
+        mgr._client = mock_client
+        mgr._connected = True
+
+        disconnected = await mgr.disconnect_idle_client(direct_kill=True)
+
+        assert disconnected is True
+        fake_process.kill.assert_called_once()
+        fake_process.wait.assert_awaited_once()
+        mock_client.disconnect.assert_awaited_once()
+        assert mgr.session_id == "sess-idle"
+        assert mgr._client is None
+        assert mgr._connected is False
+
+    @pytest.mark.asyncio
+    async def test_disconnect_idle_client_direct_kill_noops_without_process(self, config):
+        mgr = SessionManager(config=config)
+        mock_client = AsyncMock()
+        mock_client._transport = MagicMock(_process=None)
+        mgr._client = mock_client
+        mgr._connected = True
+
+        disconnected = await mgr.disconnect_idle_client(direct_kill=True)
+
+        assert disconnected is True
+        mock_client.disconnect.assert_awaited_once()
+        assert mgr._client is None
+        assert mgr._connected is False
+
+    @pytest.mark.asyncio
+    async def test_disconnect_idle_client_direct_kill_preserves_session_when_wait_times_out(self, config):
+        mgr = SessionManager(config=config)
+        mgr.set_session_id("sess-idle")
+        fake_process = MagicMock()
+        fake_process.returncode = None
+        fake_process.wait = AsyncMock(side_effect=asyncio.TimeoutError)
+        fake_transport = MagicMock(_process=fake_process)
+        mock_client = AsyncMock()
+        mock_client._transport = fake_transport
+        mgr._client = mock_client
+        mgr._connected = True
+
+        disconnected = await mgr.disconnect_idle_client(direct_kill=True)
+
+        assert disconnected is True
+        fake_process.kill.assert_called_once()
+        assert mgr.session_id == "sess-idle"
+        assert mgr._client is None
+        assert mgr._connected is False
+
+    @pytest.mark.asyncio
+    async def test_disconnect_idle_client_noops_without_connected_client(self, config):
+        mgr = SessionManager(config=config)
+
+        disconnected = await mgr.disconnect_idle_client(direct_kill=True)
+
+        assert disconnected is False
+        assert mgr._client is None
+        assert mgr._connected is False

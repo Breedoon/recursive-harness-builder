@@ -966,6 +966,8 @@ class TestCompletedAgentMessageable:
 @pytest.mark.integration
 @pytest.mark.telegram
 @pytest.mark.telegram_smoke
+@pytest.mark.telegram_core_smoke
+@pytest.mark.telegram_parallel
 @pytest.mark.timeout(600)  # 10 minutes
 class TestIdleWakeWithoutSleep:
     """Verify an idle agent wakes from a direct inbox message without sleep as the mechanism."""
