@@ -13,7 +13,7 @@ Normalizations (applied in order):
 1. Billing header: replaced with fixed value
 2. String→list: bare-string user content converted to list format
 3. Skill listing: stripped entirely from all messages
-4. Dynamic system-reminders: stripped (except CLAUDE.md)
+4. Claude Code system-reminders: stripped
 5. Git status: normalized in system prompt to fixed placeholder
 6. Tool sorting: tools[] sorted alphabetically by name
 7. Metadata: session-specific IDs normalized
@@ -187,40 +187,16 @@ def normalize_skill_listing(body: dict) -> dict:
 
 
 def _is_strippable_system_reminder(block: dict) -> bool:
-    """Check if a content block is a dynamic system-reminder that should be stripped.
-
-    Returns True for blocks that:
-    1. Are text blocks containing <system-reminder> tags
-    2. Are NOT the CLAUDE.md context (contains CLAUDEMD_MARKER)
-
-    Note: skill listing blocks are stripped by Rule 3 before this runs,
-    so no need to preserve them here.
-    """
     if not isinstance(block, dict) or block.get("type") != "text":
         return False
-    text = block.get("text", "")
-    if "<system-reminder>" not in text:
-        return False
-    # Preserve CLAUDE.md context — the marker always appears right after
-    # the opening <system-reminder> tag. Full-text search causes false
-    # positives when changed_files diffs contain the marker string (Bug 1).
-    # Check only the prefix: "<system-reminder>\n" (18 chars) + marker.
-    marker_end = 20 + len(CLAUDEMD_MARKER)
-    if CLAUDEMD_MARKER in text[:marker_end]:
-        return False
-    return True
+    return "<system-reminder>" in block.get("text", "")
 
 
 def strip_dynamic_reminders(body: dict) -> int:
-    """Rule 4: Strip all dynamic <system-reminder> blocks from user messages.
+    """Rule 4: Strip all Claude Code <system-reminder> blocks from user messages.
 
-    CC injects 26 types of runtime attachments (changed_files, todo_reminders,
-    token_usage, etc.) as <system-reminder> blocks. These have dynamic content
-    that changes between turns and aren't persisted in JSONL, creating byte
-    divergence when forks reconstruct from JSONL.
-
-    Preserves: CLAUDE.md context injection. (Skill listing already
-    stripped by Rule 3 before this runs.)
+    OBS injects the configured entry file manually in the system prompt append path,
+    so Claude Code's reminder-based project context can be removed from proxy traffic.
     """
     messages = body.get("messages", [])
     count = 0
