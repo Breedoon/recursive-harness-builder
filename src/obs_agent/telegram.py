@@ -43,6 +43,7 @@ from obs_agent.context_stats import (
     format_context_snapshot_compact,
     format_context_snapshot_lines,
 )
+from obs_agent.config import parse_context_suffix
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
 from obs_agent.context_jsonl import find_session_jsonl
@@ -4224,6 +4225,13 @@ class TelegramBot:
             pieces.append(f"({' ; '.join(details)})")
         return " ".join(pieces)
 
+    @staticmethod
+    def _context_window_tokens_for_state(state: TelegramSessionState, fallback_tokens: int) -> int:
+        if state.hook_state.effective_model:
+            _clean, tokens = parse_context_suffix(state.hook_state.effective_model)
+            return tokens
+        return fallback_tokens
+
     def _build_completion_summary(
         self,
         state: TelegramSessionState,
@@ -4236,7 +4244,10 @@ class TelegramBot:
         snapshot = build_context_snapshot(
             session_id=state.session_id,
             data=state.hook_state.last_result_data,
-            context_window_estimate_tokens=self._config.context_window_estimate_tokens,
+            context_window_estimate_tokens=self._context_window_tokens_for_state(
+                state,
+                self._config.context_window_estimate_tokens,
+            ),
             cwd=self._config.vault_path,
         )
         lines: list[str] = []
@@ -4735,7 +4746,10 @@ class TelegramBot:
         snapshot = build_context_snapshot(
             session_id=state.session_id,
             data=state.hook_state.last_result_data,
-            context_window_estimate_tokens=self._config.context_window_estimate_tokens,
+            context_window_estimate_tokens=self._context_window_tokens_for_state(
+                state,
+                self._config.context_window_estimate_tokens,
+            ),
             cwd=self._config.vault_path,
         )
         probe = None
@@ -6034,7 +6048,10 @@ class TelegramBot:
             _ctx_snapshot = build_context_snapshot(
                 session_id=state.session_id,
                 data=state.hook_state.last_result_data,
-                context_window_estimate_tokens=self._config.context_window_estimate_tokens,
+                context_window_estimate_tokens=self._context_window_tokens_for_state(
+                    state,
+                    self._config.context_window_estimate_tokens,
+                ),
                 cwd=self._config.vault_path,
             )
             _ctx_remaining = _ctx_snapshot.get("estimated_context_remaining_tokens", 0)

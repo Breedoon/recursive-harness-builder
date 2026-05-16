@@ -52,6 +52,11 @@ MODEL_RESOLUTION: dict[str, str] = {
 _CONTEXT_SUFFIX_RE = re.compile(r"\[(\d+)([mk])\]$", re.IGNORECASE)
 
 _DEFAULT_CONTEXT_TOKENS = 1_000_000
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "gpt-5.5": 400_000,
+    "gpt-5.4": 1_000_000,
+    "gpt-5.4-mini": 1_000_000,
+}
 
 
 def _context_suffix_for_tokens(context_tokens: int) -> str:
@@ -88,6 +93,20 @@ def resolve_model(shorthand: str) -> str:
     return resolved
 
 
+def context_window_for_model(
+    model_str: str,
+    *,
+    default_context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+) -> tuple[str, int, bool]:
+    """Return (resolved_clean_model, context_tokens, explicit_suffix)."""
+    resolved = resolve_model(model_str)
+    clean, ctx_tokens = split_context_suffix(resolved)
+    clean = clean.strip()
+    if ctx_tokens is not None:
+        return clean, ctx_tokens, True
+    return clean, MODEL_CONTEXT_WINDOWS.get(clean.lower(), default_context_tokens), False
+
+
 def normalize_model_for_claude_code(
     model_str: str,
     *,
@@ -99,13 +118,15 @@ def normalize_model_for_claude_code(
     reject explicit long-context suffixes. Preserve explicit suffixes, but only
     add OBS's default suffix automatically for non-Claude models.
     """
-    resolved = resolve_model(model_str)
-    clean, ctx_tokens = split_context_suffix(resolved)
-    if ctx_tokens is not None:
+    clean, ctx_tokens, explicit_context = context_window_for_model(
+        model_str,
+        default_context_tokens=default_context_tokens,
+    )
+    if explicit_context:
         return clean + _context_suffix_for_tokens(ctx_tokens)
     if is_claude_model(clean):
         return clean
-    return clean + _context_suffix_for_tokens(default_context_tokens)
+    return clean + _context_suffix_for_tokens(ctx_tokens)
 
 
 def parse_context_suffix(model_str: str) -> tuple[str, int]:
@@ -120,8 +141,8 @@ def parse_context_suffix(model_str: str) -> tuple[str, int]:
     >>> parse_context_suffix("gemini-3.1-flash-lite-preview")
     ('gemini-3.1-flash-lite-preview', 1000000)
     """
-    clean, ctx_tokens = split_context_suffix(model_str)
-    return clean, ctx_tokens or _DEFAULT_CONTEXT_TOKENS
+    clean, ctx_tokens, _explicit_context = context_window_for_model(model_str)
+    return clean, ctx_tokens
 
 
 def compaction_threshold(context_tokens: int) -> int:

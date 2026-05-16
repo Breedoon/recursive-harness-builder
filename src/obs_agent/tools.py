@@ -24,6 +24,7 @@ from obs_agent.context_stats import (
     build_context_snapshot,
     format_context_snapshot_lines,
 )
+from obs_agent.config import parse_context_suffix
 from obs_agent.lineage import (
     find_latest_obs_bootstrap_for_session,
     agent_name_for_lineage,
@@ -1232,12 +1233,18 @@ def create_obs_tools(
     async def read_inbox(args: dict) -> dict:
         return await _read_inbox(args)
 
+    def _effective_context_window_tokens() -> int:
+        if hook_state is not None and hook_state.effective_model:
+            _clean, tokens = parse_context_suffix(hook_state.effective_model)
+            return tokens
+        return config.context_window_estimate_tokens
+
     async def _render_context_and_session() -> str:
         data = hook_state.last_result_data if hook_state is not None else None
         snapshot = build_context_snapshot(
             session_id=get_session_id(),
             data=data,
-            context_window_estimate_tokens=config.context_window_estimate_tokens,
+            context_window_estimate_tokens=_effective_context_window_tokens(),
             cwd=config.vault_path,
         )
         probe = None
