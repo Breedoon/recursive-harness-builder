@@ -1,11 +1,12 @@
 """Tests for sanitization of Anthropic thinking-block signatures during JSONL fork.
 
 Context: Anthropic's API attaches a cryptographic ``signature`` to each ``thinking``
-content block. The signature is bound to the original session's request context. The API
-enforces: (1) signatures must be valid, and (2) thinking blocks cannot be modified. When
-a fork session copies the parent JSONL, the signature context doesn't match, and stripping
-just the signature field also fails (modified block). The fix in ``fork_session_jsonl``
-removes thinking/redacted_thinking blocks entirely from the forked JSONL.
+content block. The signature is bound to the original session's request context. When
+a fork session copies the parent JSONL verbatim and re-sends the inherited message
+history on its first API call, the API rejects with HTTP 400 ``Invalid signature in
+thinking block``. The fix in ``fork_session_jsonl`` strips the ``signature`` field from
+thinking content blocks before writing the forked JSONL, so the first child API call
+no longer presents an invalid signature.
 
 Canonical reproducer reference: session ``cfbdfc0b-f271-483f-8517-9c8f0e98f59c`` (line
 1200 synthesized API 400 after parent chain copy on Opus fork=true).
@@ -34,13 +35,11 @@ def _read_lines(path: Path) -> list[dict]:
     ]
 
 
-def test_fork_removes_thinking_blocks_entirely(tmp_path: Path) -> None:
-    """Forked JSONL must not contain any thinking/redacted_thinking blocks.
+def test_fork_strips_signature_from_thinking_blocks(tmp_path: Path) -> None:
+    """Forked JSONL must not contain ``signature`` on any thinking content block.
 
-    The API requires thinking blocks to be sent back exactly as received (with valid
-    signatures). Since forked sessions have a different request context, signatures are
-    invalid. Stripping just the signature also fails (API rejects modified blocks).
-    The only safe approach is removing thinking blocks entirely.
+    Anthropic's signature binds to the original session; carrying it into a forked
+    session causes a 400 on the first child API call.
     """
 
     projects_root = tmp_path / ".claude" / "projects"
@@ -84,14 +83,22 @@ def test_fork_removes_thinking_blocks_entirely(tmp_path: Path) -> None:
     )
 
     forked = _read_lines(project_dir / "sid-thinking-fork.jsonl")
+    # Locate the assistant turn in the fork
     assistant = next(e for e in forked if e.get("uuid") == "a1")
     content = assistant["message"]["content"]
 
-    thinking_blocks = [blk for blk in content if isinstance(blk, dict) and blk.get("type") in ("thinking", "redacted_thinking")]
+    thinking_blocks = [blk for blk in content if isinstance(blk, dict) and blk.get("type") == "thinking"]
     text_blocks = [blk for blk in content if isinstance(blk, dict) and blk.get("type") == "text"]
 
-    # Thinking blocks must be removed entirely — cannot be sent without valid signatures.
-    assert len(thinking_blocks) == 0, "thinking blocks must be removed entirely from forked JSONL"
+    # Thinking block must still exist (preserve assistant reasoning), but the
+    # provider-signed ``signature`` must be stripped.
+    assert len(thinking_blocks) == 1, "thinking block should be preserved (not whole-block stripped)"
+    assert "signature" not in thinking_blocks[0], (
+        "signature must be stripped from thinking block to avoid Anthropic 400 on fork resume"
+    )
+    # The reasoning content itself must be preserved.
+    assert thinking_blocks[0].get("thinking") == "deliberating about the answer"
+    assert thinking_blocks[0].get("type") == "thinking"
 
     # Non-thinking content must be unchanged.
     assert text_blocks == [{"type": "text", "text": "hello world"}]
@@ -190,8 +197,7 @@ def test_fork_preserves_non_assistant_turns_with_thinking_lookalike(tmp_path: Pa
                         "type": "thinking",
                         "thinking": "x",
                         "signature": "SIG",
-                    },
-                    {"type": "text", "text": "response"},
+                    }
                 ],
             },
         },
@@ -212,6 +218,6 @@ def test_fork_preserves_non_assistant_turns_with_thinking_lookalike(tmp_path: Pa
     # user turn preserved unchanged
     user_turn = next(e for e in forked if e.get("uuid") == "u1")
     assert user_turn["message"] == {"role": "user", "content": "go"}
-    # assistant thinking block removed entirely
+    # assistant thinking stripped
     assistant = next(e for e in forked if e.get("uuid") == "a1")
-    assert assistant["message"]["content"] == [{"type": "text", "text": "response"}]
+    assert "signature" not in assistant["message"]["content"][0]
