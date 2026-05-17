@@ -26,7 +26,7 @@ You are ONE level of the hierarchy. If the task is still complex after your deco
 
    Also use `search_team` to find agents in your team. If one exists for this or a similar task, message them using `SendInboxMessage` — ask what they found, what they did, what they were uncertain about. Their artifact has the what; messaging gets the why.
 
-2. **Read Agent Capabilities.** Read `docs/agent-capabilities.md` if your project provides one to understand what agents can and can't do reliably. A subtask is "directly executable" when an agent following the Loop procedure can handle it — single concern, clear path, within agent strengths, no unknowns requiring further decisions.
+2. **Read Agent Capabilities.** Read [docs/agent-capabilities.md](../../docs/agent-capabilities.md) if your project provides one to understand what agents can and can't do reliably. A subtask is "directly executable" when an agent following the Loop procedure can handle it — single concern, clear path, within agent strengths, no unknowns requiring further decisions.
 
 3. **Research the task.** What does this task involve? What files, actions, concerns, dependencies, unknowns, credentials, or access are required? Research as deeply as you need to make a good assessment.
 
