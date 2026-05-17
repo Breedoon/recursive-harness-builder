@@ -25,7 +25,7 @@ Use this when your task involves fetching financial or market data.
 
 **Base URL:** `https://www.alphavantage.co/query`  
 **API key:** environment variable `ALPHA_VANTAGE_API_KEY`  
-**Rate limits:** 25 requests/day and 5 requests/minute on the free tier. Space calls accordingly.
+**Rate limits:** Space calls to a maximum of 5 requests/second to avoid transient throttling. There is no artificial daily cap — make as many calls as the task requires. If the API returns a rate-limit or throttling error, wait 15 seconds and retry once before logging a gap.
 
 **Common functions:**
 
@@ -97,8 +97,4 @@ If an API call returns an error message or empty data, retry once after 15 secon
 
 ## DON'Ts
 
-- DON'T make quantitative claims without fetching data from Alpha Vantage.
-- DON'T declare something impossible before exhausting your tools.
-- DON'T overstate confidence.
-- DON'T skip writing the artifact.
-- DON'T silently change scope.
+- DON'T make quantitative claims without fetching data fro

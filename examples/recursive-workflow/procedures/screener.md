@@ -75,7 +75,7 @@ Thresholds may be relaxed only if the asset class is niche and fewer than 5 fund
 ## Edge Cases
 
 - **Asset class returns fewer than 20 candidates from SYMBOL_SEARCH:** add well-known benchmark ETFs for the class manually (e.g. SPY, IVV, VOO for US large-cap equity) and note the supplement.
-- **API rate limit:** prioritize gate 1 and 2 checks (cheaper) before gate 3 (requires full price history). Skip funds rather than stalling the pipeline.
+- **API throttling:** if Alpha Vantage returns a throttling error, wait 15 seconds and retry. Do not skip funds or artificially cap the number of API calls — make as many calls as needed to screen the full candidate universe.
 - **Fund has data gaps mid-history:** if more than 6 consecutive months are missing in the 5-year window, exclude it and note it.
 - **Fewer than 10 funds survive all gates:** relax AUM threshold first (to $50M), then expense ratio threshold by 0.25pp. Note each relaxation.
 
@@ -84,4 +84,4 @@ Thresholds may be relaxed only if the asset class is niche and fewer than 5 fund
 - DON'T pre-select funds based on name recognition or training knowledge.
 - DON'T include more than 50 funds in the shortlist — the analyzer phase cost scales linearly.
 - DON'T skip the elimination table. The Router and Auditor need to see what was excluded and why.
-- DON'T compute risk-adjusted metrics here — that's the FundAnalyzer's job.
+- DO

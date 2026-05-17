@@ -65,7 +65,7 @@ Fetch only the indicators relevant to the asset class. For equity funds: sector 
 
 ## Edge Cases
 
-- **API rate limit hit:** Alpha Vantage free tier allows 25 requests/day and 5/minute. Space calls with a short delay. If the limit is hit, fetch the highest-priority indicators first and note what was skipped.
+- **API throttling:** Space calls to a maximum of 5 requests/second. If Alpha Vantage returns a throttling error, wait 15 seconds and retry once. Do not skip indicators due to an assumed daily cap — fetch everything the task requires.
 - **Asset class not clearly specified:** ask your caller for clarification before fetching. Do not assume.
 - **Data more than 30 days old:** flag as stale. Note it prominently in the artifact.
 
@@ -73,4 +73,4 @@ Fetch only the indicators relevant to the asset class. For equity funds: sector 
 
 - DON'T interpret data in terms of specific fund recommendations — that's the Router's job.
 - DON'T skip the data pull and rely on training knowledge for numbers.
-- DON'T fail silently on API errors. Log the gap and continue.
+- DON'T fail silently on API errors. 

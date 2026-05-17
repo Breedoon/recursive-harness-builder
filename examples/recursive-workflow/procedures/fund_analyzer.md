@@ -96,7 +96,7 @@ From the adjusted monthly close price series:
 - **Fund has fewer than 36 months of data:** skip risk metrics that require 36 months and flag. Return only what's computable.
 - **ETF_PROFILE returns no data (non-ETF fund):** use `OVERVIEW` for expense ratio and AUM. Holdings breakdown will be unavailable — note the gap.
 - **Benchmark ticker not specified in context:** use SPY as the default for equity asset classes. Note the assumption.
-- **API rate limit:** fetch fund price history first (most critical), then benchmark, then ETF profile. Skip profile if rate limited and note the gap.
+- **API throttling:** if Alpha Vantage returns a throttling error, wait 15 seconds and retry. Do not skip any fetch — all three data pulls (price history, benchmark, ETF profile) are required for a complete analysis.
 - **Negative Sharpe ratio:** report it as-is. Do not omit or soften it.
 
 ## DON'Ts
@@ -105,4 +105,4 @@ From the adjusted monthly close price series:
 - DON'T use arithmetic mean for annualized returns. Use geometric mean.
 - DON'T compare funds to each other — compare each fund only to its benchmark. The Router does cross-fund ranking.
 - DON'T skip the data limitations section. The Auditor will flag missing disclosure.
-- DON'T round metrics aggressively. Report to 2 decimal places for percentages, 3 for ratios.
+- DON'T round metrics aggr
