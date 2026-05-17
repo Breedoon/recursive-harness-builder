@@ -5103,6 +5103,13 @@ class TelegramBot:
                 and tuple(member["lineage"][: len(current_lineage)]) == current_lineage
             }
             allowed.add(current_agent_name)
+        elif mode == "children":
+            allowed = {
+                agent_name
+                for agent_name, member in members.items()
+                if str(member.get("parent_agent_name") or "") == current_agent_name
+            }
+            allowed.add(current_agent_name)
         else:
             allowed = set(members)
 
@@ -5265,7 +5272,7 @@ class TelegramBot:
     async def handle_tree_children(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        await self._handle_tree_view(update=update, context=context, mode="descendants")
+        await self._handle_tree_view(update=update, context=context, mode="children")
 
     async def handle_tree_ancestors(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -5279,7 +5286,9 @@ class TelegramBot:
         mode = "tree"
         if text.startswith("/tree-ancestors"):
             mode = "ancestors"
-        elif text.startswith("/tree-") or text.startswith("/tree-descendants") or text.startswith("/tree-children"):
+        elif text.startswith("/tree-children"):
+            mode = "children"
+        elif text.startswith("/tree-") or text.startswith("/tree-descendants"):
             mode = "descendants"
         await self._handle_tree_view(update=update, context=context, mode=mode)
 
@@ -9380,7 +9389,7 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("schedule", "Create schedules once Sprint 1 reliability is approved"),
         BotCommand("tree", "Render the full agent tree for this team"),
         BotCommand("tree_descendants", "Render this agent and all descendants"),
-        BotCommand("tree_children", "Render this agent and all descendants"),
+        BotCommand("tree_children", "Render this agent and direct children"),
         BotCommand("tree_ancestors", "Render this agent and all ancestors"),
         BotCommand("fork", "Create a new topic from this head or replied message"),
         BotCommand("delete", "Delete this topic; use '/delete all' to remove all non-General topics"),

@@ -3111,7 +3111,7 @@ class TestCommands:
         update.effective_message.text = "/tree-children"
         with patch.object(bot, "_handle_tree_view", new_callable=AsyncMock) as mock_tree:
             await bot.handle_tree_alias_command(update, ctx)
-        assert mock_tree.await_args.kwargs["mode"] == "descendants"
+        assert mock_tree.await_args.kwargs["mode"] == "children"
         await bot.shutdown()
 
     async def test_child_topic_title_uses_leaf_display_name_only(self, config):
@@ -3142,13 +3142,45 @@ class TestCommands:
         assert html_text.index("New") < html_text.index("Old")
         await bot.shutdown()
 
-    async def test_tree_children_command_dispatches_descendants_view(self, config):
+    async def test_tree_children_command_dispatches_direct_children_view(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         update = _make_update("/tree_children", chat_id=67890, thread_id=321)
         ctx = _make_context()
         with patch.object(bot, "_handle_tree_view", new_callable=AsyncMock) as mock_tree:
             await bot.handle_tree_children(update, ctx)
-        assert mock_tree.await_args.kwargs["mode"] == "descendants"
+        assert mock_tree.await_args.kwargs["mode"] == "children"
+        await bot.shutdown()
+
+    async def test_tree_children_render_excludes_grandchildren_and_descendants_includes_them(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        team_name = "team-alpha"
+        current_agent_name = "root"
+        current_lineage = ("Root",)
+        members = {
+            "root": {"agent_name": "root", "display_name": "Root", "lineage": ["Root"], "lineage_length": 1},
+            "child": {"agent_name": "child", "display_name": "Child", "parent_agent_name": "root", "lineage": ["Root", "Child"], "lineage_length": 2, "created_at": 20},
+            "grandchild": {"agent_name": "grandchild", "display_name": "Grandchild", "parent_agent_name": "child", "lineage": ["Root", "Child", "Grandchild"], "lineage_length": 3, "created_at": 30},
+        }
+
+        children_html = bot._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=current_lineage,
+            members=members,
+            mode="children",
+        )
+        descendants_html = bot._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=current_lineage,
+            members=members,
+            mode="descendants",
+        )
+
+        assert "Child" in children_html
+        assert "Grandchild" not in children_html
+        assert "Child" in descendants_html
+        assert "Grandchild" in descendants_html
         await bot.shutdown()
 
     async def test_schedule_command_is_gated_until_schedule_sprint_approval(self, config):
@@ -6249,6 +6281,16 @@ class TestTelegramCommandRegistration:
         names = [command.command for command in commands]
         assert "new_group" in names
         assert "new_bot" in names
+
+    async def test_set_bot_commands_describes_tree_children_as_direct_children(self):
+        app = MagicMock()
+        app.bot.set_my_commands = AsyncMock()
+
+        await _set_bot_commands(app)
+
+        commands = app.bot.set_my_commands.await_args.args[0]
+        descriptions = {command.command: command.description for command in commands}
+        assert descriptions["tree_children"] == "Render this agent and direct children"
 
     async def test_clear_secondary_bot_commands_only_targets_non_primary_tokens(self, config):
         config.telegram_bot_token = "primary-token"
