@@ -858,6 +858,7 @@ def create_obs_tools(
         )
 
     async def _send_inbox_message(args: dict) -> dict:
+        # On delivery failure, return "message underdelivered" and use _rollback_written_message after writes.
         bootstrap = _current_obs_bootstrap()
         team_name = str(args.get("team_name", "")).strip() or (
             bootstrap.root_team_key if bootstrap is not None else ""
@@ -1202,6 +1203,14 @@ def create_obs_tools(
                 "sender": {
                     "type": "string",
                     "description": "Optional sender label; defaults to the current agent name.",
+                },
+                "needs_reply": {
+                    "type": "boolean",
+                    "description": "Set true only when the message asks a question or makes a request that needs a reply.",
+                },
+                "must_reply": {
+                    "type": "boolean",
+                    "description": "Deprecated alias for needs_reply.",
                 },
             },
             "required": ["recipient", "content"],

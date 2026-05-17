@@ -58,6 +58,7 @@ USAGE_LOG = os.path.join(LOG_DIR, "usage.jsonl")
 
 SKILL_MARKER = "The following skills are available for use with the Skill tool:"
 CLAUDEMD_MARKER = "As you answer the user's questions, you can use the following context:"
+OBS_ENTRY_FILE_MARKER = "<!-- OBS_AGENT_ENTRY_FILE_CONTEXT -->"
 
 SAVE_BODIES = os.environ.get("CACHE_PROXY_SAVE_BODIES", "").lower() in ("1", "true")
 
@@ -186,20 +187,40 @@ def normalize_skill_listing(body: dict) -> dict:
     return {"action": "not_found"}
 
 
-def _is_strippable_system_reminder(block: dict) -> bool:
+def _is_claudemd_reminder(block: dict) -> bool:
     if not isinstance(block, dict) or block.get("type") != "text":
         return False
-    return "<system-reminder>" in block.get("text", "")
+    text = block.get("text", "")
+    return text.startswith(f"<system-reminder>\n{CLAUDEMD_MARKER}")
+
+
+def _has_obs_entry_file_context(body: dict) -> bool:
+    system = body.get("system")
+    if not isinstance(system, list):
+        return False
+    for block in system:
+        if isinstance(block, dict) and block.get("type") == "text":
+            if OBS_ENTRY_FILE_MARKER in block.get("text", ""):
+                return True
+    return False
+
+
+def _is_strippable_system_reminder(block: dict, *, strip_claudemd: bool = True) -> bool:
+    if not isinstance(block, dict) or block.get("type") != "text":
+        return False
+    text = block.get("text", "")
+    if "<system-reminder>" not in text:
+        return False
+    if _is_claudemd_reminder(block) and not strip_claudemd:
+        return False
+    return True
 
 
 def strip_dynamic_reminders(body: dict) -> int:
-    """Rule 4: Strip all Claude Code <system-reminder> blocks from user messages.
-
-    OBS injects the configured entry file manually in the system prompt append path,
-    so Claude Code's reminder-based project context can be removed from proxy traffic.
-    """
+    """Rule 4: Strip dynamic Claude Code <system-reminder> blocks from user messages."""
     messages = body.get("messages", [])
     count = 0
+    strip_claudemd = _has_obs_entry_file_context(body)
     for msg in messages:
         if msg.get("role") != "user":
             continue
@@ -209,7 +230,7 @@ def strip_dynamic_reminders(body: dict) -> int:
         original_len = len(content)
         msg["content"] = [
             block for block in content
-            if not _is_strippable_system_reminder(block)
+            if not _is_strippable_system_reminder(block, strip_claudemd=strip_claudemd)
         ]
         stripped = original_len - len(msg["content"])
         count += stripped

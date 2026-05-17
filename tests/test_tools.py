@@ -95,8 +95,9 @@ class TestAgentTaskTools:
         assert schema["required"] == ["recipient", "content"]
         assert "team_name" in schema["properties"]
         assert "sender" in schema["properties"]
-        assert "needs_reply" not in schema["properties"]
-        assert "must_reply" not in schema["properties"]
+        assert "needs_reply" in schema["properties"]
+        assert "question" in schema["properties"]["needs_reply"]["description"]
+        assert "must_reply" in schema["properties"]
 
     @pytest.mark.asyncio
     async def test_send_inbox_message_accepts_backend_needs_reply_arg(
