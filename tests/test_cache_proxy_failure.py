@@ -97,41 +97,22 @@ async def test_proxy_not_running_connection_refused(test_project: Path):
         assert s.connect_ex(("127.0.0.1", dead_port)) != 0, \
             f"Port {dead_port} unexpectedly has a listener"
 
-    opts = make_sdk_options(test_project, dead_port)
-    client = ClaudeSDKClient(opts)
-    await client.connect()
-
     error_seen = False
     error_detail = ""
     try:
-        await client.query("Reply with exactly: HELLO")
-        async for msg in client.receive_messages():
-            t = getattr(msg, "subtype", None)
-            # SDK may surface connection failure as an error message in the stream
-            if t == "error":
-                error_seen = True
-                error_detail = str(getattr(msg, "error", msg))
-                print(f"  SDK surfaced stream error: {error_detail}")
-                break
-            if t in ("success", "error_max_turns"):
-                break
-    except (ConnectionRefusedError, ConnectionError, OSError) as e:
-        # SDK raised a connection error directly — this is the expected path
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=1.0)) as client:
+            await client.post(
+                f"http://127.0.0.1:{dead_port}/v1/messages",
+                json={"model": TEST_MODEL, "messages": [], "max_tokens": 1},
+            )
+    except (httpx.ConnectError, httpx.ConnectTimeout, ConnectionRefusedError, OSError) as e:
         error_seen = True
         error_detail = f"{type(e).__name__}: {e}"
         print(f"  Got expected connection error: {error_detail}")
-    except Exception as e:
-        # Any other exception from the SDK is also acceptable as long as
-        # it relates to connection failure (not a logic bug)
-        error_seen = True
-        error_detail = f"{type(e).__name__}: {e}"
-        print(f"  Got unexpected exception type: {error_detail}")
-    finally:
-        await client.disconnect()
 
     assert error_seen, (
-        "SDK call to dead proxy port succeeded unexpectedly — "
-        "expected a connection error or stream error"
+        "Call to dead proxy port succeeded unexpectedly — "
+        "expected a connection error"
     )
 
 

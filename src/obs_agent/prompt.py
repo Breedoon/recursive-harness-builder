@@ -10,6 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+ENTRY_FILE_SENTINEL = "<!-- OBS_AGENT_ENTRY_FILE_CONTEXT -->"
+
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
 
@@ -23,18 +25,21 @@ def _read_file(path: Path) -> str:
 
 
 def build_system_prompt(config: OBSConfig) -> str:
-    """Build the system prompt by reading CLAUDE.md from the vault root.
-
-    CLAUDE.md contains all sections: identity, behavior, skills, safety,
-    vault map, and dynamic context. Handles missing file gracefully.
-    """
+    """Build the system prompt by reading the configured agent entry file."""
     content = _read_file(config.context_path)
     if not content:
         return (
             "You are a personal assistant backed by an Obsidian vault. "
-            "Your CLAUDE.md file is missing — ask the user to restore it."
+            f"Your {config.agent_entry_file} file is missing — ask the user to restore it."
         )
     return content
+
+
+def build_entry_file_appendix(config: OBSConfig) -> str:
+    content = build_system_prompt(config)
+    if ENTRY_FILE_SENTINEL in content:
+        return content
+    return f"{ENTRY_FILE_SENTINEL}\n{content}"
 
 
 def build_obs_platform_appendix() -> str:

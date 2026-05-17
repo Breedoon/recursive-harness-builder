@@ -505,6 +505,286 @@ class TestUnscheduleNextOnly:
         pass
 
 
+class TestScheduleDispatchReliability:
+    async def test_due_interval_schedules_dispatch_without_blocking_poller(self, config, monkeypatch):
+        from obs_agent.telegram import TelegramBot, TelegramRoute, _TopicScheduleRecord
+
+        bot = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
+        route_a = TelegramRoute(chat_id=67890, thread_id=1)
+        route_b = TelegramRoute(chat_id=67890, thread_id=2)
+        now = time.time()
+        events: list[tuple[str, float]] = []
+        release_long = asyncio.Event()
+
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="long-running",
+                route=route_a,
+                description="long-running",
+                schedule_mode="interval",
+                cron_expr=None,
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="long",
+                max_runs=3,
+                next_run_at=now - 1,
+            )
+        )
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="quick-other-route",
+                route=route_b,
+                description="quick-other-route",
+                schedule_mode="interval",
+                cron_expr=None,
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="quick",
+                max_runs=3,
+                next_run_at=now - 1,
+            )
+        )
+
+        async def fake_execute(*, record, trigger_kind):
+            events.append((record.schedule_id, time.monotonic()))
+            if record.schedule_id == "long-running":
+                await release_long.wait()
+            else:
+                record.run_count += 1
+                record.next_run_at = time.time() + 60
+                bot._register_topic_schedule(record)
+            return True
+
+        monkeypatch.setattr(bot, "_execute_topic_schedule", fake_execute)
+
+        await bot._run_due_interval_schedules()
+        await asyncio.sleep(0.05)
+
+        assert {event[0] for event in events} == {"long-running", "quick-other-route"}
+        assert bot._topic_schedules_by_id["quick-other-route"].run_count == 1
+        assert "long-running" in bot._schedule_execution_tasks
+        assert not bot._schedule_execution_tasks["long-running"].done()
+
+        release_long.set()
+        await asyncio.gather(*list(bot._schedule_execution_tasks.values()))
+
+    async def test_same_schedule_due_again_while_running_does_not_double_fire(self, config, monkeypatch):
+        from obs_agent.telegram import TelegramBot, TelegramRoute, _TopicScheduleRecord
+
+        bot = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
+        route_a = TelegramRoute(chat_id=67890, thread_id=10)
+        route_b = TelegramRoute(chat_id=67890, thread_id=20)
+        now = time.time()
+        started: list[str] = []
+        release_long = asyncio.Event()
+
+        long_record = _TopicScheduleRecord(
+            schedule_id="same-schedule",
+            route=route_a,
+            description="same-schedule",
+            schedule_mode="interval",
+            cron_expr=None,
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="long",
+            max_runs=3,
+            next_run_at=now - 1,
+        )
+        other_record = _TopicScheduleRecord(
+            schedule_id="other-schedule",
+            route=route_b,
+            description="other-schedule",
+            schedule_mode="interval",
+            cron_expr=None,
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="other",
+            max_runs=3,
+            next_run_at=now - 1,
+        )
+        bot._register_topic_schedule(long_record)
+        bot._register_topic_schedule(other_record)
+
+        async def fake_execute(*, record, trigger_kind):
+            started.append(record.schedule_id)
+            if record.schedule_id == "same-schedule":
+                await release_long.wait()
+            else:
+                record.run_count += 1
+                record.next_run_at = time.time() + 60
+                bot._register_topic_schedule(record)
+            return True
+
+        monkeypatch.setattr(bot, "_execute_topic_schedule", fake_execute)
+
+        await bot._run_due_interval_schedules()
+        await asyncio.sleep(0.05)
+        bot._topic_schedules_by_id["same-schedule"].next_run_at = time.time() - 1
+        await bot._run_due_interval_schedules()
+        await asyncio.sleep(0.05)
+
+        assert started.count("same-schedule") == 1
+        assert started.count("other-schedule") == 1
+        assert bot._topic_schedules_by_id["other-schedule"].run_count == 1
+
+        release_long.set()
+        await asyncio.gather(*list(bot._schedule_execution_tasks.values()))
+
+    async def test_schedule_failure_isolated_from_other_due_schedules(self, config, monkeypatch):
+        from obs_agent.telegram import TelegramBot, TelegramRoute, _TopicScheduleRecord
+
+        bot = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
+        route_a = TelegramRoute(chat_id=67890, thread_id=101)
+        route_b = TelegramRoute(chat_id=67890, thread_id=202)
+        now = time.time()
+        completed: list[str] = []
+
+        for schedule_id, route in [("failing", route_a), ("survivor", route_b)]:
+            bot._register_topic_schedule(
+                _TopicScheduleRecord(
+                    schedule_id=schedule_id,
+                    route=route,
+                    description=schedule_id,
+                    schedule_mode="interval",
+                    cron_expr=None,
+                    trigger_kind="interval",
+                    interval_seconds=60,
+                    prompt=schedule_id,
+                    max_runs=3,
+                    next_run_at=now - 1,
+                )
+            )
+
+        async def fake_execute(*, record, trigger_kind):
+            if record.schedule_id == "failing":
+                record.last_error = "boom"
+                record.run_count += 1
+                record.next_run_at = time.time() + 60
+                bot._register_topic_schedule(record)
+                raise RuntimeError("boom")
+            completed.append(record.schedule_id)
+            record.run_count += 1
+            record.next_run_at = time.time() + 60
+            bot._register_topic_schedule(record)
+            return True
+
+        monkeypatch.setattr(bot, "_execute_topic_schedule", fake_execute)
+
+        await bot._run_due_interval_schedules()
+        results = await asyncio.gather(
+            *list(bot._schedule_execution_tasks.values()),
+            return_exceptions=True,
+        )
+
+        assert any(isinstance(result, RuntimeError) for result in results)
+        assert completed == ["survivor"]
+        assert bot._topic_schedules_by_id["failing"].last_error == "boom"
+        assert bot._topic_schedules_by_id["survivor"].run_count == 1
+
+    async def test_many_schedule_stress_runs_long_failing_and_multi_route(self, config, monkeypatch):
+        from obs_agent.telegram import TelegramBot, TelegramRoute, _TopicScheduleRecord
+
+        bot = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
+        now = time.time()
+        release_long = asyncio.Event()
+        started: list[str] = []
+        failures: list[str] = []
+        route_count = 5
+        schedule_count = 20
+
+        for index in range(schedule_count):
+            bot._register_topic_schedule(
+                _TopicScheduleRecord(
+                    schedule_id=f"stress-{index}",
+                    route=TelegramRoute(chat_id=67890, thread_id=index % route_count),
+                    description=f"stress-{index}",
+                    schedule_mode="interval",
+                    cron_expr=None,
+                    trigger_kind="interval",
+                    interval_seconds=60,
+                    prompt=f"stress-{index}",
+                    max_runs=3,
+                    next_run_at=now - 1,
+                )
+            )
+
+        async def fake_execute(*, record, trigger_kind):
+            started.append(record.schedule_id)
+            if record.schedule_id == "stress-0":
+                await release_long.wait()
+            if record.schedule_id == "stress-1":
+                failures.append(record.schedule_id)
+                record.last_error = "stress failure"
+                record.run_count += 1
+                record.next_run_at = time.time() + 60
+                bot._register_topic_schedule(record)
+                raise RuntimeError("stress failure")
+            record.run_count += 1
+            record.next_run_at = time.time() + 60
+            bot._register_topic_schedule(record)
+            return True
+
+        monkeypatch.setattr(bot, "_execute_topic_schedule", fake_execute)
+
+        await bot._run_due_interval_schedules()
+        await asyncio.sleep(0.05)
+
+        assert len(set(started)) == schedule_count
+        assert "stress-0" in bot._schedule_execution_tasks
+        assert not bot._schedule_execution_tasks["stress-0"].done()
+        assert failures == ["stress-1"]
+        assert bot._topic_schedules_by_id["stress-2"].run_count == 1
+        assert len({bot._topic_schedules_by_id[sid].route for sid in started}) == route_count
+
+        release_long.set()
+        await asyncio.gather(
+            *list(bot._schedule_execution_tasks.values()),
+            return_exceptions=True,
+        )
+
+    async def test_persisted_due_schedule_survives_adapter_recreation(self, config, monkeypatch):
+        from obs_agent.telegram import TelegramBot, TelegramRoute, _TopicScheduleRecord
+
+        route = TelegramRoute(chat_id=67890, thread_id=303)
+        first = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
+        first._get_state(route)
+        first._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="persisted-schedule",
+                route=route,
+                description="persisted-schedule",
+                schedule_mode="interval",
+                cron_expr=None,
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="persisted",
+                max_runs=3,
+                next_run_at=time.time() - 1,
+            )
+        )
+        first._state_store.close()
+
+        second = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
+        second._restore_state_from_store()
+        executed: list[str] = []
+
+        async def fake_execute(*, record, trigger_kind):
+            executed.append(record.schedule_id)
+            record.run_count += 1
+            record.next_run_at = time.time() + 60
+            second._register_topic_schedule(record)
+            return True
+
+        monkeypatch.setattr(second, "_execute_topic_schedule", fake_execute)
+
+        await second._run_due_interval_schedules()
+        await asyncio.gather(*list(second._schedule_execution_tasks.values()))
+
+        assert executed == ["persisted-schedule"]
+        assert second._topic_schedules_by_id["persisted-schedule"].run_count == 1
+        second._state_store.close()
+
+
 class TestIntervalSecondsLow:
     """Verify interval_seconds=0 and =1 are valid."""
 

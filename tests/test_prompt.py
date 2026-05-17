@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from obs_agent.config import OBSConfig
-from obs_agent.prompt import build_system_prompt
+from obs_agent.prompt import ENTRY_FILE_SENTINEL, build_entry_file_appendix, build_system_prompt
 
 
 # --- Basic Contract ---
@@ -92,3 +92,31 @@ class TestPromptFallbacks:
         assert isinstance(prompt, str)
         assert len(prompt) > 0, "Prompt must still be valid with empty CLAUDE.md"
         assert "missing" in prompt.lower(), "Fallback prompt should mention CLAUDE.md is missing"
+
+    def test_configured_entry_file(self, tmp_path):
+        vault = tmp_path / "vault"
+        vault.mkdir(parents=True)
+        (vault / "AGENTS.md").write_text("# Custom entry\n\nUse this file.\n")
+        cfg = OBSConfig(vault_path=vault, agent_entry_file="AGENTS.md")
+
+        assert build_system_prompt(cfg) == "# Custom entry\n\nUse this file.\n"
+
+    def test_entry_file_appendix_injects_once(self, tmp_path):
+        vault = tmp_path / "vault"
+        vault.mkdir(parents=True)
+        (vault / "CLAUDE.md").write_text("# Entry\n")
+        cfg = OBSConfig(vault_path=vault)
+
+        appendix = build_entry_file_appendix(cfg)
+        assert appendix.count(ENTRY_FILE_SENTINEL) == 1
+        assert appendix.count("# Entry") == 1
+
+    def test_entry_file_appendix_preserves_existing_sentinel(self, tmp_path):
+        vault = tmp_path / "vault"
+        vault.mkdir(parents=True)
+        (vault / "CLAUDE.md").write_text(f"{ENTRY_FILE_SENTINEL}\n# Entry\n")
+        cfg = OBSConfig(vault_path=vault)
+
+        appendix = build_entry_file_appendix(cfg)
+        assert appendix.count(ENTRY_FILE_SENTINEL) == 1
+        assert appendix.count("# Entry") == 1

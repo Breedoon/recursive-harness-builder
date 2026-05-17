@@ -114,24 +114,25 @@ def summarize_tool_use(tool_name: str, tool_input: dict) -> str:
         return _truncate(f"WebSearch: '{query}'") if query else "WebSearch"
 
     if tool_name == "AgentTask":
-        description = tool_input.get("description", "")
+        display = (
+            tool_input.get("display_name")
+            or tool_input.get("name")
+            or tool_input.get("description")
+            or tool_input.get("alias")
+            or ""
+        )
         prompt = tool_input.get("prompt", "")
         resume = tool_input.get("resume")
-        timeout_ms = tool_input.get("timeout_ms")
-        max_turns = tool_input.get("max_turns")
-        prefix = tool_name
-        if description:
-            summary = f"{prefix}: {description}"
-        elif prompt:
-            summary = f"{prefix}: {prompt}"
+        is_fork = tool_input.get("fork", True)
+        action = "resume" if resume else ("fork" if is_fork is not False else "start")
+        if display:
+            summary = f"AgentTask: {action} {display}"
+        elif prompt and not resume:
+            summary = f"AgentTask: {action} {prompt}"
         else:
-            summary = prefix
+            summary = f"AgentTask: {action}"
         if resume:
-            summary = f"{summary} resume={resume}"
-        if timeout_ms is not None:
-            summary = f"{summary} timeout={timeout_ms}ms"
-        if max_turns is not None:
-            summary = f"{summary} max_turns={max_turns}"
+            summary = f"{summary} {resume}"
         return _truncate(summary)
 
     if tool_name == "AgentTaskOutput":

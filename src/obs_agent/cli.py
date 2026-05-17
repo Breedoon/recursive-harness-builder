@@ -23,6 +23,21 @@ import httpx
 from obs_agent.config import OBSConfig
 from obs_agent.runtime_env import bootstrap_runtime_env
 
+CLI_HELP = """Usage: obs-agent [--help] [--profile PROFILE] [--test]
+
+Commands:
+  /help        Show this help
+  /stop        Interrupt the current response
+  /quit        Exit the CLI
+
+Bare quit, exit, and q also exit.
+""".strip()
+
+
+def format_unknown_command(command: str) -> str:
+    return f"Unknown command: {command}. Type /help for usage."
+
+
 if TYPE_CHECKING:
     from obs_agent.input import InputChannel
 
@@ -198,6 +213,10 @@ async def _handle_input_during_stream(
             except Exception:
                 pass
             return "/quit"
+        elif command == "/help":
+            channel.print_output(CLI_HELP + "\n")
+        elif command is not None:
+            channel.print_output(format_unknown_command(command) + "\n")
         elif text:
             try:
                 httpx.post(
@@ -307,8 +326,8 @@ async def async_main() -> None:
     base_url = config.base_url
 
     if "--help" in sys.argv or "-h" in sys.argv:
-        print("Usage: obs-agent [--help]")
-        print(f"Interactive CLI for OBS Agent (daemon at {base_url})")
+        print(CLI_HELP)
+        print(f"\nInteractive CLI for OBS Agent (daemon at {base_url})")
         sys.exit(0)
 
     # Channel selection: PromptToolkitChannel for TTY, SimpleChannel otherwise.
@@ -340,7 +359,7 @@ async def async_main() -> None:
     prompt = os.environ.get("OBS_EVAL_PROMPT", "> ")
 
     print(f"OBS Agent CLI (daemon: {base_url})")
-    print("Type your message, or /quit to exit. (Esc+Enter for newline)\n")
+    print("Type your message, /help for usage, or /quit to exit. (Esc+Enter for newline)\n")
 
     try:
         while True:
@@ -354,7 +373,7 @@ async def async_main() -> None:
 
             # Backward-compat: bare quit/exit/q still work
             if user_input.lower() in ("quit", "exit", "q"):
-                print("Goodbye.")
+                print("Goodbye. Tip: /quit also exits.")
                 break
 
             # Parse slash commands at prompt level
@@ -363,11 +382,14 @@ async def async_main() -> None:
             if command == "/quit":
                 print("Goodbye.")
                 break
+            elif command == "/help":
+                print(CLI_HELP)
+                continue
             elif command == "/stop":
                 print("(nothing to interrupt)")
                 continue
             elif command is not None:
-                print(f"Unknown command: {command}")
+                print(format_unknown_command(command))
                 continue
 
             # Regular message: stream with concurrent input
@@ -397,8 +419,8 @@ def main():
     # Handle --help synchronously before starting the event loop
     if "--help" in sys.argv or "-h" in sys.argv:
         config = OBSConfig.from_env()
-        print("Usage: obs-agent [--help] [--profile PROFILE] [--test]")
-        print(f"Interactive CLI for OBS Agent (daemon at {config.base_url})")
+        print(CLI_HELP)
+        print(f"\nInteractive CLI for OBS Agent (daemon at {config.base_url})")
         sys.exit(0)
 
     asyncio.run(async_main())

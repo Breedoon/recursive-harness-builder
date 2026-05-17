@@ -12,7 +12,7 @@ Normalizations (applied in order):
 1. Billing header: replaced with fixed value
 2. String→list: bare-string user content converted to list format
 3. Skill listing: stripped entirely from all messages
-4. Dynamic system-reminders: stripped (except CLAUDE.md)
+4. Claude Code system-reminders: stripped
 5. Git status: normalized in system prompt to fixed placeholder
 6. Tool sorting: tools[] sorted alphabetically by name
 7. Metadata: session-specific IDs normalized
@@ -56,6 +56,7 @@ USAGE_LOG = os.path.join(LOG_DIR, "usage.jsonl")
 
 SKILL_MARKER = "The following skills are available for use with the Skill tool:"
 CLAUDEMD_MARKER = "As you answer the user's questions, you can use the following context:"
+OBS_ENTRY_FILE_MARKER = "<!-- OBS_AGENT_ENTRY_FILE_CONTEXT -->"
 
 SAVE_BODIES = os.environ.get("CACHE_PROXY_SAVE_BODIES", "").lower() in ("1", "true")
 
@@ -184,44 +185,40 @@ def normalize_skill_listing(body: dict) -> dict:
     return {"action": "not_found"}
 
 
-def _is_strippable_system_reminder(block: dict) -> bool:
-    """Check if a content block is a dynamic system-reminder that should be stripped.
+def _is_claudemd_reminder(block: dict) -> bool:
+    if not isinstance(block, dict) or block.get("type") != "text":
+        return False
+    text = block.get("text", "")
+    return text.startswith(f"<system-reminder>\n{CLAUDEMD_MARKER}")
 
-    Returns True for blocks that:
-    1. Are text blocks containing <system-reminder> tags
-    2. Are NOT the CLAUDE.md context (contains CLAUDEMD_MARKER)
 
-    Note: skill listing blocks are stripped by Rule 3 before this runs,
-    so no need to preserve them here.
-    """
+def _has_obs_entry_file_context(body: dict) -> bool:
+    system = body.get("system")
+    if not isinstance(system, list):
+        return False
+    for block in system:
+        if isinstance(block, dict) and block.get("type") == "text":
+            if OBS_ENTRY_FILE_MARKER in block.get("text", ""):
+                return True
+    return False
+
+
+def _is_strippable_system_reminder(block: dict, *, strip_claudemd: bool = True) -> bool:
     if not isinstance(block, dict) or block.get("type") != "text":
         return False
     text = block.get("text", "")
     if "<system-reminder>" not in text:
         return False
-    # Preserve CLAUDE.md context — the marker always appears right after
-    # the opening <system-reminder> tag. Full-text search causes false
-    # positives when changed_files diffs contain the marker string (Bug 1).
-    # Check only the prefix: "<system-reminder>\n" (18 chars) + marker.
-    marker_end = 20 + len(CLAUDEMD_MARKER)
-    if CLAUDEMD_MARKER in text[:marker_end]:
+    if _is_claudemd_reminder(block) and not strip_claudemd:
         return False
     return True
 
 
 def strip_dynamic_reminders(body: dict) -> int:
-    """Rule 4: Strip all dynamic <system-reminder> blocks from user messages.
-
-    CC injects 26 types of runtime attachments (changed_files, todo_reminders,
-    token_usage, etc.) as <system-reminder> blocks. These have dynamic content
-    that changes between turns and aren't persisted in JSONL, creating byte
-    divergence when forks reconstruct from JSONL.
-
-    Preserves: CLAUDE.md context injection. (Skill listing already
-    stripped by Rule 3 before this runs.)
-    """
+    """Rule 4: Strip dynamic Claude Code <system-reminder> blocks from user messages."""
     messages = body.get("messages", [])
     count = 0
+    strip_claudemd = _has_obs_entry_file_context(body)
     for msg in messages:
         if msg.get("role") != "user":
             continue
@@ -231,7 +228,7 @@ def strip_dynamic_reminders(body: dict) -> int:
         original_len = len(content)
         msg["content"] = [
             block for block in content
-            if not _is_strippable_system_reminder(block)
+            if not _is_strippable_system_reminder(block, strip_claudemd=strip_claudemd)
         ]
         stripped = original_len - len(msg["content"])
         count += stripped

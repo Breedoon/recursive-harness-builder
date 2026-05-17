@@ -333,9 +333,9 @@ class TestIsStrippableSystemReminder:
         block = _skill_block()
         assert cache_proxy._is_strippable_system_reminder(block) is True
 
-    def test_claudemd_not_strippable(self):
+    def test_claudemd_is_strippable(self):
         block = _claudemd_block()
-        assert cache_proxy._is_strippable_system_reminder(block) is False
+        assert cache_proxy._is_strippable_system_reminder(block) is True
 
     def test_non_text_block_not_strippable(self):
         block = {"type": "image", "source": {}}
@@ -373,12 +373,11 @@ class TestIsStrippableSystemReminder:
         )
         assert cache_proxy._is_strippable_system_reminder(block) is True
 
-    def test_block_with_both_claudemd_and_reminder(self):
-        """A block with both CLAUDE.md marker AND system-reminder should NOT be stripped."""
+    def test_block_with_both_claudemd_and_reminder_is_strippable(self):
         block = _text_block(
             f"<system-reminder>\n{cache_proxy.CLAUDEMD_MARKER}\nsome stuff\n</system-reminder>"
         )
-        assert cache_proxy._is_strippable_system_reminder(block) is False
+        assert cache_proxy._is_strippable_system_reminder(block) is True
 
     def test_changed_files_containing_claudemd_marker_is_strippable(self):
         """Bug 1: A changed_files reminder whose diff contains the CLAUDEMD_MARKER
@@ -398,15 +397,13 @@ class TestIsStrippableSystemReminder:
         block = _text_block(diff_content)
         assert cache_proxy._is_strippable_system_reminder(block) is True
 
-    def test_real_claudemd_block_still_preserved(self):
-        """The actual CLAUDE.md context block has the marker near the start
-        and should still NOT be stripped after the fix."""
+    def test_real_claudemd_block_is_strippable(self):
         block = _text_block(
             f"<system-reminder>\n{cache_proxy.CLAUDEMD_MARKER}\n"
             "# Project Instructions\nLong vault content here...\n"
             "</system-reminder>"
         )
-        assert cache_proxy._is_strippable_system_reminder(block) is False
+        assert cache_proxy._is_strippable_system_reminder(block) is True
 
     def test_claudemd_marker_deep_in_large_diff_is_strippable(self):
         """Bug 1 regression: A large changed_files diff with the CLAUDEMD_MARKER
@@ -423,13 +420,21 @@ class TestIsStrippableSystemReminder:
         # The marker is deep inside, NOT at the start → should be strippable
         assert cache_proxy._is_strippable_system_reminder(block) is True
 
-    def test_claudemd_marker_at_exact_boundary(self):
-        """Edge case: marker starting at exactly char 20 (right after '<system-reminder>\\n')
-        should be detected as CLAUDE.md and NOT stripped."""
+    def test_claudemd_marker_at_exact_boundary_is_strippable(self):
         block = _text_block(
             f"<system-reminder>\n{cache_proxy.CLAUDEMD_MARKER}\nContent\n</system-reminder>"
         )
-        assert cache_proxy._is_strippable_system_reminder(block) is False
+        assert cache_proxy._is_strippable_system_reminder(block) is True
+
+    def test_normalize_request_strips_claude_code_entry_file_reminder(self):
+        body = _make_body(
+            system=[_text_block("<!-- OBS_AGENT_ENTRY_FILE_CONTEXT -->\n# Custom entry")],
+            messages=[_user_msg([_text_block("hello"), _claudemd_block()])],
+        )
+        result_body, info = cache_proxy.normalize_request(body)
+        assert info["reminders"] == 1
+        assert result_body["messages"][0]["content"] == [_text_block("hello")]
+        assert result_body["system"][0]["text"].count("<!-- OBS_AGENT_ENTRY_FILE_CONTEXT -->") == 1
 
 
 # ── Regression: JSONL truncation masking ──────────────────────────────────

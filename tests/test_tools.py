@@ -95,8 +95,9 @@ class TestAgentTaskTools:
         assert schema["required"] == ["recipient", "content"]
         assert "team_name" in schema["properties"]
         assert "sender" in schema["properties"]
-        assert "needs_reply" not in schema["properties"]
-        assert "must_reply" not in schema["properties"]
+        assert "needs_reply" in schema["properties"]
+        assert "question" in schema["properties"]["needs_reply"]["description"]
+        assert "must_reply" in schema["properties"]
 
     @pytest.mark.asyncio
     async def test_send_inbox_message_accepts_backend_needs_reply_arg(
@@ -277,7 +278,7 @@ class TestAgentTaskTools:
                 "content": [
                     {
                         "type": "text",
-                        "text": "AgentTask launched successfully.\nagentId: task-123\noutput_file: /tmp/task-123.jsonl\ntelegram_topic: https://t.me/c/1/2",
+                        "text": "AgentTask launched.\nagentId: task-123\noutput_file: /tmp/task-123.jsonl\ntelegram_topic: https://t.me/c/1/2",
                     }
                 ]
             }
@@ -317,7 +318,7 @@ class TestAgentTaskTools:
                 "inherit_hooks": False,
             }
         )
-        assert "AgentTask launched successfully." in result["content"][0]["text"]
+        assert "AgentTask launched." in result["content"][0]["text"]
         assert "agentId: task-123" in result["content"][0]["text"]
         assert "telegram_topic: https://t.me/c/1/2" in result["content"][0]["text"]
 
@@ -1137,6 +1138,62 @@ class TestAgentTaskTools:
         assert payload["recipient"] == child_name
         persisted = json.loads(child_path.read_text(encoding="utf-8"))
         assert persisted[-1]["text"] == "ping"
+
+    @pytest.mark.asyncio
+    async def test_search_team_children_sort_by_activity_and_accept_tree_children_alias(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        root_agent = "2026-03-30-10-10-root"
+        newer_child = "e96857c58f-newer"
+        older_child = "e96857c58f-older"
+        monkeypatch.setattr(
+            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
+            lambda **_: ObsBootstrap(
+                raw_xml="<obs-bootstrap version='2' />",
+                lineage=("Root",),
+                origin="trunk_start",
+                is_fork=False,
+                session_id="sid-root",
+                agent_id=None,
+                parent_session_id=None,
+                root_team_key=root_agent,
+                agent_name=root_agent,
+                parent_agent_name=None,
+                parent_display_name=None,
+            ),
+        )
+        team_dir = tmp_path / ".claude" / "teams" / root_agent
+        inbox_dir = team_dir / "inboxes"
+        inbox_dir.mkdir(parents=True)
+        for agent_name in (root_agent, older_child, newer_child):
+            (inbox_dir / f"{agent_name}.json").write_text("[]", encoding="utf-8")
+        (team_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "members": [
+                        {"name": root_agent, "obs": {"display_name": "Root", "lineage": ["Root"], "lineage_length": 1, "updated_at": 1}},
+                        {"name": older_child, "obs": {"display_name": "Older", "lineage": ["Root", "Older"], "lineage_length": 2, "parent_agent_name": root_agent, "created_at": 10}},
+                        {"name": newer_child, "obs": {"display_name": "Newer", "lineage": ["Root", "Newer"], "lineage_length": 2, "parent_agent_name": root_agent, "created_at": 20}},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        create_obs_tools(skill_config, lambda: "sid-root", hook_state=HookState())
+        handler = _tool_handler(captured["tools"], "search_team")
+
+        result = await handler({"mode": "tree_children"})
+
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["mode"] == "children"
+        assert payload["children"] == [newer_child, older_child]
 
     @pytest.mark.asyncio
     async def test_send_inbox_message_does_not_resolve_parent_alias(

@@ -117,6 +117,26 @@ def _transport_unavailable(tool_name: str) -> dict:
     )
 
 
+def _member_activity_sort_key(member: dict[str, Any], agent_name: str) -> tuple[float, str]:
+    candidates = [
+        member.get("last_active_at"),
+        member.get("last_activity_at"),
+        member.get("completed_at"),
+        member.get("created_at"),
+        member.get("updated_at"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, (int, float)):
+            return (-float(candidate), str(agent_name))
+        if isinstance(candidate, str) and candidate.strip():
+            try:
+                parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            return (-parsed.timestamp(), str(agent_name))
+    return (0.0, str(agent_name))
+
+
 def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
     config_path = Path.home() / ".claude" / "teams" / team_name / "config.json"
     if not config_path.exists():
@@ -838,6 +858,7 @@ def create_obs_tools(
         )
 
     async def _send_inbox_message(args: dict) -> dict:
+        # On delivery failure, return "message underdelivered" and use _rollback_written_message after writes.
         bootstrap = _current_obs_bootstrap()
         team_name = str(args.get("team_name", "")).strip() or (
             bootstrap.root_team_key if bootstrap is not None else ""
@@ -1183,6 +1204,14 @@ def create_obs_tools(
                     "type": "string",
                     "description": "Optional sender label; defaults to the current agent name.",
                 },
+                "needs_reply": {
+                    "type": "boolean",
+                    "description": "Set true only when the message asks a question or makes a request that needs a reply.",
+                },
+                "must_reply": {
+                    "type": "boolean",
+                    "description": "Deprecated alias for needs_reply.",
+                },
             },
             "required": ["recipient", "content"],
             "additionalProperties": False,
@@ -1305,9 +1334,11 @@ def create_obs_tools(
         mode = str(args.get("mode") or args.get("who") or "family").strip().lower()
         if mode == "all":
             mode = "family"
+        if mode == "tree_children":
+            mode = "children"
         if mode not in {"children", "siblings", "parent", "ancestors", "descendants", "family", "tree"}:
             return _error_result(
-                "search_team: 'mode' must be one of: parent, children, siblings, ancestors, descendants, family, tree"
+                "search_team: 'mode' must be one of: parent, children, siblings, ancestors, descendants, family, tree, tree_children"
             )
         bootstrap = _current_obs_bootstrap()
         if bootstrap is None:
@@ -1341,10 +1372,19 @@ def create_obs_tools(
         my_agent_name = bootstrap.agent_name
         my_hash = lineage_fingerprint(tuple(normalize_lineage_name(n) for n in my_lineage))
 
-        children = sorted(
+        def _sort_member_names(names: list[str]) -> list[str]:
+            return sorted(
+                names,
+                key=lambda name: _member_activity_sort_key(
+                    team_projection_metadata.get(name) or {},
+                    name,
+                ),
+            )
+
+        children = _sort_member_names([
             name for name in all_agents
             if name.startswith(f"{my_hash}-") and name != my_agent_name
-        )
+        ])
         if mode in {"children", "family"}:
             result["children"] = children
 
@@ -1366,10 +1406,10 @@ def create_obs_tools(
         if len(my_lineage) > 1:
             parent_lineage = tuple(normalize_lineage_name(n) for n in my_lineage[:-1])
             parent_hash = lineage_fingerprint(parent_lineage)
-            siblings = sorted(
+            siblings = _sort_member_names([
                 name for name in all_agents
                 if name.startswith(f"{parent_hash}-") and name != my_agent_name
-            )
+            ])
         if mode in {"siblings", "family"}:
             result["siblings"] = siblings
 
@@ -1398,14 +1438,7 @@ def create_obs_tools(
                     continue
                 if normalized_lineage[: len(my_lineage)] == my_lineage:
                     descendants.append(agent_name)
-            result["descendants"] = sorted(
-                set(descendants),
-                key=lambda name: (
-                    int((team_projection_metadata.get(name) or {}).get("lineage_length") or 9999),
-                    "/".join((team_projection_metadata.get(name) or {}).get("lineage") or []),
-                    name,
-                ),
-            )
+            result["descendants"] = _sort_member_names(list(set(descendants)))
 
         if mode == "tree":
             result["tree"] = all_agents
@@ -1427,9 +1460,8 @@ def create_obs_tools(
                     details["relation"] = "tree"
                 tree_members.append(details)
             tree_members.sort(
-                key=lambda item: (
-                    int(item.get("lineage_length") or 9999),
-                    "/".join(item.get("lineage") or []),
+                key=lambda item: _member_activity_sort_key(
+                    item,
                     str(item.get("agent_name") or ""),
                 )
             )

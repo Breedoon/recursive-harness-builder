@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 _DEFAULT_CODEBASE_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_VAULT = _DEFAULT_CODEBASE_ROOT / "examples" / "recursive-workflow"
+_DEFAULT_VAULT = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "T"
 _DEFAULT_TELEGRAM_TEMP_ROOT = Path("/tmp") / "obs-agent"
 _DEFAULT_TELEGRAM_STATE_DB_PATH = (
     _DEFAULT_CODEBASE_ROOT / ".obs-agent" / "state" / "telegram-state.sqlite3"
@@ -203,6 +203,7 @@ class OBSConfig:
     # Change this to e.g. "gpt" to make root sessions default to GPT.
     default_model: str = "claude"
     claude_dir: str = ".claude"
+    agent_entry_file: str = "CLAUDE.md"
     daemon_host: str = "127.0.0.1"
     daemon_port: int = 7832
     cache_window_seconds: int = _DEFAULT_CACHE_WINDOW_SECONDS
@@ -254,6 +255,8 @@ class OBSConfig:
             kwargs["vault_path"] = Path(vault)
         if default_model := os.environ.get("OBS_DEFAULT_MODEL"):
             kwargs["default_model"] = default_model.strip()
+        if entry_file := os.environ.get("OBS_AGENT_ENTRY_FILE"):
+            kwargs["agent_entry_file"] = entry_file.strip() or "CLAUDE.md"
         if model := os.environ.get("OBS_AGENT_MODEL") or os.environ.get("OBS_MODEL"):
             kwargs["model"] = resolve_model(model.strip())
         else:
@@ -342,7 +345,7 @@ class OBSConfig:
 
     @property
     def context_path(self) -> Path:
-        return self.vault_path / "CLAUDE.md"
+        return self.vault_path / self.agent_entry_file
 
     @property
     def skills_dir(self) -> Path:
@@ -414,8 +417,10 @@ class OBSConfig:
             raise FileNotFoundError(f"Vault not found: {self.vault_path}")
         if not self.claude_path.is_dir():
             raise FileNotFoundError(f".claude directory not found: {self.claude_path}")
+        if not _is_within(self.context_path, self.vault_path):
+            raise ValueError(f"Agent entry file must be inside vault: {self.context_path}")
         if not self.context_path.is_file():
-            raise FileNotFoundError(f"CLAUDE.md not found: {self.context_path}")
+            raise FileNotFoundError(f"Agent entry file not found: {self.context_path}")
         if _is_within(self.telegram_state_db_path, self.telegram_temp_root):
             raise ValueError(
                 "Invalid Telegram state DB path: OBS_TELEGRAM_STATE_DB_PATH must be outside "

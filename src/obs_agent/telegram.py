@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover - optional import error surfaced on cron c
 
 from telegram import Bot, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, RetryAfter, TelegramError
+from telegram.error import BadRequest, Conflict, RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from obs_agent.context_probe import probe_context_via_claude_cli
@@ -106,6 +106,17 @@ _SCHEDULE_STOP_MAX_DEFERS = 5
 _AUTO_DELIVERY_PROMPT = (
     "(System: queued updates arrived while idle. Process and summarize them.)"
 )
+
+_TELEGRAM_HELP_TEXT = """Usage:
+/help — show this help
+/stop — interrupt this topic; /stop all interrupts every topic in the chat
+/fork [name] — create a new topic from this head or a replied message
+/new [name] — reset this topic into a new trunk agent
+/clear — clear this topic but keep its agent identity
+/context — show session and context info
+
+Bare commands are not supported; use the slash form, e.g. /stop.
+""".strip()
 
 _PRIORITY_SYSTEM = 0
 _PRIORITY_ASSISTANT = 10
@@ -260,6 +271,10 @@ class _TopicDeletedError(Exception):
     def __init__(self, route: "TelegramRoute") -> None:
         self.route = route
         super().__init__(f"Topic deleted for route {route}")
+
+
+class _TelegramPollingConflictError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -654,6 +669,7 @@ class TelegramBot:
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
+        self._schedule_execution_tasks: dict[str, asyncio.Task] = {}
         self._schedule_running_by_route: set[TelegramRoute] = set()
         self._active_schedule_execution_by_route: dict[TelegramRoute, str] = {}
         self._schedule_stop_events: asyncio.Queue[tuple[TelegramRoute, dict[str, Any]]] = asyncio.Queue()
@@ -2198,9 +2214,9 @@ class TelegramBot:
         return f"F{state.child_fork_count}"
 
     def _child_topic_title_from_alias(self, state: TelegramSessionState, alias: str) -> str:
-        base = self._current_topic_base(state)
+        _ = state
         label = normalize_lineage_name(alias)
-        return f"{base} - {label}".strip()[:128]
+        return (label or "F").strip()[:128]
 
     def _next_auto_child_title(self, state: TelegramSessionState) -> str:
         return self._child_topic_title_from_alias(state, self._next_auto_child_alias(state))
@@ -2985,7 +3001,7 @@ class TelegramBot:
                 self._register_topic_schedule(record)
             return False
         lock = self._get_route_lock(record.route)
-        if lock.locked() or state.busy or record.route in self._schedule_running_by_route:
+        if lock.locked() or state.busy:
             if is_reply_wake_schedule(record):
                 try:
                     record.next_run_at = self._next_timed_run_at(record, base_ts=now)
@@ -3146,6 +3162,39 @@ class TelegramBot:
         await _emit_post_schedule_summary()
         return run_succeeded
 
+    def _cleanup_finished_schedule_tasks(self) -> None:
+        for schedule_id, task in list(self._schedule_execution_tasks.items()):
+            if task.done():
+                self._schedule_execution_tasks.pop(schedule_id, None)
+
+    def _start_topic_schedule_task(self, record: _TopicScheduleRecord) -> bool:
+        self._cleanup_finished_schedule_tasks()
+        task = self._schedule_execution_tasks.get(record.schedule_id)
+        if task is not None and not task.done():
+            return False
+        task = asyncio.create_task(
+            self._execute_topic_schedule(record=record, trigger_kind=record.trigger_kind)
+        )
+        self._schedule_execution_tasks[record.schedule_id] = task
+
+        def _discard(done_task: asyncio.Task) -> None:
+            if self._schedule_execution_tasks.get(record.schedule_id) is done_task:
+                self._schedule_execution_tasks.pop(record.schedule_id, None)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug(
+                    "Scheduled task crashed outside execution handler schedule_id=%s route=%s",
+                    record.schedule_id,
+                    record.route,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(_discard)
+        return True
+
     async def _run_due_interval_schedules(self) -> None:
         now = time.time()
         due_records = [
@@ -3158,7 +3207,7 @@ class TelegramBot:
         ]
         due_records.sort(key=lambda record: float(record.next_run_at or now))
         for record in due_records:
-            await self._execute_topic_schedule(record=record, trigger_kind=record.trigger_kind)
+            self._start_topic_schedule_task(record)
 
     async def _process_stop_schedule_events(self) -> None:
         events: list[tuple[TelegramRoute, dict[str, Any]]] = []
@@ -4086,6 +4135,15 @@ class TelegramBot:
                 await task
             except asyncio.CancelledError:
                 pass
+        for task in list(self._schedule_execution_tasks.values()):
+            if not task.done():
+                task.cancel()
+        for task in list(self._schedule_execution_tasks.values()):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._schedule_execution_tasks.clear()
         self._state_store.close()
 
     async def _send_plain_with_retry(
@@ -5062,6 +5120,25 @@ class TelegramBot:
                     entry["lineage_length"] = len(lineage)
         return members
 
+    def _member_activity_sort_key(self, member: dict[str, Any], agent_name: str) -> tuple[float, str]:
+        candidates = [
+            member.get("last_active_at"),
+            member.get("last_activity_at"),
+            member.get("completed_at"),
+            member.get("created_at"),
+            member.get("updated_at"),
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, (int, float)):
+                return (-float(candidate), str(agent_name))
+            if isinstance(candidate, str) and candidate.strip():
+                try:
+                    parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                return (-parsed.timestamp(), str(agent_name))
+        return (0.0, str(agent_name))
+
     def _render_tree_html(
         self,
         *,
@@ -5084,6 +5161,13 @@ class TelegramBot:
                 and tuple(member["lineage"][: len(current_lineage)]) == current_lineage
             }
             allowed.add(current_agent_name)
+        elif mode == "children":
+            allowed = {
+                agent_name
+                for agent_name, member in members.items()
+                if str(member.get("parent_agent_name") or "") == current_agent_name
+            }
+            allowed.add(current_agent_name)
         else:
             allowed = set(members)
 
@@ -5098,15 +5182,8 @@ class TelegramBot:
             else:
                 root_names.append(agent_name)
 
-        def _sort_key(agent_name: str) -> tuple[int, str, str]:
-            member = members[agent_name]
-            lineage = member.get("lineage")
-            lineage_key = "/".join(lineage) if isinstance(lineage, list) else ""
-            return (
-                int(member.get("lineage_length") or 9999),
-                lineage_key.casefold(),
-                str(member.get("display_name") or agent_name).casefold(),
-            )
+        def _sort_key(agent_name: str) -> tuple[float, str]:
+            return self._member_activity_sort_key(members[agent_name], agent_name)
 
         for child_names in children_by_parent.values():
             child_names.sort(key=_sort_key)
@@ -5250,6 +5327,11 @@ class TelegramBot:
     ) -> None:
         await self._handle_tree_view(update=update, context=context, mode="descendants")
 
+    async def handle_tree_children(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        await self._handle_tree_view(update=update, context=context, mode="children")
+
     async def handle_tree_ancestors(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -5262,9 +5344,47 @@ class TelegramBot:
         mode = "tree"
         if text.startswith("/tree-ancestors"):
             mode = "ancestors"
+        elif text.startswith("/tree-children"):
+            mode = "children"
         elif text.startswith("/tree-") or text.startswith("/tree-descendants"):
             mode = "descendants"
         await self._handle_tree_view(update=update, context=context, mode=mode)
+
+    async def handle_help(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /help - show concise command usage."""
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        route = self._route_for_message(update.effective_message)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=_TELEGRAM_HELP_TEXT,
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
+
+    async def handle_unknown_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle unrecognized slash commands with usage guidance."""
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        text = str(getattr(update.effective_message, "text", "") or "").strip()
+        command = text.split(maxsplit=1)[0] if text else "command"
+        route = self._route_for_message(update.effective_message)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=f"unknown command: {command}\nUse /help for usage.",
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
 
     async def handle_clear(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -5651,6 +5771,22 @@ class TelegramBot:
         except Exception:
             logger.warning("Failed clearing commands on newly created secondary bot", exc_info=True)
         self._sender_bots.append(new_sender)
+
+    async def handle_schedule(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        route = self._route_for_message(update.effective_message)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text="/schedule is gated until Sprint 1 schedule reliability is approved; use CronCreate from an agent topic for now.",
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
 
     async def handle_unschedule(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -7394,9 +7530,9 @@ class TelegramBot:
                 )
         session_marker_id: int | None = None
         session_marker_text = (
-            f"session forked, your new session id is {child_session_id}"
+            f"session forked: {child_session_id}"
             if is_fork
-            else "session launched; a fresh session id will be assigned on first turn"
+            else "fresh session will be assigned on first turn"
         )
         try:
             session_marker = await self._send_system_message(
@@ -7506,16 +7642,14 @@ class TelegramBot:
         team_name: str | None = None,
     ) -> str:
         lines = [
-            f"{task_label} launched successfully.",
+            f"{task_label} launched.",
             f"agentId: {task_id}",
         ]
         if agent_name:
             lines.append(f"agent_name: {agent_name}")
         if team_name:
             lines.append(f"team_name: {team_name}")
-        lines.append(
-            "The agent is working in the background. You will be notified automatically when it completes."
-        )
+        lines.append("Working in the background; completion will be posted here.")
         if output_file:
             lines.append(f"output_file: {output_file}")
         if topic_link:
@@ -9178,9 +9312,9 @@ class TelegramBot:
             lineage_origin="user_fork",
         )
         child_link = created["child_link"]
-        confirmation = "fork topic created"
+        confirmation = "fork created"
         if child_link:
-            confirmation = f'fork topic created: <a href="{html.escape(child_link)}">{html.escape(topic_name)}</a>'
+            confirmation = f'fork created: <a href="{html.escape(child_link)}">{html.escape(topic_name)}</a>'
         confirmation_message = await self._send_system_html_message(
             route=route,
             bot=context.bot,
@@ -9281,10 +9415,11 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.bot_data["obs_telegram_bot"] = bot
     app.add_handler(
         MessageHandler(
-            filters.TEXT & filters.Regex(r"^/(?:tree-|tree-(?:ancestors|descendants))(?:@[A-Za-z0-9_]+)?(?:\s|$)"),
+            filters.TEXT & filters.Regex(r"^/(?:tree-|tree-(?:ancestors|descendants|children))(?:@[A-Za-z0-9_]+)?(?:\s|$)"),
             bot.handle_tree_alias_command,
         )
     )
+    app.add_handler(CommandHandler("help", bot.handle_help))
     app.add_handler(CommandHandler("clear", bot.handle_clear))
     app.add_handler(CommandHandler("new", bot.handle_new))
     app.add_handler(CommandHandler("new_group", bot.handle_new_group))
@@ -9293,8 +9428,10 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("stop", bot.handle_stop))
     app.add_handler(CommandHandler("context", bot.handle_context))
     app.add_handler(CommandHandler("report", bot.handle_report))
+    app.add_handler(CommandHandler("schedule", bot.handle_schedule))
     app.add_handler(CommandHandler("tree", bot.handle_tree))
     app.add_handler(CommandHandler("tree_descendants", bot.handle_tree_descendants))
+    app.add_handler(CommandHandler("tree_children", bot.handle_tree_children))
     app.add_handler(CommandHandler("tree_ancestors", bot.handle_tree_ancestors))
     app.add_handler(CommandHandler("fork", bot.handle_fork))
     app.add_handler(CommandHandler("delete", bot.handle_delete))
@@ -9310,6 +9447,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
             bot.handle_new_bot_alias,
         )
     )
+    app.add_handler(MessageHandler(filters.COMMAND, bot.handle_unknown_command))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, bot.handle_forum_topic_created))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED, bot.handle_forum_topic_edited))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.handle_new_chat_members))
@@ -9334,6 +9472,7 @@ async def _set_bot_commands(app: Application) -> None:
     from telegram import BotCommand
 
     await app.bot.set_my_commands([
+        BotCommand("help", "Show concise command usage"),
         BotCommand("clear", "Clear this topic but keep its agent identity; use '/clear all' for the whole group"),
         BotCommand("new", "Reset this topic into a new trunk agent; optional: /new [emoji] [name]"),
         BotCommand("new_group", "Create a new forum supergroup and add the configured OBS bots"),
@@ -9342,8 +9481,10 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
         BotCommand("context", "Show session and context window info"),
         BotCommand("report", "Save a debug case file for this message/topic"),
+        BotCommand("schedule", "Create schedules once Sprint 1 reliability is approved"),
         BotCommand("tree", "Render the full agent tree for this team"),
         BotCommand("tree_descendants", "Render this agent and all descendants"),
+        BotCommand("tree_children", "Render this agent and direct children"),
         BotCommand("tree_ancestors", "Render this agent and all ancestors"),
         BotCommand("fork", "Create a new topic from this head or replied message"),
         BotCommand("delete", "Delete this topic; use '/delete all' to remove all non-General topics"),
@@ -9367,11 +9508,6 @@ _TELEGRAM_RUNTIME_RESTART_MAX_SECONDS = 30.0
 async def _shutdown_telegram_runtime(*, app: Application, tg_bot: TelegramBot) -> None:
     """Best-effort shutdown for Telegram runtime resources."""
     try:
-        await tg_bot.shutdown()
-    except Exception:
-        logger.warning("Telegram bot runtime shutdown failed", exc_info=True)
-
-    try:
         updater = app.updater
         if updater is not None and updater.running:
             await updater.stop()
@@ -9385,6 +9521,11 @@ async def _shutdown_telegram_runtime(*, app: Application, tg_bot: TelegramBot) -
         logger.warning("Telegram application stop failed", exc_info=True)
 
     try:
+        await tg_bot.shutdown()
+    except Exception:
+        logger.warning("Telegram bot runtime shutdown failed", exc_info=True)
+
+    try:
         await app.shutdown()
     except Exception:
         logger.warning("Telegram application shutdown failed", exc_info=True)
@@ -9394,6 +9535,12 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
     """Run one Telegram runtime instance until cancellation or runtime failure."""
     app = create_telegram_app(config)
     tg_bot: TelegramBot = app.bot_data["obs_telegram_bot"]
+    polling_error: asyncio.Queue[TelegramError] = asyncio.Queue(maxsize=1)
+
+    def _record_polling_error(exc: TelegramError) -> None:
+        logger.exception("Exception happened while polling for updates.", exc_info=exc)
+        if isinstance(exc, Conflict) and polling_error.empty():
+            polling_error.put_nowait(exc)
 
     logger.info("Starting Telegram bot...")
     try:
@@ -9407,11 +9554,18 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
             (os.environ.get("OBS_TELEGRAM_DROP_PENDING_UPDATES") or "").strip().lower()
             in {"1", "true", "yes", "on"}
         )
-        await app.updater.start_polling(drop_pending_updates=drop_pending_updates)
+        await app.updater.start_polling(
+            drop_pending_updates=drop_pending_updates,
+            error_callback=_record_polling_error,
+        )
 
         while True:
             await asyncio.sleep(_TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS)
             updater_running = app.updater.running if app.updater is not None else False
+            if not polling_error.empty():
+                raise _TelegramPollingConflictError(
+                    "Telegram polling conflict: another getUpdates consumer is active"
+                ) from polling_error.get_nowait()
             if not app.running or not updater_running:
                 raise RuntimeError(
                     "Telegram runtime stopped unexpectedly: "
@@ -9423,7 +9577,7 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
 
 def _is_fatal_telegram_runtime_error(exc: Exception) -> bool:
     """Errors that should fail fast rather than trigger restart loops."""
-    return isinstance(exc, ValueError)
+    return isinstance(exc, (ValueError, _TelegramPollingConflictError))
 
 
 async def run_telegram_bot(config: OBSConfig) -> None:
