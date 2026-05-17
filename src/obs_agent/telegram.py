@@ -3703,10 +3703,31 @@ class TelegramBot:
         key = self._team_worker_key(record.team_name, record.agent_name)
         if key is not None:
             self._team_worker_records[key] = record.task_id
+            child_state = self._get_state(record.child_route, create=False)
+            obs_metadata = None
+            if child_state is not None:
+                bootstrap = None
+                if child_state.pending_obs_bootstrap:
+                    try:
+                        bootstrap = parse_obs_bootstrap_xml(child_state.pending_obs_bootstrap)
+                    except Exception:
+                        bootstrap = None
+                lineage = child_state.agent_lineage
+                if (not lineage) and bootstrap is not None and bootstrap.lineage:
+                    lineage = bootstrap.lineage
+                obs_metadata = self._build_team_projection_obs_metadata(
+                    lineage=lineage,
+                    team_name=record.team_name,
+                    agent_name=record.agent_name,
+                    route=record.child_route,
+                    parent_agent_name=bootstrap.parent_agent_name if bootstrap is not None else None,
+                    parent_display_name=bootstrap.parent_display_name if bootstrap is not None else None,
+                )
             self._upsert_team_projection_config(
                 team_name=record.team_name,
                 agent_name=record.agent_name,
                 child_session_id=record.child_session_id,
+                obs_metadata=obs_metadata,
             )
             self._persist_team_worker_record(record)
 
@@ -4983,22 +5004,34 @@ class TelegramBot:
                 session_id=state.session_id,
                 cwd=self._config.vault_path,
             )
+        route_key = self._route_inbox_target_keys_by_route.get(state.route)
         lineage = state.agent_lineage
         if (not lineage) and bootstrap is not None and bootstrap.lineage:
             lineage = bootstrap.lineage
-        if not lineage:
-            lineage = self._ensure_state_lineage(state, session_id=state.session_id)
-        if not lineage:
-            return None
         env = state.session_manager.sdk_env_overrides
         team_name = (
             (bootstrap.root_team_key if bootstrap is not None else None)
             or env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
+            or (route_key[0] if route_key is not None else "")
         )
         agent_name = (
             (bootstrap.agent_name if bootstrap is not None else None)
             or env.get("CLAUDE_CODE_AGENT_NAME", "").strip()
+            or (route_key[1] if route_key is not None else "")
         )
+        if (not lineage) and team_name and agent_name:
+            metadata = self._load_team_projection_metadata(team_name)
+            member_lineage = metadata.get(agent_name, {}).get("lineage")
+            if isinstance(member_lineage, list):
+                lineage = tuple(
+                    str(item).strip()
+                    for item in member_lineage
+                    if isinstance(item, str) and str(item).strip()
+                )
+        if not lineage:
+            lineage = self._ensure_state_lineage(state, session_id=state.session_id)
+        if not lineage:
+            return None
         if not team_name or not agent_name:
             default_team_name, default_agent_name = self._default_team_projection(lineage)
             team_name = team_name or default_team_name
