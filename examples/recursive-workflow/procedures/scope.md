@@ -32,7 +32,15 @@ You are ONE level of the hierarchy. If the task is still complex after your deco
 
 4. **Decompose into subtasks.** Break the task into subtasks at the right next level — prefer 3-4 broad tracks over 12 granular steps. A single subtask is fine if the task is already atomic. Each subtask should be a coherent unit of work.
 
-   If the decomposition is uncertain or has multiple possible approaches, spawn a fork to brainstorm it. Prompt: "Follow `procedures/brainstorm.md`." Set `fork=true`.
+   If the decomposition is uncertain or has multiple possible approaches, spawn a brainstorm fork:
+
+   ```json
+   {
+     "prompt_file": "procedures/brainstorm.md",
+     "prompt": "Explore possible decompositions for this task.",
+     "fork": true
+   }
+   ```
 
 5. **Apply the complexity judgment.** For the subtasks you just produced, ask: is EACH subtask directly executable by an agent following the Loop procedure? Apply these gates to each subtask:
    - Single concern (not multiple separable concerns)

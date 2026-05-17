@@ -18,7 +18,7 @@ OBS_VAULT_PATH=/absolute/path/to/repo/examples/recursive-workflow
 
 That directory contains:
 
-- `CLAUDE.md` — minimal entry instructions for agents running in the example project.
+- `CLAUDE.md` — entry point for agents running in the example project. Includes default launch signatures.
 - `procedures/router.md` — dispatch-only orchestration.
 - `procedures/scope.md` — decomposition and SIMPLE/COMPLEX routing decision.
 - `procedures/loop.md` — execute/verify/fix-loop orchestration.

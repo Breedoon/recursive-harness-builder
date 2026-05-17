@@ -33,7 +33,15 @@ The blocker is probably NOT real. Digital tasks on the computer are almost never
 
 4. **Form and test hypotheses.** Generate at least 2 hypotheses for why the executor is wrong. Test each one against actual state — not your mental model of what state should be.
 
-5. **If precedents and hypotheses don't resolve it:** invoke `procedures/brainstorm.md` to explore resolution approaches. Frame it as: "how can we work around this blocker?"
+5. **If precedents and hypotheses don't resolve it:** spawn a brainstorm fork to explore resolution approaches.
+
+   ```json
+   {
+     "prompt_file": "procedures/brainstorm.md",
+     "prompt": "How can we work around this blocker: {one-sentence summary}?",
+     "fork": true
+   }
+   ```
 
 6. **Assess:**
    - **Solvable:** write the solution in your artifact. Explain what the executor should try.

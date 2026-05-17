@@ -4,6 +4,10 @@ Recursive Harness Builder is a local runtime for building recursive agent workfl
 
 It wraps the Claude Agent SDK with a few added design choices: the ability for agents to clone themselves into a forked subagent, unlimited depth of subagents, agent-to-agent messaging, scheduling, and hookable tool behavior.
 
+## Subscription requirements
+
+The harness itself runs at any subscription tier. However, the recursive workflow example — where agents spawn child agents that spawn further children — benefits from the higher rate limits and concurrent sessions available on **$100+/month plans** (Anthropic Max, OpenAI Pro, or equivalent). Without those limits, deep recursion will hit throttling quickly.
+
 ## Why use it
 
 Most agent tools give you one agent in one terminal, with one layer of subagents. Recursive Harness Builder lets you define a harness around the agent:

@@ -1,7 +1,7 @@
 ---
 template: procedure
-template-version: "1.8"
-last-updated: 2026-04-16 11:46:00
+template-version: "1.9"
+last-updated: 2026-05-16 21:50:00
 ---
 
 # Router
@@ -16,71 +16,61 @@ You are a router. Your only job is to spawn the right forks and read their repor
 - If an agent already exists for a task, resume or message it. Don't launch a replacement.
 `</critical_rules>`
 
-## AgentTask signatures
-
-Use these payload fields when spawning children. `prompt_file` is relative to this project directory.
-
-For scoping:
-
-```json
-{
-  "prompt_file": "procedures/scope.md",
-  "prompt": "Scope the task and classify it as SIMPLE or COMPLEX.",
-  "fork": true
-}
-```
-
-For a SIMPLE subtask, launch Loop:
-
-```json
-{
-  "prompt_file": "procedures/loop.md",
-  "prompt": "Handle this subtask: {one-sentence from decomposition}.",
-  "fork": true
-}
-```
-
-For a COMPLEX subtask, launch Router with the guard hook:
-
-```json
-{
-  "prompt_file": "procedures/router.md",
-  "prompt": "Handle this subtask: {one-sentence from decomposition}.",
-  "fork": true,
-  "hooks": {
-    "PreToolUse": "hooks/router_guard.py::check"
-  }
-}
-```
-
-For auditing:
-
-```json
-{
-  "prompt_file": "procedures/auditor.md",
-  "prompt": "Subtask artifacts at: {list paths}.",
-  "fork": true
-}
-```
-
 ## Steps
 
-1. **Spawn a scoping fork** with the scoping payload above.
+1. **Spawn a scoping fork.**
+
+   ```json
+   {
+     "prompt_file": "procedures/scope.md",
+     "prompt": "Scope the task and classify it as SIMPLE or COMPLEX.",
+     "fork": true
+   }
+   ```
 
 2. **Read the scoping artifact.** The scoper messages you with the path and an overall rating (SIMPLE or COMPLEX) plus a decomposition (1+ subtasks). Read the artifact.
 
 3. **Dispatch each subtask** based on the scoper's overall rating:
-   - **If SIMPLE:** spawn a Loop fork for each subtask.
-   - **If COMPLEX:** spawn a Router fork for each subtask with the router guard hook.
+
+   **If SIMPLE:** spawn a Loop fork for each subtask.
+
+   ```json
+   {
+     "prompt_file": "procedures/loop.md",
+     "prompt": "Handle this subtask: {one-sentence from decomposition}.",
+     "fork": true
+   }
+   ```
+
+   **If COMPLEX:** spawn a Router fork for each subtask with the router guard hook.
+
+   ```json
+   {
+     "prompt_file": "procedures/router.md",
+     "prompt": "Handle this subtask: {one-sentence from decomposition}.",
+     "fork": true,
+     "hooks": {
+       "PreToolUse": "hooks/router_guard.py::check"
+     }
+   }
+   ```
 
    Dispatch parallel subtasks simultaneously. Record each agent's ID so you can find their artifacts later. **When you have no further actions to take, end your turn. You will be woken up by a notification when a new message arrives in your inbox.**
 
-4. **When all subtasks report back, spawn an auditor fork** with the auditing payload above.
+4. **When all subtasks report back, spawn an auditor fork.**
+
+   ```json
+   {
+     "prompt_file": "procedures/auditor.md",
+     "prompt": "Subtask artifacts at: {list paths}.",
+     "fork": true
+   }
+   ```
 
    The auditor returns one of three verdicts. Branch accordingly:
    - **ON_TRACK:** go to step 5 (write artifact, ship).
    - **GAPS:** spawn Router forks to fix the specific gaps the auditor flagged. Each fork's prompt includes the gap to address and a link to the auditor's artifact. This starts a new wave. After the fixes complete, spawn a new auditor fork to re-evaluate.
-   - **OFF_TRACK:** spawn a fresh Scope fork to re-plan based on what was learned. Prompt: "The original plan is OFF_TRACK. Re-scope based on what was learned. Auditor findings at {auditor artifact path}. Prior subtask artifacts at: {list paths}. Follow `procedures/scope.md`." Set `fork=true`. When the new scope returns, dispatch its subtasks using step 3's logic (SIMPLE → Loops, COMPLEX → Routers). This also starts a new wave. After the new subtasks complete, spawn a new auditor fork.
+   - **OFF_TRACK:** spawn a fresh Scope fork to re-plan based on what was learned. Prompt: "The original plan is OFF_TRACK. Re-scope based on what was learned. Auditor findings at {auditor artifact path}. Prior subtask artifacts at: {list paths}." Set `fork=true`, `prompt_file: "procedures/scope.md"`. When the new scope returns, dispatch its subtasks using step 3's logic (SIMPLE → Loops, COMPLEX → Routers). This also starts a new wave. After the new subtasks complete, spawn a new auditor fork.
 
    **Wave limit:** after 5 total waves (GAPS + OFF_TRACK combined) with the auditor still not returning ON_TRACK, escalate to your caller as a blocker. Include the auditor's latest findings and what's been tried.
 
@@ -99,7 +89,7 @@ For auditing:
 
 ## Edge Cases
 
-- **Any sub-agent reports a blocker:** spawn a fork following `procedures/unblock.md`. You have broader context than the sub-agent.
+- **Any sub-agent reports a blocker:** spawn a fork with `prompt_file: "procedures/unblock.md"`. You have broader context than the sub-agent.
 - **Scoping can't determine complexity:** the scoper should return COMPLEX. If you somehow get no rating, treat as COMPLEX.
 - **You're resumed with a new task or correction:** spawn a scoping fork for the new request.
 - **You receive a completion/idle notification from a sub-agent:** this does NOT mean they finished all work or died. They went idle waiting for their own forks to finish. Do not assume things aren't working. You will receive both: (a) an idle/completion notification when they go idle, and (b) a message from them when they actually have results. Wait for the message.

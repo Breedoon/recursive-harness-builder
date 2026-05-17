@@ -39,6 +39,9 @@ worktrees/
 *.db
 *.log
 
+# Obsidian workspace (users may open example projects in Obsidian)
+.obsidian/
+
 # JavaScript/vendor artifacts
 node_modules/
 spikes/**/node_modules/

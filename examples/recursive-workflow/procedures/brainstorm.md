@@ -1,7 +1,7 @@
 ---
 template: procedure
-template-version: "1.3"
-last-updated: 2026-04-08 18:20:00
+template-version: "1.4"
+last-updated: 2026-05-16 21:50:00
 ---
 
 # Brainstorm
@@ -26,15 +26,55 @@ You facilitate multi-agent divergent thinking. Your job is to explore as many an
    - **High importance:** 3-4 focused forks + 1 general + 1 contrarian + fresh agents for unbiased perspective.
 
    **Agent composition:**
-   - **Focused forks:** each investigates a specific direction you've identified. Prompt: "Explore this approach: {one sentence}. Aim for 20+ ideas — the first ones are obvious, push past them. Follow `procedures/executor.md`." Set `fork=true`.
+   - **Focused forks:** each investigates a specific direction you've identified. Use different models for diversity — vary providers across forks so you get genuinely different perspectives rather than the same model's bias repeated. Give each fork a clear, descriptive summary of its exploration angle.
+
+     ```json
+     {
+       "prompt_file": "procedures/executor.md",
+       "prompt": "Explore this approach: {one sentence}. Aim for 20+ ideas — the first ones are obvious, push past them.",
+       "fork": true,
+       "model": "gemini"
+     }
+     ```
+
+     Rotate models across forks: try `"opus"`, `"gpt"`, `"gemini"`, `"sonnet"`. Not all may be available — if one fails, fall back to another. The point is diversity of reasoning, not a specific provider.
+
    - **General-purpose fork:** open exploration beyond your identified directions. Look orthogonally — different domains, different framings.
-   - **Contrarian fork:** Prompt: "Take each assumption in our conversation and systematically invert it. What if the opposite is true? Follow `procedures/executor.md`." Set `fork=true`.
+
+     ```json
+     {
+       "prompt_file": "procedures/executor.md",
+       "prompt": "Explore angles nobody else is likely to consider. Think across domains — what would a biologist, economist, or artist see here?",
+       "fork": true,
+       "model": "opus"
+     }
+     ```
+
+   - **Contrarian fork:** systematically inverts assumptions.
+
+     ```json
+     {
+       "prompt_file": "procedures/executor.md",
+       "prompt": "Take each assumption in our conversation and systematically invert it. What if the opposite is true?",
+       "fork": true,
+       "model": "gpt"
+     }
+     ```
+
    - **For important issues, add an assumption-inverter:** systematically flip each assumption and explore what follows.
    - **Anti-bias protocol:** shift creative domain every ~10 ideas. If focused on technical aspects, pivot to user experience, then business viability, then edge cases.
 
    Each agent writes its artifact to its lineage folder.
 
-2. **Phase 2: Synthesis.** Spawn a synthesizer fork. Prompt: "Synthesize all brainstorming artifacts at {paths}. Follow `procedures/executor.md`." Set `fork=true`.
+2. **Phase 2: Synthesis.** Spawn a synthesizer fork.
+
+   ```json
+   {
+     "prompt_file": "procedures/executor.md",
+     "prompt": "Synthesize all brainstorming artifacts at {paths}.",
+     "fork": true
+   }
+   ```
 
    The synthesizer:
    - Identifies convergent themes
@@ -66,6 +106,7 @@ You facilitate multi-agent divergent thinking. Your job is to explore as many an
 - **Deep disagreement after max waves:** escalate to your caller with the competing views. They have context you don't.
 - **One agent found something nobody else did:** flag it prominently. This is the recall problem being solved.
 - **Needs information nobody has:** report as inconclusive with what information is missing.
+- **A model is unavailable:** fall back to another provider. The goal is diverse reasoning, not a specific model.
 
 ## DON'Ts
 
@@ -73,3 +114,4 @@ You facilitate multi-agent divergent thinking. Your job is to explore as many an
 - DON'T dismiss minority views.
 - DON'T let the synthesizer just concatenate findings. It must integrate and rank.
 - DON'T let all agents explore the same conceptual space.
+- DON'T use the same model for all forks — diversity of reasoning is the point.
