@@ -33,6 +33,7 @@ from obs_agent.telegram import (
     TelegramRoute,
     TelegramBot,
     _ForkTaskRecord,
+    _TELEGRAM_HELP_TEXT,
     _PRIORITY_ASSISTANT,
     _TopicScheduleRecord,
     _RunOutcome,
@@ -3318,7 +3319,7 @@ class TestCommands:
                 },
             )
 
-        assert "AgentTask launched successfully." in launched["content"][0]["text"]
+        assert "AgentTask launched." in launched["content"][0]["text"]
         record = bot._fork_tasks_by_id[str(fake_task_id)]
         assert record.team_name == team_name
         assert record.agent_name == agent_name
@@ -4184,7 +4185,8 @@ class TestForkTaskRuntime:
             icon_custom_emoji_id=None,
         )
         launch_text = launched["content"][0]["text"]
-        assert "ForkTask launched successfully." in launch_text
+        assert "ForkTask launched." in launch_text
+        assert "Working in the background; completion will be posted here." in launch_text
         task_id = launch_text.split("agentId: ", 1)[1].splitlines()[0]
         assert "output_file:" in launch_text
         assert "telegram_topic: https://t.me/c/67890/321/900" in launch_text
@@ -4200,7 +4202,7 @@ class TestForkTaskRuntime:
         assert "fork task launched by agent" in send_calls[0].kwargs["text"]
         assert "source message" in send_calls[0].kwargs["text"]
         assert "https://t.me/c/67890/55" in send_calls[0].kwargs["text"]
-        assert "session forked, your new session id is sid-child" in send_calls[1].kwargs["text"]
+        assert "session forked: sid-child" in send_calls[1].kwargs["text"]
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=321))
         assert child_state is not None
         assert child_state.notify_on_completion is True
@@ -4248,7 +4250,8 @@ class TestForkTaskRuntime:
             icon_custom_emoji_id=None,
         )
         launch_text = launched["content"][0]["text"]
-        assert "AgentTask launched successfully." in launch_text
+        assert "AgentTask launched." in launch_text
+        assert "Working in the background; completion will be posted here." in launch_text
         assert "agentId: 11111111-1111-1111-1111-111111111111" in launch_text
         record = bot._fork_tasks_by_id["11111111-1111-1111-1111-111111111111"]
         assert record.is_fork is False
@@ -4264,7 +4267,7 @@ class TestForkTaskRuntime:
         assert f"team_name: {unique_team}" in send_calls[0].kwargs["text"]
         assert (
             send_calls[1].kwargs["text"]
-            == "<u><i>session launched; a fresh session id will be assigned on first turn</i></u>"
+            == "<u><i>fresh session will be assigned on first turn</i></u>"
         )
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=333))
         assert child_state is not None
@@ -5943,7 +5946,7 @@ class TestForkTaskRuntime:
         assert record.agent_name == "worker-resume"
         assert record.task_id in parent_state.active_fork_task_ids
         assert "agentId: task-123" in result["content"][0]["text"]
-        assert "AgentTask launched successfully." in result["content"][0]["text"]
+        assert "AgentTask launched." in result["content"][0]["text"]
         child_env = child_state.session_manager.create_options().env
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
@@ -6266,12 +6269,44 @@ class TestCreateTelegramApp:
             for handler in handlers
             if getattr(handler, "commands", None)
         }
+        assert command_map["help"] == "handle_help"
         assert command_map["new_group"] == "handle_new_group"
         assert command_map["new_bot"] == "handle_new_bot"
 
         callback_names = [getattr(getattr(handler, "callback", None), "__name__", None) for handler in handlers]
         assert "handle_new_group_alias" in callback_names
         assert "handle_new_bot_alias" in callback_names
+        assert "handle_unknown_command" in callback_names
+
+
+class TestTelegramCommandHelp:
+    async def test_help_command_sends_usage(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/help", message_id=42)
+        ctx = _make_context()
+
+        await bot.handle_help(update, ctx)
+
+        kwargs = ctx.bot.send_message.call_args.kwargs
+        assert _TELEGRAM_HELP_TEXT in kwargs["text"]
+        assert "Bare commands are not supported" in kwargs["text"]
+        assert kwargs["reply_to_message_id"] == 42
+        assert kwargs["disable_notification"] is True
+        await bot.shutdown()
+
+    async def test_unknown_command_points_to_help(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/wat now", message_id=43)
+        ctx = _make_context()
+
+        await bot.handle_unknown_command(update, ctx)
+
+        kwargs = ctx.bot.send_message.call_args.kwargs
+        assert "unknown command: /wat" in kwargs["text"]
+        assert "Use /help for usage." in kwargs["text"]
+        assert kwargs["reply_to_message_id"] == 43
+        assert kwargs["disable_notification"] is True
+        await bot.shutdown()
 
 
 class TestTelegramCommandRegistration:
@@ -6283,6 +6318,7 @@ class TestTelegramCommandRegistration:
 
         commands = app.bot.set_my_commands.await_args.args[0]
         names = [command.command for command in commands]
+        assert "help" in names
         assert "new_group" in names
         assert "new_bot" in names
 
@@ -7565,7 +7601,7 @@ class TestTelegramStatePersistence:
                 },
             )
 
-        assert "AgentTask launched successfully." in launched["content"][0]["text"]
+        assert "AgentTask launched." in launched["content"][0]["text"]
         assert "agentId: task-restart-1" in launched["content"][0]["text"]
         schedule_mock.assert_awaited_once()
         await restored.shutdown()

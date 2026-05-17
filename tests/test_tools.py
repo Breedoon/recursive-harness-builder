@@ -277,7 +277,7 @@ class TestAgentTaskTools:
                 "content": [
                     {
                         "type": "text",
-                        "text": "AgentTask launched successfully.\nagentId: task-123\noutput_file: /tmp/task-123.jsonl\ntelegram_topic: https://t.me/c/1/2",
+                        "text": "AgentTask launched.\nagentId: task-123\noutput_file: /tmp/task-123.jsonl\ntelegram_topic: https://t.me/c/1/2",
                     }
                 ]
             }
@@ -317,7 +317,7 @@ class TestAgentTaskTools:
                 "inherit_hooks": False,
             }
         )
-        assert "AgentTask launched successfully." in result["content"][0]["text"]
+        assert "AgentTask launched." in result["content"][0]["text"]
         assert "agentId: task-123" in result["content"][0]["text"]
         assert "telegram_topic: https://t.me/c/1/2" in result["content"][0]["text"]
 

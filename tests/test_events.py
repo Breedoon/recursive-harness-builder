@@ -207,27 +207,26 @@ class TestSummarizeToolUse:
             "AgentTask",
             {"prompt": "Summarize the codebase", "description": "Code summary"},
         )
-        assert result == "AgentTask: Code summary"
+        assert result == "AgentTask: fork Code summary"
 
     def test_agent_task_falls_back_to_prompt(self):
         """AgentTask falls back to prompt text when no description is present."""
         result = summarize_tool_use("AgentTask", {"prompt": "Research topic"})
-        assert result == "AgentTask: Research topic"
+        assert result == "AgentTask: fork Research topic"
 
-    def test_agent_task_includes_timeout(self):
-        """AgentTask shows timeout when the caller provided one."""
+    def test_agent_task_fresh_start_summary(self):
         result = summarize_tool_use(
             "AgentTask",
-            {"description": "Research topic", "timeout_ms": 5000},
+            {"description": "Research topic", "fork": False},
         )
-        assert result == "AgentTask: Research topic timeout=5000ms"
+        assert result == "AgentTask: start Research topic"
 
-    def test_agent_task_includes_max_turns(self):
+    def test_agent_task_prefers_display_name(self):
         result = summarize_tool_use(
             "AgentTask",
-            {"description": "Research topic", "max_turns": 25},
+            {"description": "Long backend description", "display_name": "Short name"},
         )
-        assert result == "AgentTask: Research topic max_turns=25"
+        assert result == "AgentTask: fork Short name"
 
     def test_agent_task_truncates_long_prompt(self):
         """AgentTask truncates long fallback prompt summaries."""
@@ -238,13 +237,13 @@ class TestSummarizeToolUse:
         assert len(result) == 200
 
     def test_agent_task_empty(self):
-        """AgentTask with no prompt or description returns just the tool name."""
+        """AgentTask with no prompt or description still shows the launch mode."""
         result = summarize_tool_use("AgentTask", {})
-        assert result == "AgentTask"
+        assert result == "AgentTask: fork"
 
     def test_agent_task_resume_summary(self):
         result = summarize_tool_use("AgentTask", {"description": "Research topic", "resume": "agent-123"})
-        assert result == "AgentTask: Research topic resume=agent-123"
+        assert result == "AgentTask: resume Research topic agent-123"
 
     def test_agent_task_output_summary(self):
         result = summarize_tool_use("AgentTaskOutput", {"task_id": "agent-123", "block": True})

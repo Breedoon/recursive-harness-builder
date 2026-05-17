@@ -17,8 +17,10 @@ from unittest.mock import MagicMock, AsyncMock, patch
 import pytest
 
 from obs_agent.cli import (
+    CLI_HELP,
     _render_status,
     check_daemon,
+    format_unknown_command,
     main,
     parse_slash_command,
     send_message,
@@ -276,6 +278,23 @@ class TestParseSlashCommand:
         command, text = parse_slash_command("/unknown")
         assert command == "/unknown"
         assert text is None
+
+    def test_help_command(self):
+        command, text = parse_slash_command("/help")
+        assert command == "/help"
+        assert text is None
+
+
+class TestCommandHelpCopy:
+    def test_cli_help_lists_bare_quit_and_slash_commands(self):
+        assert "Usage: obs-agent" in CLI_HELP
+        assert "/help" in CLI_HELP
+        assert "/stop" in CLI_HELP
+        assert "/quit" in CLI_HELP
+        assert "Bare quit, exit, and q also exit." in CLI_HELP
+
+    def test_unknown_command_mentions_help(self):
+        assert format_unknown_command("/wat") == "Unknown command: /wat. Type /help for usage."
 
 
 # --- Concurrent Input Slash Commands ---

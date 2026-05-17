@@ -107,6 +107,17 @@ _AUTO_DELIVERY_PROMPT = (
     "(System: queued updates arrived while idle. Process and summarize them.)"
 )
 
+_TELEGRAM_HELP_TEXT = """Usage:
+/help — show this help
+/stop — interrupt this topic; /stop all interrupts every topic in the chat
+/fork [name] — create a new topic from this head or a replied message
+/new [name] — reset this topic into a new trunk agent
+/clear — clear this topic but keep its agent identity
+/context — show session and context info
+
+Bare commands are not supported; use the slash form, e.g. /stop.
+""".strip()
+
 _PRIORITY_SYSTEM = 0
 _PRIORITY_ASSISTANT = 10
 _PRIORITY_OBSERVABILITY = 30
@@ -5335,6 +5346,42 @@ class TelegramBot:
             mode = "descendants"
         await self._handle_tree_view(update=update, context=context, mode=mode)
 
+    async def handle_help(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /help - show concise command usage."""
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        route = self._route_for_message(update.effective_message)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=_TELEGRAM_HELP_TEXT,
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
+
+    async def handle_unknown_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle unrecognized slash commands with usage guidance."""
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        text = str(getattr(update.effective_message, "text", "") or "").strip()
+        command = text.split(maxsplit=1)[0] if text else "command"
+        route = self._route_for_message(update.effective_message)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=f"unknown command: {command}\nUse /help for usage.",
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
+
     async def handle_clear(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -7479,9 +7526,9 @@ class TelegramBot:
                 )
         session_marker_id: int | None = None
         session_marker_text = (
-            f"session forked, your new session id is {child_session_id}"
+            f"session forked: {child_session_id}"
             if is_fork
-            else "session launched; a fresh session id will be assigned on first turn"
+            else "fresh session will be assigned on first turn"
         )
         try:
             session_marker = await self._send_system_message(
@@ -7591,16 +7638,14 @@ class TelegramBot:
         team_name: str | None = None,
     ) -> str:
         lines = [
-            f"{task_label} launched successfully.",
+            f"{task_label} launched.",
             f"agentId: {task_id}",
         ]
         if agent_name:
             lines.append(f"agent_name: {agent_name}")
         if team_name:
             lines.append(f"team_name: {team_name}")
-        lines.append(
-            "The agent is working in the background. You will be notified automatically when it completes."
-        )
+        lines.append("Working in the background; completion will be posted here.")
         if output_file:
             lines.append(f"output_file: {output_file}")
         if topic_link:
@@ -9263,9 +9308,9 @@ class TelegramBot:
             lineage_origin="user_fork",
         )
         child_link = created["child_link"]
-        confirmation = "fork topic created"
+        confirmation = "fork created"
         if child_link:
-            confirmation = f'fork topic created: <a href="{html.escape(child_link)}">{html.escape(topic_name)}</a>'
+            confirmation = f'fork created: <a href="{html.escape(child_link)}">{html.escape(topic_name)}</a>'
         confirmation_message = await self._send_system_html_message(
             route=route,
             bot=context.bot,
@@ -9370,6 +9415,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
             bot.handle_tree_alias_command,
         )
     )
+    app.add_handler(CommandHandler("help", bot.handle_help))
     app.add_handler(CommandHandler("clear", bot.handle_clear))
     app.add_handler(CommandHandler("new", bot.handle_new))
     app.add_handler(CommandHandler("new_group", bot.handle_new_group))
@@ -9397,6 +9443,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
             bot.handle_new_bot_alias,
         )
     )
+    app.add_handler(MessageHandler(filters.COMMAND, bot.handle_unknown_command))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, bot.handle_forum_topic_created))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED, bot.handle_forum_topic_edited))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.handle_new_chat_members))
@@ -9421,6 +9468,7 @@ async def _set_bot_commands(app: Application) -> None:
     from telegram import BotCommand
 
     await app.bot.set_my_commands([
+        BotCommand("help", "Show concise command usage"),
         BotCommand("clear", "Clear this topic but keep its agent identity; use '/clear all' for the whole group"),
         BotCommand("new", "Reset this topic into a new trunk agent; optional: /new [emoji] [name]"),
         BotCommand("new_group", "Create a new forum supergroup and add the configured OBS bots"),
