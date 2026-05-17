@@ -20,7 +20,7 @@ class TestVaultPathResolution:
 
     def test_default_vault_path(self):
         cfg = OBSConfig()
-        expected = config_module._DEFAULT_CODEBASE_ROOT / "examples" / "recursive-workflow"
+        expected = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "T"
         assert cfg.vault_path == expected
 
     def test_vault_path_from_constructor(self, tmp_path):
