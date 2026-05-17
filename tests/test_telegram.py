@@ -3120,6 +3120,58 @@ class TestCommands:
         assert mock_tree.await_args.kwargs["mode"] == "children"
         await bot.shutdown()
 
+    async def test_tree_context_uses_route_binding_when_state_lacks_bootstrap_env(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        state = bot._get_state(route, topic_title="Branch")
+        assert state is not None
+        team_name = "team-alpha"
+        root_agent_name = agent_name_for_lineage(("Root",), team_key=team_name)
+        current_agent_name = agent_name_for_lineage(("Root", "Branch"), team_key=team_name)
+        child_agent_name = agent_name_for_lineage(("Root", "Branch", "Child"), team_key=team_name)
+        bot._route_inbox_targets[(team_name.lower(), current_agent_name.lower())] = route
+        bot._route_inbox_target_keys_by_route[route] = (team_name.lower(), current_agent_name.lower())
+        team_dir = tmp_path / ".claude" / "teams" / team_name
+        (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
+        (team_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "members": [
+                        {"name": root_agent_name, "obs": {"display_name": "Root", "lineage": ["Root"], "lineage_length": 1}},
+                        {"name": current_agent_name, "obs": {"display_name": "Branch", "lineage": ["Root", "Branch"], "lineage_length": 2, "parent_agent_name": root_agent_name}},
+                        {"name": child_agent_name, "obs": {"display_name": "Child", "lineage": ["Root", "Branch", "Child"], "lineage_length": 3, "parent_agent_name": current_agent_name}},
+                    ]
+                },
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        context_tuple = bot._current_tree_context(state)
+        assert context_tuple == (team_name.lower(), current_agent_name.lower(), ("Root", "Branch"))
+        members = bot._load_tree_members(
+            team_name=context_tuple[0],
+            current_agent_name=context_tuple[1],
+            current_lineage=context_tuple[2],
+            current_route=route,
+        )
+        html_text = bot._render_tree_html(
+            team_name=context_tuple[0],
+            current_agent_name=context_tuple[1],
+            current_lineage=context_tuple[2],
+            members=members,
+            mode="tree",
+        )
+        assert "Branch (current)" in html_text
+        assert "Child" in html_text
+        await bot.shutdown()
+
     async def test_child_topic_title_uses_leaf_display_name_only(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         state = bot._get_state(TelegramRoute(chat_id=67890, thread_id=321), topic_title="Parent Topic")
@@ -3155,6 +3207,29 @@ class TestCommands:
         with patch.object(bot, "_handle_tree_view", new_callable=AsyncMock) as mock_tree:
             await bot.handle_tree_children(update, ctx)
         assert mock_tree.await_args.kwargs["mode"] == "children"
+        await bot.shutdown()
+
+    async def test_tree_renders_metadata_free_members_alphabetically(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        team_name = "team-alpha"
+        current_agent_name = "current-agent"
+        members = {
+            "zeta-agent": {"agent_name": "zeta-agent", "display_name": "Zeta"},
+            current_agent_name: {"agent_name": current_agent_name, "display_name": "Current", "lineage": ["Root", "Current"], "lineage_length": 2},
+            "alpha-agent": {"agent_name": "alpha-agent", "display_name": "Alpha"},
+        }
+
+        html_text = bot._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=("Root", "Current"),
+            members=members,
+            mode="tree",
+        )
+
+        assert "Alpha" in html_text
+        assert "Zeta" in html_text
+        assert html_text.index("Alpha") < html_text.index("Zeta")
         await bot.shutdown()
 
     async def test_tree_children_render_excludes_grandchildren_and_descendants_includes_them(self, config):
