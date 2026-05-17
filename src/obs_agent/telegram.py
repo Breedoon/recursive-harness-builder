@@ -654,6 +654,7 @@ class TelegramBot:
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
+        self._schedule_execution_tasks: dict[str, asyncio.Task] = {}
         self._schedule_running_by_route: set[TelegramRoute] = set()
         self._active_schedule_execution_by_route: dict[TelegramRoute, str] = {}
         self._schedule_stop_events: asyncio.Queue[tuple[TelegramRoute, dict[str, Any]]] = asyncio.Queue()
@@ -2985,7 +2986,7 @@ class TelegramBot:
                 self._register_topic_schedule(record)
             return False
         lock = self._get_route_lock(record.route)
-        if lock.locked() or state.busy or record.route in self._schedule_running_by_route:
+        if lock.locked() or state.busy:
             if is_reply_wake_schedule(record):
                 try:
                     record.next_run_at = self._next_timed_run_at(record, base_ts=now)
@@ -3146,6 +3147,39 @@ class TelegramBot:
         await _emit_post_schedule_summary()
         return run_succeeded
 
+    def _cleanup_finished_schedule_tasks(self) -> None:
+        for schedule_id, task in list(self._schedule_execution_tasks.items()):
+            if task.done():
+                self._schedule_execution_tasks.pop(schedule_id, None)
+
+    def _start_topic_schedule_task(self, record: _TopicScheduleRecord) -> bool:
+        self._cleanup_finished_schedule_tasks()
+        task = self._schedule_execution_tasks.get(record.schedule_id)
+        if task is not None and not task.done():
+            return False
+        task = asyncio.create_task(
+            self._execute_topic_schedule(record=record, trigger_kind=record.trigger_kind)
+        )
+        self._schedule_execution_tasks[record.schedule_id] = task
+
+        def _discard(done_task: asyncio.Task) -> None:
+            if self._schedule_execution_tasks.get(record.schedule_id) is done_task:
+                self._schedule_execution_tasks.pop(record.schedule_id, None)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug(
+                    "Scheduled task crashed outside execution handler schedule_id=%s route=%s",
+                    record.schedule_id,
+                    record.route,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(_discard)
+        return True
+
     async def _run_due_interval_schedules(self) -> None:
         now = time.time()
         due_records = [
@@ -3158,7 +3192,7 @@ class TelegramBot:
         ]
         due_records.sort(key=lambda record: float(record.next_run_at or now))
         for record in due_records:
-            await self._execute_topic_schedule(record=record, trigger_kind=record.trigger_kind)
+            self._start_topic_schedule_task(record)
 
     async def _process_stop_schedule_events(self) -> None:
         events: list[tuple[TelegramRoute, dict[str, Any]]] = []
@@ -4086,6 +4120,15 @@ class TelegramBot:
                 await task
             except asyncio.CancelledError:
                 pass
+        for task in list(self._schedule_execution_tasks.values()):
+            if not task.done():
+                task.cancel()
+        for task in list(self._schedule_execution_tasks.values()):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._schedule_execution_tasks.clear()
         self._state_store.close()
 
     async def _send_plain_with_retry(
