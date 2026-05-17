@@ -18,7 +18,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 from obs_agent._sdk_patch import ensure_raw_uuid_patch
 from obs_agent.hooks import HookState, create_hook_matchers
-from obs_agent.prompt import build_obs_platform_appendix
+from obs_agent.prompt import build_entry_file_appendix, build_obs_platform_appendix
 from obs_agent.tools import create_obs_tools
 
 if TYPE_CHECKING:
@@ -194,7 +194,9 @@ class SessionManager:
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
-                "append": build_obs_platform_appendix(),
+                "append": "\n\n".join(
+                    [build_entry_file_appendix(self.config), build_obs_platform_appendix()]
+                ),
             },
         )
 

@@ -8,7 +8,7 @@ import pytest
 from claude_agent_sdk import ProcessError
 
 from obs_agent.hooks import HookPipeline, HookState
-from obs_agent.prompt import build_obs_platform_appendix
+from obs_agent.prompt import ENTRY_FILE_SENTINEL, build_obs_platform_appendix
 from obs_agent.session import SessionManager
 
 
@@ -72,14 +72,15 @@ class TestResumeWindow:
 
 
 class TestCreateOptions:
-    def test_appends_obs_platform_instructions_to_system_prompt(self, config):
+    def test_appends_entry_file_and_obs_platform_instructions_to_system_prompt(self, config):
         mgr = SessionManager(config=config)
         options = mgr.create_options()
-        assert options.system_prompt == {
-            "type": "preset",
-            "preset": "claude_code",
-            "append": build_obs_platform_appendix(),
-        }
+        assert options.system_prompt["type"] == "preset"
+        assert options.system_prompt["preset"] == "claude_code"
+        append = options.system_prompt["append"]
+        assert append.count(ENTRY_FILE_SENTINEL) == 1
+        assert "Test context" in append
+        assert build_obs_platform_appendix() in append
 
     def test_includes_hooks(self, config):
         mgr = SessionManager(config=config)

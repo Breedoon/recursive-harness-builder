@@ -54,8 +54,23 @@ class TestClaudePaths:
         assert config.claude_path == fixture_vault / ".claude"
 
     def test_context_path(self, config, fixture_vault):
-        """context_path points to CLAUDE.md at vault root."""
+        """context_path points to CLAUDE.md at vault root by default."""
         assert config.context_path == fixture_vault / "CLAUDE.md"
+
+    def test_context_path_uses_configured_entry_file(self, fixture_vault):
+        cfg = OBSConfig(vault_path=fixture_vault, agent_entry_file="AGENTS.md")
+        assert cfg.context_path == fixture_vault / "AGENTS.md"
+
+    def test_agent_entry_file_from_env(self, fixture_vault, monkeypatch):
+        monkeypatch.setenv("OBS_VAULT_PATH", str(fixture_vault))
+        monkeypatch.setenv("OBS_AGENT_ENTRY_FILE", "AGENTS.md")
+        cfg = OBSConfig.from_env()
+        assert cfg.context_path == fixture_vault / "AGENTS.md"
+
+    def test_agent_entry_file_must_stay_inside_vault(self, fixture_vault):
+        cfg = OBSConfig(vault_path=fixture_vault, agent_entry_file="../AGENTS.md")
+        with pytest.raises(ValueError, match="inside vault"):
+            cfg.validate()
 
     def test_skills_dir(self, config, fixture_vault):
         """skills_dir points to .claude/skills/."""
