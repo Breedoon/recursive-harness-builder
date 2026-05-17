@@ -857,7 +857,13 @@ def create_hook_matchers(
                 _log.warning("Invalid user hook spec for %s (missing '::'): %s", event_name, spec)
                 continue
             fpath, fname = spec.rsplit("::", 1)
-            fn = load_hook_function(fpath, fname)
+            # Relative hook paths are resolved against the session vault, not
+            # the server process CWD — agents author hooks relative to their
+            # project root (e.g. "hooks/router_guard.py").
+            fpath_p = Path(fpath).expanduser()
+            if not fpath_p.is_absolute():
+                fpath_p = config.vault_path / fpath_p
+            fn = load_hook_function(str(fpath_p), fname)
             _resolved_user_checks[event_name] = _make_user_hook_check(fn, state)
         except Exception:
             _log.warning(
