@@ -50,18 +50,11 @@ if _ENV_FILE.exists():
 
 from obs_agent.config import OBSConfig
 
-# Persistent fixture vault at project root (created by scripts/clone_vault.sh)
+# Persistent fixture project at project root.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _FIXTURE_VAULT = _PROJECT_ROOT / "fixture_vault"
 _CLONE_SCRIPT = _PROJECT_ROOT / "scripts" / "clone_vault.sh"
-_DEFAULT_REAL_VAULT = (
-    Path.home()
-    / "Library"
-    / "Mobile Documents"
-    / "iCloud~md~obsidian"
-    / "Documents"
-    / "T"
-)
+_DEFAULT_REAL_VAULT = _PROJECT_ROOT / "examples" / "recursive-workflow"
 
 
 class AsyncIterFromList:

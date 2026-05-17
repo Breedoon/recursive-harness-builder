@@ -185,8 +185,8 @@ class TestTelegramLiveMedia:
         self, live_tg_media: _LiveTelegramHarness
     ) -> None:
         await _reset(live_tg_media.platform)
-        image_a = _require_file(Path("/Users/breedoon/Downloads/Play Button Png.png"))
-        image_b = _require_file(Path("/Users/breedoon/Downloads/IMG_1108.JPG"))
+        image_a = _require_file(Path("/path/to/test-media/Play Button Png.png"))
+        image_b = _require_file(Path("/path/to/test-media/IMG_1108.JPG"))
 
         first_response = await live_tg_media.platform.send_files([image_a, image_b])
         followup = await live_tg_media.platform.send(
@@ -203,7 +203,7 @@ class TestTelegramLiveMedia:
         self, live_tg_media: _LiveTelegramHarness
     ) -> None:
         await _reset(live_tg_media.platform)
-        video_path = _require_file(Path("/Users/breedoon/Downloads/IMG_0254.MOV"))
+        video_path = _require_file(Path("/path/to/test-media/IMG_0254.MOV"))
 
         first_response = await live_tg_media.platform.send_file(video_path)
         followup = await live_tg_media.platform.send(
@@ -224,8 +224,8 @@ class TestTelegramLiveMedia:
         self, live_tg_media: _LiveTelegramHarness
     ) -> None:
         await _reset(live_tg_media.platform)
-        voice_path = _require_file(Path("/Users/breedoon/Downloads/audio_2026-02-27_23-52-38.ogg"))
-        expected_transcript = _require_file(Path("/Users/breedoon/Downloads/audio_2026-02-27_23-52-38.txt"))
+        voice_path = _require_file(Path("/path/to/test-media/audio_2026-02-27_23-52-38.ogg"))
+        expected_transcript = _require_file(Path("/path/to/test-media/audio_2026-02-27_23-52-38.txt"))
 
         response = await live_tg_media.platform.send_file(
             voice_path,
@@ -252,8 +252,8 @@ class TestTelegramLiveMedia:
         self, live_tg_media: _LiveTelegramHarness
     ) -> None:
         await _reset(live_tg_media.platform)
-        voice_path = _require_file(Path("/Users/breedoon/Downloads/audio_2026-02-27_23-53-30.ogg"))
-        expected_transcript = _require_file(Path("/Users/breedoon/Downloads/audio_2026-02-27_23-53-30.txt"))
+        voice_path = _require_file(Path("/path/to/test-media/audio_2026-02-27_23-53-30.ogg"))
+        expected_transcript = _require_file(Path("/path/to/test-media/audio_2026-02-27_23-53-30.txt"))
 
         response = await live_tg_media.platform.send_file(
             voice_path,

@@ -21,6 +21,11 @@ htmlcov/
 
 # Secrets
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.session
 
 # Fixture vault (created by tests)
 fixture_vault/
@@ -28,4 +33,12 @@ fixture_vault.refresh.meta
 
 # Local runtime state
 .obs-agent/
+.worktrees/
 worktrees/
+*.sqlite
+*.db
+*.log
+
+# JavaScript/vendor artifacts
+node_modules/
+spikes/**/node_modules/

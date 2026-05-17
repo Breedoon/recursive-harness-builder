@@ -48,7 +48,7 @@ def _shorten_path(path: str) -> str:
     """Strip the vault prefix from a path, returning a vault-relative path.
 
     Example:
-        /Users/.../iCloud~md~obsidian/Documents/T/Agent/context.md
+        /workspace/project/Agent/context.md
         → Agent/context.md
     """
     vault_prefix = str(_DEFAULT_VAULT)

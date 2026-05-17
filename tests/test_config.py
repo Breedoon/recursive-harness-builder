@@ -19,9 +19,8 @@ class TestVaultPathResolution:
     """Config resolves the vault path from defaults or environment."""
 
     def test_default_vault_path(self):
-        """Default vault path points to the iCloud Obsidian vault."""
         cfg = OBSConfig()
-        expected = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "T"
+        expected = config_module._DEFAULT_CODEBASE_ROOT / "examples" / "recursive-workflow"
         assert cfg.vault_path == expected
 
     def test_vault_path_from_constructor(self, tmp_path):

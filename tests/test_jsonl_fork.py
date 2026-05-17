@@ -78,7 +78,7 @@ def test_fork_session_jsonl_copies_only_the_target_parent_chain(tmp_path: Path) 
     fork_session_id = fork_session_jsonl(
         session_id="sid-root",
         target_uuid="a2",
-        cwd=Path("/Users/breedoon/Documents/obs"),
+        cwd=Path("/workspace/recursive-harness"),
         projects_root=projects_root,
         new_session_id="sid-fork",
     )
@@ -115,6 +115,6 @@ def test_fork_session_jsonl_raises_for_unknown_uuid(tmp_path: Path) -> None:
         fork_session_jsonl(
             session_id="sid-root",
             target_uuid="missing",
-            cwd=Path("/Users/breedoon/Documents/obs"),
+            cwd=Path("/workspace/recursive-harness"),
             projects_root=projects_root,
         )

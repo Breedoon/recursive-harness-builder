@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "obs-agent"
 version = "0.1.0"
-description = "Personal AI assistant backed by Obsidian vault"
+description = "Recursive AI-agent harness with markdown procedures and optional Telegram UI"
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.1.33",

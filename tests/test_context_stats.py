@@ -169,7 +169,7 @@ def test_build_context_snapshot_prefers_jsonl_triplet_for_context_estimate(tmp_p
             },
         },
         context_window_estimate_tokens=200_000,
-        cwd=Path("/Users/breedoon/Documents/obs/fixture_vault"),
+        cwd=Path("/workspace/recursive-harness/fixture_project"),
         projects_root=projects_root,
     )
 
@@ -200,7 +200,7 @@ def test_build_context_snapshot_falls_back_when_jsonl_has_no_usage(tmp_path: Pat
             },
         },
         context_window_estimate_tokens=200_000,
-        cwd=Path("/Users/breedoon/Documents/obs"),
+        cwd=Path("/workspace/recursive-harness"),
         projects_root=projects_root,
     )
 

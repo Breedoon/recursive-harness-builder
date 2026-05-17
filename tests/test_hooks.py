@@ -74,7 +74,7 @@ class TestPreToolUseImmutableGuard:
         result = on_pre_tool_use(
             tool_name="Write",
             tool_input={
-                "file_path": "/Users/breedoon/Documents/obs/.env",
+                "file_path": "/workspace/recursive-harness/.env",
                 "content": "SECRET=123",
             },
             config=config,

@@ -25,7 +25,7 @@ def test_find_session_jsonl_prefers_matching_workspace_dir(tmp_path: Path) -> No
 
     found = find_session_jsonl(
         session_id=sid,
-        cwd=Path("/Users/breedoon/Documents/obs/fixture_vault"),
+        cwd=Path("/workspace/recursive-harness/fixture_project"),
         projects_root=projects_root,
     )
     assert found == preferred
@@ -35,7 +35,7 @@ def test_load_jsonl_usage_snapshot_returns_none_when_file_missing(tmp_path: Path
     projects_root = tmp_path / ".claude" / "projects"
     result = load_jsonl_usage_snapshot(
         session_id="missing",
-        cwd=Path("/Users/breedoon/Documents/obs"),
+        cwd=Path("/workspace/recursive-harness"),
         projects_root=projects_root,
     )
     assert result is None
@@ -55,7 +55,7 @@ def test_load_jsonl_usage_snapshot_returns_none_when_no_usage_entries(tmp_path: 
 
     result = load_jsonl_usage_snapshot(
         session_id=sid,
-        cwd=Path("/Users/breedoon/Documents/obs"),
+        cwd=Path("/workspace/recursive-harness"),
         projects_root=projects_root,
     )
     assert result is None
@@ -109,7 +109,7 @@ def test_load_jsonl_usage_snapshot_ignores_other_sessions_and_returns_latest(tmp
 
     result = load_jsonl_usage_snapshot(
         session_id=sid,
-        cwd=Path("/Users/breedoon/Documents/obs"),
+        cwd=Path("/workspace/recursive-harness"),
         projects_root=projects_root,
     )
 

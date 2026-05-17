@@ -77,7 +77,7 @@ def test_fork_strips_signature_from_thinking_blocks(tmp_path: Path) -> None:
     fork_session_jsonl(
         session_id="sid-thinking",
         target_uuid="a1",
-        cwd=Path("/Users/breedoon/Documents/obs"),
+        cwd=Path("/workspace/recursive-harness"),
         projects_root=projects_root,
         new_session_id="sid-thinking-fork",
     )
@@ -146,7 +146,7 @@ def test_fork_leaves_non_thinking_blocks_untouched(tmp_path: Path) -> None:
     fork_session_jsonl(
         session_id="sid-mixed",
         target_uuid="a1",
-        cwd=Path("/Users/breedoon/Documents/obs"),
+        cwd=Path("/workspace/recursive-harness"),
         projects_root=projects_root,
         new_session_id="sid-mixed-fork",
     )
@@ -207,7 +207,7 @@ def test_fork_preserves_non_assistant_turns_with_thinking_lookalike(tmp_path: Pa
     fork_session_jsonl(
         session_id="sid-meta",
         target_uuid="a1",
-        cwd=Path("/Users/breedoon/Documents/obs"),
+        cwd=Path("/workspace/recursive-harness"),
         projects_root=projects_root,
         new_session_id="sid-meta-fork",
     )
