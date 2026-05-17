@@ -3107,6 +3107,57 @@ class TestCommands:
         with patch.object(bot, "_handle_tree_view", new_callable=AsyncMock) as mock_tree:
             await bot.handle_tree_alias_command(update, ctx)
         assert mock_tree.await_args.kwargs["mode"] == "descendants"
+
+        update.effective_message.text = "/tree-children"
+        with patch.object(bot, "_handle_tree_view", new_callable=AsyncMock) as mock_tree:
+            await bot.handle_tree_alias_command(update, ctx)
+        assert mock_tree.await_args.kwargs["mode"] == "descendants"
+        await bot.shutdown()
+
+    async def test_child_topic_title_uses_leaf_display_name_only(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = bot._get_state(TelegramRoute(chat_id=67890, thread_id=321), topic_title="Parent Topic")
+        assert state is not None
+        assert bot._child_topic_title_from_alias(state, "Child Worker") == "Child Worker"
+        assert bot._next_topic_alias_and_title(state, "Review Agent") == ("Review Agent", "Review Agent")
+        await bot.shutdown()
+
+    async def test_tree_siblings_sort_by_activity_timestamp(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        team_name = "team-alpha"
+        current_agent_name = "root"
+        current_lineage = ("Root",)
+        members = {
+            "root": {"agent_name": "root", "display_name": "Root", "lineage": ["Root"], "lineage_length": 1},
+            "old": {"agent_name": "old", "display_name": "Old", "parent_agent_name": "root", "lineage": ["Root", "Old"], "lineage_length": 2, "created_at": 10},
+            "new": {"agent_name": "new", "display_name": "New", "parent_agent_name": "root", "lineage": ["Root", "New"], "lineage_length": 2, "created_at": 20},
+        }
+        html_text = bot._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=current_lineage,
+            members=members,
+            mode="tree",
+        )
+        assert html_text.index("New") < html_text.index("Old")
+        await bot.shutdown()
+
+    async def test_tree_children_command_dispatches_descendants_view(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/tree_children", chat_id=67890, thread_id=321)
+        ctx = _make_context()
+        with patch.object(bot, "_handle_tree_view", new_callable=AsyncMock) as mock_tree:
+            await bot.handle_tree_children(update, ctx)
+        assert mock_tree.await_args.kwargs["mode"] == "descendants"
+        await bot.shutdown()
+
+    async def test_schedule_command_is_gated_until_schedule_sprint_approval(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/schedule every hour", chat_id=67890, thread_id=321)
+        ctx = _make_context()
+        with patch.object(bot, "_send_system_message", new_callable=AsyncMock) as send_system:
+            await bot.handle_schedule(update, ctx)
+        assert "gated until Sprint 1" in send_system.await_args.kwargs["text"]
         await bot.shutdown()
 
     async def test_new_visibility_generates_random_title_and_non_current_emoji(self, config):
@@ -3799,7 +3850,7 @@ class TestTopicCommands:
         mock_fork.assert_called_once()
         ctx.bot.create_forum_topic.assert_awaited_once_with(
             chat_id=67890,
-            name="General - F1",
+            name="F1",
             icon_custom_emoji_id=None,
         )
         child_state = _state(bot, thread_id=321)
@@ -3833,7 +3884,7 @@ class TestTopicCommands:
             await bot.handle_fork(first_update, first_ctx)
         first_ctx.bot.create_forum_topic.assert_awaited_once_with(
             chat_id=67890,
-            name="General - F1",
+            name="F1",
             icon_custom_emoji_id=None,
         )
 
@@ -3848,7 +3899,7 @@ class TestTopicCommands:
             await bot.handle_fork(second_update, second_ctx)
         second_ctx.bot.create_forum_topic.assert_awaited_once_with(
             chat_id=67890,
-            name="Renamed General - F1",
+            name="F1",
             icon_custom_emoji_id=None,
         )
 
@@ -3898,7 +3949,7 @@ class TestTopicCommands:
 
         ctx.bot.create_forum_topic.assert_awaited_once_with(
             chat_id=67890,
-            name="Renamed Topic - F1",
+            name="F1",
             icon_custom_emoji_id="emoji-edited",
         )
 
@@ -3932,7 +3983,7 @@ class TestTopicCommands:
         assert mock_fork.call_args.kwargs["target_uuid"] == "older-uuid"
         ctx.bot.create_forum_topic.assert_awaited_once_with(
             chat_id=67890,
-            name="General - Focused topic",
+            name="Focused topic",
             icon_custom_emoji_id=None,
         )
 
@@ -4093,7 +4144,7 @@ class TestForkTaskRuntime:
         mock_fork.assert_called_once()
         state.last_bot.create_forum_topic.assert_awaited_once_with(
             chat_id=-10067890,
-            name="General - Audit",
+            name="Audit",
             icon_custom_emoji_id=None,
         )
         launch_text = launched["content"][0]["text"]
@@ -4157,7 +4208,7 @@ class TestForkTaskRuntime:
         mock_fork.assert_not_called()
         state.last_bot.create_forum_topic.assert_awaited_once_with(
             chat_id=-10067890,
-            name="General - Fresh child",
+            name="Fresh child",
             icon_custom_emoji_id=None,
         )
         launch_text = launched["content"][0]["text"]
