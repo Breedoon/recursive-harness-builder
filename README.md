@@ -1,161 +1,64 @@
 # Recursive Harness Builder
 
-Recursive Harness Builder is a local Python runtime for recursive AI-agent workflows defined mostly as markdown: project instructions, procedure files, and optional hooks that shape how agents plan, execute, verify, and hand work to each other.
+Recursive Harness Builder is a local runtime for building recursive agent workflows out of markdown prompts, optional hooks, and ordinary project files.
 
-It is currently extracted from a personal system still named `obs-agent` internally. The public concept is a recursive harness: package names, commands, environment variables, and some code still use OBS/vault-oriented names until the runtime is renamed.
+It wraps the Claude Agent SDK with a few added design choices: the ability for agents to clone themselves into a forked subagent, unlimited depth of subagents, agent-to-agent messaging, scheduling, and hookable tool behavior.
 
-## What this is
+## Why use it
 
-Most AI coding tools treat an agent as one long-running assistant in one terminal. This project treats agents as observable, forkable, resumable workers:
+Most agent tools give you one agent in one terminal, with one layer of subagents. Recursive Harness Builder lets you define a harness around the agent:
 
-- A conversation can fork into another agent with inherited context.
-- Agents can spawn other agents recursively.
-- Procedures are markdown prompt files that define roles such as Router, Assembler, Executor, and Verifier.
-- Hooks can attach behavior to tool calls, stops, feedback, permissions, and reporting.
-- Agents can message each other through inbox files and wake each other when work arrives.
-- Schedules can resume agents later using interval or cron-style triggers.
-- The harness can route models through Claude Code, Claude Agent SDK, and proxy-compatible providers.
+- **Fork work into child agents** that inherit context and continue independently.
+- **Attach hooks** to constrain or extend behavior, such as preventing orchestrators from editing files.
+- **Coordinate agents** through inbox messages, artifacts, schedules, and resumable sessions.
+- **Use Telegram as a UI** when you want a phone-friendly or multi-window view of many concurrent agents.
+- **Route non-Claude models** through a CLIProxyAPI-compatible endpoint when you want Codex, GPT, Gemini, or other providers.
 
-The goal is not to replace Claude Code. The goal is to wrap Claude Code and similar agent CLIs in an orchestration layer that makes recursive work visible, controllable, and recoverable.
+The runtime is the harness. The workflow is yours.
 
-## Telegram is a UI choice
+## Example workflow
 
-Telegram is the first polished UI for this harness, not the product itself.
+Start with the bundled recursive workflow example:
 
-The current Telegram runtime maps chats/topics to long-lived agent sessions. That makes the agent tree easy to watch from a phone or from Telegram Desktop / Telegram Lite, where topic-based window management is useful for many concurrent agents.
+- [`examples/recursive-workflow/`](examples/recursive-workflow/) — a small project with flat markdown procedures and a guard hook.
+- [`docs/procedures.md`](docs/procedures.md) — how procedure files are organized and launched.
 
-A different UI could sit on the same concepts: markdown procedures, agent sessions, forks, hooks, inboxes, schedules, and artifact paths.
+The example shows the intended pattern: describe coordination behavior in markdown, point an agent at the right procedure file, and let the harness manage forks, messages, hooks, and artifacts.
 
-## Harness vs. procedures
+## Quick start
 
-This repository is the **harness**:
+The recommended setup path is to let an agent install it for you.
 
-- Python runtime code
-- CLI and daemon entrypoints
-- Telegram adapter
-- session and fork lifecycle
-- schedule handling
-- team/inbox messaging
-- hook integration
-- cache/proxy support
-- live-test infrastructure
+Open Claude Code, Codex, or another coding agent and give it this prompt:
 
-The harness does not define one correct way for agents to plan, verify, or coordinate. Those behaviors live in **procedures**: markdown instructions that tell agents what roles to play and how to work.
-
-The intended public split is:
-
-- The harness is reusable infrastructure.
-- A runnable example project is included so a new user can run recursive workflows immediately.
-- Project-specific procedures can live outside the repo and be pointed to by configuration or project instructions.
-
-## What it can do today
-
-The current runtime supports:
-
-- Local CLI and HTTP daemon entrypoints.
-- Telegram bot operation with one topic per agent.
-- Forked agent tasks through the AgentTask interface.
-- Multi-agent lineage tracking.
-- Inbox messaging between agents in the same tree.
-- Per-topic schedules through interval or cron modes.
-- Telegram voice/file ingestion paths.
-- Multi-model routing through Claude Code and CLIProxyAPI-compatible endpoints.
-- Cache-normalizing proxy support for Claude Code API calls.
-- Live Telegram evals and smoke tests.
-
-Some pieces are still being generalized from a personal setup:
-
-- Configuration is still environment-variable heavy.
-- Several names still say `OBS`, `vault`, or `obs_agent`.
-- Transcription is being made pluggable; older code assumes a local script.
-- Native Windows is intended to be supported because the runtime is Python, but it has not yet been validated end-to-end.
-
-## Repository layout
-
-- `src/obs_agent/` — Python runtime package.
-- `src/cache_proxy.py` — cache-normalizing proxy support.
-- `tests/` — unit, integration, eval, and live Telegram smoke tests.
-- `examples/recursive-workflow/` — runnable starter project with its own `CLAUDE.md` and v1 recursive-workflow procedures.
-- `docs/configuration.md` — configuration and deployment modes.
-- `docs/procedures.md` — procedure-pack guidance.
-- `INSTALL.md` — setup from a fresh clone.
-- `env.example` — placeholder environment template.
+```text
+Clone https://github.com/Breedoon/recursive-harness-builder and follow INSTALL.md to set it up for me. Use examples/recursive-workflow as the first project. Ask me for any credentials or Telegram setup values you need.
+```
 
 ## Requirements
 
-The current project expects:
+You will need:
 
-- Python 3.12 or newer.
-- A virtual environment managed by `uv`.
-- Claude Code / Claude Agent SDK access.
-- Claude Code authentication through the normal local OAuth/subscription flow for the default Claude path.
-- A Telegram bot token for Telegram mode.
-- A project directory containing `.claude/` and `CLAUDE.md` until the entry-file setting is generalized; use `examples/recursive-workflow/` for the first run.
-- Optional: additional Telegram bot tokens for higher-concurrency Telegram operation.
-- Optional: Telegram userbot credentials for automated group/topic provisioning and live tests.
-- Optional: CLIProxyAPI-compatible proxy for Codex, GPT, Gemini, or other non-Claude model routing.
-- Optional: transcription backend for Telegram voice messages.
+- Python 3.12+
+- `uv`
+- Claude subscription OAuth for the default Claude path
+- Optional: Telegram bot credentials for the Telegram UI
+- Optional: CLIProxyAPI-compatible proxy for non-Claude models (eg, Codex)
 
-## Quick start for developers
+## Interfaces
 
-```bash
-git clone <repo-url>
-cd <repo>
-uv sync --extra dev
-cp env.example .env
-```
+Recursive Harness Builder currently includes:
 
-Then edit `.env` with at least:
+- a local CLI runtime;
+- a Telegram runtime with one topic per agent;
+- AgentTask-based forking;
+- inbox messaging between agents;
+- interval and cron-style schedules;
+- hook support for tool calls and lifecycle events;
+- cache/proxy support for provider routing.
 
-- `OBS_VAULT_PATH` pointing to `examples/recursive-workflow/` for the starter project, or another project directory that contains `.claude/` and `CLAUDE.md`.
-- `OBS_TELEGRAM_BOT_TOKEN` for Telegram mode.
-- `OBS_TELEGRAM_ALLOWED_USERS` with your numeric Telegram user ID.
-- model/provider settings appropriate for your Claude Code or CLI proxy setup.
-
-Run the Telegram runtime:
-
-```bash
-uv run python -m obs_agent.telegram_main
-```
-
-Or run the terminal client:
-
-```bash
-uv run obs-agent
-```
-
-The public command remains `obs-agent` for now even though the external framing is Recursive Harness Builder.
-
-See `INSTALL.md` and `docs/configuration.md` for setup details.
-
-## Documentation
-
-Start with:
-
-- `INSTALL.md` — setup from a fresh clone.
-- `env.example` — supported configuration surface with placeholders.
-- `docs/configuration.md` — environment variables and deployment modes.
-- `docs/procedures.md` — bundled and external procedure packs.
+Telegram is the UI. The core model is markdown-defined workflow procedures running on top of resumable, forkable agent sessions.
 
 ## License
 
-Apache License 2.0. See `LICENSE`.
-
-## Development posture
-
-This project is built around live behavior, not mocked confidence. Unit tests are useful, but the real proof is whether an agent works through the actual runtime surface.
-
-For Telegram-facing changes, use the live Telegram smoke/eval infrastructure. For changes touching schedules, process lifecycle, forks, or inbox messaging, test the behavior end-to-end in an isolated worktree and with test credentials.
-
-## Publication status
-
-This repo is being prepared for private GitHub sharing before public release. Before publishing broadly, it still needs:
-
-- final external naming decision;
-- clean-clone install test;
-- native Windows validation;
-- CLIProxyAPI setup validation for non-Claude models;
-- continued terminology cleanup from vault/OBS-specific names to project-directory/harness language;
-- a preflight command that verifies Python, project directory shape, Telegram config, proxy state, and Claude Code binary resolution.
-
-Do not assume every internal name is final yet.
+Apache License 2.0. See [`LICENSE`](LICENSE).
