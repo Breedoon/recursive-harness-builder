@@ -1607,6 +1607,7 @@ class TestTopicScheduling:
             new=AsyncMock(return_value=_RunOutcome(assistant_text="ok")),
         ) as run_mock, patch("obs_agent.telegram.time.time", return_value=1000.0):
             await bot._run_due_interval_schedules()
+            await asyncio.gather(*list(bot._schedule_execution_tasks.values()))
 
         run_mock.assert_awaited_once()
         updated = bot._topic_schedules_by_id["sched-int"]
@@ -2334,6 +2335,7 @@ class TestTopicScheduling:
             run_mock.assert_not_awaited()
             state.busy = False
             await bot._run_due_interval_schedules()
+            await asyncio.gather(*list(bot._schedule_execution_tasks.values()))
             run_mock.assert_awaited_once()
 
     async def test_multi_topic_due_schedules_remain_isolated(self, config):
@@ -2386,6 +2388,7 @@ class TestTopicScheduling:
             new=AsyncMock(return_value=_RunOutcome(assistant_text="ok")),
         ) as run_mock, patch("obs_agent.telegram.time.time", return_value=2000.0):
             await bot._run_due_interval_schedules()
+            await asyncio.gather(*list(bot._schedule_execution_tasks.values()))
 
         assert run_mock.await_count == 2
         called_routes = {call.kwargs["state"].route for call in run_mock.await_args_list}
@@ -2436,6 +2439,7 @@ class TestTopicScheduling:
         ) as run_mock:
             with patch("obs_agent.telegram.time.time", return_value=3000.0):
                 await bot._run_due_interval_schedules()
+                await asyncio.gather(*list(bot._schedule_execution_tasks.values()))
             with patch("obs_agent.telegram.time.time", return_value=3005.0):
                 bot._schedule_stop_events.put_nowait(
                     (route, {"session_id": None, "schedule_run_active": False})
