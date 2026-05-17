@@ -2199,9 +2199,9 @@ class TelegramBot:
         return f"F{state.child_fork_count}"
 
     def _child_topic_title_from_alias(self, state: TelegramSessionState, alias: str) -> str:
-        base = self._current_topic_base(state)
+        _ = state
         label = normalize_lineage_name(alias)
-        return f"{base} - {label}".strip()[:128]
+        return (label or "F").strip()[:128]
 
     def _next_auto_child_title(self, state: TelegramSessionState) -> str:
         return self._child_topic_title_from_alias(state, self._next_auto_child_alias(state))
@@ -5105,6 +5105,25 @@ class TelegramBot:
                     entry["lineage_length"] = len(lineage)
         return members
 
+    def _member_activity_sort_key(self, member: dict[str, Any], agent_name: str) -> tuple[float, str]:
+        candidates = [
+            member.get("last_active_at"),
+            member.get("last_activity_at"),
+            member.get("completed_at"),
+            member.get("created_at"),
+            member.get("updated_at"),
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, (int, float)):
+                return (-float(candidate), str(agent_name))
+            if isinstance(candidate, str) and candidate.strip():
+                try:
+                    parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                return (-parsed.timestamp(), str(agent_name))
+        return (0.0, str(agent_name))
+
     def _render_tree_html(
         self,
         *,
@@ -5127,6 +5146,13 @@ class TelegramBot:
                 and tuple(member["lineage"][: len(current_lineage)]) == current_lineage
             }
             allowed.add(current_agent_name)
+        elif mode == "children":
+            allowed = {
+                agent_name
+                for agent_name, member in members.items()
+                if str(member.get("parent_agent_name") or "") == current_agent_name
+            }
+            allowed.add(current_agent_name)
         else:
             allowed = set(members)
 
@@ -5141,15 +5167,8 @@ class TelegramBot:
             else:
                 root_names.append(agent_name)
 
-        def _sort_key(agent_name: str) -> tuple[int, str, str]:
-            member = members[agent_name]
-            lineage = member.get("lineage")
-            lineage_key = "/".join(lineage) if isinstance(lineage, list) else ""
-            return (
-                int(member.get("lineage_length") or 9999),
-                lineage_key.casefold(),
-                str(member.get("display_name") or agent_name).casefold(),
-            )
+        def _sort_key(agent_name: str) -> tuple[float, str]:
+            return self._member_activity_sort_key(members[agent_name], agent_name)
 
         for child_names in children_by_parent.values():
             child_names.sort(key=_sort_key)
@@ -5293,6 +5312,11 @@ class TelegramBot:
     ) -> None:
         await self._handle_tree_view(update=update, context=context, mode="descendants")
 
+    async def handle_tree_children(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        await self._handle_tree_view(update=update, context=context, mode="children")
+
     async def handle_tree_ancestors(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -5305,6 +5329,8 @@ class TelegramBot:
         mode = "tree"
         if text.startswith("/tree-ancestors"):
             mode = "ancestors"
+        elif text.startswith("/tree-children"):
+            mode = "children"
         elif text.startswith("/tree-") or text.startswith("/tree-descendants"):
             mode = "descendants"
         await self._handle_tree_view(update=update, context=context, mode=mode)
@@ -5694,6 +5720,22 @@ class TelegramBot:
         except Exception:
             logger.warning("Failed clearing commands on newly created secondary bot", exc_info=True)
         self._sender_bots.append(new_sender)
+
+    async def handle_schedule(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        route = self._route_for_message(update.effective_message)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text="/schedule is gated until Sprint 1 schedule reliability is approved; use CronCreate from an agent topic for now.",
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
 
     async def handle_unschedule(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -9324,7 +9366,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.bot_data["obs_telegram_bot"] = bot
     app.add_handler(
         MessageHandler(
-            filters.TEXT & filters.Regex(r"^/(?:tree-|tree-(?:ancestors|descendants))(?:@[A-Za-z0-9_]+)?(?:\s|$)"),
+            filters.TEXT & filters.Regex(r"^/(?:tree-|tree-(?:ancestors|descendants|children))(?:@[A-Za-z0-9_]+)?(?:\s|$)"),
             bot.handle_tree_alias_command,
         )
     )
@@ -9336,8 +9378,10 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("stop", bot.handle_stop))
     app.add_handler(CommandHandler("context", bot.handle_context))
     app.add_handler(CommandHandler("report", bot.handle_report))
+    app.add_handler(CommandHandler("schedule", bot.handle_schedule))
     app.add_handler(CommandHandler("tree", bot.handle_tree))
     app.add_handler(CommandHandler("tree_descendants", bot.handle_tree_descendants))
+    app.add_handler(CommandHandler("tree_children", bot.handle_tree_children))
     app.add_handler(CommandHandler("tree_ancestors", bot.handle_tree_ancestors))
     app.add_handler(CommandHandler("fork", bot.handle_fork))
     app.add_handler(CommandHandler("delete", bot.handle_delete))
@@ -9385,8 +9429,10 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
         BotCommand("context", "Show session and context window info"),
         BotCommand("report", "Save a debug case file for this message/topic"),
+        BotCommand("schedule", "Create schedules once Sprint 1 reliability is approved"),
         BotCommand("tree", "Render the full agent tree for this team"),
         BotCommand("tree_descendants", "Render this agent and all descendants"),
+        BotCommand("tree_children", "Render this agent and direct children"),
         BotCommand("tree_ancestors", "Render this agent and all ancestors"),
         BotCommand("fork", "Create a new topic from this head or replied message"),
         BotCommand("delete", "Delete this topic; use '/delete all' to remove all non-General topics"),
