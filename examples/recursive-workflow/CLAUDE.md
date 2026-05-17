@@ -29,6 +29,8 @@ For simple, single-concern tasks that can be handled in one execute/verify cycle
 
 When in doubt, use Router. It will scope the task and decide whether to decompose further or dispatch directly.
 
+After launching a Router, set yourself a 30-minute recurring schedule to nudge it for status and ask it to continue or unblock downstream agents if progress stalls.
+
 ## Contents
 
 - `CLAUDE.md` — this file. Entry point for agents.
