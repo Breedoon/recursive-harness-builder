@@ -37,14 +37,15 @@ def _adjacent_metadata(entries: list[dict[str, Any]], first_chain_index: int) ->
 
 
 def _sanitize_thinking_blocks(entry: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of ``entry`` with ``signature`` stripped from any thinking content blocks.
+    """Return a copy of ``entry`` with thinking/redacted_thinking blocks removed entirely.
 
     Anthropic's API attaches a cryptographic ``signature`` to each ``thinking`` content
-    block. The signature is bound to the original session's request context. When a fork
-    session resends the inherited message history on its first API call, Anthropic rejects
-    with HTTP 400 ``Invalid signature in thinking block``. Stripping ``signature`` (a
-    minimal, narrowly-scoped change) lets the forked session re-issue the message without
-    presenting an invalid signature, while preserving the thinking content itself.
+    block, bound to the original session's request context. The API enforces two rules:
+    (1) signatures must be valid, and (2) thinking blocks cannot be modified. When a fork
+    session resends inherited history, the signature context doesn't match, causing a 400.
+    Simply stripping the signature field also fails — the API rejects thinking blocks
+    without signatures as modified blocks. The only safe approach is to remove thinking
+    and redacted_thinking blocks entirely from the forked conversation history.
 
     Non-thinking content blocks (text, tool_use, tool_result, etc.) and non-assistant
     entries are returned unchanged. The input ``entry`` is not mutated.
@@ -58,7 +59,7 @@ def _sanitize_thinking_blocks(entry: dict[str, Any]) -> dict[str, Any]:
         return entry
 
     needs_change = any(
-        isinstance(blk, dict) and blk.get("type") == "thinking" and "signature" in blk
+        isinstance(blk, dict) and blk.get("type") in ("thinking", "redacted_thinking")
         for blk in content
     )
     if not needs_change:
@@ -66,10 +67,9 @@ def _sanitize_thinking_blocks(entry: dict[str, Any]) -> dict[str, Any]:
 
     new_content: list[Any] = []
     for blk in content:
-        if isinstance(blk, dict) and blk.get("type") == "thinking" and "signature" in blk:
-            new_content.append({k: v for k, v in blk.items() if k != "signature"})
-        else:
-            new_content.append(blk)
+        if isinstance(blk, dict) and blk.get("type") in ("thinking", "redacted_thinking"):
+            continue
+        new_content.append(blk)
     new_message = {**message, "content": new_content}
     return {**entry, "message": new_message}
 
