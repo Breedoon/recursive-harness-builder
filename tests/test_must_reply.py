@@ -6,7 +6,7 @@ Covers:
 - Reply_wake schedule creation and lifecycle
 - Schedule overlap validation removal (SC1)
 - Multiple coexisting schedules (SC2-SC7)
-- CronDelete blocking for agents
+- CronDelete access for agents
 - /unschedule next-only behavior
 """
 
@@ -361,40 +361,40 @@ class TestScheduleCoexistence:
         assert bot._topic_schedules_by_id["sched-b"].run_count == 0
 
 
-class TestCronDeleteBlocked:
-    """Verify agents cannot delete schedules via CronDelete MCP tool."""
+class TestCronDeleteAllowed:
+    """Verify agents can delete schedules via CronDelete MCP tool."""
 
-    def test_sc5_cron_delete_mcp_tool_returns_error(self):
-        """The CronDelete MCP tool handler returns an error (blocked for agents).
-
-        The blocking is at the MCP tool layer (tools.py), not the internal
-        _cron_delete method on TelegramBot. This is the correct layer since
-        agents call tools, not internal methods.
-        """
-        # Verify the MCP tool handler source contains the blocking logic.
-        # This is a targeted check — the tool's cron_delete function returns
-        # _error_result("CronDelete is disabled for agents...") immediately.
+    async def test_sc5_cron_delete_mcp_tool_deletes_schedule(self, config, monkeypatch):
+        from obs_agent.hooks import HookState
         from obs_agent.tools import create_obs_tools
 
-        # Can't easily call the tool closure directly without full setup,
-        # but we can verify the blocking exists by checking what the tool
-        # handler does. The live smoke test verifies end-to-end.
-        import inspect
-        from obs_agent import tools as tools_mod
+        captured = {}
 
-        # Find the cron_delete function body — it should return an error immediately
-        source = inspect.getsource(tools_mod)
-        # The function should have both CronDelete and "disabled" in it
-        # We look for the specific error message pattern
-        assert "CronDelete is disabled" in source, \
-            "CronDelete MCP tool should return error for agents"
+        def fake_create_sdk_mcp_server(name, tools):
+            captured["tools"] = tools
+            return {"type": "fake-server", "tools": tools}
+
+        monkeypatch.setattr("obs_agent.tools.create_sdk_mcp_server", fake_create_sdk_mcp_server)
+
+        deleted_ids = []
+        state = HookState()
+
+        async def cron_deleter(args: dict) -> dict:
+            deleted_ids.append(args["id"])
+            return {"deleted": True, "id": args["id"]}
+
+        state.cron_deleter = cron_deleter
+        create_obs_tools(config, lambda: "sid-123", hook_state=state)
+        handler = next(tool.handler for tool in captured["tools"] if tool.name == "CronDelete")
+
+        result = await handler({"id": "sched-agent"})
+
+        assert result.get("is_error") is not True
+        assert result.get("deleted") is True
+        assert deleted_ids == ["sched-agent"]
 
     async def test_sc5b_internal_cron_delete_still_works(self, config):
-        """TelegramBot._cron_delete still works — it's the user /unschedule path.
-
-        The blocking is only at the MCP tool layer. The internal method
-        must still work for /unschedule command handling.
-        """
+        """TelegramBot._cron_delete still works for /unschedule command handling."""
         from obs_agent.telegram import TelegramBot, TelegramRoute, _TopicScheduleRecord
 
         bot = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)

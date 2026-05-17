@@ -1611,9 +1611,7 @@ class TestCronTools:
 
         delete_result = await delete_handler({"id": "abc"})
         assert delete_result["is_error"] is True
-        # CronDelete is now blocked for agents (schedule rearchitecture)
-        assert ("does not provide task orchestration" in delete_result["content"][0]["text"]
-                or "disabled for agents" in delete_result["content"][0]["text"])
+        assert "does not provide task orchestration" in delete_result["content"][0]["text"]
 
     @pytest.mark.asyncio
     async def test_cron_delete_requires_id(self, monkeypatch, skill_config):
@@ -1627,9 +1625,7 @@ class TestCronTools:
 
         result = await handler({})
         assert result["is_error"] is True
-        # CronDelete is now blocked for agents — either "id is required" or "disabled"
-        assert ("id is required" in result["content"][0]["text"]
-                or "disabled for agents" in result["content"][0]["text"])
+        assert "id is required" in result["content"][0]["text"]
 
 
 class TestPromptFile:

@@ -842,20 +842,7 @@ def create_obs_tools(
         },
     )
     async def cron_delete(args: dict) -> dict:
-        # Agent-initiated schedule deletion is deprecated.
-        # Agents were deleting their own schedules unprompted, undermining user intent.
-        # Users can still delete schedules via /unschedule command.
-        # Considering reintroduction with guardrails (e.g., user confirmation,
-        # only delete schedules the agent created).
-        #
-        # NOTE: Blocking is at MCP tool layer only. TelegramBot._cron_delete
-        # still works (used by /unschedule command handler). If an agent ever
-        # bypasses MCP (e.g., direct method call via hook), it could still
-        # delete schedules. Low risk since agents always go through MCP tools.
-        return _error_result(
-            "CronDelete is disabled for agents. "
-            "Schedules can only be removed by the user via /unschedule command."
-        )
+        return await _cron_delete(args, tool_name="CronDelete")
 
     async def _send_inbox_message(args: dict) -> dict:
         # On delivery failure, return "message underdelivered" and use _rollback_written_message after writes.

@@ -9,7 +9,7 @@ Smoke Test 4: "Grand Hierarchy + must_reply Stress" (~20-25 min)
 
 Smoke Test 5: "Schedule Rearchitecture" (~10-15 min)
 - Coexisting schedules on same route
-- CronDelete blocked for agents
+- CronDelete available for agents
 - /unschedule deletes next-only
 - interval_seconds=1 behavior
 
@@ -396,7 +396,7 @@ class TestNamingFormatSmoke:
 
 
 # ---------------------------------------------------------------------------
-# Smoke Test 7: Schedule Rearchitecture (CronDelete blocked, coexistence)
+# Smoke Test 7: Schedule Rearchitecture (CronDelete delete, coexistence)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.telegram_smoke
@@ -405,15 +405,15 @@ class TestScheduleRearchitectureSmoke:
     """Live smoke tests for schedule rearchitecture.
 
     Tests:
-    - CronDelete returns error for agents
+    - CronDelete deletes schedules for agents
     - Multiple schedules can coexist on same route
     """
 
-    async def test_live_cron_delete_blocked(
+    async def test_live_cron_delete_succeeds(
         self,
         live_tg_forum: _LiveForumHarness,
     ) -> None:
-        """Agent calling CronDelete gets an error; user /unschedule still works."""
+        """Agent calling CronDelete deletes the schedule."""
         await _reset_general(live_tg_forum)
         tag = uuid.uuid4().hex[:8]
 
@@ -449,24 +449,24 @@ class TestScheduleRearchitectureSmoke:
             timeout=300.0,
         )
 
-        # Now try CronDelete — should be blocked
+        # Now try CronDelete — should succeed
         baseline2 = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
         await live_tg_forum.platform.send(
             (
                 "This is a deterministic schedule test. "
                 "Call CronList to get the schedule ID. "
                 "Then call CronDelete with that ID. "
-                "If CronDelete returns an error or says disabled, reply with exactly CRON-DELETE-BLOCKED-{tag}. "
-                f"If CronDelete succeeds, reply with exactly CRON-DELETE-SUCCESS-{tag}."
+                f"If CronDelete succeeds, reply with exactly CRON-DELETE-SUCCESS-{tag}. "
+                f"If CronDelete returns an error or says disabled, reply with exactly CRON-DELETE-FAILED-{tag}."
             ),
             thread_id=thread_id,
             require_done=False,
             timeout=180.0,
         )
-        block_msg = await _wait_for_message_after_containing(
+        delete_msg = await _wait_for_message_after_containing(
             live_tg_forum,
             thread_id=thread_id,
             after_message_id=baseline2,
-            token=f"CRON-DELETE-BLOCKED-{tag}",
+            token=f"CRON-DELETE-SUCCESS-{tag}",
             timeout=300.0,
         )
