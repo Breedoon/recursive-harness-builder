@@ -3209,6 +3209,29 @@ class TestCommands:
         assert mock_tree.await_args.kwargs["mode"] == "children"
         await bot.shutdown()
 
+    async def test_tree_renders_metadata_free_members_alphabetically(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        team_name = "team-alpha"
+        current_agent_name = "current-agent"
+        members = {
+            "zeta-agent": {"agent_name": "zeta-agent", "display_name": "Zeta"},
+            current_agent_name: {"agent_name": current_agent_name, "display_name": "Current", "lineage": ["Root", "Current"], "lineage_length": 2},
+            "alpha-agent": {"agent_name": "alpha-agent", "display_name": "Alpha"},
+        }
+
+        html_text = bot._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=("Root", "Current"),
+            members=members,
+            mode="tree",
+        )
+
+        assert "Alpha" in html_text
+        assert "Zeta" in html_text
+        assert html_text.index("Alpha") < html_text.index("Zeta")
+        await bot.shutdown()
+
     async def test_tree_children_render_excludes_grandchildren_and_descendants_includes_them(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         team_name = "team-alpha"
