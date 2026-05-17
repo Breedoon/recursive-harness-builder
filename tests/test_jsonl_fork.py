@@ -23,6 +23,29 @@ def _read_lines(path: Path) -> list[dict]:
     ]
 
 
+def test_fork_session_jsonl_preserves_raw_jsonl_lines(tmp_path: Path) -> None:
+    projects_root = tmp_path / ".claude" / "projects"
+    project_dir = projects_root / "-workspace-recursive-harness"
+    source_path = project_dir / "sid-root.jsonl"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_lines = [
+        '{"type":"queue-operation","operation":"dequeue"}',
+        '{"uuid":"u1","parentUuid":null,"message":{"role":"user","content":"start"}}',
+        '{"uuid":"a1","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"keep exact","signature":"sig"},{"type":"text","text":"done"}]},"extra":{"z":1,"a":2}}',
+    ]
+    source_path.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+
+    fork_session_jsonl(
+        session_id="sid-root",
+        target_uuid="a1",
+        cwd=Path("/workspace/recursive-harness"),
+        projects_root=projects_root,
+        new_session_id="sid-fork",
+    )
+
+    assert (project_dir / "sid-fork.jsonl").read_text(encoding="utf-8").splitlines() == raw_lines
+
+
 def test_fork_session_jsonl_copies_only_the_target_parent_chain(tmp_path: Path) -> None:
     projects_root = tmp_path / ".claude" / "projects"
     project_dir = projects_root / "-Users-breedoon-Documents-obs"

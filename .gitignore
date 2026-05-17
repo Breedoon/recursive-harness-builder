@@ -35,9 +35,18 @@ fixture_vault.refresh.meta
 .obs-agent/
 .worktrees/
 worktrees/
+.live-proof/
+live-artifacts/
 *.sqlite
 *.db
 *.log
+
+# Local research/artifacts
+spikes/
+docs/specs/
+linux_history_essay.txt
+unix_history_essay.txt
+env
 
 # Obsidian workspace (users may open example projects in Obsidian)
 .obsidian/
