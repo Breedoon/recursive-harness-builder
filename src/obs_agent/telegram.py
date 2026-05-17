@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover - optional import error surfaced on cron c
 
 from telegram import Bot, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, RetryAfter, TelegramError
+from telegram.error import BadRequest, Conflict, RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from obs_agent.context_probe import probe_context_via_claude_cli
@@ -271,6 +271,10 @@ class _TopicDeletedError(Exception):
     def __init__(self, route: "TelegramRoute") -> None:
         self.route = route
         super().__init__(f"Topic deleted for route {route}")
+
+
+class _TelegramPollingConflictError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -9504,11 +9508,6 @@ _TELEGRAM_RUNTIME_RESTART_MAX_SECONDS = 30.0
 async def _shutdown_telegram_runtime(*, app: Application, tg_bot: TelegramBot) -> None:
     """Best-effort shutdown for Telegram runtime resources."""
     try:
-        await tg_bot.shutdown()
-    except Exception:
-        logger.warning("Telegram bot runtime shutdown failed", exc_info=True)
-
-    try:
         updater = app.updater
         if updater is not None and updater.running:
             await updater.stop()
@@ -9522,6 +9521,11 @@ async def _shutdown_telegram_runtime(*, app: Application, tg_bot: TelegramBot) -
         logger.warning("Telegram application stop failed", exc_info=True)
 
     try:
+        await tg_bot.shutdown()
+    except Exception:
+        logger.warning("Telegram bot runtime shutdown failed", exc_info=True)
+
+    try:
         await app.shutdown()
     except Exception:
         logger.warning("Telegram application shutdown failed", exc_info=True)
@@ -9531,6 +9535,12 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
     """Run one Telegram runtime instance until cancellation or runtime failure."""
     app = create_telegram_app(config)
     tg_bot: TelegramBot = app.bot_data["obs_telegram_bot"]
+    polling_error: asyncio.Queue[TelegramError] = asyncio.Queue(maxsize=1)
+
+    def _record_polling_error(exc: TelegramError) -> None:
+        logger.exception("Exception happened while polling for updates.", exc_info=exc)
+        if isinstance(exc, Conflict) and polling_error.empty():
+            polling_error.put_nowait(exc)
 
     logger.info("Starting Telegram bot...")
     try:
@@ -9544,11 +9554,18 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
             (os.environ.get("OBS_TELEGRAM_DROP_PENDING_UPDATES") or "").strip().lower()
             in {"1", "true", "yes", "on"}
         )
-        await app.updater.start_polling(drop_pending_updates=drop_pending_updates)
+        await app.updater.start_polling(
+            drop_pending_updates=drop_pending_updates,
+            error_callback=_record_polling_error,
+        )
 
         while True:
             await asyncio.sleep(_TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS)
             updater_running = app.updater.running if app.updater is not None else False
+            if not polling_error.empty():
+                raise _TelegramPollingConflictError(
+                    "Telegram polling conflict: another getUpdates consumer is active"
+                ) from polling_error.get_nowait()
             if not app.running or not updater_running:
                 raise RuntimeError(
                     "Telegram runtime stopped unexpectedly: "
@@ -9560,7 +9577,7 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
 
 def _is_fatal_telegram_runtime_error(exc: Exception) -> bool:
     """Errors that should fail fast rather than trigger restart loops."""
-    return isinstance(exc, ValueError)
+    return isinstance(exc, (ValueError, _TelegramPollingConflictError))
 
 
 async def run_telegram_bot(config: OBSConfig) -> None:

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Conflict, TelegramError
 
 from obs_agent.events import StatusEvent
 from obs_agent.lineage import (
@@ -39,6 +39,7 @@ from obs_agent.telegram import (
     _RunOutcome,
     _TelegramMessageBinding,
     _clear_secondary_bot_commands,
+    _shutdown_telegram_runtime,
     create_reply_wake_schedule,
     create_telegram_app,
     _set_bot_commands,
@@ -6257,6 +6258,62 @@ class TestCreateTelegramApp:
         config.telegram_allowed_user_ids = [12345]
         app = create_telegram_app(config)
         assert app is not None
+
+    async def test_shutdown_stops_update_delivery_before_closing_state_store(self):
+        events: list[str] = []
+        updater = SimpleNamespace(
+            running=True,
+            stop=AsyncMock(side_effect=lambda: events.append("updater")),
+        )
+        app = SimpleNamespace(
+            updater=updater,
+            running=True,
+            stop=AsyncMock(side_effect=lambda: events.append("app")),
+            shutdown=AsyncMock(side_effect=lambda: events.append("app_shutdown")),
+        )
+        tg_bot = SimpleNamespace(shutdown=AsyncMock(side_effect=lambda: events.append("bot")))
+
+        await _shutdown_telegram_runtime(app=app, tg_bot=tg_bot)
+
+        assert events == ["updater", "app", "bot", "app_shutdown"]
+
+    async def test_polling_conflict_exits_runtime(self, config):
+        config.telegram_bot_token = "fake-token"
+        config.telegram_allowed_user_ids = [12345]
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        conflict = Conflict("terminated by other getUpdates request")
+
+        original_sleep = asyncio.sleep
+
+        async def fake_sleep(_seconds):
+            await original_sleep(0)
+
+        async def fake_start_polling(**kwargs):
+            kwargs["error_callback"](conflict)
+
+        app = SimpleNamespace(
+            bot=AsyncMock(),
+            bot_data={"obs_telegram_bot": bot},
+            running=True,
+            updater=SimpleNamespace(
+                running=True,
+                start_polling=AsyncMock(side_effect=fake_start_polling),
+                stop=AsyncMock(),
+            ),
+            initialize=AsyncMock(),
+            start=AsyncMock(),
+            stop=AsyncMock(),
+            shutdown=AsyncMock(),
+        )
+
+        with (
+            patch("obs_agent.telegram.create_telegram_app", return_value=app),
+            patch("obs_agent.telegram._clear_secondary_bot_commands", new_callable=AsyncMock),
+            patch("obs_agent.telegram._set_bot_commands", new_callable=AsyncMock),
+            patch("obs_agent.telegram.asyncio.sleep", side_effect=fake_sleep),
+        ):
+            with pytest.raises(RuntimeError, match="Telegram polling conflict"):
+                await run_telegram_bot(config)
 
     def test_registers_new_group_and_new_bot_handlers(self, config):
         config.telegram_bot_token = "fake-token"
