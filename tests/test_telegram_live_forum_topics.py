@@ -41,6 +41,11 @@ _SESSION_ID_RE = re.compile(
 _AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-f-]+)", re.IGNORECASE)
 _TOPIC_LINK_RE = re.compile(r"https://t\.me/c/\d+/(\d+)/(\d+)")
 _MESSAGE_LINK_RE = re.compile(r"https://t\.me/c/\d+/(?:\d+/)?\d+")
+_LINEAGE_FACT_RE = re.compile(
+    r"root_team_key=(?P<root_team_key>[^|\n]+)\|"
+    r"agent_name=(?P<agent_name>[^|\n]+)\|"
+    r"lineage_length=(?P<lineage_length>\d+)"
+)
 _CACHED_FORUM_CHAT_ID: int | None = None
 
 
@@ -319,6 +324,46 @@ async def _wait_for_report_with_sections(
         await asyncio.sleep(1.0)
 
 
+async def _query_session_lineage_fact(
+    harness: _LiveForumHarness,
+    *,
+    thread_id: int,
+    timeout: float = 240.0,
+) -> dict[str, str]:
+    baseline = await harness.platform.latest_bot_message_id(thread_id=thread_id)
+    token = f"LINEAGE-{uuid.uuid4().hex[:8]}"
+    await harness.platform.send(
+        (
+            "This is a deterministic lineage test. "
+            "Call session_lineage exactly once. "
+            f"Then reply with exactly {token}|root_team_key=<value>|agent_name=<value>|lineage_length=<value> "
+            "using the literal values returned by the tool. Do not explain or add other text."
+        ),
+        thread_id=thread_id,
+        require_done=False,
+        timeout=timeout,
+    )
+    deadline = asyncio.get_running_loop().time() + timeout + 120.0
+    while True:
+        recent = await harness.platform.get_recent_messages(thread_id=thread_id, limit=60)
+        for message in recent:
+            if message.message_id <= baseline or f"{token}|" not in message.text:
+                continue
+            match = _LINEAGE_FACT_RE.search(message.text)
+            if match:
+                return {
+                    "root_team_key": match.group("root_team_key").strip(),
+                    "agent_name": match.group("agent_name").strip(),
+                    "lineage_length": match.group("lineage_length").strip(),
+                }
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"Timed out waiting for parseable lineage fact after message {baseline}\n"
+                f"{harness.failure_context()}"
+            )
+        await asyncio.sleep(1.0)
+
+
 async def _send_and_wait_for_token(
     harness: _LiveForumHarness,
     *,
@@ -367,6 +412,7 @@ def _append_unread_inbox_message(
     content: str,
     summary: str,
     sender: str,
+    timestamp: str | None = None,
 ) -> None:
     inbox_path = Path.home() / ".claude" / "teams" / team_name / "inboxes" / f"{recipient}.json"
     inbox_path.parent.mkdir(parents=True, exist_ok=True)
@@ -383,7 +429,7 @@ def _append_unread_inbox_message(
             "from": sender,
             "text": content,
             "summary": summary,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "timestamp": timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "read": False,
         }
     )
@@ -2708,6 +2754,138 @@ class TestTelegramLiveForumTopics:
             timeout=240.0,
         )
         assert "agent task wake: teammate message received" in wake_message.text.lower(), (
+            live_tg_forum.failure_context()
+        )
+        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
+
+    @pytest.mark.telegram_special
+    async def test_live_idle_team_worker_ignores_pre_restart_polled_inbox(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        team_name = f"live-restart-team-{tag}"
+        worker_name = f"live-restart-worker-{tag[:4]}"
+        old_token = f"OLD-RESTART-WAKE-{tag}"
+        new_token = f"NEW-RESTART-WAKE-{tag}"
+        parent_thread_id = await live_tg_forum.platform.create_topic(f"Team Restart Wake {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic integration test. Reply with only RESTART-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"RESTART-PRIME-{tag}",
+            timeout=240.0,
+        )
+
+        launch_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic integration test for restart inbox wake filtering. "
+                "Use AgentTask exactly once with fork=false, "
+                f"team_name={team_name}, name={worker_name}, description RESTART-WORKER-{tag}, and prompt "
+                "'Call TeamCreate with team_name="
+                f"{team_name}. "
+                f"Then reply with only RESTART-IDLE-{tag}.' "
+                f"After launch, reply with only RESTART-LAUNCHED-{tag}."
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=180.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=launch_baseline,
+            token=f"RESTART-LAUNCHED-{tag}",
+            timeout=240.0,
+        )
+        launch_message = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=launch_baseline,
+            token="agent task launched",
+            timeout=240.0,
+        )
+        worker_thread_id, _ = _extract_topic_link(launch_message.text)
+        await asyncio.sleep(2.0)
+        await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+            token=f"RESTART-IDLE-{tag}",
+            timeout=420.0,
+        )
+        lineage = await _query_session_lineage_fact(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+        )
+        actual_team_name = lineage["root_team_key"]
+        actual_worker_name = lineage["agent_name"]
+
+        old_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=worker_thread_id)
+        _append_unread_inbox_message(
+            team_name=actual_team_name,
+            recipient=actual_worker_name,
+            content=old_token,
+            summary="pre-restart wake",
+            sender="external-live-test",
+        )
+        await asyncio.sleep(4.0)
+        old_wake = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+            after_message_id=old_baseline,
+            token="agent task wake: teammate message received",
+            timeout=240.0,
+        )
+        assert "agent task wake: teammate message received" in old_wake.text.lower(), (
+            live_tg_forum.failure_context()
+        )
+
+        _stop_bot(live_tg_forum.proc)
+        assert live_tg_forum.temp_root is not None
+        restart_cutoff = time.time()
+        _append_unread_inbox_message(
+            team_name=actual_team_name,
+            recipient=actual_worker_name,
+            content=f"{old_token}-AFTER-STOP",
+            summary="old after stop",
+            sender="external-live-test",
+            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(restart_cutoff - 5.0)),
+        )
+        live_tg_forum.proc, live_tg_forum.log_file = _start_bot(
+            live_tg_forum.vault_path,
+            live_tg_forum.temp_root,
+            state_db_path=live_tg_forum.state_db_path,
+        )
+        await asyncio.sleep(8.0)
+        recent_after_restart = await live_tg_forum.platform.get_recent_messages(
+            thread_id=worker_thread_id,
+            limit=20,
+        )
+        assert not any(
+            old_token in message.text and message.message_id > old_wake.message_id
+            for message in recent_after_restart
+        ), live_tg_forum.failure_context()
+
+        new_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=worker_thread_id)
+        _append_unread_inbox_message(
+            team_name=actual_team_name,
+            recipient=actual_worker_name,
+            content=new_token,
+            summary="post-restart wake",
+            sender="external-live-test",
+            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1.0)),
+        )
+        new_wake = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+            after_message_id=new_baseline,
+            token="agent task wake: teammate message received",
+            timeout=240.0,
+        )
+        assert "agent task wake: teammate message received" in new_wake.text.lower(), (
             live_tg_forum.failure_context()
         )
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()

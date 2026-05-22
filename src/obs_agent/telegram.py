@@ -663,9 +663,7 @@ class TelegramBot:
         self._route_inbox_targets: dict[tuple[str, str], TelegramRoute] = {}
         self._route_inbox_target_keys_by_route: dict[TelegramRoute, tuple[str, str]] = {}
         self._chat_titles: dict[int, str] = {}
-        # Dedup set for inbox wake polling — prevents re-triggering the same
-        # unread message every poll cycle.  Cleared on daemon restart (correct:
-        # you want to re-notify after restart) and when a NEW message arrives.
+        self._daemon_start_time = datetime.now(timezone.utc)
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
@@ -8004,6 +8002,12 @@ class TelegramBot:
             # Skip must_reply messages that have already been replied to —
             # otherwise the poller keeps nagging for them indefinitely.
             if item.get("must_reply") and item.get("replied"):
+                continue
+            try:
+                message_ts = self._parse_rfc3339_timestamp(item.get("timestamp"))
+            except (TypeError, ValueError):
+                message_ts = None
+            if message_ts is not None and message_ts < self._daemon_start_time.timestamp():
                 continue
             latest_unread = item
         if latest_unread is None:

@@ -807,7 +807,7 @@ class TestBackgroundPoller:
                         "from": "worker-b",
                         "text": "poll wake message",
                         "summary": "handoff",
-                        "timestamp": "2026-03-13T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                         "read": False,
                     }
                 ],
@@ -5123,7 +5123,7 @@ class TestForkTaskRuntime:
                         "from": "worker-b",
                         "text": "process item 8",
                         "summary": "handoff",
-                        "timestamp": "2026-03-13T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                         "read": False,
                     }
                 ],
@@ -5149,6 +5149,91 @@ class TestForkTaskRuntime:
         assert "Latest summary: handoff." in queued.text
         assert "Latest content preview: process item 8" in queued.text
         assert record.wake_requested is False
+        await bot.shutdown()
+
+    async def test_poll_team_worker_inbox_skips_messages_from_before_daemon_start(
+        self,
+        config,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        bot._daemon_start_time = datetime(2026, 3, 13, 0, 0, 0, tzinfo=timezone.utc)
+        child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        child_state = bot._get_state(child_route, topic_title="Worker Topic")
+        assert child_state is not None
+        record = _ForkTaskRecord(
+            task_id="task-team",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=child_route,
+            child_session_id="sid-child",
+            prompt="Old prompt",
+            description="Team Worker",
+            team_name="team-alpha",
+            agent_name="worker-a",
+            is_fork=False,
+            status="launched",
+        )
+        bot._fork_tasks_by_id["task-team"] = record
+        bot._fork_task_by_child_route[child_route] = "task-team"
+        bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "from": "worker-b",
+                        "text": "old restart message",
+                        "summary": "old-handoff",
+                        "timestamp": "2026-03-12T23:59:59Z",
+                        "read": False,
+                    }
+                ],
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(bot, "_handle_inbox_message_notification", new_callable=AsyncMock) as notify_mock:
+            await bot._poll_team_worker_inbox_wakes()
+
+        notify_mock.assert_not_awaited()
+        assert bot._notified_inbox_keys == set()
+
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "from": "worker-b",
+                        "text": "old restart message",
+                        "summary": "old-handoff",
+                        "timestamp": "2026-03-12T23:59:59Z",
+                        "read": False,
+                    },
+                    {
+                        "from": "worker-b",
+                        "text": "new post-restart message",
+                        "summary": "new-handoff",
+                        "timestamp": "2026-03-13T00:00:01Z",
+                        "read": False,
+                    },
+                ],
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(bot, "_handle_inbox_message_notification", new_callable=AsyncMock) as notify_mock:
+            await bot._poll_team_worker_inbox_wakes()
+
+        notify_mock.assert_awaited_once()
+        payload = notify_mock.await_args.kwargs["payload"]
+        assert payload["content"] == "new post-restart message"
+        assert payload["summary"] == "new-handoff"
         await bot.shutdown()
 
     async def test_poll_team_worker_inbox_keeps_team_scopes_separate(
@@ -5218,7 +5303,7 @@ class TestForkTaskRuntime:
                         "from": "worker-peer",
                         "text": "team-beta message",
                         "summary": "beta-summary",
-                        "timestamp": "2026-03-13T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                         "read": False,
                     }
                 ],
@@ -5329,7 +5414,7 @@ class TestForkTaskRuntime:
                         "from": "worker-peer",
                         "text": "poll wake payload",
                         "summary": "poll-handoff",
-                        "timestamp": "2026-03-14T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                         "read": False,
                     }
                 ],
