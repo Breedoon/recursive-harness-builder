@@ -868,6 +868,97 @@ class TestTelegramLiveForumTopics:
         assert context_messages, live_tg_forum.failure_context()
         assert all(" / " not in text for text in context_messages), live_tg_forum.failure_context()
 
+    @pytest.mark.telegram_special
+    async def test_live_new_removes_schedule_for_topic_only(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        reset_thread_id = await live_tg_forum.platform.create_topic(f"New Reset {tag}")
+        other_thread_id = await live_tg_forum.platform.create_topic(f"New Other {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic integration test. Reply with only NEW-RESET-PRIME-{tag}.",
+            thread_id=reset_thread_id,
+            token=f"NEW-RESET-PRIME-{tag}",
+            timeout=240.0,
+        )
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic integration test. Reply with only NEW-OTHER-PRIME-{tag}.",
+            thread_id=other_thread_id,
+            token=f"NEW-OTHER-PRIME-{tag}",
+            timeout=240.0,
+        )
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic integration test for /new reset. "
+                "Call CronCreate exactly once with schedule_mode=interval, interval_seconds=3600, "
+                f"prompt='reset schedule {tag}', description='reset schedule {tag}', max_runs=5, inherit=none. "
+                f"Then reply with only RESET-SCHEDULE-CREATED-{tag}."
+            ),
+            thread_id=reset_thread_id,
+            token=f"RESET-SCHEDULE-CREATED-{tag}",
+            timeout=240.0,
+        )
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic integration test for /new reset isolation. "
+                "Call CronCreate exactly once with schedule_mode=interval, interval_seconds=3600, "
+                f"prompt='other schedule {tag}', description='other schedule {tag}', max_runs=5, inherit=none. "
+                f"Then reply with only OTHER-SCHEDULE-CREATED-{tag}."
+            ),
+            thread_id=other_thread_id,
+            token=f"OTHER-SCHEDULE-CREATED-{tag}",
+            timeout=240.0,
+        )
+
+        baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=reset_thread_id)
+        await live_tg_forum.platform.send_control(
+            f"/new@{live_tg_forum.bot_username} Fresh Reset {tag}",
+            thread_id=reset_thread_id,
+            timeout=45.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=reset_thread_id,
+            after_message_id=baseline,
+            token="new trunk session created",
+            timeout=120.0,
+        )
+
+        schedule_after_reset = await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic integration test after /new. "
+                "Call CronList exactly once. If it returns no schedules, reply with only RESET-SCHEDULES-GONE-"
+                f"{tag}; otherwise reply with RESET-SCHEDULES-REMAIN-{tag}."
+            ),
+            thread_id=reset_thread_id,
+            token=f"RESET-SCHEDULES-GONE-{tag}",
+            timeout=240.0,
+        )
+        assert f"RESET-SCHEDULES-GONE-{tag}" in schedule_after_reset.text, live_tg_forum.failure_context()
+
+        other_schedule = await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic integration test for topic isolation. "
+                "Call CronList exactly once. If at least one schedule exists, reply with only OTHER-SCHEDULE-KEPT-"
+                f"{tag}; otherwise reply with OTHER-SCHEDULE-MISSING-{tag}."
+            ),
+            thread_id=other_thread_id,
+            token=f"OTHER-SCHEDULE-KEPT-{tag}",
+            timeout=240.0,
+        )
+        assert f"OTHER-SCHEDULE-KEPT-{tag}" in other_schedule.text, live_tg_forum.failure_context()
+        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
+
     @pytest.mark.telegram_core_smoke
     async def test_live_general_and_topic_routes_are_isolated(
         self,

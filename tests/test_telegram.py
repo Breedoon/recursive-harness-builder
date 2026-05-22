@@ -2903,6 +2903,83 @@ class TestCommands:
             == "<u><i>new trunk session created: ⚡ Fresh Start</i></u>"
         )
 
+    async def test_new_clears_route_hooks_model_override_and_schedules(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        other_route = TelegramRoute(chat_id=67890, thread_id=654)
+        state = bot._get_state(route, topic_title="Old Topic")
+        assert state is not None
+        other_state = bot._get_state(other_route, topic_title="Other Topic")
+        assert other_state is not None
+        state.session_manager.user_hooks = {"PreToolUse": "guards/check.py::validate"}
+        state.session_manager.model_override = "gpt-5.5"
+        state.topic_icon_custom_emoji_id = "emoji-old"
+        bot._set_topic_metadata(route=route, title="Old Topic", icon_custom_emoji_id="emoji-old")
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Old Topic",),
+            origin="trunk_start",
+            is_fork=False,
+        )
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="old-topic-schedule",
+                route=route,
+                description="old topic schedule",
+                schedule_mode="interval",
+                cron_expr=None,
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="old prompt",
+            )
+        )
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="other-topic-schedule",
+                route=other_route,
+                description="other topic schedule",
+                schedule_mode="interval",
+                cron_expr=None,
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="other prompt",
+            )
+        )
+
+        update = _make_update("/new Fresh Start", thread_id=321)
+        ctx = _make_context()
+        ctx.args = ["Fresh", "Start"]
+        ctx.bot.edit_forum_topic = AsyncMock(return_value=True)
+
+        with (
+            patch.object(state.session_manager, "async_reset", new_callable=AsyncMock) as mock_reset,
+            patch.object(
+                bot,
+                "_resolve_new_topic_visibility",
+                AsyncMock(return_value=("Fresh Start", None, None)),
+            ),
+        ):
+            await bot.handle_new(update, ctx)
+
+        mock_reset.assert_called_once()
+        assert state.session_manager.user_hooks is None
+        assert state.session_manager.model_override is None
+        assert "old-topic-schedule" not in bot._topic_schedules_by_id
+        assert route not in bot._schedule_ids_by_route
+        assert bot._topic_schedules_by_id["other-topic-schedule"].route == other_route
+        assert bot._schedule_ids_by_route[other_route] == {"other-topic-schedule"}
+
+        snapshot = bot._state_store.load_snapshot()
+        assert all(schedule.schedule_id != "old-topic-schedule" for schedule in snapshot.topic_schedules)
+        assert any(schedule.schedule_id == "other-topic-schedule" for schedule in snapshot.topic_schedules)
+        persisted_state = next(
+            entry
+            for entry in snapshot.route_states
+            if entry.chat_id == route.chat_id and entry.thread_id == route.thread_id
+        )
+        assert persisted_state.model_override is None
+        assert persisted_state.user_hooks_json is None
+
     async def test_new_visibility_uses_requested_valid_emoji_and_name(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=321)

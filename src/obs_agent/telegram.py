@@ -5512,6 +5512,9 @@ class TelegramBot:
         lock = self._get_route_lock(state.route)
         async with lock:
             self._remove_route_inbox_target(state.route)
+            self._delete_topic_schedules_for_route(state.route)
+            state.session_manager.user_hooks = None
+            state.session_manager.model_override = None
             state.agent_lineage = None
             state.pending_obs_bootstrap = None
             await self._reset_route_state(state)
