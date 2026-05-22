@@ -209,10 +209,11 @@ def _format_compact_tokens(value: int) -> str:
 
 
 def format_context_snapshot_compact(snapshot: dict[str, Any]) -> str:
-    """Render the minimal `context: used / window` Telegram summary."""
+    """Render the minimal Telegram completion context summary."""
     used = max(0, int(snapshot.get("estimated_context_used_tokens", 0) or 0))
-    window = max(0, int(snapshot.get("estimated_context_window_tokens", 0) or 0))
-    return f"context: {_format_compact_tokens(used)} / {_format_compact_tokens(window)}"
+    if used == 0:
+        return "context: context unavailable"
+    return f"context: {_format_compact_tokens(used)}"
 
 
 def apply_context_probe(

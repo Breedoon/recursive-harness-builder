@@ -844,6 +844,30 @@ def test_build_bot_env_preserves_anthropic_env_for_non_claude_model(
 @pytest.mark.integration
 @pytest.mark.telegram
 class TestTelegramLiveForumTopics:
+    @pytest.mark.telegram_special
+    async def test_live_completion_summary_omits_context_window_suffix(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
+        trace = await live_tg_forum.platform.send(
+            f"This is a deterministic integration test. Reply with only CTX-SUMMARY-{tag}.",
+            timeout=180.0,
+            require_done=True,
+        )
+
+        assert f"CTX-SUMMARY-{tag}" in trace.output, live_tg_forum.failure_context()
+        recent = await live_tg_forum.platform.get_recent_messages(thread_id=None, limit=40)
+        context_messages = [
+            message.text
+            for message in recent
+            if message.message_id > baseline and "context:" in message.text
+        ]
+        assert context_messages, live_tg_forum.failure_context()
+        assert all(" / " not in text for text in context_messages), live_tg_forum.failure_context()
+
     @pytest.mark.telegram_core_smoke
     async def test_live_general_and_topic_routes_are_isolated(
         self,

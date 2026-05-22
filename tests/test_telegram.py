@@ -431,7 +431,7 @@ class TestTelegramMessageFlow:
         assert calls[2]["disable_notification"] is True
         assert "<i>Read: CLAUDE.md</i>" in calls[2]["text"]
         assert "Hello from tool run" in calls[2]["text"]
-        assert calls[3]["text"] == "<u><i>context: 0 / 1m</i></u>"
+        assert calls[3]["text"] == "<u><i>context: context unavailable</i></u>"
         assert calls[3]["disable_notification"] is False
 
     async def test_thinking_content_is_rendered_verbatim(self, config):
@@ -552,7 +552,7 @@ class TestTelegramMessageFlow:
         assert calls[1] == "<u><i>working</i></u>"
         assert "turn one" in calls[2]
         assert "turn two" in calls[3]
-        assert calls[4] == "<u><i>context: 0 / 1m</i></u>"
+        assert calls[4] == "<u><i>context: context unavailable</i></u>"
 
     async def test_completion_summary_omits_username_when_configured(self, config):
         config.telegram_notify_username = "breedoon"
@@ -574,7 +574,7 @@ class TestTelegramMessageFlow:
             await bot.handle_message(update, ctx)
 
         calls = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
-        assert calls[-1] == "<u><i>context: 0 / 1m</i></u>"
+        assert calls[-1] == "<u><i>context: context unavailable</i></u>"
 
     async def test_attachment_receipt_is_sent_before_normalization(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -1238,6 +1238,36 @@ class TestBackgroundPoller:
         summary_texts = [str(call.kwargs.get("text", "")) for call in mock_send_system.await_args_list]
         assert any("interrupted" in text and "context:" in text for text in summary_texts)
         assert all("queued messages discarded" not in text for text in summary_texts)
+
+    async def test_run_and_send_completion_summary_reports_unavailable_for_zero_context(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=604))
+
+        with (
+            patch("obs_agent.telegram.ConversationRunner") as mock_runner,
+            patch.object(bot, "_send_system_message", new_callable=AsyncMock) as mock_send_system,
+        ):
+            mock_send_system.return_value = MagicMock(message_id=904)
+            instance = mock_runner.return_value
+            instance.remaining_pending = []
+
+            async def mock_run(msg):
+                _ = msg
+                yield DoneEvent()
+
+            instance.run = mock_run
+            await bot._run_and_send(
+                state=state,
+                user_text="hello",
+                bot=fake_bot,
+            )
+
+        summary_texts = [str(call.kwargs.get("text", "")) for call in mock_send_system.await_args_list]
+        assert any("context: context unavailable" in text for text in summary_texts)
+        assert all("context: 0" not in text and " / 1m" not in text for text in summary_texts)
 
     async def test_route_warning_is_deprecated(self, config):
         config.telegram_notify_username = "breedoon"
@@ -7069,7 +7099,7 @@ class TestTelegramErrorHandling:
 
             texts = [c.kwargs.get("text", "") for c in ctx.bot.send_message.call_args_list]
             assert any("FINAL_MARKER" in t for t in texts)
-            assert texts[-1] == "<u><i>context: 0 / 1m</i></u>"
+            assert texts[-1] == "<u><i>context: context unavailable</i></u>"
 
 
 class TestTelegramStatePersistence:

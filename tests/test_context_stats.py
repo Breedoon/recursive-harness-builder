@@ -132,7 +132,15 @@ def test_format_context_snapshot_compact_rounds_for_telegram() -> None:
         "estimated_context_used_tokens": 24_825,
         "estimated_context_window_tokens": 200_000,
     }
-    assert format_context_snapshot_compact(snapshot) == "context: 24k / 200k"
+    assert format_context_snapshot_compact(snapshot) == "context: 24k"
+
+
+def test_format_context_snapshot_compact_shows_unavailable_for_zero_context() -> None:
+    snapshot = {
+        "estimated_context_used_tokens": 0,
+        "estimated_context_window_tokens": 1_000_000,
+    }
+    assert format_context_snapshot_compact(snapshot) == "context: context unavailable"
 
 
 def test_build_context_snapshot_prefers_jsonl_triplet_for_context_estimate(tmp_path: Path) -> None:
