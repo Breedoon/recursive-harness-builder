@@ -1191,14 +1191,6 @@ def create_obs_tools(
                     "type": "string",
                     "description": "Optional sender label; defaults to the current agent name.",
                 },
-                "needs_reply": {
-                    "type": "boolean",
-                    "description": "Set true only when the message asks a question or makes a request that needs a reply.",
-                },
-                "must_reply": {
-                    "type": "boolean",
-                    "description": "Deprecated alias for needs_reply.",
-                },
             },
             "required": ["recipient", "content"],
             "additionalProperties": False,
