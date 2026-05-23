@@ -4126,6 +4126,48 @@ class TestTopicCommands:
         assert parent_agent_name in member_names
         assert child_agent_name in member_names
 
+    async def test_fork_command_primes_child_before_route_activation_yields(self, config, tmp_path, monkeypatch):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.topic_title = "Root"
+        state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(state)
+        bot._session_heads["sid-root"] = "head-uuid"
+        bot._record_message_binding(
+            route=state.route,
+            message_id=55,
+            jsonl_uuid="head-uuid",
+            session_id="sid-root",
+            role="assistant",
+        )
+
+        update = _make_update("/fork Child", message_id=77)
+        ctx = _make_context()
+        ctx.args = ["Child"]
+        ctx.bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=321))
+        ctx.bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=900), MagicMock(message_id=901), MagicMock(message_id=902)]
+        )
+        original_activate = bot._activate_route_session
+        observed: dict[str, object] = {}
+
+        async def observe_activation(child_state, session_id):
+            observed["lineage"] = child_state.agent_lineage
+            observed["bootstrap"] = child_state.pending_obs_bootstrap
+            observed["projection"] = bot._state_inbox_projection(child_state)
+            await original_activate(child_state, session_id)
+
+        with patch.object(bot, "_activate_route_session", side_effect=observe_activation):
+            with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-child"):
+                await bot.handle_fork(update, ctx)
+
+        team_name, agent_name = observed["projection"]
+        assert observed["lineage"] == ("Root", "Child")
+        assert team_name == root_team_key_for_lineage(("Root", "Child"))
+        assert agent_name == agent_name_for_lineage(("Root", "Child"))
+        assert "<is_fork>true</is_fork>" in observed["bootstrap"]
+
     async def test_fork_command_preserves_existing_parent_inbox_projection(self, config, tmp_path, monkeypatch):
         monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)

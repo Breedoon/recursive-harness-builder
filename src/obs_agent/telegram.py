@@ -7534,6 +7534,18 @@ class TelegramBot:
                             f"Agent name collision: '{agent_name}' already exists in team '{team_name}'. "
                             f"Choose a different name for this child agent."
                         )
+        if child_lineage is not None:
+            self._prime_obs_bootstrap(
+                child_state,
+                lineage=child_lineage,
+                origin=lineage_origin or ("user_fork" if is_fork else "agent_task_fresh"),
+                is_fork=is_fork,
+                parent_session_id=source_session_id,
+                team_name=team_name,
+                agent_name=agent_name,
+                parent_agent_name_override=parent_agent_name,
+                session_id=child_session_id or None,
+            )
         # Clear dropped key if name is being reused (respawn)
         await self._activate_route_session(child_state, child_session_id or None)
         team_env = self._build_team_worker_env(
