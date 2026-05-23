@@ -438,8 +438,15 @@ class ConversationRunner:
             except Exception as retry_exc:
                 if not _is_recoverable(retry_exc):
                     raise
+                if self._session_mgr.session_id is not None:
+                    logger.error(
+                        "Reconnect on get_client also failed; preserving session instead of starting fresh: %s",
+                        retry_exc,
+                    )
+                    await self._session_mgr.soft_reset()
+                    raise retry_exc from None
                 logger.warning(
-                    "Reconnect on get_client also failed, dropping session and starting fresh: %s",
+                    "Reconnect on get_client also failed before session creation; starting fresh: %s",
                     retry_exc,
                 )
                 await self._session_mgr.async_reset()

@@ -654,7 +654,33 @@ class TestRunnerReconnectOnStreamError:
 class TestRunnerGetClientRecovery:
     @patch("obs_agent.session.SessionManager.async_reset")
     @patch("obs_agent.session.SessionManager.get_client")
-    async def test_second_recoverable_get_client_failure_drops_session_and_starts_fresh(
+    async def test_second_recoverable_get_client_failure_preserves_existing_session(
+        self, mock_get_client, mock_async_reset, config
+    ):
+        failing = CLIJSONDecodeError("big json", ValueError("too big"))
+        mock_get_client.side_effect = [failing, failing]
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr.set_session_id("sess-existing")
+        with (
+            patch.object(session_mgr, "disconnect", new_callable=AsyncMock) as mock_disconnect,
+            patch.object(session_mgr, "soft_reset", new_callable=AsyncMock) as mock_soft_reset,
+        ):
+            runner = ConversationRunner(session_mgr, hook_state, config)
+            with pytest.raises(CLIJSONDecodeError, match="big json"):
+                await _collect_events(runner, "hello")
+
+        assert session_mgr.session_id == "sess-existing"
+        mock_disconnect.assert_awaited_once()
+        mock_soft_reset.assert_awaited_once()
+        mock_async_reset.assert_not_awaited()
+
+    @patch("obs_agent.session.SessionManager.async_reset")
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_second_recoverable_get_client_failure_before_session_starts_fresh(
         self, mock_get_client, mock_async_reset, config
     ):
         failing = CLIJSONDecodeError("big json", ValueError("too big"))
