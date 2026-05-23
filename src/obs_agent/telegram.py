@@ -2056,6 +2056,7 @@ class TelegramBot:
         hook_state.user_message_sender = self._make_user_message_sender(route)
         hook_state.user_prompt_sender = self._make_user_prompt_sender(route)
         hook_state.user_command_reader = self._make_user_command_reader(route)
+        hook_state.team_status_provider = self._make_team_status_provider(route)
         hook_state.context_snapshot_provider = self._make_context_snapshot_provider(route)
         hook_state.vault_path = self._config.vault_path
         return state
@@ -2168,6 +2169,43 @@ class TelegramBot:
             self._schedule_stop_events.put_nowait((route, payload))
 
         return _notify
+
+    def _make_team_status_provider(self, route: TelegramRoute):
+        async def _status(payload: dict[str, Any]) -> dict[str, Any] | None:
+            _ = route
+            team_name = str(payload.get("team_name") or "").strip()
+            agent_name = str(payload.get("agent_name") or "").strip()
+            if not team_name or not agent_name:
+                return None
+            record = self._resolve_team_worker_record(
+                team_name=team_name,
+                agent_name=agent_name,
+            )
+            state = None
+            if record is not None:
+                state = self._get_state(record.child_route, create=False)
+            if state is None:
+                state = self._resolve_route_inbox_target(
+                    team_name=team_name,
+                    agent_name=agent_name,
+                )
+            status_payload: dict[str, Any] = {}
+            if record is not None:
+                status_payload["status"] = "running" if self._is_fork_task_running(record) else record.status
+                status_payload["idle_ready"] = record.idle_ready
+                status_payload["created_at"] = record.created_at
+                if record.completed_at is not None:
+                    status_payload["completed_at"] = record.completed_at
+            if state is not None:
+                status_payload["running"] = bool(state.busy or state.hook_state.execution_active)
+                status_payload["model"] = state.session_manager.model_override or self._config.model
+                if state.session_manager.last_activity is not None:
+                    status_payload["last_active_at"] = state.session_manager.last_activity
+            elif "running" not in status_payload:
+                status_payload["running"] = False
+            return status_payload
+
+        return _status
 
     def _make_user_message_sender(self, route: TelegramRoute):
         async def _send(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3617,8 +3655,14 @@ class TelegramBot:
                 "parent_agent_name",
                 "parent_display_name",
                 "root_team_key",
+                "model",
+                "status",
             ):
                 value = obs.get(text_key)
+                if isinstance(value, str) and value.strip():
+                    entry[text_key] = value.strip()
+            for text_key in ("agentType", "agent_type", "model", "status"):
+                value = member.get(text_key)
                 if isinstance(value, str) and value.strip():
                     entry[text_key] = value.strip()
             lineage = obs.get("lineage")
@@ -3633,10 +3677,27 @@ class TelegramBot:
                     entry["lineage_length"] = len(normalized_lineage)
             if isinstance(obs.get("lineage_length"), int):
                 entry["lineage_length"] = int(obs["lineage_length"])
-            for int_key in ("topic_chat_id", "topic_thread_id", "updated_at"):
+            for int_key in ("topic_chat_id", "topic_thread_id"):
                 value = obs.get(int_key)
                 if isinstance(value, int):
                     entry[int_key] = value
+            for activity_key in (
+                "last_active_at",
+                "last_activity_at",
+                "completed_at",
+                "created_at",
+                "updated_at",
+                "joinedAt",
+                "joined_at",
+            ):
+                for source in (obs, member):
+                    value = source.get(activity_key)
+                    if isinstance(value, bool):
+                        continue
+                    if isinstance(value, (int, float)):
+                        entry[activity_key] = value
+                    elif isinstance(value, str) and value.strip():
+                        entry[activity_key] = value.strip()
             metadata[agent_name] = entry
         return metadata
 
@@ -5379,26 +5440,73 @@ class TelegramBot:
                 lineage = entry.get("lineage")
                 if isinstance(lineage, list):
                     entry["lineage_length"] = len(lineage)
+            record = self._resolve_team_worker_record(team_name=team_name, agent_name=agent_name)
+            state = None
+            if record is not None:
+                state = self._get_state(record.child_route, create=False)
+                entry["status"] = "running" if self._is_fork_task_running(record) else record.status
+                entry["idle_ready"] = record.idle_ready
+                entry["created_at"] = record.created_at
+                if record.completed_at is not None:
+                    entry["completed_at"] = record.completed_at
+            if state is None:
+                state = self._resolve_route_inbox_target(team_name=team_name, agent_name=agent_name)
+            if state is not None:
+                entry["running"] = bool(state.busy or state.hook_state.execution_active)
+                entry["model"] = state.session_manager.model_override or self._config.model
+                if state.session_manager.last_activity is not None:
+                    entry["last_active_at"] = state.session_manager.last_activity
+            else:
+                entry.setdefault("running", False)
         return members
 
     def _member_activity_sort_key(self, member: dict[str, Any], agent_name: str) -> tuple[float, str]:
-        candidates = [
+        timestamp = self._member_activity_timestamp(member)
+        if timestamp is None:
+            return (0.0, str(agent_name))
+        return (-timestamp, str(agent_name))
+
+    @staticmethod
+    def _coerce_tree_limit(value: str | None) -> int:
+        if value is None or not value.strip():
+            return 50
+        try:
+            limit = int(value.strip())
+        except ValueError:
+            return 50
+        if limit < 1:
+            return 1
+        return min(limit, 200)
+
+    @staticmethod
+    def _coerce_activity_timestamp(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            return timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed.timestamp()
+        return None
+
+    def _member_activity_timestamp(self, member: dict[str, Any]) -> float | None:
+        for candidate in (
             member.get("last_active_at"),
             member.get("last_activity_at"),
             member.get("completed_at"),
             member.get("created_at"),
             member.get("updated_at"),
-        ]
-        for candidate in candidates:
-            if isinstance(candidate, (int, float)):
-                return (-float(candidate), str(agent_name))
-            if isinstance(candidate, str) and candidate.strip():
-                try:
-                    parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                return (-parsed.timestamp(), str(agent_name))
-        return (0.0, str(agent_name))
+            member.get("joinedAt"),
+            member.get("joined_at"),
+        ):
+            timestamp = self._coerce_activity_timestamp(candidate)
+            if timestamp is not None:
+                return timestamp
+        return None
 
     def _render_tree_html(
         self,
@@ -5408,6 +5516,7 @@ class TelegramBot:
         current_lineage: tuple[str, ...],
         members: dict[str, dict[str, Any]],
         mode: str,
+        limit: int = 50,
     ) -> str:
         if mode == "ancestors":
             allowed = {
@@ -5465,8 +5574,20 @@ class TelegramBot:
                     label = f'<a href="{html.escape(link, quote=True)}">{label}</a>'
             if bold:
                 label = f"<b>{label}</b>"
+            metadata_bits: list[str] = []
+            status = str(member.get("status") or "").strip()
+            running = member.get("running")
+            if running is True and status != "running":
+                metadata_bits.append("running")
+            elif status:
+                metadata_bits.append(status)
+            model = str(member.get("model") or "").strip()
+            if model:
+                metadata_bits.append(model)
             if agent_name == current_agent_name:
                 label = f"{label} (current)"
+            if metadata_bits and not bold:
+                label = f"{label} [{' / '.join(html.escape(bit) for bit in metadata_bits)}]"
             return label
 
         if mode == "ancestors":
@@ -5500,16 +5621,27 @@ class TelegramBot:
 
         lines: list[str] = []
 
-        def _walk(agent_name: str, depth: int) -> None:
+        rendered_count = 0
+        omitted_count = 0
+
+        def _walk(agent_name: str, depth: int, limit: int) -> None:
+            nonlocal rendered_count, omitted_count
+            if rendered_count >= limit:
+                omitted_count += 1
+                return
             indent = "\u00A0" * (4 * depth)
             lines.append(
                 f"{indent}- {_label_html(agent_name, allow_link=agent_name != current_agent_name)}"
             )
+            rendered_count += 1
             for child_name in children_by_parent.get(agent_name, []):
-                _walk(child_name, depth + 1)
+                _walk(child_name, depth + 1, limit)
 
         for root_name in body_roots:
-            _walk(root_name, 0)
+            _walk(root_name, 0, limit)
+
+        if omitted_count:
+            lines.append(f"... {omitted_count} more agents omitted; use a narrower tree command")
 
         header = _label_html(
             header_agent_name,
@@ -5554,12 +5686,14 @@ class TelegramBot:
             current_lineage=current_lineage,
             current_route=route,
         )
+        limit_arg = context.args[0] if context.args else None
         html_text = self._render_tree_html(
             team_name=team_name,
             current_agent_name=current_agent_name,
             current_lineage=current_lineage,
             members=members,
             mode=mode,
+            limit=self._coerce_tree_limit(limit_arg),
         )
         if not html_text:
             await self._send_system_message(

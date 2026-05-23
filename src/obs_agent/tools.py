@@ -117,24 +117,70 @@ def _transport_unavailable(tool_name: str) -> dict:
     )
 
 
-def _member_activity_sort_key(member: dict[str, Any], agent_name: str) -> tuple[float, str]:
-    candidates = [
+def _coerce_activity_timestamp(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        return timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.timestamp()
+    return None
+
+
+def _member_activity_timestamp(member: dict[str, Any]) -> float | None:
+    for candidate in (
         member.get("last_active_at"),
         member.get("last_activity_at"),
         member.get("completed_at"),
         member.get("created_at"),
         member.get("updated_at"),
-    ]
-    for candidate in candidates:
-        if isinstance(candidate, (int, float)):
-            return (-float(candidate), str(agent_name))
-        if isinstance(candidate, str) and candidate.strip():
-            try:
-                parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            return (-parsed.timestamp(), str(agent_name))
-    return (0.0, str(agent_name))
+        member.get("joinedAt"),
+        member.get("joined_at"),
+    ):
+        timestamp = _coerce_activity_timestamp(candidate)
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def _member_activity_sort_key(member: dict[str, Any], agent_name: str) -> tuple[float, str]:
+    timestamp = _member_activity_timestamp(member)
+    if timestamp is None:
+        return (0.0, str(agent_name))
+    return (-timestamp, str(agent_name))
+
+
+def _coerce_limit_arg(value: object, *, default: int = 50, maximum: int = 200) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ValueError("limit must be an integer")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    return min(limit, maximum)
+
+
+def _copy_text_value(target: dict[str, Any], source: dict[str, Any], key: str) -> None:
+    value = source.get(key)
+    if isinstance(value, str) and value.strip():
+        target[key] = value.strip()
+
+
+def _copy_numeric_value(target: dict[str, Any], source: dict[str, Any], key: str) -> None:
+    value = source.get(key)
+    if isinstance(value, bool):
+        return
+    if isinstance(value, (int, float)):
+        target[key] = value
 
 
 def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
@@ -160,15 +206,17 @@ def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
         if not isinstance(obs, dict):
             continue
         entry: dict[str, Any] = {"agent_name": agent_name}
-        display_name = obs.get("display_name")
-        if isinstance(display_name, str) and display_name.strip():
-            entry["display_name"] = display_name.strip()
-        parent_agent_name = obs.get("parent_agent_name")
-        if isinstance(parent_agent_name, str) and parent_agent_name.strip():
-            entry["parent_agent_name"] = parent_agent_name.strip()
-        parent_display_name = obs.get("parent_display_name")
-        if isinstance(parent_display_name, str) and parent_display_name.strip():
-            entry["parent_display_name"] = parent_display_name.strip()
+        for text_key in (
+            "display_name",
+            "parent_agent_name",
+            "parent_display_name",
+            "root_team_key",
+        ):
+            _copy_text_value(entry, obs, text_key)
+        for member_text_key in ("agentType", "agent_type", "model", "status"):
+            _copy_text_value(entry, member, member_text_key)
+        for obs_text_key in ("model", "status"):
+            _copy_text_value(entry, obs, obs_text_key)
         lineage = obs.get("lineage")
         if isinstance(lineage, list):
             normalized_lineage = [
@@ -179,6 +227,25 @@ def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
             if normalized_lineage:
                 entry["lineage"] = normalized_lineage
                 entry["lineage_length"] = len(normalized_lineage)
+        if isinstance(obs.get("lineage_length"), int):
+            entry["lineage_length"] = int(obs["lineage_length"])
+        for int_key in ("topic_chat_id", "topic_thread_id"):
+            value = obs.get(int_key)
+            if isinstance(value, int):
+                entry[int_key] = value
+        for activity_key in (
+            "last_active_at",
+            "last_activity_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+            "joinedAt",
+            "joined_at",
+        ):
+            _copy_numeric_value(entry, obs, activity_key)
+            _copy_numeric_value(entry, member, activity_key)
+            _copy_text_value(entry, obs, activity_key)
+            _copy_text_value(entry, member, activity_key)
         metadata[agent_name] = entry
     return metadata
 
@@ -1307,6 +1374,14 @@ def create_obs_tools(
                 "type": "string",
                 "description": "One of: parent, children, siblings, ancestors, descendants, family, tree",
             },
+            "team_name": {
+                "type": "string",
+                "description": "Optional team name to inspect; defaults to the current root team.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of agents returned for list outputs. Defaults to 50, maximum 200.",
+            },
         },
     )
     async def search_team(args: dict) -> dict:
@@ -1315,6 +1390,10 @@ def create_obs_tools(
             mode = "family"
         if mode == "tree_children":
             mode = "children"
+        try:
+            limit = _coerce_limit_arg(args.get("limit"))
+        except ValueError as exc:
+            return _error_result(f"search_team: {exc}")
         if mode not in {"children", "siblings", "parent", "ancestors", "descendants", "family", "tree"}:
             return _error_result(
                 "search_team: 'mode' must be one of: parent, children, siblings, ancestors, descendants, family, tree, tree_children"
@@ -1327,18 +1406,14 @@ def create_obs_tools(
         if not bootstrap.lineage:
             return _error_result("Cannot use search_team: empty lineage")
 
-        inboxes_dir = (
-            Path.home()
-            / ".claude"
-            / "teams"
-            / bootstrap.root_team_key
-            / "inboxes"
-        )
-        team_projection_metadata = _load_team_projection_metadata(bootstrap.root_team_key)
+        team_name = str(args.get("team_name") or "").strip() or bootstrap.root_team_key
+        inboxes_dir = Path.home() / ".claude" / "teams" / team_name / "inboxes"
+        team_projection_metadata = _load_team_projection_metadata(team_name)
         result: dict[str, Any] = {
             "mode": mode,
-            "team_name": bootstrap.root_team_key,
+            "team_name": team_name,
             "current_agent": bootstrap.agent_name,
+            "limit": limit,
         }
         all_agents = []
         if inboxes_dir.is_dir():
@@ -1360,25 +1435,45 @@ def create_obs_tools(
                 ),
             )
 
+        def _limited(names: list[str]) -> list[str]:
+            return names[:limit]
+
+        async def _augment_runtime_status(details: dict[str, Any]) -> None:
+            provider = hook_state.team_status_provider if hook_state is not None else None
+            if provider is None:
+                return
+            try:
+                status_payload = await provider(
+                    {"team_name": team_name, "agent_name": details.get("agent_name")}
+                )
+            except Exception:
+                logger.warning("Failed resolving team runtime status", exc_info=True)
+                return
+            if not isinstance(status_payload, dict):
+                return
+            for key, value in status_payload.items():
+                if value is not None:
+                    details[key] = value
+
         children = _sort_member_names([
             name for name in all_agents
             if name.startswith(f"{my_hash}-") and name != my_agent_name
         ])
         if mode in {"children", "family"}:
-            result["children"] = children
+            result["children"] = _limited(children)
 
         parent: str | None = None
+        if len(my_lineage) > 1:
+            parent_name = bootstrap.parent_agent_name
+            if not parent_name:
+                parent_lineage = my_lineage[:-1]
+                parent_name = agent_name_for_lineage(
+                    parent_lineage,
+                    team_key=team_name,
+                )
+            if parent_name in all_agents:
+                parent = parent_name
         if mode in {"parent", "family"}:
-            if len(my_lineage) > 1:
-                parent_name = bootstrap.parent_agent_name
-                if not parent_name:
-                    parent_lineage = my_lineage[:-1]
-                    parent_name = agent_name_for_lineage(
-                        parent_lineage,
-                        team_key=bootstrap.root_team_key,
-                    )
-                if parent_name in all_agents:
-                    parent = parent_name
             result["parent"] = parent
 
         siblings: list[str] = []
@@ -1390,17 +1485,17 @@ def create_obs_tools(
                 if name.startswith(f"{parent_hash}-") and name != my_agent_name
             ])
         if mode in {"siblings", "family"}:
-            result["siblings"] = siblings
+            result["siblings"] = _limited(siblings)
 
         if mode == "ancestors":
             ancestors = [
                 agent_name_for_lineage(
                     my_lineage[: idx + 1],
-                    team_key=bootstrap.root_team_key,
+                    team_key=team_name,
                 )
                 for idx in range(len(my_lineage) - 1)
             ]
-            result["ancestors"] = ancestors
+            result["ancestors"] = _limited(ancestors)
 
         if mode == "descendants":
             descendants: list[str] = []
@@ -1417,14 +1512,13 @@ def create_obs_tools(
                     continue
                 if normalized_lineage[: len(my_lineage)] == my_lineage:
                     descendants.append(agent_name)
-            result["descendants"] = _sort_member_names(list(set(descendants)))
+            result["descendants"] = _limited(_sort_member_names(list(set(descendants))))
 
         if mode == "tree":
-            result["tree"] = all_agents
             child_set = set(children)
             sibling_set = set(siblings)
             tree_members: list[dict[str, Any]] = []
-            for agent_name in all_agents:
+            for agent_name in sorted(all_agents):
                 details = dict(team_projection_metadata.get(agent_name) or {})
                 details["agent_name"] = agent_name
                 if agent_name == my_agent_name:
@@ -1437,6 +1531,10 @@ def create_obs_tools(
                     details["relation"] = "sibling"
                 else:
                     details["relation"] = "tree"
+                activity_timestamp = _member_activity_timestamp(details)
+                if activity_timestamp is not None:
+                    details["last_activity_at"] = activity_timestamp
+                await _augment_runtime_status(details)
                 tree_members.append(details)
             tree_members.sort(
                 key=lambda item: _member_activity_sort_key(
@@ -1444,6 +1542,8 @@ def create_obs_tools(
                     str(item.get("agent_name") or ""),
                 )
             )
+            tree_members = tree_members[:limit]
+            result["tree"] = [str(member["agent_name"]) for member in tree_members]
             result["tree_members"] = tree_members
 
         return {

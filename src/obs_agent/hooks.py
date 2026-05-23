@@ -236,6 +236,7 @@ class HookState:
     user_message_sender: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     user_prompt_sender: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     user_command_reader: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    team_status_provider: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None
     context_snapshot_provider: Callable[..., dict[str, Any] | None] | None = None
     sdk_env_overrides: dict[str, str] = field(default_factory=dict)
     vault_path: Path | None = None

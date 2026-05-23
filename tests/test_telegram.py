@@ -3211,6 +3211,46 @@ class TestCommands:
         assert "- <a href=\"https://t.me/c/67890/555\">Sibling</a>" in html_text
         await bot.shutdown()
 
+    async def test_tree_renders_metadata_and_limit_notice(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        team_name = "team-root"
+        current_agent_name = "root-agent"
+        members = {
+            current_agent_name: {
+                "agent_name": current_agent_name,
+                "display_name": "Root",
+                "lineage": ["Root"],
+                "lineage_length": 1,
+            }
+        }
+        for idx in range(3):
+            agent_name = f"child-{idx}"
+            members[agent_name] = {
+                "agent_name": agent_name,
+                "display_name": f"Child {idx}",
+                "lineage": ["Root", f"Child {idx}"],
+                "lineage_length": 2,
+                "parent_agent_name": current_agent_name,
+                "status": "completed",
+                "model": "claude-haiku-4-5",
+                "created_at": idx,
+            }
+
+        html_text = bot._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=("Root",),
+            members=members,
+            mode="tree",
+            limit=2,
+        )
+
+        assert "Child 2 [completed / claude-haiku-4-5]" in html_text
+        assert "Child 1 [completed / claude-haiku-4-5]" in html_text
+        assert "Child 0" not in html_text
+        assert "... 1 more agents omitted" in html_text
+        await bot.shutdown()
+
     async def test_tree_ancestors_and_descendants_filters(
         self,
         config,
