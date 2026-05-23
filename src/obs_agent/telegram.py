@@ -111,6 +111,7 @@ _AUTO_DELIVERY_PROMPT = (
 
 _TELEGRAM_HELP_TEXT = """Usage:
 /help — show this help
+/guide — show the DM setup guide
 /stop — interrupt this topic
 /fork [name] — create a new topic from this head or a replied message
 /new [name] — reset this topic into a new trunk agent
@@ -121,6 +122,16 @@ _TELEGRAM_HELP_TEXT = """Usage:
 
 Bare commands are not supported; use the slash form, e.g. /stop.
 Deprecated: /delete and cross-topic all arguments are disabled.
+""".strip()
+
+_TELEGRAM_DM_GUIDE_TEXT = """OBS setup guide
+
+Use this private chat with the main bot to set up the agent workspace:
+1. /new-group <group title> — create a forum supergroup and add the configured OBS bots.
+2. /new-bot [display name] — create a new Claudia sender bot through BotFather.
+3. After a group is created, use its topics for normal agent work.
+
+Shortcuts: /new -group <group title> and /new -bot [display name].
 """.strip()
 
 _DEPRECATED_ALL_SCOPE_TEXT = "Cross-topic 'all' arguments are deprecated; run the command in each topic instead."
@@ -1273,6 +1284,20 @@ class TelegramBot:
         if route.thread_id is None:
             return self._chat_titles.get(route.chat_id) or "General"
         return f"Topic {route.thread_id}"
+
+    @staticmethod
+    def _is_private_message(message: Any) -> bool:
+        chat = getattr(message, "chat", None)
+        chat_type = getattr(chat, "type", None)
+        if isinstance(chat_type, str):
+            return chat_type.lower() == "private"
+        return getattr(message, "chat_id", 0) > 0
+
+    @staticmethod
+    def _guide_text_for_message(message: Any) -> str:
+        if TelegramBot._is_private_message(message):
+            return _TELEGRAM_DM_GUIDE_TEXT
+        return _TELEGRAM_HELP_TEXT
 
     @staticmethod
     def _safe_int(value: Any, default: int) -> int:
@@ -5760,7 +5785,23 @@ class TelegramBot:
         await self._send_system_message(
             route=route,
             bot=context.bot,
-            text=_TELEGRAM_HELP_TEXT,
+            text=self._guide_text_for_message(update.effective_message),
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
+
+    async def handle_guide(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        route = self._route_for_message(update.effective_message)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=_TELEGRAM_DM_GUIDE_TEXT,
             disable_notification=True,
             reply_to_message_id=update.effective_message.message_id,
         )
@@ -5913,6 +5954,20 @@ class TelegramBot:
             context,
             command_names=("new_group",),
         )
+        if not raw_args and self._is_private_message(update.effective_message):
+            if update.effective_user is None or update.effective_message is None:
+                return
+            if not self._is_authorized(update.effective_user.id):
+                return
+            route = self._route_for_message(update.effective_message)
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=_TELEGRAM_DM_GUIDE_TEXT,
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
         await self._run_userbot_command(
             update,
             context,
@@ -5935,6 +5990,20 @@ class TelegramBot:
             context,
             command_names=("new-group", "new_group"),
         )
+        if not raw_args and self._is_private_message(update.effective_message):
+            if update.effective_user is None or update.effective_message is None:
+                return
+            if not self._is_authorized(update.effective_user.id):
+                return
+            route = self._route_for_message(update.effective_message)
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=_TELEGRAM_DM_GUIDE_TEXT,
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
         await self._run_userbot_command(
             update,
             context,
@@ -9870,6 +9939,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
         )
     )
     app.add_handler(CommandHandler("help", lambda update, context: bot._log_command_and_call(update, context, "help", bot.handle_help)))
+    app.add_handler(CommandHandler("guide", lambda update, context: bot._log_command_and_call(update, context, "guide", bot.handle_guide)))
     app.add_handler(CommandHandler("clear", lambda update, context: bot._log_command_and_call(update, context, "clear", bot.handle_clear)))
     app.add_handler(CommandHandler("new", lambda update, context: bot._log_command_and_call(update, context, "new", bot.handle_new)))
     app.add_handler(CommandHandler("new_group", lambda update, context: bot._log_command_and_call(update, context, "new_group", bot.handle_new_group)))
@@ -9922,7 +9992,8 @@ async def _set_bot_commands(app: Application) -> None:
     from telegram import BotCommand
 
     await app.bot.set_my_commands([
-        BotCommand("help", "Show concise command usage"),
+        BotCommand("help", "Show setup guide in DMs or topic usage in groups"),
+        BotCommand("guide", "Show the DM setup guide"),
         BotCommand("clear", "Clear this topic but keep its agent identity"),
         BotCommand("new", "Reset this topic into a new trunk agent; optional: /new [emoji] [name]"),
         BotCommand("new_group", "Create a new forum supergroup and add the configured OBS bots"),

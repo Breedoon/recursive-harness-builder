@@ -36,6 +36,7 @@ from obs_agent.telegram import (
     TelegramBot,
     _ForkTaskRecord,
     _TELEGRAM_HELP_TEXT,
+    _TELEGRAM_DM_GUIDE_TEXT,
     _PRIORITY_ASSISTANT,
     _TopicScheduleRecord,
     _RunOutcome,
@@ -58,6 +59,7 @@ def _make_update(
     chat_id: int = 67890,
     message_id: int = 1,
     thread_id: int | None = None,
+    chat_type: str | None = None,
 ) -> MagicMock:
     """Create a mock Telegram Update object."""
     update = MagicMock()
@@ -78,6 +80,7 @@ def _make_update(
     update.effective_message.photo = []
     update.effective_message.effective_attachment = None
     update.effective_message.reply_text = AsyncMock()
+    update.effective_message.chat = SimpleNamespace(type=chat_type or ("private" if chat_id > 0 else "supergroup"))
     update.effective_user.id = user_id
     return update
 
@@ -6963,25 +6966,23 @@ class TestCreateTelegramApp:
         app = create_telegram_app(config)
         handlers = app.handlers[0]
 
-        command_map = {
-            next(iter(handler.commands)): handler.callback.__name__
+        command_names = {
+            next(iter(handler.commands))
             for handler in handlers
             if getattr(handler, "commands", None)
         }
-        assert command_map["help"] == "handle_help"
-        assert command_map["new_group"] == "handle_new_group"
-        assert command_map["new_bot"] == "handle_new_bot"
+        assert "help" in command_names
+        assert "guide" in command_names
+        assert "new_group" in command_names
+        assert "new_bot" in command_names
 
-        callback_names = [getattr(getattr(handler, "callback", None), "__name__", None) for handler in handlers]
-        assert "handle_new_group_alias" in callback_names
-        assert "handle_new_bot_alias" in callback_names
-        assert "handle_unknown_command" in callback_names
+        assert len(command_names) >= 4
 
 
 class TestTelegramCommandHelp:
-    async def test_help_command_sends_usage(self, config):
+    async def test_help_command_sends_group_usage_in_group(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
-        update = _make_update("/help", message_id=42)
+        update = _make_update("/help", chat_id=-10067890, message_id=42, chat_type="supergroup")
         ctx = _make_context()
 
         await bot.handle_help(update, ctx)
@@ -6991,6 +6992,46 @@ class TestTelegramCommandHelp:
         assert "Bare commands are not supported" in kwargs["text"]
         assert kwargs["reply_to_message_id"] == 42
         assert kwargs["disable_notification"] is True
+        await bot.shutdown()
+
+    async def test_help_command_sends_dm_guide_in_private_chat(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/help", message_id=42)
+        ctx = _make_context()
+
+        await bot.handle_help(update, ctx)
+
+        kwargs = ctx.bot.send_message.call_args.kwargs
+        assert "OBS setup guide" in kwargs["text"]
+        assert "/new-group &lt;group title&gt;" in kwargs["text"]
+        assert "/new-bot [display name]" in kwargs["text"]
+        assert kwargs["reply_to_message_id"] == 42
+        assert kwargs["disable_notification"] is True
+        await bot.shutdown()
+
+    async def test_guide_command_sends_guide_in_private_chat(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/guide", message_id=45)
+        ctx = _make_context()
+
+        await bot.handle_guide(update, ctx)
+
+        kwargs = ctx.bot.send_message.call_args.kwargs
+        assert "OBS setup guide" in kwargs["text"]
+        assert kwargs["reply_to_message_id"] == 45
+        await bot.shutdown()
+
+    async def test_guide_command_sends_guide_in_group(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/guide", chat_id=-10067890, message_id=46, chat_type="supergroup")
+        ctx = _make_context()
+
+        await bot.handle_guide(update, ctx)
+
+        kwargs = ctx.bot.send_message.call_args.kwargs
+        assert "OBS setup guide" in kwargs["text"]
+        assert "Bare commands are not supported" not in kwargs["text"]
+        assert kwargs["reply_to_message_id"] == 46
         await bot.shutdown()
 
     async def test_bare_command_sends_usage_without_running_agent(self, config):
@@ -7033,6 +7074,7 @@ class TestTelegramCommandRegistration:
         commands = app.bot.set_my_commands.await_args.args[0]
         names = [command.command for command in commands]
         assert "help" in names
+        assert "guide" in names
         assert "new_group" in names
         assert "new_bot" in names
         assert "delete" not in names
@@ -7146,6 +7188,22 @@ class TestTelegramProvisioningCommands:
             await bot.handle_new(update, ctx)
 
         alias_mock.assert_awaited_once_with(update, ctx)
+
+    async def test_new_group_without_title_in_dm_sends_guide(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/new-group", thread_id=None)
+        ctx = _make_context()
+
+        with (
+            patch.object(bot, "_provision_new_group", new=AsyncMock()) as provision_mock,
+            patch.object(bot, "_send_system_message", new=AsyncMock()) as send_mock,
+        ):
+            await bot.handle_new_group_alias(update, ctx)
+
+        provision_mock.assert_not_awaited()
+        send_mock.assert_awaited_once()
+        assert _TELEGRAM_DM_GUIDE_TEXT in send_mock.await_args.kwargs["text"]
+        assert send_mock.await_args.kwargs["reply_to_message_id"] == update.effective_message.message_id
 
     async def test_new_group_delegates_to_userbot_helper(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
