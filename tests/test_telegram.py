@@ -4081,6 +4081,103 @@ class TestTopicCommands:
         assert ctx.bot.send_message.call_args_list[1].kwargs["message_thread_id"] == 321
         assert ctx.bot.send_message.call_args_list[2].kwargs["message_thread_id"] is None
 
+    async def test_fork_command_registers_parent_for_child_inbox_delivery(self, config, tmp_path, monkeypatch):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.topic_title = "Root"
+        state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(state)
+        bot._session_heads["sid-root"] = "head-uuid"
+        bot._record_message_binding(
+            route=state.route,
+            message_id=55,
+            jsonl_uuid="head-uuid",
+            session_id="sid-root",
+            role="assistant",
+        )
+
+        update = _make_update("/fork Child", message_id=77)
+        ctx = _make_context()
+        ctx.args = ["Child"]
+        ctx.bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=321))
+        ctx.bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=900), MagicMock(message_id=901), MagicMock(message_id=902)]
+        )
+
+        with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-child"):
+            await bot.handle_fork(update, ctx)
+
+        child_state = _state(bot, thread_id=321)
+        assert child_state is not None
+        team_name = child_state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"]
+        parent_agent_name = agent_name_for_lineage(("Root",), team_key=team_name)
+        child_agent_name = agent_name_for_lineage(("Root", "Child"), team_key=team_name)
+
+        assert bot._resolve_route_inbox_target(
+            team_name=team_name,
+            agent_name=parent_agent_name,
+        ) is state
+        assert bot._recipient_delivery_status(
+            team_name=team_name,
+            agent_name=parent_agent_name,
+        )["deliverable"] is True
+        assert bot._recipient_delivery_status(
+            team_name=team_name,
+            agent_name=child_agent_name,
+        )["deliverable"] is True
+
+        team_config = tmp_path / ".claude" / "teams" / team_name / "config.json"
+        members = json.loads(team_config.read_text(encoding="utf-8"))["members"]
+        member_names = {member["name"] for member in members}
+        assert parent_agent_name in member_names
+        assert child_agent_name in member_names
+
+    async def test_fork_command_preserves_existing_parent_inbox_projection(self, config, tmp_path, monkeypatch):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.topic_title = "Root"
+        state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(state)
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root",),
+            origin="trunk_start",
+            is_fork=False,
+            session_id="sid-root",
+            team_name="team-custom",
+            agent_name="parent-custom",
+        )
+        bot._session_heads["sid-root"] = "head-uuid"
+        bot._record_message_binding(
+            route=state.route,
+            message_id=55,
+            jsonl_uuid="head-uuid",
+            session_id="sid-root",
+            role="assistant",
+        )
+
+        update = _make_update("/fork Child", message_id=77)
+        ctx = _make_context()
+        ctx.args = ["Child"]
+        ctx.bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=321))
+        ctx.bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=900), MagicMock(message_id=901), MagicMock(message_id=902)]
+        )
+
+        with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-child"):
+            await bot.handle_fork(update, ctx)
+
+        child_state = _state(bot, thread_id=321)
+        assert child_state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] == "team-custom"
+        assert state.session_manager.sdk_env_overrides["CLAUDE_CODE_AGENT_NAME"] == "parent-custom"
+        assert bot._resolve_route_inbox_target(
+            team_name="team-custom",
+            agent_name="parent-custom",
+        ) is state
+        assert "<parent_agent_name>parent-custom</parent_agent_name>" in (child_state.pending_obs_bootstrap or "")
+
     async def test_fork_command_resets_unnamed_counter_when_topic_title_changes(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         state = _state(bot)

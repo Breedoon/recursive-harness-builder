@@ -1069,6 +1069,80 @@ class TestTelegramLiveForumTopics:
         assert general_session_after == general_session_before, live_tg_forum.failure_context()
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
 
+    @pytest.mark.telegram_core_smoke
+    async def test_live_fork_command_child_can_send_inbox_message_to_parent(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        inbox_token = f"FORK-PARENT-INBOX-{tag}"
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic integration test. Reply with only PRIME-{tag}.",
+            token=f"PRIME-{tag}",
+            timeout=240.0,
+        )
+        parent_lineage = await _query_session_lineage_fact(
+            live_tg_forum,
+            thread_id=None,
+        )
+        parent_agent_name = parent_lineage["agent_name"]
+        baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
+
+        await live_tg_forum.platform.send_control(
+            f"/fork@{live_tg_forum.bot_username} Child-{tag}",
+            timeout=30.0,
+        )
+        launch_msg = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=None,
+            after_message_id=baseline,
+            token="fork created",
+            timeout=120.0,
+        )
+        child_thread_id, _ = _extract_topic_link(launch_msg.text)
+        child_lineage = await _query_session_lineage_fact(
+            live_tg_forum,
+            thread_id=child_thread_id,
+        )
+        assert child_lineage["root_team_key"] == parent_lineage["root_team_key"], live_tg_forum.failure_context()
+
+        child_done = await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic integration test. "
+                "Call SendInboxMessage exactly once with "
+                f"team_name={child_lineage['root_team_key']}, recipient={parent_agent_name}, "
+                f"content={inbox_token}, summary=child-to-parent, sender={child_lineage['agent_name']}. "
+                f"Then reply with only CHILD-SENT-{tag}."
+            ),
+            thread_id=child_thread_id,
+            token=f"CHILD-SENT-{tag}",
+            timeout=300.0,
+        )
+        assert f"CHILD-SENT-{tag}" in child_done.text, live_tg_forum.failure_context()
+
+        parent_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
+        parent_read = await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic integration test. "
+                "Call ReadInbox exactly once with "
+                f"team_name={parent_lineage['root_team_key']}, agent={parent_agent_name}, "
+                "include_read=false, mark_read=true, limit=20. "
+                f"If the inbox contains {inbox_token}, reply with only PARENT-RECEIVED-{tag}; "
+                f"otherwise reply with only PARENT-MISSING-{tag}."
+            ),
+            thread_id=None,
+            token=f"PARENT-RECEIVED-{tag}",
+            timeout=240.0,
+        )
+        assert f"PARENT-RECEIVED-{tag}" in parent_read.text, live_tg_forum.failure_context()
+        assert parent_read.message_id > parent_baseline, live_tg_forum.failure_context()
+        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
+
     async def test_live_inline_reply_fork_stays_in_same_topic_and_plain_followup_uses_it(
         self,
         live_tg_forum: _LiveForumHarness,

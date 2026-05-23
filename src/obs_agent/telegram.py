@@ -2379,6 +2379,7 @@ class TelegramBot:
         parent_session_id: str | None = None,
         team_name: str | None = None,
         agent_name: str | None = None,
+        parent_agent_name_override: str | None = None,
         session_id: str | None = None,
     ) -> str:
         normalized_lineage = tuple(
@@ -2393,7 +2394,7 @@ class TelegramBot:
             default_team_name, default_agent_name = self._default_team_projection(normalized_lineage)
             resolved_team_name = resolved_team_name or default_team_name
             resolved_agent_name = resolved_agent_name or default_agent_name
-        parent_agent_name: str | None = None
+        parent_agent_name: str | None = (parent_agent_name_override or "").strip() or None
         parent_display_name: str | None = None
         if len(normalized_lineage) > 1:
             parent_lineage = normalized_lineage[:-1]
@@ -2403,7 +2404,7 @@ class TelegramBot:
                     resolved_team_name,
                     parent_display_name,
                 )
-            parent_agent_name = agent_name_for_lineage(
+            parent_agent_name = parent_agent_name or agent_name_for_lineage(
                 parent_lineage,
                 team_key=resolved_team_name,
             )
@@ -7421,9 +7422,27 @@ class TelegramBot:
             # Children inherit the parent's root_team_key — only trunk generates
             # a new timestamp-based key. The agent_name is always computed fresh.
             default_agent_name = agent_name_for_lineage(child_lineage)
+            parent_projection = self._state_inbox_projection(parent_state)
             parent_team_key = self._get_parent_team_key(parent_state)
             team_name = (team_name or "").strip() or parent_team_key or root_team_key_for_lineage(child_lineage)
             agent_name = (agent_name or "").strip() or default_agent_name
+            if parent_projection is not None and parent_projection[0] == team_name:
+                parent_agent_name = parent_projection[1]
+            else:
+                parent_agent_name = agent_name_for_lineage(parent_lineage, team_key=team_name)
+            if self._resolve_route_inbox_target(
+                team_name=team_name,
+                agent_name=parent_agent_name,
+            ) is None:
+                self._prime_obs_bootstrap(
+                    parent_state,
+                    lineage=parent_lineage,
+                    origin="fork_parent",
+                    is_fork=False,
+                    session_id=source_session_id or parent_state.session_id,
+                    team_name=team_name,
+                    agent_name=parent_agent_name,
+                )
             # Collision detection is based on current bindings, not merely on
             # inbox-file existence. Deleted topics intentionally leave inbox
             # files behind so backlog can survive until the same identity is
@@ -7535,6 +7554,7 @@ class TelegramBot:
                 parent_session_id=source_session_id,
                 team_name=team_name,
                 agent_name=agent_name,
+                parent_agent_name_override=parent_agent_name,
                 session_id=child_session_id or None,
             )
 
