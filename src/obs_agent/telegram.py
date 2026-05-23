@@ -115,6 +115,8 @@ _TELEGRAM_HELP_TEXT = """Usage:
 /new [name] — reset this topic into a new trunk agent
 /clear — clear this topic but keep its agent identity
 /context — show session and context info
+/schedule — show schedules attached to this topic
+/unschedule [id] — remove a schedule from this topic
 
 Bare commands are not supported; use the slash form, e.g. /stop.
 Deprecated: /delete and cross-topic all arguments are disabled.
@@ -4590,6 +4592,16 @@ class TelegramBot:
             )
         return f"schedule_triggered: {self._schedule_display_name(record)}"
 
+    def _next_schedule_line_for_record(self, record: _TopicScheduleRecord, *, now_ts: float) -> str:
+        if record.next_run_at is not None:
+            run_at_text = self._format_schedule_timestamp(
+                ts=record.next_run_at,
+                record=record,
+                now_ts=now_ts,
+            )
+            return f"next_schedule: {self._schedule_display_name(record)} at {run_at_text}"
+        return f"next_schedule: {self._schedule_display_name(record)} on next stop"
+
     def _next_schedule_line(self, route: TelegramRoute) -> str | None:
         now = time.time()
         timed_records = [
@@ -4611,15 +4623,7 @@ class TelegramBot:
         if record is None:
             return None
 
-        if record.next_run_at is not None:
-            run_at_text = self._format_schedule_timestamp(
-                ts=record.next_run_at,
-                record=record,
-                now_ts=now,
-            )
-            pieces = [f"next_schedule: {self._schedule_display_name(record)} at {run_at_text}"]
-        else:
-            pieces = [f"next_schedule: {self._schedule_display_name(record)} on next stop"]
+        pieces = [self._next_schedule_line_for_record(record, now_ts=now)]
         details = self._schedule_details(record, now_ts=now)
         if details:
             pieces.append(f"({' ; '.join(details)})")
@@ -6016,10 +6020,27 @@ class TelegramBot:
         if not self._is_authorized(update.effective_user.id):
             return
         route = self._route_for_message(update.effective_message)
+        schedules = self._active_schedules_for_route(route)
+        if not schedules:
+            text = "no schedules attached to this topic"
+        else:
+            now = time.time()
+            lines = [f"schedules for this topic: {len(schedules)}"]
+            for record in sorted(
+                schedules,
+                key=lambda item: (item.next_run_at is None, item.next_run_at or float("inf"), item.schedule_id),
+            ):
+                next_line = self._next_schedule_line_for_record(record, now_ts=now)
+                details = self._schedule_details(record, now_ts=now)
+                detail_text = f" ({' ; '.join(details)})" if details else ""
+                lines.append(
+                    f"- {record.schedule_id}: {self._schedule_display_name(record)} — {next_line}{detail_text}"
+                )
+            text = "\n".join(lines)
         await self._send_system_message(
             route=route,
             bot=context.bot,
-            text="/schedule is gated until Sprint 1 schedule reliability is approved; use CronCreate from an agent topic for now.",
+            text=text,
             disable_notification=True,
             reply_to_message_id=update.effective_message.message_id,
         )

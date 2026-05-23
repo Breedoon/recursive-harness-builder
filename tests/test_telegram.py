@@ -3434,13 +3434,42 @@ class TestCommands:
         assert "Grandchild" in descendants_html
         await bot.shutdown()
 
-    async def test_schedule_command_is_gated_until_schedule_sprint_approval(self, config):
+    async def test_schedule_command_lists_topic_schedules(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
-        update = _make_update("/schedule every hour", chat_id=67890, thread_id=321)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        assert bot._get_state(route) is not None
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-visible",
+                route=route,
+                description="Visible",
+                schedule_mode="interval",
+                cron_expr=None,
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="run",
+                max_runs=3,
+                next_run_at=1060.0,
+            )
+        )
+        update = _make_update("/schedule", chat_id=67890, thread_id=321)
         ctx = _make_context()
-        with patch.object(bot, "_send_system_message", new_callable=AsyncMock) as send_system:
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
             await bot.handle_schedule(update, ctx)
-        assert "gated until Sprint 1" in send_system.await_args.kwargs["text"]
+        text = ctx.bot.send_message.call_args.kwargs["text"]
+        next_local = _expected_local_schedule_time(1060.0, now_ts=1000.0, include_seconds=False)
+        assert "schedules for this topic: 1" in text
+        assert "sched-visible" in text
+        assert f"next_schedule: Visible at {next_local}" in text
+        assert "remaining=3" in text
+        await bot.shutdown()
+
+    async def test_schedule_command_reports_empty_topic(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/schedule", chat_id=67890, thread_id=321)
+        ctx = _make_context()
+        await bot.handle_schedule(update, ctx)
+        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>no schedules attached to this topic</i></u>"
         await bot.shutdown()
 
     async def test_new_visibility_generates_random_title_and_non_current_emoji(self, config):
