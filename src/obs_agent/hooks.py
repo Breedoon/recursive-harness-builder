@@ -233,6 +233,9 @@ class HookState:
     inbox_recipient_validator: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     inbox_message_notifier: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None
     stop_event_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    user_message_sender: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    user_prompt_sender: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+    user_command_reader: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
     context_snapshot_provider: Callable[..., dict[str, Any] | None] | None = None
     sdk_env_overrides: dict[str, str] = field(default_factory=dict)
     vault_path: Path | None = None
@@ -677,6 +680,9 @@ _OBS_CONTEXT_FIELDS: dict[str, str] = {
     # Messaging
     "inbox_message_notifier": "inbox_message_notifier",
     "inbox_recipient_validator": "inbox_recipient_validator",
+    "send_user_message": "user_message_sender",
+    "prompt_user": "user_prompt_sender",
+    "read_user_commands": "user_command_reader",
     # Session
     "session_id": "session_id",
 }

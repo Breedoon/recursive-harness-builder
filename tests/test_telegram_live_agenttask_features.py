@@ -412,6 +412,98 @@ class TestPromptFromFile:
 @pytest.mark.integration
 @pytest.mark.telegram
 @pytest.mark.telegram_smoke
+class TestPythonHookTelegramInteraction:
+    async def test_live_smoke_hook_to_user_message_and_command_log(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        parent_thread_id = await live_tg_forum.platform.create_topic(f"Smoke Hook User {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only HOOKUSER-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"HOOKUSER-PRIME-{tag}",
+            timeout=180.0,
+        )
+        baseline_commands = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        await live_tg_forum.platform.send_control(
+            f"/context@{live_tg_forum.bot_username} HOOKUSER-COMMAND-{tag}",
+            thread_id=parent_thread_id,
+            timeout=40.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=baseline_commands,
+            token="session",
+            timeout=60.0,
+        )
+
+        hook_file = Path(f"/tmp/obs_test_hook_user_{tag}.py")
+        hook_file.write_text(
+            "_sent = False\n"
+            "async def interact(hook_input, tool_use_id, context):\n"
+            "    global _sent\n"
+            "    if hook_input.get('hook_event_name') != 'PreToolUse' or _sent:\n"
+            "        return None\n"
+            "    obs = context['obs']\n"
+            f"    await obs['send_user_message']({{'text': 'HOOKUSER-MSG-{tag}', 'prefix': 'live hook'}})\n"
+            f"    await obs['prompt_user']({{'text': 'HOOKUSER-PROMPT-{tag}', 'prefix': 'live hook prompt'}})\n"
+            "    commands = await obs['read_user_commands']({'limit': 20})\n"
+            f"    saw_context = any(cmd.get('command') == 'context' and 'HOOKUSER-COMMAND-{tag}' in cmd.get('text', '') for cmd in commands.get('commands', []))\n"
+            "    _sent = True\n"
+            f"    return {{'hookSpecificOutput': {{'hookEventName': 'PreToolUse', 'additionalContext': 'HOOKUSER-CMD-{tag}=' + str(saw_context)}}}}\n"
+        )
+        hooks_json = json.dumps({"PreToolUse": f"{hook_file}::interact"})
+        try:
+            baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+            await live_tg_forum.platform.send(
+                (
+                    "This is a deterministic hook-to-user smoke test. "
+                    f"Use AgentTask exactly once with fork=false and hooks='{hooks_json}', "
+                    f"and prompt 'Use Bash to run echo hook-user. Then reply with exactly HOOKUSER-DONE-{tag} and include whether HOOKUSER-CMD-{tag}=True was in your hook context.' "
+                    f"After launching, reply with only HOOKUSER-LAUNCHED-{tag}."
+                ),
+                thread_id=parent_thread_id,
+                require_done=False,
+                timeout=180.0,
+            )
+            launch_msg = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline,
+                token="task launched",
+                timeout=240.0,
+            )
+            child_thread_id, _ = _extract_topic_link(launch_msg.text)
+            await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=child_thread_id,
+                token=f"HOOKUSER-MSG-{tag}",
+                timeout=180.0,
+            )
+            await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=child_thread_id,
+                token=f"HOOKUSER-PROMPT-{tag}",
+                timeout=180.0,
+            )
+            child_reply = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=child_thread_id,
+                token=f"HOOKUSER-DONE-{tag}",
+                timeout=240.0,
+            )
+            assert f"HOOKUSER-CMD-{tag}=True" in child_reply.text
+        finally:
+            hook_file.unlink(missing_ok=True)
+
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
 class TestPythonHooksBasic:
     async def test_live_smoke_python_hooks_basic(
         self,

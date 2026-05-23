@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import inspect
 import json
 import logging
 import os
@@ -135,6 +136,7 @@ _BARE_COMMAND_USAGE: dict[str, str] = {
     "forktask": "Use AgentTask from an agent topic to launch delegated work.",
     "delete": _DELETE_DEPRECATED_TEXT,
 }
+_USER_COMMAND_LOG_LIMIT = 200
 
 _PRIORITY_SYSTEM = 0
 _PRIORITY_ASSISTANT = 10
@@ -668,6 +670,7 @@ class TelegramBot:
             temp_root=config.telegram_temp_root,
             transcription_script=config.telegram_transcription_script,
         )
+        self._command_log_path = self._normalizer.boot_root / "user-command-log.jsonl"
 
         self._route_locks: dict[TelegramRoute, asyncio.Lock] = {}
         self._states_by_route: dict[TelegramRoute, TelegramSessionState] = {}
@@ -2025,6 +2028,9 @@ class TelegramBot:
         hook_state.inbox_recipient_validator = self._make_inbox_recipient_validator(route)
         hook_state.inbox_message_notifier = self._make_inbox_message_notifier(route)
         hook_state.stop_event_notifier = self._make_stop_event_notifier(route)
+        hook_state.user_message_sender = self._make_user_message_sender(route)
+        hook_state.user_prompt_sender = self._make_user_prompt_sender(route)
+        hook_state.user_command_reader = self._make_user_command_reader(route)
         hook_state.context_snapshot_provider = self._make_context_snapshot_provider(route)
         hook_state.vault_path = self._config.vault_path
         return state
@@ -2138,11 +2144,155 @@ class TelegramBot:
 
         return _notify
 
+    def _make_user_message_sender(self, route: TelegramRoute):
+        async def _send(payload: dict[str, Any]) -> dict[str, Any]:
+            return await self._send_hook_user_message(route=route, payload=payload, prompt=False)
+
+        return _send
+
+    def _make_user_prompt_sender(self, route: TelegramRoute):
+        async def _prompt(payload: dict[str, Any]) -> dict[str, Any]:
+            return await self._send_hook_user_message(route=route, payload=payload, prompt=True)
+
+        return _prompt
+
+    def _make_user_command_reader(self, route: TelegramRoute):
+        async def _read(payload: dict[str, Any]) -> dict[str, Any]:
+            return self._read_user_command_log(route=route, payload=payload)
+
+        return _read
+
     def _make_context_snapshot_provider(self, route: TelegramRoute):
         def _snapshot(**_: Any) -> dict[str, Any]:
             return self._build_hook_context_snapshot(route)
 
         return _snapshot
+
+    async def _send_hook_user_message(
+        self,
+        *,
+        route: TelegramRoute,
+        payload: dict[str, Any],
+        prompt: bool,
+    ) -> dict[str, Any]:
+        state = self._get_state(route, create=False)
+        bot = self._bot_for_state(state) if state is not None else self._primary_bot
+        if bot is None:
+            return {"ok": False, "error": "telegram bot unavailable for this route"}
+        text = str(payload.get("text") or payload.get("message") or "").strip()
+        if not text:
+            return {"ok": False, "error": "text is required"}
+        disable_notification = self._coerce_payload_bool(
+            payload.get("disable_notification"),
+            default=not prompt,
+        )
+        reply_to_message_id = self._coerce_optional_int(payload.get("reply_to_message_id"))
+        prefix = str(payload.get("prefix") or ("hook prompt" if prompt else "hook message")).strip()
+        rendered = f"{prefix}: {text}" if prefix else text
+        sent = await self._send_system_message(
+            route=route,
+            bot=bot,
+            text=rendered,
+            disable_notification=disable_notification,
+            reply_to_message_id=reply_to_message_id,
+        )
+        sent_messages = sent if isinstance(sent, list) else [sent]
+        return {
+            "ok": True,
+            "message_ids": [
+                message_id
+                for message_id in (self._sent_message_id(msg) for msg in sent_messages)
+                if message_id is not None
+            ],
+            "route": {"chat_id": route.chat_id, "thread_id": route.thread_id},
+        }
+
+    @staticmethod
+    def _coerce_payload_bool(value: Any, *, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    @staticmethod
+    def _coerce_optional_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _read_user_command_log(self, *, route: TelegramRoute, payload: dict[str, Any]) -> dict[str, Any]:
+        limit = self._coerce_optional_int(payload.get("limit")) or 20
+        limit = max(1, min(limit, _USER_COMMAND_LOG_LIMIT))
+        include_all_routes = self._coerce_payload_bool(payload.get("all_routes"), default=False)
+        records: list[dict[str, Any]] = []
+        if self._command_log_path.exists():
+            for line in self._command_log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if not include_all_routes and not self._command_record_matches_route(record, route):
+                    continue
+                records.append(record)
+        return {
+            "ok": True,
+            "path": str(self._command_log_path),
+            "commands": records[-limit:],
+            "route": {"chat_id": route.chat_id, "thread_id": route.thread_id},
+        }
+
+    @staticmethod
+    def _command_record_matches_route(record: dict[str, Any], route: TelegramRoute) -> bool:
+        record_route = record.get("route")
+        if not isinstance(record_route, dict):
+            return False
+        return record_route.get("chat_id") == route.chat_id and record_route.get("thread_id") == route.thread_id
+
+    def _log_user_command(self, update: Update, command: str) -> None:
+        message = update.effective_message
+        user = update.effective_user
+        if message is None:
+            return
+        route = self._route_for_message(message)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "command": command,
+            "text": str(getattr(message, "text", "") or ""),
+            "message_id": getattr(message, "message_id", None),
+            "route": {"chat_id": route.chat_id, "thread_id": route.thread_id},
+            "user": {
+                "id": getattr(user, "id", None) if user is not None else None,
+                "username": self._coerce_username(user) if user is not None else None,
+            },
+        }
+        self._command_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._command_log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+
+    async def _log_command_and_call(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        command: str,
+        handler,
+    ) -> None:
+        user = update.effective_user
+        if user is not None and self._is_authorized(user.id):
+            self._log_user_command(update, command)
+        result = handler(update, context)
+        if inspect.isawaitable(result):
+            await result
 
     def _is_authorized(self, user_id: int) -> bool:
         # SECURITY: empty allowed list = NO ONE can use the bot (deny by default)
@@ -9536,38 +9686,38 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"^/(?:tree-|tree-(?:ancestors|descendants|children))(?:@[A-Za-z0-9_]+)?(?:\s|$)"),
-            bot.handle_tree_alias_command,
+            lambda update, context: bot._log_command_and_call(update, context, "tree_alias", bot.handle_tree_alias_command),
         )
     )
-    app.add_handler(CommandHandler("help", bot.handle_help))
-    app.add_handler(CommandHandler("clear", bot.handle_clear))
-    app.add_handler(CommandHandler("new", bot.handle_new))
-    app.add_handler(CommandHandler("new_group", bot.handle_new_group))
-    app.add_handler(CommandHandler("new_bot", bot.handle_new_bot))
-    app.add_handler(CommandHandler("unschedule", bot.handle_unschedule))
-    app.add_handler(CommandHandler("stop", bot.handle_stop))
-    app.add_handler(CommandHandler("context", bot.handle_context))
-    app.add_handler(CommandHandler("report", bot.handle_report))
-    app.add_handler(CommandHandler("schedule", bot.handle_schedule))
-    app.add_handler(CommandHandler("tree", bot.handle_tree))
-    app.add_handler(CommandHandler("tree_descendants", bot.handle_tree_descendants))
-    app.add_handler(CommandHandler("tree_children", bot.handle_tree_children))
-    app.add_handler(CommandHandler("tree_ancestors", bot.handle_tree_ancestors))
-    app.add_handler(CommandHandler("fork", bot.handle_fork))
-    app.add_handler(CommandHandler("delete", bot.handle_delete))
+    app.add_handler(CommandHandler("help", lambda update, context: bot._log_command_and_call(update, context, "help", bot.handle_help)))
+    app.add_handler(CommandHandler("clear", lambda update, context: bot._log_command_and_call(update, context, "clear", bot.handle_clear)))
+    app.add_handler(CommandHandler("new", lambda update, context: bot._log_command_and_call(update, context, "new", bot.handle_new)))
+    app.add_handler(CommandHandler("new_group", lambda update, context: bot._log_command_and_call(update, context, "new_group", bot.handle_new_group)))
+    app.add_handler(CommandHandler("new_bot", lambda update, context: bot._log_command_and_call(update, context, "new_bot", bot.handle_new_bot)))
+    app.add_handler(CommandHandler("unschedule", lambda update, context: bot._log_command_and_call(update, context, "unschedule", bot.handle_unschedule)))
+    app.add_handler(CommandHandler("stop", lambda update, context: bot._log_command_and_call(update, context, "stop", bot.handle_stop)))
+    app.add_handler(CommandHandler("context", lambda update, context: bot._log_command_and_call(update, context, "context", bot.handle_context)))
+    app.add_handler(CommandHandler("report", lambda update, context: bot._log_command_and_call(update, context, "report", bot.handle_report)))
+    app.add_handler(CommandHandler("schedule", lambda update, context: bot._log_command_and_call(update, context, "schedule", bot.handle_schedule)))
+    app.add_handler(CommandHandler("tree", lambda update, context: bot._log_command_and_call(update, context, "tree", bot.handle_tree)))
+    app.add_handler(CommandHandler("tree_descendants", lambda update, context: bot._log_command_and_call(update, context, "tree_descendants", bot.handle_tree_descendants)))
+    app.add_handler(CommandHandler("tree_children", lambda update, context: bot._log_command_and_call(update, context, "tree_children", bot.handle_tree_children)))
+    app.add_handler(CommandHandler("tree_ancestors", lambda update, context: bot._log_command_and_call(update, context, "tree_ancestors", bot.handle_tree_ancestors)))
+    app.add_handler(CommandHandler("fork", lambda update, context: bot._log_command_and_call(update, context, "fork", bot.handle_fork)))
+    app.add_handler(CommandHandler("delete", lambda update, context: bot._log_command_and_call(update, context, "delete", bot.handle_delete)))
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(_NEW_GROUP_ALIAS_PATTERN),
-            bot.handle_new_group_alias,
+            lambda update, context: bot._log_command_and_call(update, context, "new_group_alias", bot.handle_new_group_alias),
         )
     )
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(_NEW_BOT_ALIAS_PATTERN),
-            bot.handle_new_bot_alias,
+            lambda update, context: bot._log_command_and_call(update, context, "new_bot_alias", bot.handle_new_bot_alias),
         )
     )
-    app.add_handler(MessageHandler(filters.COMMAND, bot.handle_unknown_command))
+    app.add_handler(MessageHandler(filters.COMMAND, lambda update, context: bot._log_command_and_call(update, context, "unknown", bot.handle_unknown_command)))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, bot.handle_forum_topic_created))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED, bot.handle_forum_topic_edited))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.handle_new_chat_members))
