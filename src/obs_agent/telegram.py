@@ -62,6 +62,7 @@ from obs_agent.lineage import (
 from obs_agent.queueing import QueuedMessage, coerce_queued_message
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent, TurnEndEvent
 from obs_agent.session import SessionManager
+from obs_agent.startup_logging import StartupProfiler
 from obs_agent.telegram_format import md_to_telegram_html, split_message
 from obs_agent.telegram_ingest import TelegramInboundNormalizer
 from obs_agent.telegram_state_store import TelegramStateStore
@@ -747,16 +748,33 @@ class TelegramBot:
         )
         self._typing_actions_enabled = bool(config.telegram_typing_actions_enabled)
 
-    async def initialize_runtime(self) -> None:
+    async def initialize_runtime(self, startup: StartupProfiler | None = None) -> None:
         """Purge the Telegram temp root once and create a fresh workspace."""
-        self._normalizer.initialize()
-        self._state_store.initialize()
-        self._state_store.prune(
-            retention_days=self._config.telegram_state_retention_days
-        )
-        self._restore_state_from_store()
-        await self._ensure_transport_worker()
-        await self._ensure_background_poller(None)
+        if startup is None:
+            self._normalizer.initialize()
+            self._state_store.initialize()
+            self._state_store.prune(
+                retention_days=self._config.telegram_state_retention_days
+            )
+            self._restore_state_from_store()
+            await self._ensure_transport_worker()
+            await self._ensure_background_poller(None)
+            return
+
+        with startup.phase("telegram_normalizer"):
+            self._normalizer.initialize()
+        with startup.phase("telegram_state_initialize"):
+            self._state_store.initialize()
+        with startup.phase("telegram_state_prune", retention_days=self._config.telegram_state_retention_days):
+            self._state_store.prune(
+                retention_days=self._config.telegram_state_retention_days
+            )
+        with startup.phase("telegram_state_restore"):
+            self._restore_state_from_store()
+        with startup.phase("telegram_transport_worker"):
+            await self._ensure_transport_worker()
+        with startup.phase("telegram_background_poller", enabled=self._enable_background_poller):
+            await self._ensure_background_poller(None)
 
     def _next_transport_sequence(self) -> int:
         self._transport_sequence += 1
@@ -9828,7 +9846,9 @@ async def _shutdown_telegram_runtime(*, app: Application, tg_bot: TelegramBot) -
 
 async def _run_telegram_bot_once(config: OBSConfig) -> None:
     """Run one Telegram runtime instance until cancellation or runtime failure."""
-    app = create_telegram_app(config)
+    startup = StartupProfiler(logger, "telegram-runtime")
+    with startup.phase("create_telegram_app", sender_bot_count=len(config.telegram_sender_bot_tokens)):
+        app = create_telegram_app(config)
     tg_bot: TelegramBot = app.bot_data["obs_telegram_bot"]
     polling_error: asyncio.Queue[TelegramError] = asyncio.Queue(maxsize=1)
 
@@ -9839,20 +9859,27 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
 
     logger.info("Starting Telegram bot...")
     try:
-        await tg_bot.initialize_runtime()
-        await app.initialize()
-        await tg_bot._ensure_background_poller(app.bot)
-        await _clear_secondary_bot_commands(config)
-        await _set_bot_commands(app)
-        await app.start()
+        await tg_bot.initialize_runtime(startup)
+        with startup.phase("telegram_application_initialize"):
+            await app.initialize()
+        with startup.phase("telegram_background_poller_with_bot"):
+            await tg_bot._ensure_background_poller(app.bot)
+        with startup.phase("telegram_secondary_commands", sender_bot_count=max(len(config.telegram_sender_bot_tokens) - 1, 0)):
+            await _clear_secondary_bot_commands(config)
+        with startup.phase("telegram_primary_commands"):
+            await _set_bot_commands(app)
+        with startup.phase("telegram_application_start"):
+            await app.start()
         drop_pending_updates = (
             (os.environ.get("OBS_TELEGRAM_DROP_PENDING_UPDATES") or "").strip().lower()
             in {"1", "true", "yes", "on"}
         )
-        await app.updater.start_polling(
-            drop_pending_updates=drop_pending_updates,
-            error_callback=_record_polling_error,
-        )
+        with startup.phase("telegram_start_polling", drop_pending_updates=drop_pending_updates):
+            await app.updater.start_polling(
+                drop_pending_updates=drop_pending_updates,
+                error_callback=_record_polling_error,
+            )
+        startup.complete(sender_bot_count=len(config.telegram_sender_bot_tokens))
 
         while True:
             await asyncio.sleep(_TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS)

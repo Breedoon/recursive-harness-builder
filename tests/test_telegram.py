@@ -9,6 +9,7 @@ Covers the simplified Telegram runtime:
 """
 
 import asyncio
+import logging
 import json
 import uuid
 from contextlib import suppress
@@ -28,6 +29,7 @@ from obs_agent.lineage import (
 )
 from obs_agent.queueing import QueuedMessage
 from obs_agent.runner import DoneEvent, TextEvent, TurnEndEvent
+from obs_agent.startup_logging import StartupProfiler
 from obs_agent.telegram import (
     FragmentBuffer,
     TelegramRoute,
@@ -149,6 +151,22 @@ class TestTelegramBotAuth:
         await bot.handle_message(update, ctx)
 
         ctx.bot.send_message.assert_not_called()
+
+
+class TestTelegramRuntimeStartup:
+    async def test_initialize_runtime_logs_startup_phases(self, config, caplog):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        profiler = StartupProfiler(logging.getLogger("tests.telegram.startup"), "telegram-runtime")
+
+        with caplog.at_level(logging.INFO, logger="tests.telegram.startup"):
+            await bot.initialize_runtime(profiler)
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("startup phase_complete component=telegram-runtime phase=telegram_normalizer" in msg for msg in messages)
+        assert any("startup phase_complete component=telegram-runtime phase=telegram_state_restore" in msg for msg in messages)
+        assert any("startup phase_complete component=telegram-runtime phase=telegram_background_poller" in msg for msg in messages)
+
+        await bot.shutdown()
 
 
 class TestTelegramMessageFlow:
