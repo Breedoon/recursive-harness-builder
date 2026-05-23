@@ -2516,6 +2516,69 @@ class TestForkViaReply:
         assert state.session_id == "sid-fork"
         mock_fork.assert_called_once()
 
+    async def test_inline_reply_fork_preserves_route_identity_projection(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.topic_title = "Root"
+        state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(state)
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root",),
+            origin="trunk_start",
+            is_fork=False,
+            session_id="sid-root",
+            team_name="team-inline",
+            agent_name="agent-inline",
+        )
+        bot._message_map[(67890, 5)] = _TelegramMessageBinding(
+            jsonl_uuid="assistant-1",
+            session_id="sid-root",
+            role="assistant",
+            route=state.route,
+        )
+        bot._session_heads["sid-root"] = "assistant-latest"
+        trigger = QueuedMessage(
+            text="follow up",
+            telegram_message_id=11,
+            reply_to_message_id=5,
+        )
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        original_activate = bot._activate_route_session
+        observed: dict[str, object] = {}
+
+        async def observe_activation(route_state, session_id):
+            observed["projection_before_activation"] = bot._state_inbox_projection(route_state)
+            observed["bootstrap_before_activation"] = route_state.pending_obs_bootstrap
+            await original_activate(route_state, session_id)
+
+        with patch.object(bot, "_activate_route_session", side_effect=observe_activation):
+            with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-fork"):
+                proceed, _ = await bot._resolve_session_for_trigger(
+                    state=state,
+                    trigger_message=trigger,
+                    bot=fake_bot,
+                )
+
+        assert proceed is True
+        assert state.session_id == "sid-fork"
+        assert observed["projection_before_activation"] == ("team-inline", "agent-inline")
+        assert "<origin>inline_fork</origin>" in observed["bootstrap_before_activation"]
+        assert "<is_fork>true</is_fork>" in observed["bootstrap_before_activation"]
+        assert state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] == "team-inline"
+        assert state.session_manager.sdk_env_overrides["CLAUDE_CODE_AGENT_NAME"] == "agent-inline"
+        assert bot._resolve_route_inbox_target(
+            team_name="team-inline",
+            agent_name="agent-inline",
+        ) is state
+
     async def test_reply_to_old_user_message_forks_session(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         state = _state(bot)

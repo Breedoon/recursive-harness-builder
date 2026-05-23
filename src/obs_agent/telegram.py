@@ -4865,6 +4865,12 @@ class TelegramBot:
             await self._activate_route_session(state, binding.session_id)
             return True, reply_to_user_message_id
 
+        lineage = self._ensure_state_lineage(state, session_id=binding.session_id)
+        projection = self._state_inbox_projection(state)
+        if projection is None:
+            team_name, agent_name = self._default_team_projection(lineage)
+        else:
+            team_name, agent_name = projection
         fork_session_id = fork_session_jsonl(
             session_id=binding.session_id,
             target_uuid=binding.jsonl_uuid,
@@ -4875,8 +4881,6 @@ class TelegramBot:
             session_id=fork_session_id,
             jsonl_uuid=binding.jsonl_uuid,
         )
-        await self._activate_route_session(state, fork_session_id)
-        lineage = self._ensure_state_lineage(state, session_id=binding.session_id)
         self._prime_obs_bootstrap(
             state,
             lineage=lineage,
@@ -4884,6 +4888,19 @@ class TelegramBot:
             is_fork=True,
             parent_session_id=binding.session_id,
             session_id=fork_session_id,
+            team_name=team_name,
+            agent_name=agent_name,
+        )
+        await self._activate_route_session(state, fork_session_id)
+        self._prime_obs_bootstrap(
+            state,
+            lineage=lineage,
+            origin="inline_fork",
+            is_fork=True,
+            parent_session_id=binding.session_id,
+            session_id=fork_session_id,
+            team_name=team_name,
+            agent_name=agent_name,
         )
         return True, reply_to_user_message_id
 

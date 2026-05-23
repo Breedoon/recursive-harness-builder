@@ -1207,6 +1207,10 @@ class TestTelegramLiveForumTopics:
         )
         alpha_message_id = _message_containing(alpha_trace, f"ALPHA-{tag}").message_id
         session_before = await _session_id_for_route(live_tg_forum, thread_id=thread_id)
+        lineage_before = await _query_session_lineage_fact(
+            live_tg_forum,
+            thread_id=thread_id,
+        )
 
         beta_trace = await live_tg_forum.platform.send(
             f"This is a deterministic integration test. Reply with only BETA-{tag}.",
@@ -1224,6 +1228,10 @@ class TestTelegramLiveForumTopics:
             reply_to_message_id=alpha_message_id,
         )
         session_after = await _session_id_for_route(live_tg_forum, thread_id=thread_id)
+        lineage_after = await _query_session_lineage_fact(
+            live_tg_forum,
+            thread_id=thread_id,
+        )
         plain_followup = await live_tg_forum.platform.send(
             (
                 "This is a deterministic integration test. "
@@ -1235,6 +1243,7 @@ class TestTelegramLiveForumTopics:
 
         assert "NO" in reply_fork_trace.output, live_tg_forum.failure_context()
         assert session_after != session_before, live_tg_forum.failure_context()
+        assert lineage_after == lineage_before, live_tg_forum.failure_context()
         assert "NO" in plain_followup.output, live_tg_forum.failure_context()
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
 
