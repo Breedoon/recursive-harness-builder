@@ -765,7 +765,7 @@ class TestTelegramLiveSmoke:
         )
         assert parent_session_after == parent_session_before, live_tg_forum.failure_context()
 
-    async def test_live_smoke_stop_all_interrupts_parent_and_delegated_tasks(
+    async def test_live_smoke_stop_all_is_deprecated(
         self,
         live_tg_forum: _LiveForumHarness,
     ) -> None:
@@ -773,136 +773,13 @@ class TestTelegramLiveSmoke:
         tag = uuid.uuid4().hex[:8]
         parent_thread_id = await live_tg_forum.platform.create_topic(f"Smoke StopAll {tag}")
 
-        await _send_and_wait_for_token(
-            live_tg_forum,
-            text=f"This is a deterministic smoke test. Reply with only STOP-PRIME-{tag}.",
-            thread_id=parent_thread_id,
-            token=f"STOP-PRIME-{tag}",
-            timeout=180.0,
-        )
-
-        setup_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
-        await live_tg_forum.platform.send(
-            (
-                "This is a deterministic smoke stop-all test. "
-                "Do not call tools in parallel; execute exactly one tool call at a time. "
-                "Use AgentTask exactly twice with fork=true and run_in_background=true. "
-                f"First AgentTask description STOP-A-{tag}, prompt "
-                f"'Use Bash to run sleep 180 and then reply with only CHILD-A-LATE-{tag}.' "
-                f"Second AgentTask description STOP-B-{tag}, prompt "
-                f"'Use Bash to run sleep 180 and then reply with only CHILD-B-LATE-{tag}.' "
-                "Capture the returned handles and reply with exactly one line in this schema: "
-                f'STOP-SETUP-{tag}: {{"child_task_ids":["<id1>","<id2>"]}}'
-            ),
-            thread_id=parent_thread_id,
-            require_done=False,
-            timeout=240.0,
-        )
-        setup_line = await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=parent_thread_id,
-            after_message_id=setup_baseline,
-            token=f"STOP-SETUP-{tag}:",
-            timeout=360.0,
-        )
-        setup_payload = _extract_json_object(setup_line.text)
-        child_ids_raw = setup_payload.get("child_task_ids")
-        assert isinstance(child_ids_raw, list), live_tg_forum.failure_context()
-        child_task_ids = [
-            str(value).strip()
-            for value in child_ids_raw
-            if str(value).strip()
-        ]
-        assert len(child_task_ids) >= 2, live_tg_forum.failure_context()
-
-        deadline = asyncio.get_running_loop().time() + 180.0
-        child_threads: set[int] = set()
-        while asyncio.get_running_loop().time() < deadline and len(child_threads) < 2:
-            recent = await live_tg_forum.platform.get_recent_messages(
-                thread_id=parent_thread_id,
-                limit=200,
-            )
-            for msg in recent:
-                if msg.message_id <= setup_baseline:
-                    continue
-                if "fork task launched" not in msg.text.lower():
-                    continue
-                try:
-                    thread_id, _ = _extract_topic_link(msg.text)
-                except AssertionError:
-                    continue
-                child_threads.add(thread_id)
-            if len(child_threads) < 2:
-                await asyncio.sleep(1.0)
-        assert len(child_threads) >= 2, live_tg_forum.failure_context()
-
-        forbidden_tokens = [
-            f"PARENT-ALL-LATE-{tag}",
-            f"CHILD-A-LATE-{tag}",
-            f"CHILD-B-LATE-{tag}",
-        ]
-        child_late_tokens = [
-            f"CHILD-A-LATE-{tag}",
-            f"CHILD-B-LATE-{tag}",
-        ]
-        inspected_threads = {parent_thread_id, *child_threads}
-
-        parent_busy_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
-        await live_tg_forum.platform.send_nowait(
-            (
-                "This is a deterministic smoke stop-all test. "
-                f"Use Bash to run sleep 180, then reply with only PARENT-ALL-LATE-{tag}."
-            ),
-            thread_id=parent_thread_id,
-        )
-        await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=parent_thread_id,
-            after_message_id=parent_busy_baseline,
-            token="working",
-            timeout=120.0,
-        )
-
-        stop_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
         stop_trace = await live_tg_forum.platform.send_control(
             f"/stop@{live_tg_forum.bot_username} all",
             thread_id=parent_thread_id,
             timeout=120.0,
         )
         normalized_stop = stop_trace.output.lower()
-        assert (
-            "interrupt sent to all topics" in normalized_stop
-            or "interrupt sent" in normalized_stop
-        ), live_tg_forum.failure_context()
-
-        for child_thread_id in sorted(child_threads):
-            child_recent = await live_tg_forum.platform.get_recent_messages(
-                thread_id=child_thread_id,
-                limit=200,
-            )
-            completed_before_stop = any(
-                message.message_id <= stop_baseline
-                and any(token in message.text for token in child_late_tokens)
-                for message in child_recent
-            )
-            if completed_before_stop:
-                continue
-            stopped = await _wait_for_message_containing(
-                live_tg_forum,
-                thread_id=child_thread_id,
-                token="fork task stopped",
-                timeout=300.0,
-            )
-            assert "fork task stopped" in stopped.text.lower(), live_tg_forum.failure_context()
-
-        for thread_id in inspected_threads:
-            recent = await live_tg_forum.platform.get_recent_messages(thread_id=thread_id, limit=200)
-            for token in forbidden_tokens:
-                assert not any(
-                    message.message_id > stop_baseline
-                    and _message_is_exact_token(message.text, token)
-                    for message in recent
-                ), live_tg_forum.failure_context()
+        assert "arguments are deprecated" in normalized_stop, live_tg_forum.failure_context()
 
     async def test_live_smoke_stop_interrupts_parent_but_not_delegated_children(
         self,

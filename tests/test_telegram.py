@@ -3633,7 +3633,7 @@ class TestCommands:
         msg = ctx.bot.send_message.call_args.kwargs["text"]
         assert "unscheduled" in msg.lower() or "sched-only" in msg
 
-    async def test_unschedule_all_removes_chat_schedules(self, config):
+    async def test_unschedule_all_is_deprecated(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route_a = TelegramRoute(chat_id=67890, thread_id=1)
         route_b = TelegramRoute(chat_id=67890, thread_id=2)
@@ -3668,13 +3668,14 @@ class TestCommands:
             )
         )
 
-        update = _make_update("/unschedule all", thread_id=1)
+        update = _make_update("/unschedule all", message_id=88, thread_id=1)
         ctx = _make_context()
         ctx.args = ["all"]
         await bot.handle_unschedule(update, ctx)
-        assert bot._schedule_ids_by_route.get(route_a, set()) == set()
-        assert bot._schedule_ids_by_route.get(route_b, set()) == set()
-        assert "unscheduled 2 schedule(s) across this chat" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert bot._schedule_ids_by_route.get(route_a, set()) == {"sched-a"}
+        assert bot._schedule_ids_by_route.get(route_b, set()) == {"sched-b"}
+        assert "Cross-topic &#x27;all&#x27; arguments are deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert ctx.bot.send_message.call_args.kwargs["reply_to_message_id"] == 88
 
     async def test_stop_sets_interrupt_flag_and_calls_sdk_interrupt(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -3696,7 +3697,7 @@ class TestCommands:
         ctx.bot.send_message.assert_called_once()
         assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent</i></u>"
 
-    async def test_stop_all_sets_interrupt_flag_for_all_routes(self, config):
+    async def test_stop_all_is_deprecated(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         general = _state(bot)
         topic = _state(bot, thread_id=321)
@@ -3709,22 +3710,19 @@ class TestCommands:
         topic.session_manager._client = topic_client
         topic.session_manager._connected = True
 
-        update = _make_update("/stop all")
+        update = _make_update("/stop all", message_id=89)
         ctx = _make_context()
         ctx.args = ["all"]
         await bot.handle_stop(update, ctx)
 
-        assert general.hook_state.interrupt_flag is True
-        assert topic.hook_state.interrupt_flag is True
-        assert general.hook_state.interrupt_notice_pending is True
-        assert topic.hook_state.interrupt_notice_pending is True
-        assert general.hook_state.pause_queue_delivery is False
-        assert topic.hook_state.pause_queue_delivery is False
-        general_client.interrupt.assert_awaited_once()
-        topic_client.interrupt.assert_awaited_once()
-        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
+        assert general.hook_state.interrupt_flag is False
+        assert topic.hook_state.interrupt_flag is False
+        general_client.interrupt.assert_not_awaited()
+        topic_client.interrupt.assert_not_awaited()
+        assert "Cross-topic &#x27;all&#x27; arguments are deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert ctx.bot.send_message.call_args.kwargs["reply_to_message_id"] == 89
 
-    async def test_stop_all_with_mention_suffix_targets_all_routes(self, config):
+    async def test_stop_all_with_mention_suffix_is_deprecated(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         general = _state(bot)
         topic = _state(bot, thread_id=321)
@@ -3742,13 +3740,13 @@ class TestCommands:
         ctx.args = ["all@obs_bot"]
         await bot.handle_stop(update, ctx)
 
-        assert general.hook_state.interrupt_flag is True
-        assert topic.hook_state.interrupt_flag is True
-        general_client.interrupt.assert_awaited_once()
-        topic_client.interrupt.assert_awaited_once()
-        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
+        assert general.hook_state.interrupt_flag is False
+        assert topic.hook_state.interrupt_flag is False
+        general_client.interrupt.assert_not_awaited()
+        topic_client.interrupt.assert_not_awaited()
+        assert "Cross-topic &#x27;all&#x27; arguments are deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
 
-    async def test_stop_with_command_mention_targets_all_routes(self, config):
+    async def test_stop_with_command_mention_all_is_deprecated(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         general = _state(bot)
         topic = _state(bot, thread_id=321)
@@ -3766,11 +3764,11 @@ class TestCommands:
         ctx.args = ["all"]
         await bot.handle_stop(update, ctx)
 
-        assert general.hook_state.interrupt_flag is True
-        assert topic.hook_state.interrupt_flag is True
-        general_client.interrupt.assert_awaited_once()
-        topic_client.interrupt.assert_awaited_once()
-        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
+        assert general.hook_state.interrupt_flag is False
+        assert topic.hook_state.interrupt_flag is False
+        general_client.interrupt.assert_not_awaited()
+        topic_client.interrupt.assert_not_awaited()
+        assert "Cross-topic &#x27;all&#x27; arguments are deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
 
     async def test_stop_does_not_mark_parent_agent_task_terminal_request(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -3832,10 +3830,7 @@ class TestCommands:
             bot._fork_tasks_by_id["task-agent-all"] = record
             bot._fork_task_tasks["task-agent-all"] = running
 
-            update = _make_update("/stop all", thread_id=None)
-            ctx = _make_context()
-            ctx.args = ["all"]
-            await bot.handle_stop(update, ctx)
+            await bot._cancel_route_fork_tasks(child_route, status="stopped")
             await asyncio.sleep(0)
 
         assert record.terminal_request == "stopped"
@@ -3901,10 +3896,8 @@ class TestCommands:
             bot._fork_task_tasks["task-agent-a"] = task_a
             bot._fork_task_tasks["task-agent-b"] = task_b
 
-            update = _make_update("/stop all", thread_id=None)
-            ctx = _make_context()
-            ctx.args = ["all"]
-            await bot.handle_stop(update, ctx)
+            await bot._cancel_route_fork_tasks(child_a_route, status="stopped")
+            await bot._cancel_route_fork_tasks(child_b_route, status="stopped")
             await asyncio.sleep(0)
 
         assert record_a.terminal_request == "stopped"
@@ -4324,35 +4317,38 @@ class TestTopicCommands:
         assert bot._message_map[(67890, 77)].jsonl_uuid == "late-uuid"
         assert bot._session_heads["sid-late"] == "late-uuid"
 
-    async def test_delete_current_topic_drops_route_state(self, config):
+    async def test_delete_current_topic_is_deprecated(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         topic_state = _state(bot, thread_id=321)
         topic_state.session_manager.set_session_id("sid-topic")
 
-        update = _make_update("/delete", thread_id=321)
+        update = _make_update("/delete", message_id=77, thread_id=321)
         ctx = _make_context()
         ctx.bot.delete_forum_topic = AsyncMock(return_value=True)
 
         await bot.handle_delete(update, ctx)
 
-        ctx.bot.delete_forum_topic.assert_awaited_once_with(chat_id=67890, message_thread_id=321)
-        assert TelegramRoute(chat_id=67890, thread_id=321) not in bot._states_by_route
+        ctx.bot.delete_forum_topic.assert_not_awaited()
+        assert TelegramRoute(chat_id=67890, thread_id=321) in bot._states_by_route
+        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>/delete is deprecated and disabled; manage Telegram topics directly in Telegram.</i></u>"
+        assert ctx.bot.send_message.call_args.kwargs["reply_to_message_id"] == 77
 
-    async def test_delete_all_replies_in_general_route(self, config):
+    async def test_delete_all_is_deprecated_in_topic(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         _state(bot)
         _state(bot, thread_id=321)
 
-        update = _make_update("/delete all", thread_id=321)
+        update = _make_update("/delete all", message_id=78, thread_id=321)
         ctx = _make_context()
         ctx.args = ["all"]
         ctx.bot.delete_forum_topic = AsyncMock(return_value=True)
 
         await bot.handle_delete(update, ctx)
 
-        assert ctx.bot.send_message.call_args.kwargs["message_thread_id"] is None
-        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>all non-General topics deleted</i></u>"
-        assert ctx.bot.send_message.call_args.kwargs["disable_notification"] is False
+        ctx.bot.delete_forum_topic.assert_not_awaited()
+        assert ctx.bot.send_message.call_args.kwargs["message_thread_id"] == 321
+        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>/delete is deprecated and disabled; manage Telegram topics directly in Telegram.</i></u>"
+        assert ctx.bot.send_message.call_args.kwargs["disable_notification"] is True
 
 
 class TestForkTaskRuntime:
@@ -6471,7 +6467,8 @@ class TestForkTaskRuntime:
         delete_ctx = _make_context()
         delete_ctx.bot.delete_forum_topic = AsyncMock(return_value=True)
         await bot.handle_delete(delete_update, delete_ctx)
-        assert record.terminal_request == "failed"
+        assert record.terminal_request is None
+        delete_ctx.bot.delete_forum_topic.assert_not_awaited()
 
     async def test_active_fork_tasks_still_emit_completion_summary(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -6715,6 +6712,21 @@ class TestTelegramCommandHelp:
         assert kwargs["disable_notification"] is True
         await bot.shutdown()
 
+    async def test_bare_command_sends_usage_without_running_agent(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("stop", message_id=44)
+        ctx = _make_context()
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            await bot.handle_message(update, ctx)
+
+        mock_runner.assert_not_called()
+        kwargs = ctx.bot.send_message.call_args.kwargs
+        assert "Use /stop to interrupt this topic." in kwargs["text"]
+        assert kwargs["reply_to_message_id"] == 44
+        assert kwargs["disable_notification"] is True
+        await bot.shutdown()
+
     async def test_unknown_command_points_to_help(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         update = _make_update("/wat now", message_id=43)
@@ -6742,6 +6754,7 @@ class TestTelegramCommandRegistration:
         assert "help" in names
         assert "new_group" in names
         assert "new_bot" in names
+        assert "delete" not in names
 
     async def test_set_bot_commands_describes_tree_children_as_direct_children(self):
         app = MagicMock()

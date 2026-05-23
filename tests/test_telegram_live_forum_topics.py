@@ -496,7 +496,7 @@ class _LiveForumHarness:
 
 
 async def _warm_platform(harness: _LiveForumHarness) -> None:
-    clear_cmd = f"/clear@{harness.bot_username} all"
+    clear_cmd = f"/clear@{harness.bot_username}"
     for _ in range(6):
         trace = await harness.platform.send_control(clear_cmd, timeout=25.0)
         if "cleared" in trace.output.lower():
@@ -509,11 +509,11 @@ async def _warm_platform(harness: _LiveForumHarness) -> None:
                 await asyncio.sleep(2.0)
             return
         await asyncio.sleep(1.0)
-    raise AssertionError("Forum bot did not respond to warmup /clear all")
+    raise AssertionError("Forum bot did not respond to warmup /clear")
 
 
 async def _reset_general(harness: _LiveForumHarness) -> None:
-    clear_cmd = f"/clear@{harness.bot_username} all"
+    clear_cmd = f"/clear@{harness.bot_username}"
     for _ in range(6):
         baseline = await harness.platform.latest_bot_message_id(thread_id=None)
         trace = await harness.platform.send_control(
@@ -539,7 +539,7 @@ async def _reset_general(harness: _LiveForumHarness) -> None:
                 await asyncio.sleep(2.0)
             return
         await asyncio.sleep(1.0)
-    raise AssertionError("Forum bot did not confirm /clear all")
+    raise AssertionError("Forum bot did not confirm /clear")
 
 
 async def _session_id_for_route(
@@ -844,6 +844,56 @@ def test_build_bot_env_preserves_anthropic_env_for_non_claude_model(
 @pytest.mark.integration
 @pytest.mark.telegram
 class TestTelegramLiveForumTopics:
+    @pytest.mark.telegram_core_smoke
+    async def test_live_command_help_and_deprecations(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        thread_id = await live_tg_forum.platform.create_topic(f"Command UX {tag}")
+
+        help_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
+        await live_tg_forum.platform.send_nowait("help", thread_id=thread_id)
+        help_msg = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_id,
+            after_message_id=help_baseline,
+            token="usage",
+            timeout=45.0,
+        )
+
+        delete_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
+        await live_tg_forum.platform.send_nowait(
+            f"/delete@{live_tg_forum.bot_username}",
+            thread_id=thread_id,
+        )
+        delete_msg = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_id,
+            after_message_id=delete_baseline,
+            token="deprecated and disabled",
+            timeout=45.0,
+        )
+
+        stop_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
+        await live_tg_forum.platform.send_nowait(
+            f"/stop@{live_tg_forum.bot_username} all",
+            thread_id=thread_id,
+        )
+        stop_msg = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_id,
+            after_message_id=stop_baseline,
+            token="arguments are deprecated",
+            timeout=45.0,
+        )
+
+        assert "/help" in help_msg.text and "usage" in help_msg.text.lower(), live_tg_forum.failure_context()
+        assert "deprecated and disabled" in delete_msg.text, live_tg_forum.failure_context()
+        assert "arguments are deprecated" in stop_msg.text, live_tg_forum.failure_context()
+        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
+
     @pytest.mark.telegram_special
     async def test_live_completion_summary_omits_context_window_suffix(
         self,

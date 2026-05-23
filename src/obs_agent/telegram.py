@@ -109,14 +109,32 @@ _AUTO_DELIVERY_PROMPT = (
 
 _TELEGRAM_HELP_TEXT = """Usage:
 /help — show this help
-/stop — interrupt this topic; /stop all interrupts every topic in the chat
+/stop — interrupt this topic
 /fork [name] — create a new topic from this head or a replied message
 /new [name] — reset this topic into a new trunk agent
 /clear — clear this topic but keep its agent identity
 /context — show session and context info
 
 Bare commands are not supported; use the slash form, e.g. /stop.
+Deprecated: /delete and cross-topic all arguments are disabled.
 """.strip()
+
+_DEPRECATED_ALL_SCOPE_TEXT = "Cross-topic 'all' arguments are deprecated; run the command in each topic instead."
+_DELETE_DEPRECATED_TEXT = "/delete is deprecated and disabled; manage Telegram topics directly in Telegram."
+_BARE_COMMAND_USAGE: dict[str, str] = {
+    "help": "Use /help for command usage.",
+    "stop": "Use /stop to interrupt this topic.",
+    "fork": "Use /fork [name] to create a new topic.",
+    "new": "Use /new [name] to reset this topic into a new trunk agent.",
+    "clear": "Use /clear to clear this topic while keeping its agent identity.",
+    "context": "Use /context to show session and context info.",
+    "report": "Use /report [comment] to save a debug case file.",
+    "schedule": "Use /schedule for schedule command status.",
+    "unschedule": "Use /unschedule to remove a schedule from this topic.",
+    "tree": "Use /tree to render the agent tree.",
+    "forktask": "Use AgentTask from an agent topic to launch delegated work.",
+    "delete": _DELETE_DEPRECATED_TEXT,
+}
 
 _PRIORITY_SYSTEM = 0
 _PRIORITY_ASSISTANT = 10
@@ -4920,6 +4938,8 @@ class TelegramBot:
             await self._media_group_buffer.add(update, context)
             return
         if message.text is not None:
+            if await self._maybe_handle_bare_command(update, context):
+                return
             await self._fragment_buffer.add(update, context)
             return
         receipt_message_ids: list[int] = []
@@ -4943,31 +4963,46 @@ class TelegramBot:
             user_warnings=normalized.user_warnings,
         )
 
-    def _routes_in_chat(self, chat_id: int) -> list[TelegramRoute]:
-        return [route for route in self._states_by_route if route.chat_id == chat_id]
-
     def _command_targets(
         self,
         *,
         route: TelegramRoute,
         args: list[str],
     ) -> tuple[list[TelegramSessionState], bool]:
-        normalized_arg = ""
-        if len(args) == 1:
-            normalized_arg = args[0].strip().lower()
-            # Telegram control clients sometimes send "/cmd all@botname";
-            # treat that as the same scope selector as "/cmd all".
-            if "@" in normalized_arg:
-                normalized_arg = normalized_arg.split("@", 1)[0].strip()
-        apply_all = len(args) == 1 and normalized_arg == "all"
-        if apply_all:
-            routes = self._routes_in_chat(route.chat_id)
-            if route not in routes:
-                routes.append(route)
-            states = [self._get_state(candidate) for candidate in routes]
-            return [state for state in states if state is not None], True
         state = self._get_state(route)
         return ([state] if state is not None else []), False
+
+    def _has_deprecated_all_arg(self, args: list[str]) -> bool:
+        for arg in args:
+            normalized_arg = arg.strip().lower()
+            if "@" in normalized_arg:
+                normalized_arg = normalized_arg.split("@", 1)[0].strip()
+            if normalized_arg == "all":
+                return True
+        return False
+
+    async def _maybe_handle_bare_command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> bool:
+        if update.effective_message is None:
+            return False
+        raw_text = str(update.effective_message.text or "").strip()
+        if not raw_text or raw_text.startswith("/") or any(ch.isspace() for ch in raw_text):
+            return False
+        normalized = raw_text.strip().lower()
+        if normalized not in _BARE_COMMAND_USAGE:
+            return False
+        route = self._route_for_message(update.effective_message)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=_BARE_COMMAND_USAGE[normalized],
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
+        return True
 
     async def _build_context_lines(self, state: TelegramSessionState) -> list[str]:
         snapshot = build_context_snapshot(
@@ -5421,7 +5456,7 @@ class TelegramBot:
     async def handle_clear(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /clear - reset current topic or all topics in the current chat."""
+        """Handle /clear - reset current topic."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
@@ -5429,12 +5464,17 @@ class TelegramBot:
 
         await self._ensure_background_poller(context.bot)
         route = self._route_for_message(update.effective_message)
-        states, apply_all = self._command_targets(route=route, args=context.args)
-        has_schedules = (
-            any(bool(self._schedule_ids_by_route.get(state.route, set())) for state in states)
-            if apply_all
-            else bool(self._schedule_ids_by_route.get(route, set()))
-        )
+        if self._has_deprecated_all_arg(context.args):
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=_DEPRECATED_ALL_SCOPE_TEXT,
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
+        states, _ = self._command_targets(route=route, args=context.args)
+        has_schedules = bool(self._schedule_ids_by_route.get(route, set()))
         for state in states:
             state.last_bot = context.bot
             state.hook_state.interrupt_flag = True
@@ -5451,20 +5491,9 @@ class TelegramBot:
             route=route,
             bot=context.bot,
             text=(
-                (
-                    "all topic sessions cleared; schedules were kept; agent identities were kept. "
-                    "Use /unschedule all to remove schedules across this chat."
-                )
-                if apply_all and has_schedules
-                else (
-                    "session cleared; schedule was kept; agent identity was kept. Use /unschedule to remove this topic schedule."
-                    if has_schedules
-                    else (
-                        "all topic sessions cleared; agent identities were kept"
-                        if apply_all
-                        else "session cleared; agent identity was kept"
-                    )
-                )
+                "session cleared; schedule was kept; agent identity was kept. Use /unschedule to remove this topic schedule."
+                if has_schedules
+                else "session cleared; agent identity was kept"
             ),
             disable_notification=True,
         )
@@ -5826,30 +5855,20 @@ class TelegramBot:
     async def handle_unschedule(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /unschedule - remove schedule(s) from this topic or chat (/unschedule all)."""
+        """Handle /unschedule - remove schedule(s) from this topic."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
             return
 
         route = self._route_for_message(update.effective_message)
-        states, apply_all = self._command_targets(route=route, args=context.args)
-        if apply_all:
-            deleted = 0
-            for state in states:
-                schedule_ids = sorted(self._schedule_ids_by_route.get(state.route, set()))
-                for schedule_id in schedule_ids:
-                    self._delete_topic_schedule(schedule_id)
-                    deleted += 1
+        if self._has_deprecated_all_arg(context.args):
             await self._send_system_message(
                 route=route,
                 bot=context.bot,
-                text=(
-                    f"unscheduled {deleted} schedule(s) across this chat"
-                    if deleted > 0
-                    else "no schedules attached to this chat"
-                ),
+                text=_DEPRECATED_ALL_SCOPE_TEXT,
                 disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
             )
             return
 
@@ -5974,27 +5993,32 @@ class TelegramBot:
 
         await self._ensure_background_poller(context.bot)
         route = self._route_for_message(update.effective_message)
-        states, apply_all = self._command_targets(route=route, args=context.args)
+        if self._has_deprecated_all_arg(context.args):
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=_DEPRECATED_ALL_SCOPE_TEXT,
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
+        states, _ = self._command_targets(route=route, args=context.args)
         interrupt_sent = 0
         for state in states:
             state.last_bot = context.bot
             if await self._request_route_interrupt(state):
                 interrupt_sent += 1
-            if apply_all:
-                await self._cancel_route_fork_tasks(state.route, status="stopped")
-            else:
-                self._mark_child_task_terminal_request(state.route, "stopped")
+            self._mark_child_task_terminal_request(state.route, "stopped")
         logger.info(
-            "Interrupt via /stop from user %d all=%s sdk_interrupts=%d/%d",
+            "Interrupt via /stop from user %d sdk_interrupts=%d/%d",
             update.effective_user.id,
-            apply_all,
             interrupt_sent,
             len(states),
         )
         await self._send_system_message(
             route=route,
             bot=context.bot,
-            text="interrupt sent to all topics" if apply_all else "interrupt sent",
+            text="interrupt sent",
             disable_notification=True,
         )
 
@@ -9395,63 +9419,20 @@ class TelegramBot:
     async def handle_delete(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /delete - delete current topic or all non-General topics."""
+        """Handle deprecated /delete without deleting Telegram topics."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
             return
 
         route = self._route_for_message(update.effective_message)
-        if len(context.args) == 1 and context.args[0].strip().lower() == "all":
-            targets = [candidate for candidate in self._routes_in_chat(route.chat_id) if candidate.thread_id is not None]
-            # Drop state FIRST (non-blocking cleanup), then fire-and-forget
-            # the Telegram topic deletion.  Previous implementation awaited
-            # each delete future sequentially which deadlocked when the
-            # transport worker was busy.
-            for target in targets:
-                await self._drop_route_state(target, terminal_status="failed")
-            for target in targets:
-                try:
-                    await self._ensure_transport_worker()
-                    self._increment_pending_chat_ops(target.chat_id)
-                    await self._transport_queue.put(
-                        _TransportEnvelope(
-                            priority=_PRIORITY_SYSTEM,
-                            sequence=self._next_transport_sequence(),
-                            op=_TransportDeleteTopicOp(
-                                route=target,
-                                fallback_bot=context.bot,
-                                future=asyncio.get_running_loop().create_future(),
-                            ),
-                        )
-                    )
-                except Exception:
-                    logger.debug("Failed enqueueing delete for route=%s", target, exc_info=True)
-            reply_route = route if route.thread_id is None else TelegramRoute(chat_id=route.chat_id, thread_id=None)
-            await self._send_system_message(
-                route=reply_route,
-                bot=context.bot,
-                text="all non-General topics deleted",
-                disable_notification=False,
-            )
-            return
-
-        if route.thread_id is None:
-            await self._send_system_message(
-                route=route,
-                bot=context.bot,
-                text="can't delete General",
-                disable_notification=True,
-            )
-            return
-        try:
-            await self._enqueue_delete_topic(
-                route=route,
-                fallback_bot=context.bot,
-                priority=_PRIORITY_SYSTEM,
-            )
-        finally:
-            await self._drop_route_state(route, terminal_status="failed")
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=_DELETE_DEPRECATED_TEXT,
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
 
 
 def create_telegram_app(config: OBSConfig) -> Application:
@@ -9533,12 +9514,12 @@ async def _set_bot_commands(app: Application) -> None:
 
     await app.bot.set_my_commands([
         BotCommand("help", "Show concise command usage"),
-        BotCommand("clear", "Clear this topic but keep its agent identity; use '/clear all' for the whole group"),
+        BotCommand("clear", "Clear this topic but keep its agent identity"),
         BotCommand("new", "Reset this topic into a new trunk agent; optional: /new [emoji] [name]"),
         BotCommand("new_group", "Create a new forum supergroup and add the configured OBS bots"),
         BotCommand("new_bot", "Create a new Claudia sender bot through BotFather"),
-        BotCommand("unschedule", "Remove schedule(s) from this topic; use /unschedule all"),
-        BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
+        BotCommand("unschedule", "Remove schedule(s) from this topic"),
+        BotCommand("stop", "Interrupt this topic"),
         BotCommand("context", "Show session and context window info"),
         BotCommand("report", "Save a debug case file for this message/topic"),
         BotCommand("schedule", "Create schedules once Sprint 1 reliability is approved"),
@@ -9547,7 +9528,6 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("tree_children", "Render this agent and direct children"),
         BotCommand("tree_ancestors", "Render this agent and all ancestors"),
         BotCommand("fork", "Create a new topic from this head or replied message"),
-        BotCommand("delete", "Delete this topic; use '/delete all' to remove all non-General topics"),
     ])
 
 

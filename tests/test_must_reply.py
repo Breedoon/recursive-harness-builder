@@ -496,12 +496,8 @@ class TestUnscheduleNextOnly:
         bot._delete_topic_schedule("target-sched")
         assert "target-sched" not in bot._schedule_ids_by_route.get(route, set())
 
-    def test_sc7_unschedule_all_still_works(self):
-        """'/unschedule all' deletes all schedules across the chat (unchanged).
-
-        This is verified by the existing test_unschedule_all_removes_chat_schedules
-        in test_telegram.py.
-        """
+    def test_sc7_unschedule_all_is_deprecated(self):
+        """'/unschedule all' is deprecated; topic-local unschedule remains covered above."""
         pass
 
 
