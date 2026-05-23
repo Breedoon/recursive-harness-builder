@@ -105,6 +105,7 @@ def config(fixture_vault: Path) -> OBSConfig:
         vault_path=fixture_vault,
         telegram_allowed_user_ids=[12345],
         telegram_state_db_path=fixture_vault / ".claude" / "telegram-state.sqlite3",
+        team_storage_root=fixture_vault / ".claude" / "teams",
     )
 
 
@@ -222,6 +223,7 @@ def e2e_config(e2e_vault: Path) -> OBSConfig:
     return OBSConfig(
         vault_path=e2e_vault,
         telegram_state_db_path=e2e_vault / ".claude" / "telegram-state.sqlite3",
+        team_storage_root=e2e_vault / ".claude" / "teams",
     )
 
 

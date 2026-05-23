@@ -183,8 +183,12 @@ def _copy_numeric_value(target: dict[str, Any], source: dict[str, Any], key: str
         target[key] = value
 
 
-def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
-    config_path = Path.home() / ".claude" / "teams" / team_name / "config.json"
+def _team_dir(config: OBSConfig, team_name: str) -> Path:
+    return config.team_storage_root / team_name
+
+
+def _load_team_projection_metadata(config: OBSConfig, team_name: str) -> dict[str, dict[str, Any]]:
+    config_path = _team_dir(config, team_name) / "config.json"
     if not config_path.exists():
         return {}
     try:
@@ -967,7 +971,7 @@ def create_obs_tools(
         def _is_deliverable(validation: dict[str, Any] | None) -> bool:
             return bool(validation and validation.get("deliverable"))
 
-        inbox_dir = Path.home() / ".claude" / "teams" / team_name / "inboxes"
+        inbox_dir = _team_dir(config, team_name) / "inboxes"
         resolved_recipient = recipient
         inbox_path = inbox_dir / f"{resolved_recipient}.json"
         validation = await _validate_recipient(resolved_recipient)
@@ -1112,10 +1116,7 @@ def create_obs_tools(
         # delete the reply_wake schedule.
         if sender and sender != resolved_recipient:
             sender_inbox_path = (
-                Path.home()
-                / ".claude"
-                / "teams"
-                / team_name
+                _team_dir(config, team_name)
                 / "inboxes"
                 / f"{sender}.json"
             )
@@ -1186,14 +1187,7 @@ def create_obs_tools(
         if limit <= 0:
             return _error_result("Cannot use ReadInbox: limit must be positive")
 
-        inbox_path = (
-            Path.home()
-            / ".claude"
-            / "teams"
-            / team_name
-            / "inboxes"
-            / f"{agent}.json"
-        )
+        inbox_path = _team_dir(config, team_name) / "inboxes" / f"{agent}.json"
         lock = _inbox_lock(inbox_path)
         async with lock:
             entries: list[dict] = []
@@ -1407,8 +1401,8 @@ def create_obs_tools(
             return _error_result("Cannot use search_team: empty lineage")
 
         team_name = str(args.get("team_name") or "").strip() or bootstrap.root_team_key
-        inboxes_dir = Path.home() / ".claude" / "teams" / team_name / "inboxes"
-        team_projection_metadata = _load_team_projection_metadata(team_name)
+        inboxes_dir = _team_dir(config, team_name) / "inboxes"
+        team_projection_metadata = _load_team_projection_metadata(config, team_name)
         result: dict[str, Any] = {
             "mode": mode,
             "team_name": team_name,

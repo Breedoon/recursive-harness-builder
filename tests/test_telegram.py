@@ -1054,6 +1054,26 @@ class TestBackgroundPoller:
         assert env["CLAUDE_CODE_TEAM_NAME"].endswith("-root")
         assert state.hook_state.sdk_env_overrides["AF_SERVICE_WRITE_FILE"] == "/tmp/report.md"
 
+    async def test_prime_obs_bootstrap_writes_team_projection_under_configured_root(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=224)
+        state = bot._get_state(route, topic_title="Alpha")
+        assert state is not None
+
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root", "Alpha"),
+            origin="agent_task_fresh",
+            is_fork=False,
+            session_id="sid-child",
+        )
+
+        team_name = state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"]
+        agent_name = state.session_manager.sdk_env_overrides["CLAUDE_CODE_AGENT_NAME"]
+        expected_inbox = config.team_storage_root / team_name / "inboxes" / f"{agent_name}.json"
+        assert expected_inbox.exists()
+        assert bot._team_inbox_path(team_name, agent_name) == expected_inbox
+
     async def test_run_and_send_injects_pending_child_bootstrap_even_when_fork_session_has_parent_head(
         self,
         config,

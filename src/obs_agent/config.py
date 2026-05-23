@@ -14,6 +14,7 @@ _DEFAULT_TELEGRAM_TEMP_ROOT = Path("/tmp") / "obs-agent"
 _DEFAULT_TELEGRAM_STATE_DB_PATH = (
     _DEFAULT_CODEBASE_ROOT / ".obs-agent" / "state" / "telegram-state.sqlite3"
 )
+_DEFAULT_TEAM_STORAGE_ROOT = Path.home() / ".claude" / "teams"
 _DEFAULT_TELEGRAM_TRANSCRIPTION_SCRIPT = _DEFAULT_CODEBASE_ROOT / "examples" / "transcription" / "transcribe"
 _DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no expiry for now
 
@@ -235,6 +236,7 @@ class OBSConfig:
     telegram_notify_username: str | None = None
     telegram_temp_root: Path = field(default_factory=lambda: _DEFAULT_TELEGRAM_TEMP_ROOT)
     telegram_state_db_path: Path = field(default_factory=lambda: _DEFAULT_TELEGRAM_STATE_DB_PATH)
+    team_storage_root: Path = field(default_factory=lambda: _DEFAULT_TEAM_STORAGE_ROOT)
     telegram_state_retention_days: int = 30
     telegram_transcription_script: Path = field(
         default_factory=lambda: _DEFAULT_TELEGRAM_TRANSCRIPTION_SCRIPT
@@ -317,6 +319,8 @@ class OBSConfig:
             kwargs["telegram_temp_root"] = Path(tg_temp_root)
         if tg_state_db := os.environ.get("OBS_TELEGRAM_STATE_DB_PATH"):
             kwargs["telegram_state_db_path"] = Path(tg_state_db)
+        if team_storage_root := os.environ.get("OBS_TEAM_STORAGE_ROOT"):
+            kwargs["team_storage_root"] = Path(team_storage_root)
         if tg_state_retention := os.environ.get("OBS_TELEGRAM_STATE_RETENTION_DAYS"):
             kwargs["telegram_state_retention_days"] = int(tg_state_retention)
         if tg_transcribe := os.environ.get("OBS_TELEGRAM_TRANSCRIPTION_SCRIPT"):

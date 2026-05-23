@@ -3549,6 +3549,9 @@ class TelegramBot:
             return self._child_topic_title_from_alias(state, normalized_alias)
         return self._next_auto_child_title(state)
 
+    def _team_dir(self, team_name: str) -> Path:
+        return self._config.team_storage_root / team_name
+
     def _build_team_worker_env(
         self,
         *,
@@ -3628,7 +3631,7 @@ class TelegramBot:
         self,
         team_name: str,
     ) -> dict[str, dict[str, Any]]:
-        config_path = Path.home() / ".claude" / "teams" / team_name / "config.json"
+        config_path = self._team_dir(team_name) / "config.json"
         if not config_path.exists():
             return {}
         try:
@@ -3714,7 +3717,7 @@ class TelegramBot:
         if not normalized_team or not normalized_agent:
             return
 
-        team_dir = Path.home() / ".claude" / "teams" / normalized_team
+        team_dir = self._team_dir(normalized_team)
         config_path = team_dir / "config.json"
         team_dir.mkdir(parents=True, exist_ok=True)
 
@@ -5401,7 +5404,7 @@ class TelegramBot:
         current_route: TelegramRoute,
     ) -> dict[str, dict[str, Any]]:
         metadata = self._load_team_projection_metadata(team_name)
-        inbox_dir = Path.home() / ".claude" / "teams" / team_name / "inboxes"
+        inbox_dir = self._team_dir(team_name) / "inboxes"
         all_agents: set[str] = set(metadata)
         if inbox_dir.is_dir():
             for path in inbox_dir.iterdir():
@@ -7821,7 +7824,7 @@ class TelegramBot:
             )
             if team_name and agent_name:
                 inbox_path = (
-                    Path.home() / ".claude" / "teams" / team_name
+                    self._team_dir(team_name)
                     / "inboxes" / f"{agent_name}.json"
                 )
                 agent_key = self._team_worker_key(team_name, agent_name)
@@ -7847,7 +7850,7 @@ class TelegramBot:
                             candidate_lineage = parent_lineage + (candidate_name,)
                             _, candidate_agent = self._default_team_projection(candidate_lineage)
                             candidate_inbox = (
-                                Path.home() / ".claude" / "teams" / team_name
+                                self._team_dir(team_name)
                                 / "inboxes" / f"{candidate_agent}.json"
                             )
                             candidate_bound = (
@@ -8311,9 +8314,8 @@ class TelegramBot:
             max_attempts=1,
         )
 
-    @staticmethod
-    def _team_inbox_path(team_name: str, agent_name: str) -> Path:
-        return Path.home() / ".claude" / "teams" / team_name / "inboxes" / f"{agent_name}.json"
+    def _team_inbox_path(self, team_name: str, agent_name: str) -> Path:
+        return self._team_dir(team_name) / "inboxes" / f"{agent_name}.json"
 
     async def _send_bounce_backs_for_dead_agent(self, route: TelegramRoute) -> None:
         """Notify senders of a dead agent that their messages may not have been read.

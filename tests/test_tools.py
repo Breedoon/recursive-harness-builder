@@ -46,7 +46,8 @@ def skill_vault(tmp_path):
 
 @pytest.fixture
 def skill_config(skill_vault):
-    return OBSConfig(vault_path=Path(skill_vault))
+    vault = Path(skill_vault)
+    return OBSConfig(vault_path=vault, team_storage_root=vault / ".claude" / "teams")
 
 
 class TestAgentTaskTools:
@@ -124,7 +125,7 @@ class TestAgentTaskTools:
         payload = json.loads(result["content"][0]["text"])
         assert payload["success"] is True
 
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
         assert persisted[-1]["must_reply"] is True
         assert persisted[-1]["replied"] is False
@@ -155,7 +156,7 @@ class TestAgentTaskTools:
         payload = json.loads(result["content"][0]["text"])
         assert payload["success"] is True
 
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
         assert persisted[-1]["must_reply"] is True
         assert persisted[-1]["replied"] is False
@@ -657,7 +658,7 @@ class TestAgentTaskTools:
         assert payload["messages"][0]["text"] == "hello team"
         assert payload["messages"][0]["from"] == "lead"
 
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
         assert persisted[0]["read"] is True
 
@@ -696,9 +697,7 @@ class TestAgentTaskTools:
         assert json.loads(send_result["content"][0]["text"])["success"] is True
 
         inbox_path = (
-            tmp_path
-            / ".claude"
-            / "teams"
+            skill_config.team_storage_root
             / "obs-tree-root-123"
             / "inboxes"
             / "obs-agent-peer-999.json"
@@ -707,9 +706,7 @@ class TestAgentTaskTools:
         assert persisted[0]["from"] == "obs-agent-child-123"
 
         self_inbox = (
-            tmp_path
-            / ".claude"
-            / "teams"
+            skill_config.team_storage_root
             / "obs-tree-root-123"
             / "inboxes"
             / "obs-agent-child-123.json"
@@ -843,9 +840,7 @@ class TestAgentTaskTools:
         assert payload["success"] is True
 
         inbox_path = (
-            tmp_path
-            / ".claude"
-            / "teams"
+            skill_config.team_storage_root
             / "2026-03-31-10-00-root"
             / "inboxes"
             / "2026-03-31-10-00-root.json"
@@ -880,7 +875,7 @@ class TestAgentTaskTools:
         payload = json.loads(result["content"][0]["text"])
         assert payload["success"] is True
 
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
         assert "must_reply" not in persisted[-1]
         assert "replied" not in persisted[-1]
@@ -1021,7 +1016,7 @@ class TestAgentTaskTools:
 
         assert result["is_error"] is True
         assert "underdelivered" in result["content"][0]["text"]
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         assert not inbox_path.exists()
 
     @pytest.mark.asyncio
@@ -1053,7 +1048,7 @@ class TestAgentTaskTools:
         payload = json.loads(result["content"][0]["text"])
         assert payload["success"] is True
         assert payload["delivered"] is True
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         assert inbox_path.exists()
 
     @pytest.mark.asyncio
@@ -1087,7 +1082,7 @@ class TestAgentTaskTools:
 
         assert result["is_error"] is True
         assert "underdelivered" in result["content"][0]["text"]
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         assert not inbox_path.exists()
 
     @pytest.mark.asyncio
@@ -1121,7 +1116,7 @@ class TestAgentTaskTools:
         send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
 
         child_name = "e96857c58f-alpha-child"
-        child_path = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "inboxes" / f"{child_name}.json"
+        child_path = skill_config.team_storage_root / "2026-03-30-10-10-root" / "inboxes" / f"{child_name}.json"
         child_path.parent.mkdir(parents=True, exist_ok=True)
         child_path.write_text("[]", encoding="utf-8")
 
@@ -1168,7 +1163,7 @@ class TestAgentTaskTools:
                 parent_display_name=None,
             ),
         )
-        team_dir = tmp_path / ".claude" / "teams" / root_agent
+        team_dir = skill_config.team_storage_root / root_agent
         inbox_dir = team_dir / "inboxes"
         inbox_dir.mkdir(parents=True)
         for agent_name in (root_agent, older_child, newer_child):
@@ -1224,7 +1219,7 @@ class TestAgentTaskTools:
                 parent_display_name=None,
             ),
         )
-        team_dir = tmp_path / ".claude" / "teams" / root_agent
+        team_dir = skill_config.team_storage_root / root_agent
         inbox_dir = team_dir / "inboxes"
         inbox_dir.mkdir(parents=True)
         for agent_name in (root_agent, child_a, child_b):
@@ -1299,7 +1294,7 @@ class TestAgentTaskTools:
         create_obs_tools(skill_config, lambda: "sid-child", hook_state=state)
         send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
 
-        root_path = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "inboxes" / "2026-03-30-10-10-root.json"
+        root_path = skill_config.team_storage_root / "2026-03-30-10-10-root" / "inboxes" / "2026-03-30-10-10-root.json"
         root_path.parent.mkdir(parents=True, exist_ok=True)
         root_path.write_text("[]", encoding="utf-8")
 
@@ -1327,7 +1322,7 @@ class TestAgentTaskTools:
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
         read_handler = _tool_handler(captured["tools"], "ReadInbox")
 
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
@@ -1385,7 +1380,7 @@ class TestAgentTaskTools:
         create_obs_tools(skill_config, lambda: "sid-leaf", hook_state=HookState())
         handler = _tool_handler(captured["tools"], "search_team")
 
-        inboxes = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "inboxes"
+        inboxes = skill_config.team_storage_root / "2026-03-30-10-10-root" / "inboxes"
         inboxes.mkdir(parents=True, exist_ok=True)
         for name in [
             "2026-03-30-10-10-root",
@@ -1397,7 +1392,7 @@ class TestAgentTaskTools:
             "aaaaaaaaaa-cousin",
         ]:
             (inboxes / f"{name}.json").write_text("[]", encoding="utf-8")
-        team_config = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "config.json"
+        team_config = skill_config.team_storage_root / "2026-03-30-10-10-root" / "config.json"
         team_config.write_text(
             json.dumps(
                 {
@@ -1555,7 +1550,7 @@ class TestAgentTaskTools:
 
         await asyncio.gather(*[_send(i) for i in range(40)])
 
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
         assert len(persisted) == 40
         assert all(isinstance(item, dict) for item in persisted)
