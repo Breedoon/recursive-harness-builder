@@ -819,7 +819,7 @@ class TestBackgroundPoller:
         bot._fork_task_by_child_route[child_route] = "task-team"
         bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
 
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
@@ -3132,7 +3132,7 @@ class TestCommands:
         child_agent_name = agent_name_for_lineage(("Root", "Branch", "Child"), team_key=team_name)
         grandchild_agent_name = agent_name_for_lineage(("Root", "Branch", "Child", "Grandchild"), team_key=team_name)
         sibling_agent_name = agent_name_for_lineage(("Root", "Sibling"), team_key=team_name)
-        team_dir = tmp_path / ".claude" / "teams" / team_name
+        team_dir = config.team_storage_root / team_name
         (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
         for agent_name in (
             root_agent_name,
@@ -3296,7 +3296,7 @@ class TestCommands:
         child_agent_name = agent_name_for_lineage(("Root", "Branch", "Child"), team_key=team_name)
         grandchild_agent_name = agent_name_for_lineage(("Root", "Branch", "Child", "Grandchild"), team_key=team_name)
         sibling_agent_name = agent_name_for_lineage(("Root", "Sibling"), team_key=team_name)
-        team_dir = tmp_path / ".claude" / "teams" / team_name
+        team_dir = config.team_storage_root / team_name
         (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
         for agent_name in (
             root_agent_name,
@@ -3388,7 +3388,7 @@ class TestCommands:
         child_agent_name = agent_name_for_lineage(("Root", "Branch", "Child"), team_key=team_name)
         bot._route_inbox_targets[(team_name.lower(), current_agent_name.lower())] = route
         bot._route_inbox_target_keys_by_route[route] = (team_name.lower(), current_agent_name.lower())
-        team_dir = tmp_path / ".claude" / "teams" / team_name
+        team_dir = config.team_storage_root / team_name
         (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
         (team_dir / "config.json").write_text(
             json.dumps(
@@ -4293,7 +4293,7 @@ class TestTopicCommands:
             agent_name=child_agent_name,
         )["deliverable"] is True
 
-        team_config = tmp_path / ".claude" / "teams" / team_name / "config.json"
+        team_config = config.team_storage_root / team_name / "config.json"
         members = json.loads(team_config.read_text(encoding="utf-8"))["members"]
         member_names = {member["name"] for member in members}
         assert parent_agent_name in member_names
@@ -4996,7 +4996,7 @@ class TestForkTaskRuntime:
                 },
             )
 
-        team_config = tmp_path / ".claude" / "teams" / "team-alpha" / "config.json"
+        team_config = config.team_storage_root / "team-alpha" / "config.json"
         assert team_config.exists()
         payload = json.loads(team_config.read_text(encoding="utf-8"))
         members = payload.get("members") or []
@@ -5553,7 +5553,7 @@ class TestForkTaskRuntime:
         bot._fork_tasks_by_id["task-team"] = record
         bot._fork_task_by_child_route[child_route] = "task-team"
         bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
@@ -5619,7 +5619,7 @@ class TestForkTaskRuntime:
         bot._fork_tasks_by_id["task-team"] = record
         bot._fork_task_by_child_route[child_route] = "task-team"
         bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
@@ -5733,7 +5733,7 @@ class TestForkTaskRuntime:
         bot._team_worker_records[("team-alpha", "worker-shared")] = record_a.task_id
         bot._team_worker_records[("team-beta", "worker-shared")] = record_b.task_id
 
-        inbox_path = tmp_path / ".claude" / "teams" / "team-beta" / "inboxes" / "worker-shared.json"
+        inbox_path = config.team_storage_root / "team-beta" / "inboxes" / "worker-shared.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
@@ -5844,7 +5844,7 @@ class TestForkTaskRuntime:
             session_id="sid-route-child",
         )
 
-        inbox_path = tmp_path / ".claude" / "teams" / team_name / "inboxes" / f"{agent_name}.json"
+        inbox_path = config.team_storage_root / team_name / "inboxes" / f"{agent_name}.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
