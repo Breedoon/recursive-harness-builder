@@ -5272,6 +5272,9 @@ class TestForkTaskRuntime:
         bot._fork_tasks_by_id["task-team"] = record
         bot._fork_task_by_child_route[child_route] = "task-team"
         bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        child_state.last_bot = fake_bot
         running = asyncio.create_task(asyncio.sleep(30))
         bot._fork_task_tasks["task-team"] = running
         try:
@@ -5290,6 +5293,11 @@ class TestForkTaskRuntime:
             with suppress(asyncio.CancelledError):
                 await running
 
+        assert fake_bot.send_message.await_count == 1
+        sent_text = fake_bot.send_message.await_args.kwargs["text"]
+        assert "agent task active: teammate message queued for current turn" in sent_text
+        assert "team_name: team-alpha" in sent_text
+        assert "agent_name: worker-a" in sent_text
         queued = child_state.hook_state.message_queue.get_nowait()
         assert isinstance(queued, QueuedMessage)
         assert "System notification: New teammate messages arrived while you were still running." in queued.text
@@ -5305,6 +5313,9 @@ class TestForkTaskRuntime:
         route = TelegramRoute(chat_id=-10067890, thread_id=222)
         state = bot._get_state(route, topic_title="Busy Root")
         assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
         state.busy = True
         bot._route_inbox_targets[("team-alpha", "root-agent")] = route
 
@@ -5319,6 +5330,11 @@ class TestForkTaskRuntime:
             },
         )
 
+        assert fake_bot.send_message.await_count == 1
+        sent_text = fake_bot.send_message.await_args.kwargs["text"]
+        assert "topic active: teammate message queued for current turn" in sent_text
+        assert "team_name: team-alpha" in sent_text
+        assert "agent_name: root-agent" in sent_text
         queued = state.hook_state.message_queue.get_nowait()
         assert isinstance(queued, QueuedMessage)
         assert "System notification: New teammate messages arrived while you were still running." in queued.text

@@ -7932,6 +7932,37 @@ class TelegramBot:
             )
         )
 
+    async def _send_running_inbox_notice(
+        self,
+        *,
+        state: TelegramSessionState,
+        label: str,
+        team_name: str,
+        agent_name: str,
+        sender: str | None,
+        summary: str | None,
+    ) -> None:
+        bot = self._bot_for_state(state)
+        if bot is None:
+            return
+        lines = [label]
+        lines.append(f"team_name: {html.escape(team_name)}")
+        lines.append(f"agent_name: {html.escape(agent_name)}")
+        sender_norm = (sender or "").strip()
+        summary_norm = (summary or "").strip()
+        if sender_norm:
+            lines.append(f"from: {html.escape(sender_norm)}")
+        if summary_norm:
+            lines.append(f"summary: {html.escape(summary_norm)}")
+        await self._send_system_html_message(
+            route=state.route,
+            bot=bot,
+            html_text="\n".join(lines),
+            disable_notification=True,
+            underline=False,
+            max_attempts=1,
+        )
+
     @staticmethod
     def _team_inbox_path(team_name: str, agent_name: str) -> Path:
         return Path.home() / ".claude" / "teams" / team_name / "inboxes" / f"{agent_name}.json"
@@ -8421,6 +8452,14 @@ class TelegramBot:
                         summary=summary,
                         content=content,
                     )
+                    await self._send_running_inbox_notice(
+                        state=state,
+                        label="topic active: teammate message queued for current turn",
+                        team_name=team_name,
+                        agent_name=recipient,
+                        sender=sender,
+                        summary=summary,
+                    )
                 _mark_direct_send_notified()
                 return {"delivered": True}
             except Exception as exc:
@@ -8449,6 +8488,14 @@ class TelegramBot:
                     sender=sender,
                     summary=summary,
                     content=content,
+                )
+                await self._send_running_inbox_notice(
+                    state=child_state,
+                    label="agent task active: teammate message queued for current turn",
+                    team_name=team_name,
+                    agent_name=recipient,
+                    sender=sender,
+                    summary=summary,
                 )
             else:
                 record.wake_requested = True
