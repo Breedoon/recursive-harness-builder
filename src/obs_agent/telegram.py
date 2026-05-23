@@ -7637,7 +7637,7 @@ class TelegramBot:
                 )
         session_marker_id: int | None = None
         session_marker_text = (
-            f"session forked: {child_session_id}"
+            "fork session ready"
             if is_fork
             else "fresh session will be assigned on first turn"
         )
@@ -7692,30 +7692,29 @@ class TelegramBot:
         prompt_file: str | None = None,
         prompt_file_content: str | None = None,
     ) -> str:
-        lines = ["fork task launched by agent" if is_fork else "agent task launched by agent"]
-        lines.append(
-            html.escape(
-                f"<fork_context><is_fork>{str(is_fork).lower()}</is_fork><agent_id>{agent_id}</agent_id></fork_context>"
-            )
-        )
+        heading = "fork task launched by agent" if is_fork else "agent task launched by agent"
+        details = [
+            f"agentId: {agent_id}",
+            f"is_fork: {str(is_fork).lower()}",
+        ]
+        if description:
+            details.append(f"description: {description}")
+        if team_name:
+            details.append(f"team_name: {team_name}")
+        if agent_name:
+            details.append(f"agent_name: {agent_name}")
+        if max_turns is not None:
+            details.append(f"max_turns: {max_turns}")
+        if prompt_file:
+            details.append(f"prompt_file: {prompt_file}")
+        if prompt:
+            details.append("prompt:")
+            details.append(prompt)
+        lines = [heading, f"<pre>{html.escape(chr(10).join(details))}</pre>"]
         if source_link:
             lines.append(
                 f'forked from <a href="{html.escape(source_link)}">source message</a>'
             )
-        lines.append(f"agentId: {html.escape(agent_id)}")
-        if description:
-            lines.append(f"description: {html.escape(description)}")
-        if team_name:
-            lines.append(f"team_name: {html.escape(team_name)}")
-        if agent_name:
-            lines.append(f"agent_name: {html.escape(agent_name)}")
-        if max_turns is not None:
-            lines.append(f"max_turns: {max_turns}")
-        if prompt_file:
-            lines.append(f"prompt_file: {html.escape(prompt_file)}")
-        if prompt:
-            lines.append("prompt:")
-            lines.append(html.escape(prompt))
         return "\n".join(lines)
 
     @staticmethod
@@ -7748,20 +7747,24 @@ class TelegramBot:
         agent_name: str | None = None,
         team_name: str | None = None,
     ) -> str:
-        lines = [
-            f"{task_label} launched.",
-            f"agentId: {task_id}",
-        ]
+        details = [f"agentId: {task_id}"]
         if agent_name:
-            lines.append(f"agent_name: {agent_name}")
+            details.append(f"agent_name: {agent_name}")
         if team_name:
-            lines.append(f"team_name: {team_name}")
-        lines.append("Working in the background; completion will be posted here.")
+            details.append(f"team_name: {team_name}")
         if output_file:
-            lines.append(f"output_file: {output_file}")
+            details.append(f"output_file: {output_file}")
         if topic_link:
-            lines.append(f"telegram_topic: {topic_link}")
-        return "\n".join(lines)
+            details.append(f"telegram_topic: {topic_link}")
+        return "\n".join(
+            [
+                f"{task_label} launched.",
+                "```text",
+                "\n".join(details),
+                "```",
+                "Working in the background; completion will be posted here.",
+            ]
+        )
 
     def _build_super_task_lifecycle_html(
         self,

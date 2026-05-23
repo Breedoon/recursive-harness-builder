@@ -4567,6 +4567,8 @@ class TestForkTaskRuntime:
         )
         launch_text = launched["content"][0]["text"]
         assert "ForkTask launched." in launch_text
+        assert "```text\nagentId:" in launch_text
+        assert "```" in launch_text
         assert "Working in the background; completion will be posted here." in launch_text
         task_id = launch_text.split("agentId: ", 1)[1].splitlines()[0]
         assert "output_file:" in launch_text
@@ -4580,10 +4582,15 @@ class TestForkTaskRuntime:
         assert record.max_turns is None
         assert task_id in state.active_fork_task_ids
         send_calls = state.last_bot.send_message.await_args_list
-        assert "fork task launched by agent" in send_calls[0].kwargs["text"]
-        assert "source message" in send_calls[0].kwargs["text"]
-        assert "https://t.me/c/67890/55" in send_calls[0].kwargs["text"]
-        assert "session forked: sid-child" in send_calls[1].kwargs["text"]
+        child_launch_text = send_calls[0].kwargs["text"]
+        assert "fork task launched by agent" in child_launch_text
+        assert "<pre>" in child_launch_text
+        assert "agentId:" in child_launch_text
+        assert "source message" in child_launch_text
+        assert "https://t.me/c/67890/55" in child_launch_text
+        assert "sid-child" not in child_launch_text
+        assert send_calls[1].kwargs["text"] == "<u><i>fork session ready</i></u>"
+        assert "sid-child" not in send_calls[1].kwargs["text"]
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=321))
         assert child_state is not None
         assert child_state.notify_on_completion is True
@@ -4632,6 +4639,7 @@ class TestForkTaskRuntime:
         )
         launch_text = launched["content"][0]["text"]
         assert "AgentTask launched." in launch_text
+        assert "```text\nagentId: 11111111-1111-1111-1111-111111111111" in launch_text
         assert "Working in the background; completion will be posted here." in launch_text
         assert "agentId: 11111111-1111-1111-1111-111111111111" in launch_text
         record = bot._fork_tasks_by_id["11111111-1111-1111-1111-111111111111"]
@@ -6349,6 +6357,51 @@ class TestForkTaskRuntime:
         assert child_b_state.hook_state.interrupt_flag is False
         fake_client_a.interrupt.assert_awaited_once()
         fake_client_b.interrupt.assert_not_awaited()
+
+    async def test_fork_task_child_service_message_uses_code_block_without_session_id(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        html_text = bot._build_fork_task_child_service_html(
+            agent_id="task-123",
+            description="Audit",
+            prompt="Inspect the docs",
+            source_link="https://t.me/c/67890/55",
+            is_fork=True,
+            team_name="team-a",
+            agent_name="agent-a",
+        )
+
+        assert "fork task launched by agent" in html_text
+        assert "<pre>" in html_text
+        assert "agentId: task-123" in html_text
+        assert "team_name: team-a" in html_text
+        assert "agent_name: agent-a" in html_text
+        assert "prompt:\nInspect the docs" in html_text
+        assert "source message" in html_text
+        assert "session_id" not in html_text
+        assert "session forked" not in html_text
+
+    async def test_fork_task_parent_launch_message_uses_code_block(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        text = bot._build_fork_task_launch_text(
+            task_id="task-123",
+            output_file="/tmp/task-123.jsonl",
+            topic_link="https://t.me/c/1/2",
+            task_label="AgentTask",
+            agent_name="agent-a",
+            team_name="team-a",
+        )
+
+        assert text.startswith("AgentTask launched.\n```text\n")
+        assert "agentId: task-123" in text
+        assert "agent_name: agent-a" in text
+        assert "team_name: team-a" in text
+        assert "output_file: /tmp/task-123.jsonl" in text
+        assert "telegram_topic: https://t.me/c/1/2" in text
+        assert "\n```\nWorking in the background; completion will be posted here." in text
+        assert "session_id" not in text
+        assert "session forked" not in text
 
     async def test_fork_task_notification_includes_tool_use_id_and_usage(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)

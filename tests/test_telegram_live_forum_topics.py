@@ -1084,7 +1084,7 @@ class TestTelegramLiveForumTopics:
             live_tg_forum,
             thread_id=None,
             after_message_id=baseline,
-            token="fork topic created",
+            token="fork created",
             timeout=120.0,
         )
         child_thread_id, service_message_id = _extract_topic_link(launch_msg.text)
@@ -1093,9 +1093,10 @@ class TestTelegramLiveForumTopics:
             limit=6,
         )
 
-        assert any("fork created" in message.text.lower() for message in child_recent), (
-            launch_msg.text + live_tg_forum.failure_context()
-        )
+        child_text = "\n".join(message.text for message in child_recent)
+        assert "fork created" in child_text.lower(), launch_msg.text + live_tg_forum.failure_context()
+        assert "fork session ready" in child_text.lower(), child_text + live_tg_forum.failure_context()
+        assert "session forked:" not in child_text.lower(), child_text + live_tg_forum.failure_context()
         assert any(str(service_message_id) == str(message.message_id) for message in child_recent), (
             launch_msg.text + live_tg_forum.failure_context()
         )
@@ -2687,7 +2688,7 @@ class TestTelegramLiveForumTopics:
             live_tg_forum,
             thread_id=None,
             after_message_id=fork_baseline,
-            token="fork topic created",
+            token="fork created",
             timeout=120.0,
         )
         child_thread_id, service_message_id = _extract_topic_link(fork_message.text)
