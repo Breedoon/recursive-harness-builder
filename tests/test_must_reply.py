@@ -762,6 +762,8 @@ class TestScheduleDispatchReliability:
 
         second = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
         second._restore_state_from_store()
+        assert route in second._states_by_route
+        assert second._states_by_route[route].route == route
         executed: list[str] = []
 
         async def fake_execute(*, record, trigger_kind):
@@ -778,6 +780,60 @@ class TestScheduleDispatchReliability:
 
         assert executed == ["persisted-schedule"]
         assert second._topic_schedules_by_id["persisted-schedule"].run_count == 1
+        second._state_store.close()
+
+    async def test_restore_recreates_state_for_schedule_only_route(self, config, monkeypatch):
+        from obs_agent.telegram import TelegramBot, TelegramRoute
+
+        route = TelegramRoute(chat_id=67890, thread_id=404)
+        first = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
+        first._state_store.upsert_topic_schedule(
+            schedule_id="orphaned-persisted-schedule",
+            chat_id=route.chat_id,
+            thread_id=route.thread_id,
+            description="orphaned-persisted-schedule",
+            schedule_mode="interval",
+            cron_expr=None,
+            trigger_kind="interval",
+            interval_seconds=60,
+            prompt="persisted",
+            run_mode="continue",
+            recurring=True,
+            enabled=True,
+            run_count=0,
+            max_runs=3,
+            from_ts=None,
+            until_ts=None,
+            inherit_mode="none",
+            next_run_at=time.time() - 1,
+            last_run_at=None,
+            last_success_at=None,
+            last_error=None,
+            max_retry_attempts=0,
+            retry_delay_seconds=30,
+            retry_attempt_count=0,
+        )
+        first._state_store.close()
+
+        second = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
+        second._restore_state_from_store()
+        assert route in second._states_by_route
+        executed: list[str] = []
+
+        async def fake_execute(*, record, trigger_kind):
+            executed.append(record.schedule_id)
+            record.run_count += 1
+            record.next_run_at = time.time() + 60
+            second._register_topic_schedule(record)
+            return True
+
+        monkeypatch.setattr(second, "_execute_topic_schedule", fake_execute)
+
+        await second._run_due_interval_schedules()
+        await asyncio.gather(*list(second._schedule_execution_tasks.values()))
+
+        assert executed == ["orphaned-persisted-schedule"]
+        assert second._topic_schedules_by_id["orphaned-persisted-schedule"].run_count == 1
         second._state_store.close()
 
 

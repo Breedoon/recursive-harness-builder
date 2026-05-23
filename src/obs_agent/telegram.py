@@ -1679,6 +1679,11 @@ class TelegramBot:
 
         for entry in snapshot.topic_schedules:
             route = TelegramRoute(chat_id=entry.chat_id, thread_id=entry.thread_id)
+            state = self._states_by_route.get(route)
+            if state is None:
+                state = self._build_session_state(route)
+                self._states_by_route[route] = state
+                self._upsert_route_inbox_target(state)
             record = _TopicScheduleRecord(
                 schedule_id=entry.schedule_id,
                 route=route,
