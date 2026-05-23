@@ -1258,6 +1258,77 @@ class TestAgentTaskTools:
         assert payload["tree_members"][0]["model"] == "claude-haiku-4-5"
 
     @pytest.mark.asyncio
+    async def test_search_team_family_member_metadata_respects_team_name_limit_and_status(
+        self,
+        monkeypatch,
+        skill_config,
+        tmp_path,
+    ):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
+        default_root = "2026-03-30-10-10-default-root"
+        requested_team = "team-beta"
+        child_a = "e96857c58f-a"
+        child_b = "e96857c58f-b"
+        monkeypatch.setattr(
+            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
+            lambda **_: ObsBootstrap(
+                raw_xml="<obs-bootstrap version='2' />",
+                lineage=("Root",),
+                origin="trunk_start",
+                is_fork=False,
+                session_id="sid-root",
+                agent_id=None,
+                parent_session_id=None,
+                root_team_key=default_root,
+                agent_name=default_root,
+                parent_agent_name=None,
+                parent_display_name=None,
+            ),
+        )
+        requested_team_dir = skill_config.team_storage_root / requested_team
+        requested_inbox_dir = requested_team_dir / "inboxes"
+        requested_inbox_dir.mkdir(parents=True)
+        for agent_name in (default_root, child_a, child_b):
+            (requested_inbox_dir / f"{agent_name}.json").write_text("[]", encoding="utf-8")
+        (requested_team_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "members": [
+                        {"name": default_root, "obs": {"display_name": "Root", "lineage": ["Root"], "lineage_length": 1, "created_at": 1}},
+                        {"name": child_a, "agentType": "general-purpose", "obs": {"display_name": "A", "lineage": ["Root", "A"], "lineage_length": 2, "parent_agent_name": default_root, "created_at": 30}},
+                        {"name": child_b, "agentType": "general-purpose", "obs": {"display_name": "B", "lineage": ["Root", "B"], "lineage_length": 2, "parent_agent_name": default_root, "created_at": 20}},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        state = HookState()
+
+        async def status_provider(payload):
+            assert payload["team_name"] == requested_team
+            if payload["agent_name"] == child_a:
+                return {"running": True, "status": "running", "model": "claude-sonnet-4-6", "last_active_at": 40}
+            return {"running": False}
+
+        state.team_status_provider = status_provider
+        create_obs_tools(skill_config, lambda: "sid-root", hook_state=state)
+        handler = _tool_handler(captured["tools"], "search_team")
+
+        result = await handler({"mode": "family", "team_name": requested_team, "limit": 1})
+
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["team_name"] == requested_team
+        assert payload["limit"] == 1
+        assert payload["children"] == [child_a]
+        assert [member["agent_name"] for member in payload["children_members"]] == [child_a]
+        assert payload["children_members"][0]["running"] is True
+        assert payload["children_members"][0]["status"] == "running"
+        assert payload["children_members"][0]["model"] == "claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
     async def test_send_inbox_message_does_not_resolve_parent_alias(
         self,
         monkeypatch,

@@ -1449,12 +1449,28 @@ def create_obs_tools(
                 if value is not None:
                     details[key] = value
 
+        async def _member_details(agent_name: str, relation: str | None = None) -> dict[str, Any]:
+            details = dict(team_projection_metadata.get(agent_name) or {})
+            details["agent_name"] = agent_name
+            if relation is not None:
+                details["relation"] = relation
+            activity_timestamp = _member_activity_timestamp(details)
+            if activity_timestamp is not None:
+                details["last_activity_at"] = activity_timestamp
+            await _augment_runtime_status(details)
+            return details
+
+        async def _member_details_list(names: list[str], relation: str) -> list[dict[str, Any]]:
+            return [await _member_details(name, relation) for name in names]
+
         children = _sort_member_names([
             name for name in all_agents
             if name.startswith(f"{my_hash}-") and name != my_agent_name
         ])
         if mode in {"children", "family"}:
-            result["children"] = _limited(children)
+            limited_children = _limited(children)
+            result["children"] = limited_children
+            result["children_members"] = await _member_details_list(limited_children, "child")
 
         parent: str | None = None
         if len(my_lineage) > 1:
@@ -1469,6 +1485,7 @@ def create_obs_tools(
                 parent = parent_name
         if mode in {"parent", "family"}:
             result["parent"] = parent
+            result["parent_member"] = await _member_details(parent, "parent") if parent is not None else None
 
         siblings: list[str] = []
         if len(my_lineage) > 1:
@@ -1479,7 +1496,9 @@ def create_obs_tools(
                 if name.startswith(f"{parent_hash}-") and name != my_agent_name
             ])
         if mode in {"siblings", "family"}:
-            result["siblings"] = _limited(siblings)
+            limited_siblings = _limited(siblings)
+            result["siblings"] = limited_siblings
+            result["siblings_members"] = await _member_details_list(limited_siblings, "sibling")
 
         if mode == "ancestors":
             ancestors = [
@@ -1489,7 +1508,9 @@ def create_obs_tools(
                 )
                 for idx in range(len(my_lineage) - 1)
             ]
-            result["ancestors"] = _limited(ancestors)
+            limited_ancestors = _limited(ancestors)
+            result["ancestors"] = limited_ancestors
+            result["ancestors_members"] = await _member_details_list(limited_ancestors, "ancestor")
 
         if mode == "descendants":
             descendants: list[str] = []
@@ -1506,30 +1527,26 @@ def create_obs_tools(
                     continue
                 if normalized_lineage[: len(my_lineage)] == my_lineage:
                     descendants.append(agent_name)
-            result["descendants"] = _limited(_sort_member_names(list(set(descendants))))
+            limited_descendants = _limited(_sort_member_names(list(set(descendants))))
+            result["descendants"] = limited_descendants
+            result["descendants_members"] = await _member_details_list(limited_descendants, "descendant")
 
         if mode == "tree":
             child_set = set(children)
             sibling_set = set(siblings)
             tree_members: list[dict[str, Any]] = []
             for agent_name in sorted(all_agents):
-                details = dict(team_projection_metadata.get(agent_name) or {})
-                details["agent_name"] = agent_name
                 if agent_name == my_agent_name:
-                    details["relation"] = "self"
+                    relation = "self"
                 elif parent is not None and agent_name == parent:
-                    details["relation"] = "parent"
+                    relation = "parent"
                 elif agent_name in child_set:
-                    details["relation"] = "child"
+                    relation = "child"
                 elif agent_name in sibling_set:
-                    details["relation"] = "sibling"
+                    relation = "sibling"
                 else:
-                    details["relation"] = "tree"
-                activity_timestamp = _member_activity_timestamp(details)
-                if activity_timestamp is not None:
-                    details["last_activity_at"] = activity_timestamp
-                await _augment_runtime_status(details)
-                tree_members.append(details)
+                    relation = "tree"
+                tree_members.append(await _member_details(agent_name, relation))
             tree_members.sort(
                 key=lambda item: _member_activity_sort_key(
                     item,
