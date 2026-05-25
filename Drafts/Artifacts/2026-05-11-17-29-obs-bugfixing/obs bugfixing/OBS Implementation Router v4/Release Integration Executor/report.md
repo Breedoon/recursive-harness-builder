@@ -190,6 +190,20 @@ Untracked generated scratch `tests/pytest-tmp/` was removed when empty.
 - The schedule smoke evidence is weaker because it passed as the first test in a combined run that later timed out before printing a final summary. The assertions before the pass marker completed.
 - Live smoke required deriving `OBS_TEST_TELEGRAM_BOT_TOKEN` from available plural/generic env vars; the harness skip behavior remains sensitive to the singular variable being absent.
 
+## Commit
+
+Created normal branch commit:
+
+- `ad1cd37 Integrate OBS release readiness fixes`
+
+No merge to `main` was performed.
+
+Final `git status --short` after cleanup showed only a pre-existing untracked messaging artifact directory:
+
+```text
+?? "Drafts/Artifacts/2026-05-11-17-29-obs-bugfixing/obs bugfixing/OBS Implementation Router v4/Messaging Teams Reduced Executor/"
+```
+
 ## Status
 
-Release integration is implemented and tested with chunked/full-scope local evidence plus targeted live Telegram evidence. A normal commit should be created on `obs-bugfixing-20260523-baseline` if the caller accepts the bounded caveats above.
+Release integration is implemented, tested with chunked/full-scope local evidence plus targeted live Telegram evidence, and committed on `obs-bugfixing-20260523-baseline` with the bounded caveats above.
