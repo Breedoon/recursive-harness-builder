@@ -14,7 +14,7 @@ _DEFAULT_TELEGRAM_TEMP_ROOT = Path("/tmp") / "obs-agent"
 _DEFAULT_TELEGRAM_STATE_DB_PATH = (
     _DEFAULT_CODEBASE_ROOT / ".obs-agent" / "state" / "telegram-state.sqlite3"
 )
-_DEFAULT_TEAM_STORAGE_ROOT = Path.home() / ".claude" / "teams"
+_DEFAULT_TEAM_STORAGE_ROOT = _DEFAULT_TELEGRAM_TEMP_ROOT.parent / f"{_DEFAULT_TELEGRAM_TEMP_ROOT.name}-teams"
 _DEFAULT_TELEGRAM_TRANSCRIPTION_SCRIPT = _DEFAULT_CODEBASE_ROOT / "examples" / "transcription" / "transcribe"
 _DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no expiry for now
 
@@ -429,4 +429,9 @@ class OBSConfig:
             raise ValueError(
                 "Invalid Telegram state DB path: OBS_TELEGRAM_STATE_DB_PATH must be outside "
                 "OBS_TELEGRAM_TEMP_ROOT to avoid startup cleanup deleting persistence data."
+            )
+        if _is_within(self.team_storage_root, self.telegram_temp_root):
+            raise ValueError(
+                "Invalid team storage path: OBS_TEAM_STORAGE_ROOT must be outside "
+                "OBS_TELEGRAM_TEMP_ROOT because inbound media cleanup purges that directory at startup."
             )

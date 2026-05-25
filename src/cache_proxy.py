@@ -421,9 +421,9 @@ def log(msg: str):
 
 
 def _estimate_input_tokens(body: dict) -> int:
-    """Approximate Claude Code's local token estimate for auto-compact."""
+    """Conservative fallback when non-Claude upstream omits usage."""
     try:
-        return max(0, int(len(json.dumps(body, separators=(",", ":"))) / 4))
+        return max(0, len(json.dumps(body, separators=(",", ":"))))
     except Exception:
         return 0
 

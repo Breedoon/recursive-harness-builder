@@ -406,7 +406,76 @@ class TestPromptFromFile:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Python hooks basic
+# Test 4: session_source explicit JSONL fork
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+@pytest.mark.telegram
+@pytest.mark.telegram_smoke
+class TestSessionSource:
+    async def test_live_smoke_agenttask_session_source_jsonl_path(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        source_marker = f"SS-SOURCE-MARKER-{tag}"
+        child_marker = f"SS-CHILD-MARKER-{tag}"
+        source_thread_id = await live_tg_forum.platform.create_topic(f"Smoke SessionSource Src {tag}")
+        launcher_thread_id = await live_tg_forum.platform.create_topic(f"Smoke SessionSource Launch {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=(
+                "This is a deterministic session_source smoke test. "
+                f"Remember the source marker {source_marker}. Reply with only SS-SOURCE-READY-{tag}."
+            ),
+            thread_id=source_thread_id,
+            token=f"SS-SOURCE-READY-{tag}",
+            timeout=180.0,
+        )
+        source_jsonl = await _wait_for_jsonl_with_user_markers(
+            (source_marker,),
+            timeout=120.0,
+        )
+
+        baseline = await live_tg_forum.platform.latest_bot_message_id(
+            thread_id=launcher_thread_id
+        )
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic session_source smoke test. "
+                f"Use AgentTask exactly once with fork=true, session_source='{source_jsonl}', "
+                f"and prompt 'Reply with exactly {child_marker}.' "
+                f"After launching, reply with only SS-LAUNCHED-{tag}."
+            ),
+            thread_id=launcher_thread_id,
+            require_done=False,
+            timeout=180.0,
+        )
+        launch_msg = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=launcher_thread_id,
+            after_message_id=baseline,
+            token="task launched",
+            timeout=240.0,
+        )
+        child_thread_id, _ = _extract_topic_link(launch_msg.text)
+        await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=child_thread_id,
+            token=child_marker,
+            timeout=240.0,
+        )
+
+        child_jsonl = await _wait_for_jsonl_with_user_markers(
+            (source_marker, child_marker),
+            timeout=120.0,
+        )
+        assert child_jsonl != source_jsonl
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Python hooks basic
 # ---------------------------------------------------------------------------
 
 @pytest.mark.integration

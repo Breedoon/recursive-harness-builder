@@ -277,6 +277,17 @@ def _normalize_resume_arg(value: object) -> str | None:
     return normalized
 
 
+def _normalize_session_source_arg(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if normalized.lower() in {"false", "none", "null", "nil", "0", "no"}:
+        return None
+    return normalized
+
+
 def _inbox_lock(path: Path) -> asyncio.Lock:
     lock = _INBOX_FILE_LOCKS.get(path)
     if lock is None:
@@ -349,6 +360,7 @@ def create_obs_tools(
         ).strip() or None
         description = display_name  # Internal payload still uses "description" key
         resume = _normalize_resume_arg(args.get("resume"))
+        session_source = _normalize_session_source_arg(args.get("session_source"))
         run_in_background = args.get("run_in_background")
         team_name = str(args.get("team_name", "")).strip() or None
         agent_name = str(args.get("agent_name") or "").strip() or None
@@ -358,6 +370,14 @@ def create_obs_tools(
                 fork = _coerce_bool_arg(args.get("fork"), name="fork")
             except ValueError:
                 return _error_result(f"Cannot launch {tool_name}: fork must be true or false")
+        if session_source and not fork:
+            return _error_result(
+                f"Cannot launch {tool_name}: session_source is only supported with fork=true"
+            )
+        if session_source and resume:
+            return _error_result(
+                f"Cannot launch {tool_name}: resume and session_source are mutually exclusive"
+            )
         # Model selection — "inherit" or empty means use parent's model.
         model_raw = str(args.get("model", "")).strip()
         model: str | None = None
@@ -473,6 +493,7 @@ def create_obs_tools(
                 "prompt": prompt,
                 "description": description,
                 "resume": resume,
+                "session_source": session_source,
                 "run_in_background": True,
                 "timeout_ms": timeout_ms,
                 "max_turns": max_turns,
@@ -530,6 +551,13 @@ def create_obs_tools(
             "resume": {
                 "type": "string",
                 "description": "Optional agentId to resume an existing child task",
+            },
+            "session_source": {
+                "type": "string",
+                "description": (
+                    "Optional Claude session source to fork from when fork=true. "
+                    "Accepts a stored session ID or JSONL file path. Not supported with fork=false."
+                ),
             },
             "fork": {
                 "type": "boolean",
@@ -1094,6 +1122,7 @@ def create_obs_tools(
                     notifier_result = raw_notifier_result
             except Exception:
                 logger.warning("SendInboxMessage notifier failed", exc_info=True)
+                notifier_result = {"delivered": False, "reason": "recipient wake failed"}
         if notifier_result is not None and notifier_result.get("delivered") is False:
             await _rollback_written_message()
             reason = str(notifier_result.get("reason") or "recipient wake failed")
@@ -1251,6 +1280,14 @@ def create_obs_tools(
                 "sender": {
                     "type": "string",
                     "description": "Optional sender label; defaults to the current agent name.",
+                },
+                "needs_reply": {
+                    "type": "boolean",
+                    "description": "Set true only when the message asks a question or makes a request that needs a reply.",
+                },
+                "must_reply": {
+                    "type": "boolean",
+                    "description": "Deprecated alias for needs_reply.",
                 },
             },
             "required": ["recipient", "content"],
@@ -1534,8 +1571,18 @@ def create_obs_tools(
         if mode == "tree":
             child_set = set(children)
             sibling_set = set(siblings)
+            sort_key_by_name: dict[str, tuple[float, str]] = {}
+            for agent_name in all_agents:
+                sort_key_by_name[agent_name] = _member_activity_sort_key(
+                    team_projection_metadata.get(agent_name) or {},
+                    agent_name,
+                )
+            limited_tree_names = sorted(
+                all_agents,
+                key=lambda name: sort_key_by_name[name],
+            )[:limit]
             tree_members: list[dict[str, Any]] = []
-            for agent_name in sorted(all_agents):
+            for agent_name in limited_tree_names:
                 if agent_name == my_agent_name:
                     relation = "self"
                 elif parent is not None and agent_name == parent:
@@ -1553,9 +1600,11 @@ def create_obs_tools(
                     str(item.get("agent_name") or ""),
                 )
             )
-            tree_members = tree_members[:limit]
             result["tree"] = [str(member["agent_name"]) for member in tree_members]
             result["tree_members"] = tree_members
+            omitted = max(0, len(all_agents) - len(tree_members))
+            if omitted:
+                result["omitted"] = omitted
 
         return {
             "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=True)}],

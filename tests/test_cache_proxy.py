@@ -1097,6 +1097,14 @@ class TestParseSSEUsage:
         assert usage == {}
 
 
+class TestEstimateInputTokens:
+    def test_uses_conservative_character_count_not_json_divided_by_four(self):
+        body = {"messages": [{"role": "user", "content": "x" * 80}]}
+        compact_json = json.dumps(body, separators=(",", ":"))
+        assert cache_proxy._estimate_input_tokens(body) == len(compact_json)
+        assert cache_proxy._estimate_input_tokens(body) > int(len(compact_json) / 4)
+
+
 class TestInjectUsageIfMissing:
     def test_injects_estimated_usage_into_zero_usage_message_start(self):
         event = {

@@ -3052,7 +3052,7 @@ class TestTelegramLiveSmoke:
             live_tg_forum,
             thread_id=root_thread_id,
             after_message_id=baseline_fork,
-            token="fork topic created",
+            token="fork created",
             timeout=180.0,
         )
         child_thread_id, _ = _extract_topic_link(fork_message.text)

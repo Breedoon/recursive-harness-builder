@@ -156,6 +156,7 @@ async def collect_sse_response(
 
 
 @pytest.mark.integration
+@pytest.mark.real_get_client
 class TestLiveIntegration:
     """Live integration tests with real uvicorn + real Claude SDK.
 

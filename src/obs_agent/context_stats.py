@@ -56,6 +56,13 @@ def build_context_snapshot(
         "estimated_context_remaining_tokens": context_window_estimate_tokens,
         "estimated_context_remaining_pct": 100.0,
         "context_estimate_source": "usage_fallback",
+        "sdk_context_total_tokens": 0,
+        "sdk_context_max_tokens": 0,
+        "sdk_context_raw_max_tokens": 0,
+        "sdk_context_percentage": None,
+        "sdk_context_model": None,
+        "sdk_context_auto_compact_enabled": None,
+        "sdk_context_auto_compact_threshold": None,
         "jsonl_session_file": None,
         "jsonl_assistant_entries": 0,
         "jsonl_usage_entries": 0,
@@ -64,6 +71,7 @@ def build_context_snapshot(
     }
 
     usage = {}
+    context_usage = {}
     if data:
         # Prefer the latest known session_id from result data if present.
         if data.get("session_id"):
@@ -73,6 +81,7 @@ def build_context_snapshot(
         snapshot["total_cost_usd"] = _as_float_or_none(data.get("total_cost_usd"))
         snapshot["duration_ms"] = data.get("duration_ms")
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        context_usage = data.get("context_usage") if isinstance(data.get("context_usage"), dict) else {}
 
     input_tokens = _as_int(usage.get("input_tokens"))
     output_tokens = _as_int(usage.get("output_tokens"))
@@ -88,6 +97,32 @@ def build_context_snapshot(
             "sdk_total_tokens_billed": total_billed,
         }
     )
+
+    context_total = _as_int(context_usage.get("totalTokens"))
+    context_max = _as_int(context_usage.get("maxTokens"))
+    context_raw_max = _as_int(context_usage.get("rawMaxTokens"))
+    if context_total > 0 and (context_max > 0 or context_raw_max > 0):
+        window = context_raw_max or context_max
+        used = min(context_total, window)
+        remaining = max(0, window - used)
+        pct_remaining = (remaining / window) * 100 if window > 0 else 0.0
+        snapshot.update(
+            {
+                "estimated_context_window_tokens": window,
+                "estimated_context_used_tokens": used,
+                "estimated_context_remaining_tokens": remaining,
+                "estimated_context_remaining_pct": pct_remaining,
+                "context_estimate_source": "sdk_context_usage",
+                "sdk_context_total_tokens": context_total,
+                "sdk_context_max_tokens": context_max,
+                "sdk_context_raw_max_tokens": context_raw_max,
+                "sdk_context_percentage": _as_float_or_none(context_usage.get("percentage")),
+                "sdk_context_model": context_usage.get("model"),
+                "sdk_context_auto_compact_enabled": context_usage.get("isAutoCompactEnabled"),
+                "sdk_context_auto_compact_threshold": context_usage.get("autoCompactThreshold"),
+            }
+        )
+        return snapshot
 
     resolved_session_id = snapshot.get("session_id")
     jsonl_usage = load_jsonl_usage_snapshot(
@@ -190,6 +225,13 @@ def format_context_snapshot_lines(snapshot: dict[str, Any]) -> list[str]:
         f"estimated_context_used_tokens: {snapshot.get('estimated_context_used_tokens', 0)}",
         f"estimated_context_remaining_tokens: {snapshot.get('estimated_context_remaining_tokens', 0)}",
         f"estimated_context_remaining_pct: {float(snapshot.get('estimated_context_remaining_pct', 0.0)):.1f}%",
+        f"sdk_context_total_tokens: {snapshot.get('sdk_context_total_tokens', 0)}",
+        f"sdk_context_max_tokens: {snapshot.get('sdk_context_max_tokens', 0)}",
+        f"sdk_context_raw_max_tokens: {snapshot.get('sdk_context_raw_max_tokens', 0)}",
+        f"sdk_context_percentage: {snapshot.get('sdk_context_percentage') if snapshot.get('sdk_context_percentage') is not None else '?'}",
+        f"sdk_context_model: {snapshot.get('sdk_context_model') or '(none)'}",
+        f"sdk_context_auto_compact_enabled: {snapshot.get('sdk_context_auto_compact_enabled') if snapshot.get('sdk_context_auto_compact_enabled') is not None else '?'}",
+        f"sdk_context_auto_compact_threshold: {snapshot.get('sdk_context_auto_compact_threshold') if snapshot.get('sdk_context_auto_compact_threshold') is not None else '?'}",
         f"recent_peak_context_triplet_tokens: {snapshot.get('recent_peak_context_triplet_tokens', 0)}",
         f"session_peak_context_triplet_tokens: {snapshot.get('session_peak_context_triplet_tokens', 0)}",
         f"jsonl_assistant_entries: {snapshot.get('jsonl_assistant_entries', 0)}",
@@ -211,9 +253,16 @@ def _format_compact_tokens(value: int) -> str:
 def format_context_snapshot_compact(snapshot: dict[str, Any]) -> str:
     """Render the minimal Telegram completion context summary."""
     used = max(0, int(snapshot.get("estimated_context_used_tokens", 0) or 0))
-    if used == 0:
+    window = max(0, int(snapshot.get("estimated_context_window_tokens", 0) or 0))
+    remaining = max(0, int(snapshot.get("estimated_context_remaining_tokens", 0) or 0))
+    if used == 0 or window == 0:
         return "context: context unavailable"
-    return f"context: {_format_compact_tokens(used)}"
+    pct_remaining = (remaining / window) * 100 if window > 0 else 0.0
+    return (
+        f"context: {_format_compact_tokens(remaining)} remaining "
+        f"({_format_compact_tokens(used)} / {_format_compact_tokens(window)}, "
+        f"{pct_remaining:.0f}%)"
+    )
 
 
 def apply_context_probe(

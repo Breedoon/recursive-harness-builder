@@ -48,7 +48,7 @@ from obs_agent.config import parse_context_suffix
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
 from obs_agent.context_jsonl import find_session_jsonl
-from obs_agent.jsonl_fork import fork_session_jsonl
+from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
 from obs_agent.lineage import (
     agent_name_for_lineage,
     build_obs_bootstrap_xml,
@@ -673,6 +673,11 @@ class TelegramBot:
             raise ValueError(
                 "Invalid Telegram state DB path: OBS_TELEGRAM_STATE_DB_PATH must be outside "
                 "OBS_TELEGRAM_TEMP_ROOT to avoid startup cleanup deleting persistence data."
+            )
+        if _path_is_within(config.team_storage_root, config.telegram_temp_root):
+            raise ValueError(
+                "Invalid team storage path: OBS_TEAM_STORAGE_ROOT must be outside "
+                "OBS_TELEGRAM_TEMP_ROOT because inbound media cleanup purges that directory at startup."
             )
         self._fragment_buffer = FragmentBuffer(
             on_complete=self._process_message, gap_seconds=fragment_gap
@@ -1945,6 +1950,9 @@ class TelegramBot:
             if self._is_fork_task_running(record, completing_task_id=completing_task_id):
                 skip("running")
                 continue
+            if record.wake_requested:
+                skip("wake_requested")
+                continue
             child_state = self._states_by_route.get(record.child_route)
             if child_state is None:
                 skip("missing_child_state")
@@ -2026,13 +2034,16 @@ class TelegramBot:
             if self._is_fork_task_running(candidate.record, completing_task_id=completing_task_id):
                 prune_skip_reasons["became_running"] = prune_skip_reasons.get("became_running", 0) + 1
                 continue
+            if candidate.record.wake_requested:
+                prune_skip_reasons["became_wake_requested"] = prune_skip_reasons.get("became_wake_requested", 0) + 1
+                continue
             if candidate.state.busy:
                 prune_skip_reasons["became_busy"] = prune_skip_reasons.get("became_busy", 0) + 1
                 continue
             if candidate.state.hook_state.execution_active:
                 prune_skip_reasons["became_execution_active"] = prune_skip_reasons.get("became_execution_active", 0) + 1
                 continue
-            if await candidate.state.session_manager.disconnect_idle_client(direct_kill=True):
+            if await candidate.state.session_manager.disconnect_idle_client(direct_kill=kill_on_idle):
                 pruned += 1
             else:
                 prune_skip_reasons["disconnect_no_client"] = prune_skip_reasons.get("disconnect_no_client", 0) + 1
@@ -7795,6 +7806,7 @@ class TelegramBot:
         temperature: float | None = None,
         user_hooks: dict[str, str] | None = None,
         inherit_hooks: bool = False,
+        source_jsonl_path: Path | None = None,
     ) -> dict[str, Any]:
         if is_fork:
             if not source_session_id or not source_uuid:
@@ -7803,6 +7815,7 @@ class TelegramBot:
                 session_id=source_session_id,
                 target_uuid=source_uuid,
                 cwd=self._config.vault_path,
+                source_path=source_jsonl_path,
                 new_session_id=str(uuid.uuid4()),
             )
             self._set_session_head(
@@ -8863,22 +8876,25 @@ class TelegramBot:
                     content=content,
                 )
                 if not woken:
-                    self._queue_running_team_worker_notice(
-                        state=state,
-                        team_name=team_name,
-                        agent_name=recipient,
-                        sender=sender,
-                        summary=summary,
-                        content=content,
-                    )
-                    await self._send_running_inbox_notice(
-                        state=state,
-                        label="topic active: teammate message queued for current turn",
-                        team_name=team_name,
-                        agent_name=recipient,
-                        sender=sender,
-                        summary=summary,
-                    )
+                    if state.busy or state.hook_state.pause_queue_delivery:
+                        self._queue_running_team_worker_notice(
+                            state=state,
+                            team_name=team_name,
+                            agent_name=recipient,
+                            sender=sender,
+                            summary=summary,
+                            content=content,
+                        )
+                        await self._send_running_inbox_notice(
+                            state=state,
+                            label="topic active: teammate message queued for current turn",
+                            team_name=team_name,
+                            agent_name=recipient,
+                            sender=sender,
+                            summary=summary,
+                        )
+                    else:
+                        return {"delivered": False, "reason": "recipient route is temporarily busy; wake deferred"}
                 _mark_direct_send_notified()
                 return {"delivered": True}
             except Exception as exc:
@@ -9132,6 +9148,9 @@ class TelegramBot:
             raise RuntimeError("ForkTask is only available inside an active Telegram topic")
 
         resume_task_id = self._normalize_resume_task_id(args.get("resume"))
+        session_source_raw = str(args.get("session_source") or "").strip() or None
+        if resume_task_id and session_source_raw:
+            raise ValueError("resume and session_source are mutually exclusive")
         if resume_task_id:
             return await self._resume_fork_task(
                 route=route,
@@ -9141,6 +9160,8 @@ class TelegramBot:
             )
 
         is_fork = self._coerce_fork_flag(args.get("fork"))
+        if session_source_raw and not is_fork:
+            raise ValueError("session_source is only supported with fork=true")
         launch_tool_name = str(args.get("task_tool_name") or "").strip() or (
             "ForkTask" if is_fork else "AgentTask"
         )
@@ -9154,57 +9175,76 @@ class TelegramBot:
         source_uuid: str | None = None
         source_route = route
         source_message_id: int | None = None
+        source_jsonl_path: Path | None = None
         if is_fork:
-            source_session_id, source_uuid, source_route, source_message_id = self._resolve_fork_source(
-                state=state
-            )
-            fallback_session_id = str(args.get("session_id") or "").strip() or None
-            if not source_session_id and fallback_session_id:
-                source_session_id = fallback_session_id
-            if source_session_id and not source_uuid:
-                persisted_uuid = await self._await_persisted_session_uuid(
-                    session_id=source_session_id,
-                    timeout_seconds=8.0,
+            explicit_session_source = False
+            if session_source_raw:
+                source_descriptor = resolve_session_source(
+                    session_source_raw,
+                    cwd=self._config.vault_path,
                 )
-                if persisted_uuid:
-                    source_uuid = persisted_uuid
-                    self._set_session_head(
+                explicit_session_source = True
+                source_session_id = source_descriptor.source_session_id
+                source_jsonl_path = source_descriptor.source_jsonl_path
+            else:
+                source_session_id, source_uuid, source_route, source_message_id = self._resolve_fork_source(
+                    state=state
+                )
+                fallback_session_id = str(args.get("session_id") or "").strip() or None
+                if not source_session_id and fallback_session_id:
+                    source_session_id = fallback_session_id
+                if source_session_id and not source_uuid:
+                    persisted_uuid = await self._await_persisted_session_uuid(
                         session_id=source_session_id,
-                        jsonl_uuid=persisted_uuid,
+                        timeout_seconds=8.0,
                     )
-                    resolved_uuid, resolved_route, resolved_message_id = self._resolve_persisted_fork_source(
-                        session_id=source_session_id,
-                        preferred_uuid=persisted_uuid,
-                        preferred_route=source_route,
-                    )
-                    source_uuid = resolved_uuid
-                    source_route = resolved_route
-                    source_message_id = resolved_message_id
-            if not source_session_id or not source_uuid:
-                raise RuntimeError("Cannot launch ForkTask yet: no mapped head in this topic")
+                    if persisted_uuid:
+                        source_uuid = persisted_uuid
+                        self._set_session_head(
+                            session_id=source_session_id,
+                            jsonl_uuid=persisted_uuid,
+                        )
+                        resolved_uuid, resolved_route, resolved_message_id = self._resolve_persisted_fork_source(
+                            session_id=source_session_id,
+                            preferred_uuid=persisted_uuid,
+                            preferred_route=source_route,
+                        )
+                        source_uuid = resolved_uuid
+                        source_route = resolved_route
+                        source_message_id = resolved_message_id
+                if not source_session_id or not source_uuid:
+                    raise RuntimeError("Cannot launch ForkTask yet: no mapped head in this topic")
 
-            # Wait for the parent's JSONL to stabilize before copying.
-            # The parent may still be streaming tool_use blocks to JSONL;
+            # Wait for the source JSONL to stabilize before copying.
+            # The source may still be streaming tool_use blocks to JSONL;
             # copying now would produce a truncated prefix → cache miss.
             stable_uuid = await self._await_jsonl_stability(
+                jsonl_path=source_jsonl_path,
+            ) if source_jsonl_path is not None else await self._await_jsonl_stability(
                 session_id=source_session_id,
             )
-            if stable_uuid and stable_uuid != source_uuid:
+            if not stable_uuid:
+                if explicit_session_source:
+                    raise RuntimeError("Cannot launch ForkTask yet: no persisted head for session_source")
+            elif stable_uuid != source_uuid:
                 logger.info(
                     "[fork_task] JSONL advanced during stability wait: %s → %s",
                     source_uuid,
                     stable_uuid,
                 )
-                resolved_uuid, resolved_route, resolved_message_id = (
-                    self._resolve_persisted_fork_source(
-                        session_id=source_session_id,
-                        preferred_uuid=stable_uuid,
-                        preferred_route=source_route,
+                if explicit_session_source:
+                    source_uuid = stable_uuid
+                else:
+                    resolved_uuid, resolved_route, resolved_message_id = (
+                        self._resolve_persisted_fork_source(
+                            session_id=source_session_id,
+                            preferred_uuid=stable_uuid,
+                            preferred_route=source_route,
+                        )
                     )
-                )
-                source_uuid = resolved_uuid
-                source_route = resolved_route
-                source_message_id = resolved_message_id
+                    source_uuid = resolved_uuid
+                    source_route = resolved_route
+                    source_message_id = resolved_message_id
 
         task_id = str(uuid.uuid4())
         description = str(
@@ -9252,6 +9292,7 @@ class TelegramBot:
             source_uuid=source_uuid,
             source_route=source_route,
             source_message_id=source_message_id,
+            source_jsonl_path=source_jsonl_path,
             topic_name=topic_name,
             child_service_html=child_service_html,
             notify_on_completion=True,

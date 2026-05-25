@@ -122,6 +122,13 @@ class TestTelegramBotAuth:
         with pytest.raises(ValueError, match="outside OBS_TELEGRAM_TEMP_ROOT"):
             TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
 
+    def test_team_storage_inside_temp_root_is_rejected(self, config, tmp_path):
+        config.telegram_temp_root = tmp_path / "tg-temp"
+        config.telegram_state_db_path = tmp_path / "telegram-state.sqlite3"
+        config.team_storage_root = config.telegram_temp_root / "teams"
+        with pytest.raises(ValueError, match="OBS_TEAM_STORAGE_ROOT must be outside"):
+            TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
     async def test_allowed_user_passes(self, config):
         config.telegram_allowed_user_ids = [12345]
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -2345,6 +2352,30 @@ class TestTopicScheduling:
         assert summary.count("next_schedule:") == 1
         next_local = _expected_local_schedule_time(1060.0, now_ts=1000.0, include_seconds=False)
         assert f"next_schedule: First at {next_local}" in summary
+
+    async def test_completion_summary_shows_context_remaining_from_sdk_usage(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=821)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.set_session_id("sid-sdk-summary")
+        state.hook_state.last_result_data = {
+            "session_id": "sid-sdk-summary",
+            "num_turns": 2,
+            "context_usage": {
+                "totalTokens": 180_000,
+                "maxTokens": 190_000,
+                "rawMaxTokens": 200_000,
+                "percentage": 90.0,
+                "model": "gpt-5.5[200k]",
+                "isAutoCompactEnabled": True,
+                "autoCompactThreshold": 167_000,
+            },
+        }
+
+        summary = bot._build_completion_summary(state)
+
+        assert summary.startswith("context: 20k remaining (180k / 200k, 10%)")
 
     async def test_completion_summary_includes_next_schedule_line(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -5500,7 +5531,7 @@ class TestForkTaskRuntime:
         state.busy = True
         bot._route_inbox_targets[("team-alpha", "root-agent")] = route
 
-        await bot._handle_inbox_message_notification(
+        result = await bot._handle_inbox_message_notification(
             sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
             payload={
                 "team_name": "team-alpha",
@@ -5511,6 +5542,7 @@ class TestForkTaskRuntime:
             },
         )
 
+        assert result == {"delivered": True}
         assert fake_bot.send_message.await_count == 1
         sent_text = fake_bot.send_message.await_args.kwargs["text"]
         assert "topic active: teammate message queued for current turn" in sent_text
@@ -5523,6 +5555,33 @@ class TestForkTaskRuntime:
         assert "Latest sender: worker-b." in queued.text
         assert "Latest summary: handoff." in queued.text
         assert "Latest content preview: process root item 3" in queued.text
+        await bot.shutdown()
+
+    async def test_inbox_message_reports_deferred_when_idle_route_cannot_wake_due_chat_pending_ops(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=222)
+        state = bot._get_state(route, topic_title="Idle Root")
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+        bot._route_inbox_targets[("team-alpha", "root-agent")] = route
+        bot._chat_pending_ops[route.chat_id] = 1
+
+        result = await bot._handle_inbox_message_notification(
+            sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
+            payload={
+                "team_name": "team-alpha",
+                "recipient": "root-agent",
+                "sender": "worker-b",
+                "summary": "handoff",
+                "content": "process root item 3",
+            },
+        )
+
+        assert result == {"delivered": False, "reason": "recipient route is temporarily busy; wake deferred"}
+        assert fake_bot.send_message.await_count == 0
+        assert state.hook_state.message_queue.empty()
         await bot.shutdown()
 
     async def test_poll_team_worker_inbox_queues_notice_when_worker_is_running(
