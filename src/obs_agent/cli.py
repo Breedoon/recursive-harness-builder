@@ -23,7 +23,7 @@ import httpx
 from obs_agent.config import OBSConfig
 from obs_agent.runtime_env import bootstrap_runtime_env
 
-CLI_HELP = """Usage: obs-agent [--help] [--profile PROFILE] [--test]
+CLI_HELP = """Usage: obs-agent [--help] [--profile PROFILE] [--test] [--prod]
 
 Commands:
   /help        Show this help
