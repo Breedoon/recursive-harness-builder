@@ -166,6 +166,30 @@ Pre-existing branch changes that remained in the commit set included:
 - test environment safety / cache proxy / context-window expectation updates across `pyproject.toml`, `src/obs_agent/config.py`, `tests/conftest.py`, `tests/conftest_cache_proxy.py`, `tests/test_agenttask_features_unit.py`, `tests/test_cache_parallel_forks.py`, `tests/test_cache_proxy_normalizations.py`, `tests/test_integration_live.py`, `tests/test_session.py`, `tests/test_telegram.py`, `tests/test_telegram_live_agenttask_features.py`, `tests/test_telegram_live_forking.py`, `tests/test_telegram_live_forum_topics.py`, and `tests/test_telegram_live_media.py`.
 - `tests/test_bug_reproductions.py`: `/delete_all` strict xfail remained removed because the isolated live reproduction XPASSed.
 
+## Commit and final status
+
+Fix commit created during this task:
+
+```text
+448530e7d54a4a39faaf3b9fca7b0c453c85e953 Fix final pytest regressions
+```
+
+Final status immediately after that commit:
+
+```text
+## obs-bugfixing-20260523-baseline
+?? .release-evidence/
+?? Drafts/Artifacts/2026-05-11-17-29-obs-bugfixing/obs bugfixing/OBS Implementation Router v4/Messaging Teams Reduced Executor/
+?? Drafts/Artifacts/2026-05-11-17-29-obs-bugfixing/obs bugfixing/OBS Implementation Router v6/E3b direct full tests and fixes/
+?? tests/pytest-tmp/
+```
+
+Preservation stash check after the commit:
+
+```text
+stash@{0} On obs-bugfixing-20260523-baseline: preserve dirty OBS bugfix work before merging main 2026-05-27
+```
+
 ## Blockers and uncertainty
 
 - The exact requested full-suite command could not be completed within the foreground command cap and timed out even under a one-hour monitor because the suite includes many live Telegram tests. I validated the suite in chunks and isolated the failing live subset instead.
