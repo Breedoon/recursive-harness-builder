@@ -27,13 +27,16 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return loaded
 
 
-def _apply_env_defaults(values: dict[str, str]) -> None:
+def _apply_env_defaults(values: dict[str, str]) -> set[str]:
+    existing_keys = set(os.environ)
     for key, value in values.items():
         os.environ.setdefault(key, value)
+    return existing_keys
 
 
-def _resolve_profile(argv: Iterable[str]) -> tuple[str | None, list[str]]:
+def _resolve_profile(argv: Iterable[str]) -> tuple[str | None, bool, list[str]]:
     explicit_profile: str | None = None
+    explicit_prod = False
     filtered: list[str] = []
     args = list(argv)
     idx = 0
@@ -41,6 +44,9 @@ def _resolve_profile(argv: Iterable[str]) -> tuple[str | None, list[str]]:
         arg = args[idx]
         if arg in {"--test", "--test-instance"}:
             explicit_profile = "test"
+        elif arg == "--prod":
+            explicit_profile = "prod"
+            explicit_prod = True
         elif arg == "--profile":
             if idx + 1 >= len(args):
                 raise SystemExit("--profile requires a value")
@@ -51,16 +57,17 @@ def _resolve_profile(argv: Iterable[str]) -> tuple[str | None, list[str]]:
         else:
             filtered.append(arg)
         idx += 1
-    return explicit_profile, filtered
+    return explicit_profile, explicit_prod, filtered
 
 
-def _apply_profile_prefix(profile: str) -> None:
+def _apply_profile_prefix(profile: str, explicit_env_keys: set[str]) -> None:
     prefix = f"OBS_{profile.upper()}_"
     for key, value in list(os.environ.items()):
         if not key.startswith(prefix):
             continue
         generic_key = "OBS_" + key[len(prefix):]
-        os.environ.setdefault(generic_key, value)
+        if generic_key not in explicit_env_keys:
+            os.environ[generic_key] = value
 
 
 def _apply_profile_defaults(profile: str) -> None:
@@ -78,19 +85,22 @@ def bootstrap_runtime_env(
 
     The bootstrap is intentionally conservative:
     - existing explicit environment variables win
-    - profile-specific values only fill generic vars when those are unset
+    - profile-specific values override generic vars loaded from .env
+    - existing explicit environment variables win over .env and profile mapping
     - test profile defaults the model to Haiku; prod remains the config default
     """
 
     provided_args = list(sys.argv[1:] if argv is None else argv)
-    explicit_profile, filtered_args = _resolve_profile(provided_args)
+    explicit_profile, explicit_prod, filtered_args = _resolve_profile(provided_args)
 
-    _apply_env_defaults(_read_env_file(env_path or _DEFAULT_ENV_PATH))
+    explicit_env_keys = _apply_env_defaults(_read_env_file(env_path or _DEFAULT_ENV_PATH))
 
-    profile = explicit_profile or (os.environ.get("OBS_PROFILE") or "").strip().lower() or "prod"
+    env_profile = (os.environ.get("OBS_PROFILE") or "").strip().lower()
+    requested_profile = explicit_profile or env_profile
+    profile = "prod" if explicit_prod else ("test" if requested_profile == "prod" else requested_profile or "test")
     os.environ["OBS_PROFILE"] = profile
 
-    _apply_profile_prefix(profile)
+    _apply_profile_prefix(profile, explicit_env_keys)
     _apply_profile_defaults(profile)
 
     if argv is None and mutate_argv:

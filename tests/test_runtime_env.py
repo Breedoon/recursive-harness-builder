@@ -16,6 +16,7 @@ def _clear_runtime_env(monkeypatch) -> None:
         "OBS_MODEL",
         "OBS_TEST_VAULT_PATH",
         "OBS_TEST_DAEMON_PORT",
+        "OBS_TEST_CACHE_PROXY_PORT",
         "OBS_TEST_TELEGRAM_BOT_TOKEN",
         "OBS_TEST_TELEGRAM_BOT_TOKEN_2",
         "OBS_TEST_TELEGRAM_BOT_TOKENS",
@@ -27,12 +28,16 @@ def _clear_runtime_env(monkeypatch) -> None:
         "OBS_TEST_TELEGRAM_USERBOT_API_HASH",
         "OBS_TEST_TELEGRAM_USERBOT_SESSION",
         "OBS_PROD_TELEGRAM_BOT_TOKEN",
+        "OBS_PROD_CACHE_PROXY_PORT",
         "OBS_PROD_TELEGRAM_ALLOWED_USERS",
         "OBS_PROD_TELEGRAM_GROUP_FOLDER_TITLE",
         "OBS_PROD_TELEGRAM_GROUP_ADDLIST_URL",
         "OBS_PROD_TELEGRAM_USERBOT_API_ID",
         "OBS_PROD_TELEGRAM_USERBOT_API_HASH",
         "OBS_PROD_TELEGRAM_USERBOT_SESSION",
+        "OBS_VAULT_PATH",
+        "OBS_DAEMON_PORT",
+        "OBS_CACHE_PROXY_PORT",
         "OBS_TELEGRAM_BOT_TOKEN",
         "OBS_TELEGRAM_BOT_TOKENS",
         "OBS_TELEGRAM_ALLOWED_USERS",
@@ -51,6 +56,30 @@ def _clear_runtime_env(monkeypatch) -> None:
         "TELEGRAM_TEST_USER_ID",
     ):
         monkeypatch.delenv(key, raising=False)
+
+
+def test_default_profile_is_test_and_maps_prefixed_env(monkeypatch, tmp_path: Path) -> None:
+    _clear_runtime_env(monkeypatch)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "OBS_TEST_TELEGRAM_BOT_TOKEN=test-primary",
+                "OBS_PROD_TELEGRAM_BOT_TOKEN=prod-primary",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    profile = bootstrap_runtime_env(
+        argv=[],
+        env_path=env_path,
+        mutate_argv=False,
+    )
+
+    assert profile == "test"
+    assert os.environ["OBS_PROFILE"] == "test"
+    assert os.environ["OBS_TELEGRAM_BOT_TOKEN"] == "test-primary"
 
 
 def test_test_profile_maps_prefixed_env_and_sets_haiku(monkeypatch, tmp_path: Path) -> None:
@@ -105,6 +134,7 @@ def test_prefixed_profile_env_maps_to_generic_keys(monkeypatch, tmp_path: Path) 
             [
                 "OBS_TEST_VAULT_PATH=/tmp/test-vault",
                 "OBS_TEST_DAEMON_PORT=9999",
+                "OBS_TEST_CACHE_PROXY_PORT=28923",
             ]
         ),
         encoding="utf-8",
@@ -118,6 +148,29 @@ def test_prefixed_profile_env_maps_to_generic_keys(monkeypatch, tmp_path: Path) 
 
     assert OBSConfig.from_env().vault_path == Path("/tmp/test-vault")
     assert OBSConfig.from_env().daemon_port == 9999
+    assert OBSConfig.from_env().cache_proxy_port == 28923
+
+
+def test_profile_mapping_overrides_generic_env_file_defaults(monkeypatch, tmp_path: Path) -> None:
+    _clear_runtime_env(monkeypatch)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "OBS_CACHE_PROXY_PORT=18923",
+                "OBS_TEST_CACHE_PROXY_PORT=28923",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    bootstrap_runtime_env(
+        argv=[],
+        env_path=env_path,
+        mutate_argv=False,
+    )
+
+    assert OBSConfig.from_env().cache_proxy_port == 28923
 
 
 def test_explicit_generic_env_wins_over_profile_mapping(monkeypatch, tmp_path: Path) -> None:
@@ -136,6 +189,78 @@ def test_explicit_generic_env_wins_over_profile_mapping(monkeypatch, tmp_path: P
     )
 
     assert os.environ["OBS_TELEGRAM_BOT_TOKEN"] == "explicit-generic"
+
+
+def test_env_profile_prod_does_not_map_prod_prefixed_env(monkeypatch, tmp_path: Path) -> None:
+    _clear_runtime_env(monkeypatch)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "OBS_PROFILE=prod",
+                "OBS_TEST_TELEGRAM_BOT_TOKEN=test-primary",
+                "OBS_PROD_TELEGRAM_BOT_TOKEN=prod-primary",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    profile = bootstrap_runtime_env(
+        argv=[],
+        env_path=env_path,
+        mutate_argv=False,
+    )
+
+    assert profile == "test"
+    assert os.environ["OBS_TELEGRAM_BOT_TOKEN"] == "test-primary"
+
+
+def test_profile_prod_arg_does_not_map_prod_prefixed_env(monkeypatch, tmp_path: Path) -> None:
+    _clear_runtime_env(monkeypatch)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "OBS_TEST_TELEGRAM_BOT_TOKEN=test-primary",
+                "OBS_PROD_TELEGRAM_BOT_TOKEN=prod-primary",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    profile = bootstrap_runtime_env(
+        argv=["--profile", "prod"],
+        env_path=env_path,
+        mutate_argv=False,
+    )
+
+    assert profile == "test"
+    assert os.environ["OBS_TELEGRAM_BOT_TOKEN"] == "test-primary"
+
+
+def test_prod_flag_maps_prod_prefixed_env(monkeypatch, tmp_path: Path) -> None:
+    _clear_runtime_env(monkeypatch)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "OBS_TEST_TELEGRAM_BOT_TOKEN=test-primary",
+                "OBS_PROD_TELEGRAM_BOT_TOKEN=prod-primary",
+                "OBS_PROD_CACHE_PROXY_PORT=18923",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    profile = bootstrap_runtime_env(
+        argv=["--prod"],
+        env_path=env_path,
+        mutate_argv=False,
+    )
+
+    assert profile == "prod"
+    assert os.environ["OBS_TELEGRAM_BOT_TOKEN"] == "prod-primary"
+    assert OBSConfig.from_env().cache_proxy_port == 18923
 
 
 def test_legacy_profile_keys_are_not_mapped(monkeypatch, tmp_path: Path) -> None:
