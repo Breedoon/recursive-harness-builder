@@ -18,6 +18,11 @@ from typing import Any
 
 import pytest
 
+pytestmark = pytest.mark.skipif(
+    os.environ.get("OBS_RUN_EXPENSIVE_TELEGRAM_AGENTTASK_LIVE") != "1",
+    reason="expensive AgentTask Telegram live smokes require explicit opt-in",
+)
+
 from tests.test_telegram_live_forum_topics import (
     _extract_topic_link,
     _send_and_wait_for_token,

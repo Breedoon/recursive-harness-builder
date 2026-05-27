@@ -232,7 +232,7 @@ def _ensure_fixture_vault() -> Path:
     if _FIXTURE_VAULT.is_dir():
         return _FIXTURE_VAULT
     if not _CLONE_SCRIPT.exists():
-        raise FileNotFoundError(f"Clone script not found: {_CLONE_SCRIPT}")
+        pytest.skip(f"Eval fixture vault bootstrap unavailable: {_CLONE_SCRIPT}")
     result = subprocess.run(
         [str(_CLONE_SCRIPT)],
         capture_output=True,

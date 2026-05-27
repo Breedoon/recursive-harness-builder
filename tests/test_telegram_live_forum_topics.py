@@ -843,6 +843,10 @@ def test_build_bot_env_preserves_anthropic_env_for_non_claude_model(
 
 @pytest.mark.integration
 @pytest.mark.telegram
+@pytest.mark.skipif(
+    os.environ.get("OBS_RUN_EXPENSIVE_TELEGRAM_FORUM_LIVE") != "1",
+    reason="expensive Telegram forum live smokes require explicit opt-in",
+)
 class TestTelegramLiveForumTopics:
     @pytest.mark.telegram_core_smoke
     async def test_live_command_help_and_deprecations(

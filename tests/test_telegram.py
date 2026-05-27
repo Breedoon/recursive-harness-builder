@@ -4736,7 +4736,7 @@ class TestForkTaskRuntime:
         assert child_state is not None
         assert child_state.notify_on_completion is True
         assert child_state.session_manager.model_override == "gpt-5.5"
-        assert child_state.session_manager.create_options().model == "gpt-5.5[400k]"
+        assert child_state.session_manager.create_options().model == "gpt-5.5[256k]"
         assert (
             child_state.session_manager.create_options().env["ANTHROPIC_API_KEY"]
             == config.cli_proxy_api_key
@@ -4804,9 +4804,9 @@ class TestForkTaskRuntime:
         assert child_state.session_id is None
         assert child_state.session_manager.model_override == "gpt-5.5"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[400k]"
+        assert child_options.model == "gpt-5.5[256k]"
         child_env = child_options.env
-        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
+        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "256000"
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
         assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == unique_team
@@ -4851,10 +4851,10 @@ class TestForkTaskRuntime:
         assert child_state is not None
         assert child_state.session_manager.model_override == "gpt-5.5"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[400k]"
-        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "400000"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
-        assert child_options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "86"
+        assert child_options.model == "gpt-5.5[256k]"
+        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "256000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "256000"
+        assert child_options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "84"
         assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
         await bot.shutdown()
 

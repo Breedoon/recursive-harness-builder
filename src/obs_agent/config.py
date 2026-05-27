@@ -52,7 +52,7 @@ _CONTEXT_SUFFIX_RE = re.compile(r"\[(\d+)([mk])\]$", re.IGNORECASE)
 
 _DEFAULT_CONTEXT_TOKENS = 1_000_000
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    "gpt-5.5": 400_000,
+    "gpt-5.5": 256_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.4-mini": 1_000_000,
 }

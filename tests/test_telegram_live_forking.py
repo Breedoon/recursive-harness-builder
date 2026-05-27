@@ -18,6 +18,11 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
+pytestmark = pytest.mark.skipif(
+    os.environ.get("OBS_RUN_EXPENSIVE_TELEGRAM_FORKING_LIVE") != "1",
+    reason="expensive Telegram forking live smokes require explicit opt-in",
+)
+
 from obs_agent.context_jsonl import find_session_jsonl
 from tests.evals.platform_telegram import TelegramObservedMessage, TelegramPlatform, TelegramResponseTrace
 from tests.live_test_vault import ensure_live_test_vault
