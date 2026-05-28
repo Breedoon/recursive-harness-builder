@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -39,12 +40,16 @@ def _mock_session_get_client(request):
 # Only sets variables not already in the environment.
 # ---------------------------------------------------------------------------
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+_ENV_PROFILE = "prod" if "--prod" in sys.argv[1:] else "test"
+_ENV_ALLOWED_PROFILE_PREFIX = f"OBS_{_ENV_PROFILE.upper()}_"
 if _ENV_FILE.exists():
     for _line in _ENV_FILE.read_text().splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _key, _, _val = _line.partition("=")
             _key, _val = _key.strip(), _val.strip()
+            if _key.startswith("OBS_PROD_") and not _key.startswith(_ENV_ALLOWED_PROFILE_PREFIX):
+                continue
             if _key and _val and _key not in os.environ:
                 os.environ[_key] = _val
 
