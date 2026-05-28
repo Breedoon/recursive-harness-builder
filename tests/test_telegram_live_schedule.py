@@ -263,6 +263,7 @@ class TestTelegramLiveSchedule:
         assert not any(token_b in message.text for message in recent_a), live_tg_forum.failure_context()
         assert not any(token_a in message.text for message in recent_b), live_tg_forum.failure_context()
 
+    @pytest.mark.timeout(900)
     async def test_live_interval_schedule_survives_test_daemon_restart(
         self,
         live_tg_forum: _LiveForumHarness,
@@ -330,6 +331,7 @@ class TestTelegramLiveSchedule:
         )
         assert token in fired.text, live_tg_forum.failure_context()
 
+    @pytest.mark.timeout(600)
     async def test_live_cron_schedule_fires_on_wall_clock_boundary(
         self,
         live_tg_forum: _LiveForumHarness,
@@ -371,6 +373,7 @@ class TestTelegramLiveSchedule:
         )
         assert "cron" in completion.text.lower(), live_tg_forum.failure_context()
 
+    @pytest.mark.timeout(600)
     async def test_live_clear_keeps_schedule_and_unschedule_stops_future_runs(
         self,
         live_tg_forum: _LiveForumHarness,

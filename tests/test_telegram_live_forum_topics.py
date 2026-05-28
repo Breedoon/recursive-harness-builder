@@ -245,10 +245,18 @@ def _message_containing(
 
 
 def _extract_json_object(text: str) -> dict[str, object]:
+    decoder = json.JSONDecoder()
     start = text.find("{")
-    end = text.rfind("}")
-    assert start != -1 and end != -1 and end > start, f"missing JSON object in:\n{text}"
-    return json.loads(text[start : end + 1])
+    while start != -1:
+        try:
+            value, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            start = text.find("{", start + 1)
+            continue
+        if isinstance(value, dict):
+            return value
+        start = text.find("{", start + 1)
+    raise AssertionError(f"missing JSON object in:\n{text}")
 
 
 async def _wait_for_message_containing(

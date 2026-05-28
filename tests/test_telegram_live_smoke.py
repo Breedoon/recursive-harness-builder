@@ -781,6 +781,7 @@ class TestTelegramLiveSmoke:
         normalized_stop = stop_trace.output.lower()
         assert "arguments are deprecated" in normalized_stop, live_tg_forum.failure_context()
 
+    @pytest.mark.timeout(1200)
     async def test_live_smoke_stop_interrupts_parent_but_not_delegated_children(
         self,
         live_tg_forum: _LiveForumHarness,
