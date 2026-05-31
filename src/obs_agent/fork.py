@@ -14,9 +14,41 @@ from typing import TYPE_CHECKING
 from claude_agent_sdk import ClaudeAgentOptions, TextBlock, query
 
 from obs_agent.metrics import log_result
+from obs_agent import tracing
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
+
+
+@tracing.traced_op
+async def _fork_run(
+    session_id: str,
+    prompt: str,
+    model: str,
+    *,
+    system_prompt: str | None = None,
+    max_turns: int | None = None,
+) -> str:
+    """Execute a prompt in a forked session. Args are serializable for Weave tracing."""
+    options = ClaudeAgentOptions(resume=session_id, fork_session=True)
+    if system_prompt is not None:
+        options.system_prompt = system_prompt
+    if max_turns is not None:
+        options.max_turns = max_turns
+
+    result_parts: list[str] = []
+    last_message = None
+    async for message in query(prompt=prompt, options=options):
+        last_message = message
+        if hasattr(message, "content") and isinstance(message.content, list):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    result_parts.append(block.text)
+
+    if last_message is not None:
+        log_result(last_message, label="fork")
+
+    return "\n".join(result_parts)
 
 
 class ForkRunner:
@@ -37,28 +69,13 @@ class ForkRunner:
 
         Returns the text content of the forked session's response.
         """
-        options = ClaudeAgentOptions(
-            resume=self.session_id,
-            fork_session=True,
+        return await _fork_run(
+            self.session_id,
+            prompt,
+            self.config.model,
+            system_prompt=system_prompt,
+            max_turns=max_turns,
         )
-        if system_prompt is not None:
-            options.system_prompt = system_prompt
-        if max_turns is not None:
-            options.max_turns = max_turns
-
-        result_parts: list[str] = []
-        last_message = None
-        async for message in query(prompt=prompt, options=options):
-            last_message = message
-            if hasattr(message, "content") and isinstance(message.content, list):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        result_parts.append(block.text)
-
-        if last_message is not None:
-            log_result(last_message, label="fork")
-
-        return "\n".join(result_parts)
 
     async def extract_memory(self) -> str:
         """Extract and persist session learnings to the vault.

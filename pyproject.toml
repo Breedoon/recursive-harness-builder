@@ -21,6 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tracing = ["weave>=0.52"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
