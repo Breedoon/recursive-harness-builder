@@ -27,6 +27,15 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return loaded
 
 
+def _filter_env_file_values(values: dict[str, str], profile: str) -> dict[str, str]:
+    allowed_profile_prefix = f"OBS_{profile.upper()}_"
+    return {
+        key: value
+        for key, value in values.items()
+        if not key.startswith("OBS_PROD_") or key.startswith(allowed_profile_prefix)
+    }
+
+
 def _apply_env_defaults(values: dict[str, str]) -> set[str]:
     existing_keys = set(os.environ)
     for key, value in values.items():
@@ -93,11 +102,12 @@ def bootstrap_runtime_env(
     provided_args = list(sys.argv[1:] if argv is None else argv)
     explicit_profile, explicit_prod, filtered_args = _resolve_profile(provided_args)
 
-    explicit_env_keys = _apply_env_defaults(_read_env_file(env_path or _DEFAULT_ENV_PATH))
-
-    env_profile = (os.environ.get("OBS_PROFILE") or "").strip().lower()
+    env_values = _read_env_file(env_path or _DEFAULT_ENV_PATH)
+    env_profile = (os.environ.get("OBS_PROFILE") or env_values.get("OBS_PROFILE") or "").strip().lower()
     requested_profile = explicit_profile or env_profile
     profile = "prod" if explicit_prod else ("test" if requested_profile == "prod" else requested_profile or "test")
+
+    explicit_env_keys = _apply_env_defaults(_filter_env_file_values(env_values, profile))
     os.environ["OBS_PROFILE"] = profile
 
     _apply_profile_prefix(profile, explicit_env_keys)

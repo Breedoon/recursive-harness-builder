@@ -170,10 +170,6 @@ class TestBug1PhantomNotificationLoop:
 class TestBug2DeleteAllFreeze:
     """Reproduce: /delete_all command freezes the daemon."""
 
-    @pytest.mark.xfail(
-        reason="BUG: /delete_all may freeze the daemon — needs investigation",
-        strict=True,
-    )
     async def test_delete_all_does_not_freeze_daemon(
         self,
         live_tg_forum: _LiveForumHarness,

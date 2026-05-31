@@ -60,11 +60,17 @@ from conftest_cache_proxy import (
     find_session_jsonl,
 )
 
-pytestmark = [pytest.mark.live, pytest.mark.asyncio]
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.asyncio,
+    pytest.mark.skipif(
+        os.environ.get("OBS_RUN_EXPENSIVE_CACHE_LIVE") != "1",
+        reason="expensive live cache fork tests require explicit opt-in",
+    ),
+]
 
-# Larger text block for 100K+ conversations (5 chunks = ~50K tokens).
-# Combined with parent+forks, conversations reach 100K+ easily.
-BULK_TEXT_LARGE = BULK_TEXT * 5  # ~50K tokens
+# Larger text block for 100K+ conversations without exceeding Haiku's 200k input limit.
+BULK_TEXT_LARGE = BULK_TEXT * 3  # ~30K tokens
 
 
 # ── Process cleanup ──────────────────────────────────────────────────────
@@ -177,7 +183,7 @@ async def _run_single_turn(
     Each connection = one API call = one proxy log entry.
     Returns (session_id, proxy_usage_row, proxy_log_start).
     """
-    log_start = proxy_log_length()
+    log_start = proxy_log_length(proxy_port=proxy_port)
     opts = make_sdk_options(
         project_dir, proxy_port,
         resume=resume,
@@ -191,8 +197,9 @@ async def _run_single_turn(
         await client.disconnect()
 
     assert sid, f"Failed to get session ID (resume={resume}, fork={fork_session})"
-    rows = get_proxy_usage_for_turns(start_offset=log_start)
-    usage = rows[0] if rows else {}
+    rows = get_proxy_usage_for_turns(start_offset=log_start, proxy_port=proxy_port, min_rows=1)
+    assert rows, f"Proxy usage row not written after API call (start_offset={log_start})"
+    usage = rows[0]
     return sid, usage, log_start
 
 
@@ -517,7 +524,7 @@ async def test_fork_after_tool_use_has_complete_blocks(proxy, test_project):
     3. Check the fork's JSONL for complete tool_use/tool_result entries
     4. The fork should also HIT cache (byte-identical prefix)
     """
-    log_start = proxy_log_length()
+    log_start = proxy_log_length(proxy_port=proxy)
     opts = make_sdk_options(test_project, proxy)
     client = ClaudeSDKClient(opts)
     await client.connect()
@@ -534,7 +541,7 @@ async def test_fork_after_tool_use_has_complete_blocks(proxy, test_project):
     finally:
         await client.disconnect()
 
-    parent_usage_rows = get_proxy_usage_for_turns(start_offset=log_start)
+    parent_usage_rows = get_proxy_usage_for_turns(start_offset=log_start, proxy_port=proxy)
     parent_last_tot = parent_usage_rows[-1].get("tot", 0) if parent_usage_rows else 0
     crs = [u.get("cr", 0) for u in parent_usage_rows]
     baseline = compute_baseline(crs)
@@ -714,7 +721,7 @@ async def test_gpt_prefix_replay_caches_through_cli_proxy(proxy, test_project):
     model = "gpt-5.4-mini"
     model_with_context = f"{model}[1m]"
     cliproxy_start = _cliproxy_model_detail_count(model)
-    proxy_log_start = proxy_log_length()
+    proxy_log_start = proxy_log_length(proxy_port=proxy)
 
     opts = make_sdk_options(test_project, proxy, model=model_with_context)
     client = ClaudeSDKClient(opts)
@@ -725,7 +732,7 @@ async def test_gpt_prefix_replay_caches_through_cli_proxy(proxy, test_project):
     finally:
         await client.disconnect()
 
-    proxy_rows = get_proxy_usage_for_turns(start_offset=proxy_log_start)
+    proxy_rows = get_proxy_usage_for_turns(start_offset=proxy_log_start, proxy_port=proxy)
     cliproxy_rows = _cliproxy_model_details(model)[cliproxy_start:]
     print(f"\n  GPT cache session: {sid}")
     for i, row in enumerate(proxy_rows, 1):
@@ -762,7 +769,7 @@ async def test_jsonl_timing_fix_comparative(proxy, test_project):
     OBS-specific (telegram.py copies JSONL independently of the SDK).
     """
     # Parent: build context then trigger tool_use
-    log_start = proxy_log_length()
+    log_start = proxy_log_length(proxy_port=proxy)
     opts = make_sdk_options(test_project, proxy)
     client = ClaudeSDKClient(opts)
     await client.connect()
@@ -786,7 +793,7 @@ async def test_jsonl_timing_fix_comparative(proxy, test_project):
     finally:
         await client.disconnect()
 
-    parent_usage = get_proxy_usage_for_turns(start_offset=log_start)
+    parent_usage = get_proxy_usage_for_turns(start_offset=log_start, proxy_port=proxy)
     parent_last_tot = parent_usage[-1].get("tot", 0) if parent_usage else 0
     crs = [u.get("cr", 0) for u in parent_usage]
     baseline = compute_baseline(crs)

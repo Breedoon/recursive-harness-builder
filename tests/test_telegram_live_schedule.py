@@ -10,6 +10,9 @@ import pytest
 from tests.test_telegram_live_forum_topics import (
     _LiveForumHarness,
     _message_containing,
+    _resolve_sender_tokens,
+    _start_bot,
+    _stop_bot,
     _wait_for_message_after_containing,
     live_tg_forum,  # fixture import
 )
@@ -19,6 +22,46 @@ from tests.test_telegram_live_forum_topics import (
 @pytest.mark.telegram
 @pytest.mark.telegram_smoke
 class TestTelegramLiveSchedule:
+    async def test_live_schedule_command_lists_topic_schedule(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        thread_id = await live_tg_forum.platform.create_topic(f"Schedule Command {tag}")
+        schedule_name = f"CMD-{tag}"
+
+        create_trace = await live_tg_forum.platform.send(
+            (
+                "This is a deterministic live scheduling command test. "
+                "Call CronCreate exactly once with "
+                "schedule_mode='interval', cron='* * * * *', interval_seconds=120, reset_session=false, max_runs=2, "
+                f"description='{schedule_name}', "
+                f"prompt='This is a deterministic live scheduling command test. Reply with only SCHED-CMD-{tag}.' "
+                f"After the tool call, reply with only CMD-CREATED-{tag}."
+            ),
+            thread_id=thread_id,
+            timeout=180.0,
+        )
+        assert f"CMD-CREATED-{tag}" in create_trace.output, live_tg_forum.failure_context()
+        assert len(_resolve_sender_tokens()) >= 5, live_tg_forum.failure_context()
+
+        schedule_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
+        await live_tg_forum.platform.send_nowait(
+            f"/schedule@{live_tg_forum.bot_username}",
+            thread_id=thread_id,
+        )
+        schedule_msg = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_id,
+            after_message_id=schedule_baseline,
+            token=schedule_name,
+            timeout=45.0,
+        )
+        lowered = schedule_msg.text.lower()
+        assert "schedules for this topic: 1" in lowered, live_tg_forum.failure_context()
+        assert "next_schedule:" in lowered, live_tg_forum.failure_context()
+        assert "gated" not in lowered, live_tg_forum.failure_context()
+
     async def test_live_interval_schedule_runs_and_emits_completion_next_schedule(
         self,
         live_tg_forum: _LiveForumHarness,
@@ -220,6 +263,75 @@ class TestTelegramLiveSchedule:
         assert not any(token_b in message.text for message in recent_a), live_tg_forum.failure_context()
         assert not any(token_a in message.text for message in recent_b), live_tg_forum.failure_context()
 
+    @pytest.mark.timeout(900)
+    async def test_live_interval_schedule_survives_test_daemon_restart(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        thread_id = await live_tg_forum.platform.create_topic(f"Schedule Restart {tag}")
+        token = f"SCHED-RESTART-{tag}"
+        schedule_name = f"RESTART-{tag}"
+
+        create_trace = await live_tg_forum.platform.send(
+            (
+                "This is a deterministic live scheduling restart test. "
+                "Call CronCreate exactly once with "
+                "schedule_mode='interval', cron='* * * * *', interval_seconds=120, reset_session=false, max_runs=2, "
+                f"description='{schedule_name}', "
+                f"prompt='This is a deterministic live scheduling restart test. Reply with only {token}.' "
+                f"After the tool call, reply with only RESTART-CREATED-{tag}."
+            ),
+            thread_id=thread_id,
+            timeout=180.0,
+        )
+        assert f"RESTART-CREATED-{tag}" in create_trace.output, live_tg_forum.failure_context()
+        assert len(_resolve_sender_tokens()) >= 5, live_tg_forum.failure_context()
+
+        list_before = await live_tg_forum.platform.send(
+            (
+                "This is a deterministic live scheduling restart test. "
+                "Call CronList exactly once. "
+                f"If a schedule with description {schedule_name} exists, reply with only RESTART-LIST-BEFORE-{tag}; "
+                f"otherwise reply with only RESTART-LIST-MISSING-BEFORE-{tag}."
+            ),
+            thread_id=thread_id,
+            timeout=120.0,
+        )
+        assert f"RESTART-LIST-BEFORE-{tag}" in list_before.output, live_tg_forum.failure_context()
+
+        _stop_bot(live_tg_forum.proc)
+        assert live_tg_forum.temp_root is not None
+        live_tg_forum.proc, live_tg_forum.log_file = _start_bot(
+            live_tg_forum.vault_path,
+            live_tg_forum.temp_root,
+            state_db_path=live_tg_forum.state_db_path,
+        )
+        await asyncio.sleep(5.0)
+
+        list_after = await live_tg_forum.platform.send(
+            (
+                "This is a deterministic live scheduling restart test after daemon restart. "
+                "Call CronList exactly once. "
+                f"If a schedule with description {schedule_name} exists, reply with only RESTART-LIST-AFTER-{tag}; "
+                f"otherwise reply with only RESTART-LIST-MISSING-AFTER-{tag}."
+            ),
+            thread_id=thread_id,
+            timeout=120.0,
+        )
+        assert f"RESTART-LIST-AFTER-{tag}" in list_after.output, live_tg_forum.failure_context()
+
+        after_marker = _message_containing(list_after, f"RESTART-LIST-AFTER-{tag}")
+        fired = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=thread_id,
+            after_message_id=after_marker.message_id,
+            token=token,
+            timeout=180.0,
+        )
+        assert token in fired.text, live_tg_forum.failure_context()
+
+    @pytest.mark.timeout(600)
     async def test_live_cron_schedule_fires_on_wall_clock_boundary(
         self,
         live_tg_forum: _LiveForumHarness,
@@ -261,6 +373,7 @@ class TestTelegramLiveSchedule:
         )
         assert "cron" in completion.text.lower(), live_tg_forum.failure_context()
 
+    @pytest.mark.timeout(600)
     async def test_live_clear_keeps_schedule_and_unschedule_stops_future_runs(
         self,
         live_tg_forum: _LiveForumHarness,

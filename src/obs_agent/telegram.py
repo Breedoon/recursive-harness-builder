@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import inspect
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ from obs_agent.config import parse_context_suffix
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
 from obs_agent.context_jsonl import find_session_jsonl
-from obs_agent.jsonl_fork import fork_session_jsonl
+from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
 from obs_agent.lineage import (
     agent_name_for_lineage,
     build_obs_bootstrap_xml,
@@ -61,6 +62,7 @@ from obs_agent.lineage import (
 from obs_agent.queueing import QueuedMessage, coerce_queued_message
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent, TurnEndEvent
 from obs_agent.session import SessionManager
+from obs_agent.startup_logging import StartupProfiler
 from obs_agent.telegram_format import md_to_telegram_html, split_message
 from obs_agent.telegram_ingest import TelegramInboundNormalizer
 from obs_agent.telegram_state_store import TelegramStateStore
@@ -109,14 +111,46 @@ _AUTO_DELIVERY_PROMPT = (
 
 _TELEGRAM_HELP_TEXT = """Usage:
 /help — show this help
-/stop — interrupt this topic; /stop all interrupts every topic in the chat
+/guide — show the DM setup guide
+/stop — interrupt this topic
 /fork [name] — create a new topic from this head or a replied message
 /new [name] — reset this topic into a new trunk agent
 /clear — clear this topic but keep its agent identity
 /context — show session and context info
+/schedule — show schedules attached to this topic
+/unschedule [id] — remove a schedule from this topic
 
 Bare commands are not supported; use the slash form, e.g. /stop.
+Deprecated: /delete and cross-topic all arguments are disabled.
 """.strip()
+
+_TELEGRAM_DM_GUIDE_TEXT = """OBS setup guide
+
+Use this private chat with the main bot to set up the agent workspace:
+1. /new-group <group title> — create a forum supergroup and add the configured OBS bots.
+2. /new-bot [display name] — create a new Claudia sender bot through BotFather.
+3. After a group is created, use its topics for normal agent work.
+
+Shortcuts: /new -group <group title> and /new -bot [display name].
+""".strip()
+
+_DEPRECATED_ALL_SCOPE_TEXT = "Cross-topic 'all' arguments are deprecated; run the command in each topic instead."
+_DELETE_DEPRECATED_TEXT = "/delete is deprecated and disabled; manage Telegram topics directly in Telegram."
+_BARE_COMMAND_USAGE: dict[str, str] = {
+    "help": "Use /help for command usage.",
+    "stop": "Use /stop to interrupt this topic.",
+    "fork": "Use /fork [name] to create a new topic.",
+    "new": "Use /new [name] to reset this topic into a new trunk agent.",
+    "clear": "Use /clear to clear this topic while keeping its agent identity.",
+    "context": "Use /context to show session and context info.",
+    "report": "Use /report [comment] to save a debug case file.",
+    "schedule": "Use /schedule for schedule command status.",
+    "unschedule": "Use /unschedule to remove a schedule from this topic.",
+    "tree": "Use /tree to render the agent tree.",
+    "forktask": "Use AgentTask from an agent topic to launch delegated work.",
+    "delete": _DELETE_DEPRECATED_TEXT,
+}
+_USER_COMMAND_LOG_LIMIT = 200
 
 _PRIORITY_SYSTEM = 0
 _PRIORITY_ASSISTANT = 10
@@ -640,6 +674,11 @@ class TelegramBot:
                 "Invalid Telegram state DB path: OBS_TELEGRAM_STATE_DB_PATH must be outside "
                 "OBS_TELEGRAM_TEMP_ROOT to avoid startup cleanup deleting persistence data."
             )
+        if _path_is_within(config.team_storage_root, config.telegram_temp_root):
+            raise ValueError(
+                "Invalid team storage path: OBS_TEAM_STORAGE_ROOT must be outside "
+                "OBS_TELEGRAM_TEMP_ROOT because inbound media cleanup purges that directory at startup."
+            )
         self._fragment_buffer = FragmentBuffer(
             on_complete=self._process_message, gap_seconds=fragment_gap
         )
@@ -650,6 +689,7 @@ class TelegramBot:
             temp_root=config.telegram_temp_root,
             transcription_script=config.telegram_transcription_script,
         )
+        self._command_log_path = self._normalizer.boot_root / "user-command-log.jsonl"
 
         self._route_locks: dict[TelegramRoute, asyncio.Lock] = {}
         self._states_by_route: dict[TelegramRoute, TelegramSessionState] = {}
@@ -663,9 +703,7 @@ class TelegramBot:
         self._route_inbox_targets: dict[tuple[str, str], TelegramRoute] = {}
         self._route_inbox_target_keys_by_route: dict[TelegramRoute, tuple[str, str]] = {}
         self._chat_titles: dict[int, str] = {}
-        # Dedup set for inbox wake polling — prevents re-triggering the same
-        # unread message every poll cycle.  Cleared on daemon restart (correct:
-        # you want to re-notify after restart) and when a NEW message arrives.
+        self._daemon_start_time = datetime.now(timezone.utc)
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
@@ -726,16 +764,33 @@ class TelegramBot:
         )
         self._typing_actions_enabled = bool(config.telegram_typing_actions_enabled)
 
-    async def initialize_runtime(self) -> None:
+    async def initialize_runtime(self, startup: StartupProfiler | None = None) -> None:
         """Purge the Telegram temp root once and create a fresh workspace."""
-        self._normalizer.initialize()
-        self._state_store.initialize()
-        self._state_store.prune(
-            retention_days=self._config.telegram_state_retention_days
-        )
-        self._restore_state_from_store()
-        await self._ensure_transport_worker()
-        await self._ensure_background_poller(None)
+        if startup is None:
+            self._normalizer.initialize()
+            self._state_store.initialize()
+            self._state_store.prune(
+                retention_days=self._config.telegram_state_retention_days
+            )
+            self._restore_state_from_store()
+            await self._ensure_transport_worker()
+            await self._ensure_background_poller(None)
+            return
+
+        with startup.phase("telegram_normalizer"):
+            self._normalizer.initialize()
+        with startup.phase("telegram_state_initialize"):
+            self._state_store.initialize()
+        with startup.phase("telegram_state_prune", retention_days=self._config.telegram_state_retention_days):
+            self._state_store.prune(
+                retention_days=self._config.telegram_state_retention_days
+            )
+        with startup.phase("telegram_state_restore"):
+            self._restore_state_from_store()
+        with startup.phase("telegram_transport_worker"):
+            await self._ensure_transport_worker()
+        with startup.phase("telegram_background_poller", enabled=self._enable_background_poller):
+            await self._ensure_background_poller(None)
 
     def _next_transport_sequence(self) -> int:
         self._transport_sequence += 1
@@ -1236,6 +1291,20 @@ class TelegramBot:
         return f"Topic {route.thread_id}"
 
     @staticmethod
+    def _is_private_message(message: Any) -> bool:
+        chat = getattr(message, "chat", None)
+        chat_type = getattr(chat, "type", None)
+        if isinstance(chat_type, str):
+            return chat_type.lower() == "private"
+        return getattr(message, "chat_id", 0) > 0
+
+    @staticmethod
+    def _guide_text_for_message(message: Any) -> str:
+        if TelegramBot._is_private_message(message):
+            return _TELEGRAM_DM_GUIDE_TEXT
+        return _TELEGRAM_HELP_TEXT
+
+    @staticmethod
     def _safe_int(value: Any, default: int) -> int:
         try:
             return int(value)
@@ -1660,6 +1729,11 @@ class TelegramBot:
 
         for entry in snapshot.topic_schedules:
             route = TelegramRoute(chat_id=entry.chat_id, thread_id=entry.thread_id)
+            state = self._states_by_route.get(route)
+            if state is None:
+                state = self._build_session_state(route)
+                self._states_by_route[route] = state
+                self._upsert_route_inbox_target(state)
             record = _TopicScheduleRecord(
                 schedule_id=entry.schedule_id,
                 route=route,
@@ -1876,6 +1950,9 @@ class TelegramBot:
             if self._is_fork_task_running(record, completing_task_id=completing_task_id):
                 skip("running")
                 continue
+            if record.wake_requested:
+                skip("wake_requested")
+                continue
             child_state = self._states_by_route.get(record.child_route)
             if child_state is None:
                 skip("missing_child_state")
@@ -1957,13 +2034,16 @@ class TelegramBot:
             if self._is_fork_task_running(candidate.record, completing_task_id=completing_task_id):
                 prune_skip_reasons["became_running"] = prune_skip_reasons.get("became_running", 0) + 1
                 continue
+            if candidate.record.wake_requested:
+                prune_skip_reasons["became_wake_requested"] = prune_skip_reasons.get("became_wake_requested", 0) + 1
+                continue
             if candidate.state.busy:
                 prune_skip_reasons["became_busy"] = prune_skip_reasons.get("became_busy", 0) + 1
                 continue
             if candidate.state.hook_state.execution_active:
                 prune_skip_reasons["became_execution_active"] = prune_skip_reasons.get("became_execution_active", 0) + 1
                 continue
-            if await candidate.state.session_manager.disconnect_idle_client(direct_kill=True):
+            if await candidate.state.session_manager.disconnect_idle_client(direct_kill=kill_on_idle):
                 pruned += 1
             else:
                 prune_skip_reasons["disconnect_no_client"] = prune_skip_reasons.get("disconnect_no_client", 0) + 1
@@ -2009,6 +2089,10 @@ class TelegramBot:
         hook_state.inbox_recipient_validator = self._make_inbox_recipient_validator(route)
         hook_state.inbox_message_notifier = self._make_inbox_message_notifier(route)
         hook_state.stop_event_notifier = self._make_stop_event_notifier(route)
+        hook_state.user_message_sender = self._make_user_message_sender(route)
+        hook_state.user_prompt_sender = self._make_user_prompt_sender(route)
+        hook_state.user_command_reader = self._make_user_command_reader(route)
+        hook_state.team_status_provider = self._make_team_status_provider(route)
         hook_state.context_snapshot_provider = self._make_context_snapshot_provider(route)
         hook_state.vault_path = self._config.vault_path
         return state
@@ -2122,11 +2206,192 @@ class TelegramBot:
 
         return _notify
 
+    def _make_team_status_provider(self, route: TelegramRoute):
+        async def _status(payload: dict[str, Any]) -> dict[str, Any] | None:
+            _ = route
+            team_name = str(payload.get("team_name") or "").strip()
+            agent_name = str(payload.get("agent_name") or "").strip()
+            if not team_name or not agent_name:
+                return None
+            record = self._resolve_team_worker_record(
+                team_name=team_name,
+                agent_name=agent_name,
+            )
+            state = None
+            if record is not None:
+                state = self._get_state(record.child_route, create=False)
+            if state is None:
+                state = self._resolve_route_inbox_target(
+                    team_name=team_name,
+                    agent_name=agent_name,
+                )
+            status_payload: dict[str, Any] = {}
+            if record is not None:
+                status_payload["status"] = "running" if self._is_fork_task_running(record) else record.status
+                status_payload["idle_ready"] = record.idle_ready
+                status_payload["created_at"] = record.created_at
+                if record.completed_at is not None:
+                    status_payload["completed_at"] = record.completed_at
+            if state is not None:
+                status_payload["running"] = bool(state.busy or state.hook_state.execution_active)
+                status_payload["model"] = state.session_manager.model_override or self._config.model
+                if state.session_manager.last_activity is not None:
+                    status_payload["last_active_at"] = state.session_manager.last_activity
+            elif "running" not in status_payload:
+                status_payload["running"] = False
+            return status_payload
+
+        return _status
+
+    def _make_user_message_sender(self, route: TelegramRoute):
+        async def _send(payload: dict[str, Any]) -> dict[str, Any]:
+            return await self._send_hook_user_message(route=route, payload=payload, prompt=False)
+
+        return _send
+
+    def _make_user_prompt_sender(self, route: TelegramRoute):
+        async def _prompt(payload: dict[str, Any]) -> dict[str, Any]:
+            return await self._send_hook_user_message(route=route, payload=payload, prompt=True)
+
+        return _prompt
+
+    def _make_user_command_reader(self, route: TelegramRoute):
+        async def _read(payload: dict[str, Any]) -> dict[str, Any]:
+            return self._read_user_command_log(route=route, payload=payload)
+
+        return _read
+
     def _make_context_snapshot_provider(self, route: TelegramRoute):
         def _snapshot(**_: Any) -> dict[str, Any]:
             return self._build_hook_context_snapshot(route)
 
         return _snapshot
+
+    async def _send_hook_user_message(
+        self,
+        *,
+        route: TelegramRoute,
+        payload: dict[str, Any],
+        prompt: bool,
+    ) -> dict[str, Any]:
+        state = self._get_state(route, create=False)
+        bot = self._bot_for_state(state) if state is not None else self._primary_bot
+        if bot is None:
+            return {"ok": False, "error": "telegram bot unavailable for this route"}
+        text = str(payload.get("text") or payload.get("message") or "").strip()
+        if not text:
+            return {"ok": False, "error": "text is required"}
+        disable_notification = self._coerce_payload_bool(
+            payload.get("disable_notification"),
+            default=not prompt,
+        )
+        reply_to_message_id = self._coerce_optional_int(payload.get("reply_to_message_id"))
+        prefix = str(payload.get("prefix") or ("hook prompt" if prompt else "hook message")).strip()
+        rendered = f"{prefix}: {text}" if prefix else text
+        sent = await self._send_system_message(
+            route=route,
+            bot=bot,
+            text=rendered,
+            disable_notification=disable_notification,
+            reply_to_message_id=reply_to_message_id,
+        )
+        sent_messages = sent if isinstance(sent, list) else [sent]
+        return {
+            "ok": True,
+            "message_ids": [
+                message_id
+                for message_id in (self._sent_message_id(msg) for msg in sent_messages)
+                if message_id is not None
+            ],
+            "route": {"chat_id": route.chat_id, "thread_id": route.thread_id},
+        }
+
+    @staticmethod
+    def _coerce_payload_bool(value: Any, *, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    @staticmethod
+    def _coerce_optional_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _read_user_command_log(self, *, route: TelegramRoute, payload: dict[str, Any]) -> dict[str, Any]:
+        limit = self._coerce_optional_int(payload.get("limit")) or 20
+        limit = max(1, min(limit, _USER_COMMAND_LOG_LIMIT))
+        include_all_routes = self._coerce_payload_bool(payload.get("all_routes"), default=False)
+        records: list[dict[str, Any]] = []
+        if self._command_log_path.exists():
+            for line in self._command_log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if not include_all_routes and not self._command_record_matches_route(record, route):
+                    continue
+                records.append(record)
+        return {
+            "ok": True,
+            "path": str(self._command_log_path),
+            "commands": records[-limit:],
+            "route": {"chat_id": route.chat_id, "thread_id": route.thread_id},
+        }
+
+    @staticmethod
+    def _command_record_matches_route(record: dict[str, Any], route: TelegramRoute) -> bool:
+        record_route = record.get("route")
+        if not isinstance(record_route, dict):
+            return False
+        return record_route.get("chat_id") == route.chat_id and record_route.get("thread_id") == route.thread_id
+
+    def _log_user_command(self, update: Update, command: str) -> None:
+        message = update.effective_message
+        user = update.effective_user
+        if message is None:
+            return
+        route = self._route_for_message(message)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "command": command,
+            "text": str(getattr(message, "text", "") or ""),
+            "message_id": getattr(message, "message_id", None),
+            "route": {"chat_id": route.chat_id, "thread_id": route.thread_id},
+            "user": {
+                "id": getattr(user, "id", None) if user is not None else None,
+                "username": self._coerce_username(user) if user is not None else None,
+            },
+        }
+        self._command_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._command_log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+
+    async def _log_command_and_call(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        command: str,
+        handler,
+    ) -> None:
+        user = update.effective_user
+        if user is not None and self._is_authorized(user.id):
+            self._log_user_command(update, command)
+        result = handler(update, context)
+        if inspect.isawaitable(result):
+            await result
 
     def _is_authorized(self, user_id: int) -> bool:
         # SECURITY: empty allowed list = NO ONE can use the bot (deny by default)
@@ -2381,6 +2646,7 @@ class TelegramBot:
         parent_session_id: str | None = None,
         team_name: str | None = None,
         agent_name: str | None = None,
+        parent_agent_name_override: str | None = None,
         session_id: str | None = None,
     ) -> str:
         normalized_lineage = tuple(
@@ -2395,7 +2661,7 @@ class TelegramBot:
             default_team_name, default_agent_name = self._default_team_projection(normalized_lineage)
             resolved_team_name = resolved_team_name or default_team_name
             resolved_agent_name = resolved_agent_name or default_agent_name
-        parent_agent_name: str | None = None
+        parent_agent_name: str | None = (parent_agent_name_override or "").strip() or None
         parent_display_name: str | None = None
         if len(normalized_lineage) > 1:
             parent_lineage = normalized_lineage[:-1]
@@ -2405,7 +2671,7 @@ class TelegramBot:
                     resolved_team_name,
                     parent_display_name,
                 )
-            parent_agent_name = agent_name_for_lineage(
+            parent_agent_name = parent_agent_name or agent_name_for_lineage(
                 parent_lineage,
                 team_key=resolved_team_name,
             )
@@ -3319,6 +3585,9 @@ class TelegramBot:
             return self._child_topic_title_from_alias(state, normalized_alias)
         return self._next_auto_child_title(state)
 
+    def _team_dir(self, team_name: str) -> Path:
+        return self._config.team_storage_root / team_name
+
     def _build_team_worker_env(
         self,
         *,
@@ -3398,7 +3667,7 @@ class TelegramBot:
         self,
         team_name: str,
     ) -> dict[str, dict[str, Any]]:
-        config_path = Path.home() / ".claude" / "teams" / team_name / "config.json"
+        config_path = self._team_dir(team_name) / "config.json"
         if not config_path.exists():
             return {}
         try:
@@ -3425,8 +3694,14 @@ class TelegramBot:
                 "parent_agent_name",
                 "parent_display_name",
                 "root_team_key",
+                "model",
+                "status",
             ):
                 value = obs.get(text_key)
+                if isinstance(value, str) and value.strip():
+                    entry[text_key] = value.strip()
+            for text_key in ("agentType", "agent_type", "model", "status"):
+                value = member.get(text_key)
                 if isinstance(value, str) and value.strip():
                     entry[text_key] = value.strip()
             lineage = obs.get("lineage")
@@ -3441,10 +3716,27 @@ class TelegramBot:
                     entry["lineage_length"] = len(normalized_lineage)
             if isinstance(obs.get("lineage_length"), int):
                 entry["lineage_length"] = int(obs["lineage_length"])
-            for int_key in ("topic_chat_id", "topic_thread_id", "updated_at"):
+            for int_key in ("topic_chat_id", "topic_thread_id"):
                 value = obs.get(int_key)
                 if isinstance(value, int):
                     entry[int_key] = value
+            for activity_key in (
+                "last_active_at",
+                "last_activity_at",
+                "completed_at",
+                "created_at",
+                "updated_at",
+                "joinedAt",
+                "joined_at",
+            ):
+                for source in (obs, member):
+                    value = source.get(activity_key)
+                    if isinstance(value, bool):
+                        continue
+                    if isinstance(value, (int, float)):
+                        entry[activity_key] = value
+                    elif isinstance(value, str) and value.strip():
+                        entry[activity_key] = value.strip()
             metadata[agent_name] = entry
         return metadata
 
@@ -3461,7 +3753,7 @@ class TelegramBot:
         if not normalized_team or not normalized_agent:
             return
 
-        team_dir = Path.home() / ".claude" / "teams" / normalized_team
+        team_dir = self._team_dir(normalized_team)
         config_path = team_dir / "config.json"
         team_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4418,6 +4710,16 @@ class TelegramBot:
             )
         return f"schedule_triggered: {self._schedule_display_name(record)}"
 
+    def _next_schedule_line_for_record(self, record: _TopicScheduleRecord, *, now_ts: float) -> str:
+        if record.next_run_at is not None:
+            run_at_text = self._format_schedule_timestamp(
+                ts=record.next_run_at,
+                record=record,
+                now_ts=now_ts,
+            )
+            return f"next_schedule: {self._schedule_display_name(record)} at {run_at_text}"
+        return f"next_schedule: {self._schedule_display_name(record)} on next stop"
+
     def _next_schedule_line(self, route: TelegramRoute) -> str | None:
         now = time.time()
         timed_records = [
@@ -4439,15 +4741,7 @@ class TelegramBot:
         if record is None:
             return None
 
-        if record.next_run_at is not None:
-            run_at_text = self._format_schedule_timestamp(
-                ts=record.next_run_at,
-                record=record,
-                now_ts=now,
-            )
-            pieces = [f"next_schedule: {self._schedule_display_name(record)} at {run_at_text}"]
-        else:
-            pieces = [f"next_schedule: {self._schedule_display_name(record)} on next stop"]
+        pieces = [self._next_schedule_line_for_record(record, now_ts=now)]
         details = self._schedule_details(record, now_ts=now)
         if details:
             pieces.append(f"({' ; '.join(details)})")
@@ -4848,6 +5142,12 @@ class TelegramBot:
             await self._activate_route_session(state, binding.session_id)
             return True, reply_to_user_message_id
 
+        lineage = self._ensure_state_lineage(state, session_id=binding.session_id)
+        projection = self._state_inbox_projection(state)
+        if projection is None:
+            team_name, agent_name = self._default_team_projection(lineage)
+        else:
+            team_name, agent_name = projection
         fork_session_id = fork_session_jsonl(
             session_id=binding.session_id,
             target_uuid=binding.jsonl_uuid,
@@ -4858,8 +5158,6 @@ class TelegramBot:
             session_id=fork_session_id,
             jsonl_uuid=binding.jsonl_uuid,
         )
-        await self._activate_route_session(state, fork_session_id)
-        lineage = self._ensure_state_lineage(state, session_id=binding.session_id)
         self._prime_obs_bootstrap(
             state,
             lineage=lineage,
@@ -4867,6 +5165,19 @@ class TelegramBot:
             is_fork=True,
             parent_session_id=binding.session_id,
             session_id=fork_session_id,
+            team_name=team_name,
+            agent_name=agent_name,
+        )
+        await self._activate_route_session(state, fork_session_id)
+        self._prime_obs_bootstrap(
+            state,
+            lineage=lineage,
+            origin="inline_fork",
+            is_fork=True,
+            parent_session_id=binding.session_id,
+            session_id=fork_session_id,
+            team_name=team_name,
+            agent_name=agent_name,
         )
         return True, reply_to_user_message_id
 
@@ -4921,6 +5232,8 @@ class TelegramBot:
             await self._media_group_buffer.add(update, context)
             return
         if message.text is not None:
+            if await self._maybe_handle_bare_command(update, context):
+                return
             await self._fragment_buffer.add(update, context)
             return
         receipt_message_ids: list[int] = []
@@ -4944,31 +5257,46 @@ class TelegramBot:
             user_warnings=normalized.user_warnings,
         )
 
-    def _routes_in_chat(self, chat_id: int) -> list[TelegramRoute]:
-        return [route for route in self._states_by_route if route.chat_id == chat_id]
-
     def _command_targets(
         self,
         *,
         route: TelegramRoute,
         args: list[str],
     ) -> tuple[list[TelegramSessionState], bool]:
-        normalized_arg = ""
-        if len(args) == 1:
-            normalized_arg = args[0].strip().lower()
-            # Telegram control clients sometimes send "/cmd all@botname";
-            # treat that as the same scope selector as "/cmd all".
-            if "@" in normalized_arg:
-                normalized_arg = normalized_arg.split("@", 1)[0].strip()
-        apply_all = len(args) == 1 and normalized_arg == "all"
-        if apply_all:
-            routes = self._routes_in_chat(route.chat_id)
-            if route not in routes:
-                routes.append(route)
-            states = [self._get_state(candidate) for candidate in routes]
-            return [state for state in states if state is not None], True
         state = self._get_state(route)
         return ([state] if state is not None else []), False
+
+    def _has_deprecated_all_arg(self, args: list[str]) -> bool:
+        for arg in args:
+            normalized_arg = arg.strip().lower()
+            if "@" in normalized_arg:
+                normalized_arg = normalized_arg.split("@", 1)[0].strip()
+            if normalized_arg == "all":
+                return True
+        return False
+
+    async def _maybe_handle_bare_command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> bool:
+        if update.effective_message is None:
+            return False
+        raw_text = str(update.effective_message.text or "").strip()
+        if not raw_text or raw_text.startswith("/") or any(ch.isspace() for ch in raw_text):
+            return False
+        normalized = raw_text.strip().lower()
+        if normalized not in _BARE_COMMAND_USAGE:
+            return False
+        route = self._route_for_message(update.effective_message)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=_BARE_COMMAND_USAGE[normalized],
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
+        return True
 
     async def _build_context_lines(self, state: TelegramSessionState) -> list[str]:
         snapshot = build_context_snapshot(
@@ -5112,7 +5440,7 @@ class TelegramBot:
         current_route: TelegramRoute,
     ) -> dict[str, dict[str, Any]]:
         metadata = self._load_team_projection_metadata(team_name)
-        inbox_dir = Path.home() / ".claude" / "teams" / team_name / "inboxes"
+        inbox_dir = self._team_dir(team_name) / "inboxes"
         all_agents: set[str] = set(metadata)
         if inbox_dir.is_dir():
             for path in inbox_dir.iterdir():
@@ -5151,26 +5479,73 @@ class TelegramBot:
                 lineage = entry.get("lineage")
                 if isinstance(lineage, list):
                     entry["lineage_length"] = len(lineage)
+            record = self._resolve_team_worker_record(team_name=team_name, agent_name=agent_name)
+            state = None
+            if record is not None:
+                state = self._get_state(record.child_route, create=False)
+                entry["status"] = "running" if self._is_fork_task_running(record) else record.status
+                entry["idle_ready"] = record.idle_ready
+                entry["created_at"] = record.created_at
+                if record.completed_at is not None:
+                    entry["completed_at"] = record.completed_at
+            if state is None:
+                state = self._resolve_route_inbox_target(team_name=team_name, agent_name=agent_name)
+            if state is not None:
+                entry["running"] = bool(state.busy or state.hook_state.execution_active)
+                entry["model"] = state.session_manager.model_override or self._config.model
+                if state.session_manager.last_activity is not None:
+                    entry["last_active_at"] = state.session_manager.last_activity
+            else:
+                entry.setdefault("running", False)
         return members
 
     def _member_activity_sort_key(self, member: dict[str, Any], agent_name: str) -> tuple[float, str]:
-        candidates = [
+        timestamp = self._member_activity_timestamp(member)
+        if timestamp is None:
+            return (0.0, str(agent_name))
+        return (-timestamp, str(agent_name))
+
+    @staticmethod
+    def _coerce_tree_limit(value: str | None) -> int:
+        if value is None or not value.strip():
+            return 50
+        try:
+            limit = int(value.strip())
+        except ValueError:
+            return 50
+        if limit < 1:
+            return 1
+        return min(limit, 200)
+
+    @staticmethod
+    def _coerce_activity_timestamp(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            return timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed.timestamp()
+        return None
+
+    def _member_activity_timestamp(self, member: dict[str, Any]) -> float | None:
+        for candidate in (
             member.get("last_active_at"),
             member.get("last_activity_at"),
             member.get("completed_at"),
             member.get("created_at"),
             member.get("updated_at"),
-        ]
-        for candidate in candidates:
-            if isinstance(candidate, (int, float)):
-                return (-float(candidate), str(agent_name))
-            if isinstance(candidate, str) and candidate.strip():
-                try:
-                    parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                return (-parsed.timestamp(), str(agent_name))
-        return (0.0, str(agent_name))
+            member.get("joinedAt"),
+            member.get("joined_at"),
+        ):
+            timestamp = self._coerce_activity_timestamp(candidate)
+            if timestamp is not None:
+                return timestamp
+        return None
 
     def _render_tree_html(
         self,
@@ -5180,6 +5555,7 @@ class TelegramBot:
         current_lineage: tuple[str, ...],
         members: dict[str, dict[str, Any]],
         mode: str,
+        limit: int = 50,
     ) -> str:
         if mode == "ancestors":
             allowed = {
@@ -5237,8 +5613,20 @@ class TelegramBot:
                     label = f'<a href="{html.escape(link, quote=True)}">{label}</a>'
             if bold:
                 label = f"<b>{label}</b>"
+            metadata_bits: list[str] = []
+            status = str(member.get("status") or "").strip()
+            running = member.get("running")
+            if running is True and status != "running":
+                metadata_bits.append("running")
+            elif status:
+                metadata_bits.append(status)
+            model = str(member.get("model") or "").strip()
+            if model:
+                metadata_bits.append(model)
             if agent_name == current_agent_name:
                 label = f"{label} (current)"
+            if metadata_bits and not bold:
+                label = f"{label} [{' / '.join(html.escape(bit) for bit in metadata_bits)}]"
             return label
 
         if mode == "ancestors":
@@ -5272,16 +5660,27 @@ class TelegramBot:
 
         lines: list[str] = []
 
-        def _walk(agent_name: str, depth: int) -> None:
+        rendered_count = 0
+        omitted_count = 0
+
+        def _walk(agent_name: str, depth: int, limit: int) -> None:
+            nonlocal rendered_count, omitted_count
+            if rendered_count >= limit:
+                omitted_count += 1
+                return
             indent = "\u00A0" * (4 * depth)
             lines.append(
                 f"{indent}- {_label_html(agent_name, allow_link=agent_name != current_agent_name)}"
             )
+            rendered_count += 1
             for child_name in children_by_parent.get(agent_name, []):
-                _walk(child_name, depth + 1)
+                _walk(child_name, depth + 1, limit)
 
         for root_name in body_roots:
-            _walk(root_name, 0)
+            _walk(root_name, 0, limit)
+
+        if omitted_count:
+            lines.append(f"... {omitted_count} more agents omitted; use a narrower tree command")
 
         header = _label_html(
             header_agent_name,
@@ -5326,12 +5725,14 @@ class TelegramBot:
             current_lineage=current_lineage,
             current_route=route,
         )
+        limit_arg = context.args[0] if context.args else None
         html_text = self._render_tree_html(
             team_name=team_name,
             current_agent_name=current_agent_name,
             current_lineage=current_lineage,
             members=members,
             mode=mode,
+            limit=self._coerce_tree_limit(limit_arg),
         )
         if not html_text:
             await self._send_system_message(
@@ -5395,7 +5796,23 @@ class TelegramBot:
         await self._send_system_message(
             route=route,
             bot=context.bot,
-            text=_TELEGRAM_HELP_TEXT,
+            text=self._guide_text_for_message(update.effective_message),
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
+
+    async def handle_guide(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        route = self._route_for_message(update.effective_message)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=_TELEGRAM_DM_GUIDE_TEXT,
             disable_notification=True,
             reply_to_message_id=update.effective_message.message_id,
         )
@@ -5422,7 +5839,7 @@ class TelegramBot:
     async def handle_clear(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /clear - reset current topic or all topics in the current chat."""
+        """Handle /clear - reset current topic."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
@@ -5430,12 +5847,17 @@ class TelegramBot:
 
         await self._ensure_background_poller(context.bot)
         route = self._route_for_message(update.effective_message)
-        states, apply_all = self._command_targets(route=route, args=context.args)
-        has_schedules = (
-            any(bool(self._schedule_ids_by_route.get(state.route, set())) for state in states)
-            if apply_all
-            else bool(self._schedule_ids_by_route.get(route, set()))
-        )
+        if self._has_deprecated_all_arg(context.args):
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=_DEPRECATED_ALL_SCOPE_TEXT,
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
+        states, _ = self._command_targets(route=route, args=context.args)
+        has_schedules = bool(self._schedule_ids_by_route.get(route, set()))
         for state in states:
             state.last_bot = context.bot
             state.hook_state.interrupt_flag = True
@@ -5452,20 +5874,9 @@ class TelegramBot:
             route=route,
             bot=context.bot,
             text=(
-                (
-                    "all topic sessions cleared; schedules were kept; agent identities were kept. "
-                    "Use /unschedule all to remove schedules across this chat."
-                )
-                if apply_all and has_schedules
-                else (
-                    "session cleared; schedule was kept; agent identity was kept. Use /unschedule to remove this topic schedule."
-                    if has_schedules
-                    else (
-                        "all topic sessions cleared; agent identities were kept"
-                        if apply_all
-                        else "session cleared; agent identity was kept"
-                    )
-                )
+                "session cleared; schedule was kept; agent identity was kept. Use /unschedule to remove this topic schedule."
+                if has_schedules
+                else "session cleared; agent identity was kept"
             ),
             disable_notification=True,
         )
@@ -5514,6 +5925,9 @@ class TelegramBot:
         lock = self._get_route_lock(state.route)
         async with lock:
             self._remove_route_inbox_target(state.route)
+            self._delete_topic_schedules_for_route(state.route)
+            state.session_manager.user_hooks = None
+            state.session_manager.model_override = None
             state.agent_lineage = None
             state.pending_obs_bootstrap = None
             await self._reset_route_state(state)
@@ -5551,6 +5965,20 @@ class TelegramBot:
             context,
             command_names=("new_group",),
         )
+        if not raw_args and self._is_private_message(update.effective_message):
+            if update.effective_user is None or update.effective_message is None:
+                return
+            if not self._is_authorized(update.effective_user.id):
+                return
+            route = self._route_for_message(update.effective_message)
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=_TELEGRAM_DM_GUIDE_TEXT,
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
         await self._run_userbot_command(
             update,
             context,
@@ -5573,6 +6001,20 @@ class TelegramBot:
             context,
             command_names=("new-group", "new_group"),
         )
+        if not raw_args and self._is_private_message(update.effective_message):
+            if update.effective_user is None or update.effective_message is None:
+                return
+            if not self._is_authorized(update.effective_user.id):
+                return
+            route = self._route_for_message(update.effective_message)
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=_TELEGRAM_DM_GUIDE_TEXT,
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
         await self._run_userbot_command(
             update,
             context,
@@ -5813,10 +6255,27 @@ class TelegramBot:
         if not self._is_authorized(update.effective_user.id):
             return
         route = self._route_for_message(update.effective_message)
+        schedules = self._active_schedules_for_route(route)
+        if not schedules:
+            text = "no schedules attached to this topic"
+        else:
+            now = time.time()
+            lines = [f"schedules for this topic: {len(schedules)}"]
+            for record in sorted(
+                schedules,
+                key=lambda item: (item.next_run_at is None, item.next_run_at or float("inf"), item.schedule_id),
+            ):
+                next_line = self._next_schedule_line_for_record(record, now_ts=now)
+                details = self._schedule_details(record, now_ts=now)
+                detail_text = f" ({' ; '.join(details)})" if details else ""
+                lines.append(
+                    f"- {record.schedule_id}: {self._schedule_display_name(record)} — {next_line}{detail_text}"
+                )
+            text = "\n".join(lines)
         await self._send_system_message(
             route=route,
             bot=context.bot,
-            text="/schedule is gated until Sprint 1 schedule reliability is approved; use CronCreate from an agent topic for now.",
+            text=text,
             disable_notification=True,
             reply_to_message_id=update.effective_message.message_id,
         )
@@ -5824,30 +6283,20 @@ class TelegramBot:
     async def handle_unschedule(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /unschedule - remove schedule(s) from this topic or chat (/unschedule all)."""
+        """Handle /unschedule - remove schedule(s) from this topic."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
             return
 
         route = self._route_for_message(update.effective_message)
-        states, apply_all = self._command_targets(route=route, args=context.args)
-        if apply_all:
-            deleted = 0
-            for state in states:
-                schedule_ids = sorted(self._schedule_ids_by_route.get(state.route, set()))
-                for schedule_id in schedule_ids:
-                    self._delete_topic_schedule(schedule_id)
-                    deleted += 1
+        if self._has_deprecated_all_arg(context.args):
             await self._send_system_message(
                 route=route,
                 bot=context.bot,
-                text=(
-                    f"unscheduled {deleted} schedule(s) across this chat"
-                    if deleted > 0
-                    else "no schedules attached to this chat"
-                ),
+                text=_DEPRECATED_ALL_SCOPE_TEXT,
                 disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
             )
             return
 
@@ -5972,27 +6421,32 @@ class TelegramBot:
 
         await self._ensure_background_poller(context.bot)
         route = self._route_for_message(update.effective_message)
-        states, apply_all = self._command_targets(route=route, args=context.args)
+        if self._has_deprecated_all_arg(context.args):
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=_DEPRECATED_ALL_SCOPE_TEXT,
+                disable_notification=True,
+                reply_to_message_id=update.effective_message.message_id,
+            )
+            return
+        states, _ = self._command_targets(route=route, args=context.args)
         interrupt_sent = 0
         for state in states:
             state.last_bot = context.bot
             if await self._request_route_interrupt(state):
                 interrupt_sent += 1
-            if apply_all:
-                await self._cancel_route_fork_tasks(state.route, status="stopped")
-            else:
-                self._mark_child_task_terminal_request(state.route, "stopped")
+            self._mark_child_task_terminal_request(state.route, "stopped")
         logger.info(
-            "Interrupt via /stop from user %d all=%s sdk_interrupts=%d/%d",
+            "Interrupt via /stop from user %d sdk_interrupts=%d/%d",
             update.effective_user.id,
-            apply_all,
             interrupt_sent,
             len(states),
         )
         await self._send_system_message(
             route=route,
             bot=context.bot,
-            text="interrupt sent to all topics" if apply_all else "interrupt sent",
+            text="interrupt sent",
             disable_notification=True,
         )
 
@@ -7352,6 +7806,7 @@ class TelegramBot:
         temperature: float | None = None,
         user_hooks: dict[str, str] | None = None,
         inherit_hooks: bool = False,
+        source_jsonl_path: Path | None = None,
     ) -> dict[str, Any]:
         if is_fork:
             if not source_session_id or not source_uuid:
@@ -7360,6 +7815,7 @@ class TelegramBot:
                 session_id=source_session_id,
                 target_uuid=source_uuid,
                 cwd=self._config.vault_path,
+                source_path=source_jsonl_path,
                 new_session_id=str(uuid.uuid4()),
             )
             self._set_session_head(
@@ -7420,9 +7876,27 @@ class TelegramBot:
             # Children inherit the parent's root_team_key — only trunk generates
             # a new timestamp-based key. The agent_name is always computed fresh.
             default_agent_name = agent_name_for_lineage(child_lineage)
+            parent_projection = self._state_inbox_projection(parent_state)
             parent_team_key = self._get_parent_team_key(parent_state)
             team_name = (team_name or "").strip() or parent_team_key or root_team_key_for_lineage(child_lineage)
             agent_name = (agent_name or "").strip() or default_agent_name
+            if parent_projection is not None and parent_projection[0] == team_name:
+                parent_agent_name = parent_projection[1]
+            else:
+                parent_agent_name = agent_name_for_lineage(parent_lineage, team_key=team_name)
+            if self._resolve_route_inbox_target(
+                team_name=team_name,
+                agent_name=parent_agent_name,
+            ) is None:
+                self._prime_obs_bootstrap(
+                    parent_state,
+                    lineage=parent_lineage,
+                    origin="fork_parent",
+                    is_fork=False,
+                    session_id=source_session_id or parent_state.session_id,
+                    team_name=team_name,
+                    agent_name=parent_agent_name,
+                )
             # Collision detection is based on current bindings, not merely on
             # inbox-file existence. Deleted topics intentionally leave inbox
             # files behind so backlog can survive until the same identity is
@@ -7432,7 +7906,7 @@ class TelegramBot:
             )
             if team_name and agent_name:
                 inbox_path = (
-                    Path.home() / ".claude" / "teams" / team_name
+                    self._team_dir(team_name)
                     / "inboxes" / f"{agent_name}.json"
                 )
                 agent_key = self._team_worker_key(team_name, agent_name)
@@ -7458,7 +7932,7 @@ class TelegramBot:
                             candidate_lineage = parent_lineage + (candidate_name,)
                             _, candidate_agent = self._default_team_projection(candidate_lineage)
                             candidate_inbox = (
-                                Path.home() / ".claude" / "teams" / team_name
+                                self._team_dir(team_name)
                                 / "inboxes" / f"{candidate_agent}.json"
                             )
                             candidate_bound = (
@@ -7490,6 +7964,18 @@ class TelegramBot:
                             f"Agent name collision: '{agent_name}' already exists in team '{team_name}'. "
                             f"Choose a different name for this child agent."
                         )
+        if child_lineage is not None:
+            self._prime_obs_bootstrap(
+                child_state,
+                lineage=child_lineage,
+                origin=lineage_origin or ("user_fork" if is_fork else "agent_task_fresh"),
+                is_fork=is_fork,
+                parent_session_id=source_session_id,
+                team_name=team_name,
+                agent_name=agent_name,
+                parent_agent_name_override=parent_agent_name,
+                session_id=child_session_id or None,
+            )
         # Clear dropped key if name is being reused (respawn)
         await self._activate_route_session(child_state, child_session_id or None)
         team_env = self._build_team_worker_env(
@@ -7534,6 +8020,7 @@ class TelegramBot:
                 parent_session_id=source_session_id,
                 team_name=team_name,
                 agent_name=agent_name,
+                parent_agent_name_override=parent_agent_name,
                 session_id=child_session_id or None,
             )
 
@@ -7563,7 +8050,7 @@ class TelegramBot:
                 )
         session_marker_id: int | None = None
         session_marker_text = (
-            f"session forked: {child_session_id}"
+            "fork session ready"
             if is_fork
             else "fresh session will be assigned on first turn"
         )
@@ -7618,30 +8105,29 @@ class TelegramBot:
         prompt_file: str | None = None,
         prompt_file_content: str | None = None,
     ) -> str:
-        lines = ["fork task launched by agent" if is_fork else "agent task launched by agent"]
-        lines.append(
-            html.escape(
-                f"<fork_context><is_fork>{str(is_fork).lower()}</is_fork><agent_id>{agent_id}</agent_id></fork_context>"
-            )
-        )
+        heading = "fork task launched by agent" if is_fork else "agent task launched by agent"
+        details = [
+            f"agentId: {agent_id}",
+            f"is_fork: {str(is_fork).lower()}",
+        ]
+        if description:
+            details.append(f"description: {description}")
+        if team_name:
+            details.append(f"team_name: {team_name}")
+        if agent_name:
+            details.append(f"agent_name: {agent_name}")
+        if max_turns is not None:
+            details.append(f"max_turns: {max_turns}")
+        if prompt_file:
+            details.append(f"prompt_file: {prompt_file}")
+        if prompt:
+            details.append("prompt:")
+            details.append(prompt)
+        lines = [heading, f"<pre>{html.escape(chr(10).join(details))}</pre>"]
         if source_link:
             lines.append(
                 f'forked from <a href="{html.escape(source_link)}">source message</a>'
             )
-        lines.append(f"agentId: {html.escape(agent_id)}")
-        if description:
-            lines.append(f"description: {html.escape(description)}")
-        if team_name:
-            lines.append(f"team_name: {html.escape(team_name)}")
-        if agent_name:
-            lines.append(f"agent_name: {html.escape(agent_name)}")
-        if max_turns is not None:
-            lines.append(f"max_turns: {max_turns}")
-        if prompt_file:
-            lines.append(f"prompt_file: {html.escape(prompt_file)}")
-        if prompt:
-            lines.append("prompt:")
-            lines.append(html.escape(prompt))
         return "\n".join(lines)
 
     @staticmethod
@@ -7674,20 +8160,24 @@ class TelegramBot:
         agent_name: str | None = None,
         team_name: str | None = None,
     ) -> str:
-        lines = [
-            f"{task_label} launched.",
-            f"agentId: {task_id}",
-        ]
+        details = [f"agentId: {task_id}"]
         if agent_name:
-            lines.append(f"agent_name: {agent_name}")
+            details.append(f"agent_name: {agent_name}")
         if team_name:
-            lines.append(f"team_name: {team_name}")
-        lines.append("Working in the background; completion will be posted here.")
+            details.append(f"team_name: {team_name}")
         if output_file:
-            lines.append(f"output_file: {output_file}")
+            details.append(f"output_file: {output_file}")
         if topic_link:
-            lines.append(f"telegram_topic: {topic_link}")
-        return "\n".join(lines)
+            details.append(f"telegram_topic: {topic_link}")
+        return "\n".join(
+            [
+                f"{task_label} launched.",
+                "```text",
+                "\n".join(details),
+                "```",
+                "Working in the background; completion will be posted here.",
+            ]
+        )
 
     def _build_super_task_lifecycle_html(
         self,
@@ -7875,9 +8365,39 @@ class TelegramBot:
             )
         )
 
-    @staticmethod
-    def _team_inbox_path(team_name: str, agent_name: str) -> Path:
-        return Path.home() / ".claude" / "teams" / team_name / "inboxes" / f"{agent_name}.json"
+    async def _send_running_inbox_notice(
+        self,
+        *,
+        state: TelegramSessionState,
+        label: str,
+        team_name: str,
+        agent_name: str,
+        sender: str | None,
+        summary: str | None,
+    ) -> None:
+        bot = self._bot_for_state(state)
+        if bot is None:
+            return
+        lines = [label]
+        lines.append(f"team_name: {html.escape(team_name)}")
+        lines.append(f"agent_name: {html.escape(agent_name)}")
+        sender_norm = (sender or "").strip()
+        summary_norm = (summary or "").strip()
+        if sender_norm:
+            lines.append(f"from: {html.escape(sender_norm)}")
+        if summary_norm:
+            lines.append(f"summary: {html.escape(summary_norm)}")
+        await self._send_system_html_message(
+            route=state.route,
+            bot=bot,
+            html_text="\n".join(lines),
+            disable_notification=True,
+            underline=False,
+            max_attempts=1,
+        )
+
+    def _team_inbox_path(self, team_name: str, agent_name: str) -> Path:
+        return self._team_dir(team_name) / "inboxes" / f"{agent_name}.json"
 
     async def _send_bounce_backs_for_dead_agent(self, route: TelegramRoute) -> None:
         """Notify senders of a dead agent that their messages may not have been read.
@@ -8004,6 +8524,12 @@ class TelegramBot:
             # Skip must_reply messages that have already been replied to —
             # otherwise the poller keeps nagging for them indefinitely.
             if item.get("must_reply") and item.get("replied"):
+                continue
+            try:
+                message_ts = self._parse_rfc3339_timestamp(item.get("timestamp"))
+            except (TypeError, ValueError):
+                message_ts = None
+            if message_ts is not None and message_ts < self._daemon_start_time.timestamp():
                 continue
             latest_unread = item
         if latest_unread is None:
@@ -8350,14 +8876,25 @@ class TelegramBot:
                     content=content,
                 )
                 if not woken:
-                    self._queue_running_team_worker_notice(
-                        state=state,
-                        team_name=team_name,
-                        agent_name=recipient,
-                        sender=sender,
-                        summary=summary,
-                        content=content,
-                    )
+                    if state.busy or state.hook_state.pause_queue_delivery:
+                        self._queue_running_team_worker_notice(
+                            state=state,
+                            team_name=team_name,
+                            agent_name=recipient,
+                            sender=sender,
+                            summary=summary,
+                            content=content,
+                        )
+                        await self._send_running_inbox_notice(
+                            state=state,
+                            label="topic active: teammate message queued for current turn",
+                            team_name=team_name,
+                            agent_name=recipient,
+                            sender=sender,
+                            summary=summary,
+                        )
+                    else:
+                        return {"delivered": False, "reason": "recipient route is temporarily busy; wake deferred"}
                 _mark_direct_send_notified()
                 return {"delivered": True}
             except Exception as exc:
@@ -8386,6 +8923,14 @@ class TelegramBot:
                     sender=sender,
                     summary=summary,
                     content=content,
+                )
+                await self._send_running_inbox_notice(
+                    state=child_state,
+                    label="agent task active: teammate message queued for current turn",
+                    team_name=team_name,
+                    agent_name=recipient,
+                    sender=sender,
+                    summary=summary,
                 )
             else:
                 record.wake_requested = True
@@ -8603,6 +9148,9 @@ class TelegramBot:
             raise RuntimeError("ForkTask is only available inside an active Telegram topic")
 
         resume_task_id = self._normalize_resume_task_id(args.get("resume"))
+        session_source_raw = str(args.get("session_source") or "").strip() or None
+        if resume_task_id and session_source_raw:
+            raise ValueError("resume and session_source are mutually exclusive")
         if resume_task_id:
             return await self._resume_fork_task(
                 route=route,
@@ -8612,6 +9160,8 @@ class TelegramBot:
             )
 
         is_fork = self._coerce_fork_flag(args.get("fork"))
+        if session_source_raw and not is_fork:
+            raise ValueError("session_source is only supported with fork=true")
         launch_tool_name = str(args.get("task_tool_name") or "").strip() or (
             "ForkTask" if is_fork else "AgentTask"
         )
@@ -8625,57 +9175,76 @@ class TelegramBot:
         source_uuid: str | None = None
         source_route = route
         source_message_id: int | None = None
+        source_jsonl_path: Path | None = None
         if is_fork:
-            source_session_id, source_uuid, source_route, source_message_id = self._resolve_fork_source(
-                state=state
-            )
-            fallback_session_id = str(args.get("session_id") or "").strip() or None
-            if not source_session_id and fallback_session_id:
-                source_session_id = fallback_session_id
-            if source_session_id and not source_uuid:
-                persisted_uuid = await self._await_persisted_session_uuid(
-                    session_id=source_session_id,
-                    timeout_seconds=8.0,
+            explicit_session_source = False
+            if session_source_raw:
+                source_descriptor = resolve_session_source(
+                    session_source_raw,
+                    cwd=self._config.vault_path,
                 )
-                if persisted_uuid:
-                    source_uuid = persisted_uuid
-                    self._set_session_head(
+                explicit_session_source = True
+                source_session_id = source_descriptor.source_session_id
+                source_jsonl_path = source_descriptor.source_jsonl_path
+            else:
+                source_session_id, source_uuid, source_route, source_message_id = self._resolve_fork_source(
+                    state=state
+                )
+                fallback_session_id = str(args.get("session_id") or "").strip() or None
+                if not source_session_id and fallback_session_id:
+                    source_session_id = fallback_session_id
+                if source_session_id and not source_uuid:
+                    persisted_uuid = await self._await_persisted_session_uuid(
                         session_id=source_session_id,
-                        jsonl_uuid=persisted_uuid,
+                        timeout_seconds=8.0,
                     )
-                    resolved_uuid, resolved_route, resolved_message_id = self._resolve_persisted_fork_source(
-                        session_id=source_session_id,
-                        preferred_uuid=persisted_uuid,
-                        preferred_route=source_route,
-                    )
-                    source_uuid = resolved_uuid
-                    source_route = resolved_route
-                    source_message_id = resolved_message_id
-            if not source_session_id or not source_uuid:
-                raise RuntimeError("Cannot launch ForkTask yet: no mapped head in this topic")
+                    if persisted_uuid:
+                        source_uuid = persisted_uuid
+                        self._set_session_head(
+                            session_id=source_session_id,
+                            jsonl_uuid=persisted_uuid,
+                        )
+                        resolved_uuid, resolved_route, resolved_message_id = self._resolve_persisted_fork_source(
+                            session_id=source_session_id,
+                            preferred_uuid=persisted_uuid,
+                            preferred_route=source_route,
+                        )
+                        source_uuid = resolved_uuid
+                        source_route = resolved_route
+                        source_message_id = resolved_message_id
+                if not source_session_id or not source_uuid:
+                    raise RuntimeError("Cannot launch ForkTask yet: no mapped head in this topic")
 
-            # Wait for the parent's JSONL to stabilize before copying.
-            # The parent may still be streaming tool_use blocks to JSONL;
+            # Wait for the source JSONL to stabilize before copying.
+            # The source may still be streaming tool_use blocks to JSONL;
             # copying now would produce a truncated prefix → cache miss.
             stable_uuid = await self._await_jsonl_stability(
+                jsonl_path=source_jsonl_path,
+            ) if source_jsonl_path is not None else await self._await_jsonl_stability(
                 session_id=source_session_id,
             )
-            if stable_uuid and stable_uuid != source_uuid:
+            if not stable_uuid:
+                if explicit_session_source:
+                    raise RuntimeError("Cannot launch ForkTask yet: no persisted head for session_source")
+            elif stable_uuid != source_uuid:
                 logger.info(
                     "[fork_task] JSONL advanced during stability wait: %s → %s",
                     source_uuid,
                     stable_uuid,
                 )
-                resolved_uuid, resolved_route, resolved_message_id = (
-                    self._resolve_persisted_fork_source(
-                        session_id=source_session_id,
-                        preferred_uuid=stable_uuid,
-                        preferred_route=source_route,
+                if explicit_session_source:
+                    source_uuid = stable_uuid
+                else:
+                    resolved_uuid, resolved_route, resolved_message_id = (
+                        self._resolve_persisted_fork_source(
+                            session_id=source_session_id,
+                            preferred_uuid=stable_uuid,
+                            preferred_route=source_route,
+                        )
                     )
-                )
-                source_uuid = resolved_uuid
-                source_route = resolved_route
-                source_message_id = resolved_message_id
+                    source_uuid = resolved_uuid
+                    source_route = resolved_route
+                    source_message_id = resolved_message_id
 
         task_id = str(uuid.uuid4())
         description = str(
@@ -8723,6 +9292,7 @@ class TelegramBot:
             source_uuid=source_uuid,
             source_route=source_route,
             source_message_id=source_message_id,
+            source_jsonl_path=source_jsonl_path,
             topic_name=topic_name,
             child_service_html=child_service_html,
             notify_on_completion=True,
@@ -9368,63 +9938,20 @@ class TelegramBot:
     async def handle_delete(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /delete - delete current topic or all non-General topics."""
+        """Handle deprecated /delete without deleting Telegram topics."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
             return
 
         route = self._route_for_message(update.effective_message)
-        if len(context.args) == 1 and context.args[0].strip().lower() == "all":
-            targets = [candidate for candidate in self._routes_in_chat(route.chat_id) if candidate.thread_id is not None]
-            # Drop state FIRST (non-blocking cleanup), then fire-and-forget
-            # the Telegram topic deletion.  Previous implementation awaited
-            # each delete future sequentially which deadlocked when the
-            # transport worker was busy.
-            for target in targets:
-                await self._drop_route_state(target, terminal_status="failed")
-            for target in targets:
-                try:
-                    await self._ensure_transport_worker()
-                    self._increment_pending_chat_ops(target.chat_id)
-                    await self._transport_queue.put(
-                        _TransportEnvelope(
-                            priority=_PRIORITY_SYSTEM,
-                            sequence=self._next_transport_sequence(),
-                            op=_TransportDeleteTopicOp(
-                                route=target,
-                                fallback_bot=context.bot,
-                                future=asyncio.get_running_loop().create_future(),
-                            ),
-                        )
-                    )
-                except Exception:
-                    logger.debug("Failed enqueueing delete for route=%s", target, exc_info=True)
-            reply_route = route if route.thread_id is None else TelegramRoute(chat_id=route.chat_id, thread_id=None)
-            await self._send_system_message(
-                route=reply_route,
-                bot=context.bot,
-                text="all non-General topics deleted",
-                disable_notification=False,
-            )
-            return
-
-        if route.thread_id is None:
-            await self._send_system_message(
-                route=route,
-                bot=context.bot,
-                text="can't delete General",
-                disable_notification=True,
-            )
-            return
-        try:
-            await self._enqueue_delete_topic(
-                route=route,
-                fallback_bot=context.bot,
-                priority=_PRIORITY_SYSTEM,
-            )
-        finally:
-            await self._drop_route_state(route, terminal_status="failed")
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=_DELETE_DEPRECATED_TEXT,
+            disable_notification=True,
+            reply_to_message_id=update.effective_message.message_id,
+        )
 
 
 def create_telegram_app(config: OBSConfig) -> Application:
@@ -9449,38 +9976,39 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"^/(?:tree-|tree-(?:ancestors|descendants|children))(?:@[A-Za-z0-9_]+)?(?:\s|$)"),
-            bot.handle_tree_alias_command,
+            lambda update, context: bot._log_command_and_call(update, context, "tree_alias", bot.handle_tree_alias_command),
         )
     )
-    app.add_handler(CommandHandler("help", bot.handle_help))
-    app.add_handler(CommandHandler("clear", bot.handle_clear))
-    app.add_handler(CommandHandler("new", bot.handle_new))
-    app.add_handler(CommandHandler("new_group", bot.handle_new_group))
-    app.add_handler(CommandHandler("new_bot", bot.handle_new_bot))
-    app.add_handler(CommandHandler("unschedule", bot.handle_unschedule))
-    app.add_handler(CommandHandler("stop", bot.handle_stop))
-    app.add_handler(CommandHandler("context", bot.handle_context))
-    app.add_handler(CommandHandler("report", bot.handle_report))
-    app.add_handler(CommandHandler("schedule", bot.handle_schedule))
-    app.add_handler(CommandHandler("tree", bot.handle_tree))
-    app.add_handler(CommandHandler("tree_descendants", bot.handle_tree_descendants))
-    app.add_handler(CommandHandler("tree_children", bot.handle_tree_children))
-    app.add_handler(CommandHandler("tree_ancestors", bot.handle_tree_ancestors))
-    app.add_handler(CommandHandler("fork", bot.handle_fork))
-    app.add_handler(CommandHandler("delete", bot.handle_delete))
+    app.add_handler(CommandHandler("help", lambda update, context: bot._log_command_and_call(update, context, "help", bot.handle_help)))
+    app.add_handler(CommandHandler("guide", lambda update, context: bot._log_command_and_call(update, context, "guide", bot.handle_guide)))
+    app.add_handler(CommandHandler("clear", lambda update, context: bot._log_command_and_call(update, context, "clear", bot.handle_clear)))
+    app.add_handler(CommandHandler("new", lambda update, context: bot._log_command_and_call(update, context, "new", bot.handle_new)))
+    app.add_handler(CommandHandler("new_group", lambda update, context: bot._log_command_and_call(update, context, "new_group", bot.handle_new_group)))
+    app.add_handler(CommandHandler("new_bot", lambda update, context: bot._log_command_and_call(update, context, "new_bot", bot.handle_new_bot)))
+    app.add_handler(CommandHandler("unschedule", lambda update, context: bot._log_command_and_call(update, context, "unschedule", bot.handle_unschedule)))
+    app.add_handler(CommandHandler("stop", lambda update, context: bot._log_command_and_call(update, context, "stop", bot.handle_stop)))
+    app.add_handler(CommandHandler("context", lambda update, context: bot._log_command_and_call(update, context, "context", bot.handle_context)))
+    app.add_handler(CommandHandler("report", lambda update, context: bot._log_command_and_call(update, context, "report", bot.handle_report)))
+    app.add_handler(CommandHandler("schedule", lambda update, context: bot._log_command_and_call(update, context, "schedule", bot.handle_schedule)))
+    app.add_handler(CommandHandler("tree", lambda update, context: bot._log_command_and_call(update, context, "tree", bot.handle_tree)))
+    app.add_handler(CommandHandler("tree_descendants", lambda update, context: bot._log_command_and_call(update, context, "tree_descendants", bot.handle_tree_descendants)))
+    app.add_handler(CommandHandler("tree_children", lambda update, context: bot._log_command_and_call(update, context, "tree_children", bot.handle_tree_children)))
+    app.add_handler(CommandHandler("tree_ancestors", lambda update, context: bot._log_command_and_call(update, context, "tree_ancestors", bot.handle_tree_ancestors)))
+    app.add_handler(CommandHandler("fork", lambda update, context: bot._log_command_and_call(update, context, "fork", bot.handle_fork)))
+    app.add_handler(CommandHandler("delete", lambda update, context: bot._log_command_and_call(update, context, "delete", bot.handle_delete)))
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(_NEW_GROUP_ALIAS_PATTERN),
-            bot.handle_new_group_alias,
+            lambda update, context: bot._log_command_and_call(update, context, "new_group_alias", bot.handle_new_group_alias),
         )
     )
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(_NEW_BOT_ALIAS_PATTERN),
-            bot.handle_new_bot_alias,
+            lambda update, context: bot._log_command_and_call(update, context, "new_bot_alias", bot.handle_new_bot_alias),
         )
     )
-    app.add_handler(MessageHandler(filters.COMMAND, bot.handle_unknown_command))
+    app.add_handler(MessageHandler(filters.COMMAND, lambda update, context: bot._log_command_and_call(update, context, "unknown", bot.handle_unknown_command)))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, bot.handle_forum_topic_created))
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_EDITED, bot.handle_forum_topic_edited))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.handle_new_chat_members))
@@ -9505,13 +10033,14 @@ async def _set_bot_commands(app: Application) -> None:
     from telegram import BotCommand
 
     await app.bot.set_my_commands([
-        BotCommand("help", "Show concise command usage"),
-        BotCommand("clear", "Clear this topic but keep its agent identity; use '/clear all' for the whole group"),
+        BotCommand("help", "Show setup guide in DMs or topic usage in groups"),
+        BotCommand("guide", "Show the DM setup guide"),
+        BotCommand("clear", "Clear this topic but keep its agent identity"),
         BotCommand("new", "Reset this topic into a new trunk agent; optional: /new [emoji] [name]"),
         BotCommand("new_group", "Create a new forum supergroup and add the configured OBS bots"),
         BotCommand("new_bot", "Create a new Claudia sender bot through BotFather"),
-        BotCommand("unschedule", "Remove schedule(s) from this topic; use /unschedule all"),
-        BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
+        BotCommand("unschedule", "Remove schedule(s) from this topic"),
+        BotCommand("stop", "Interrupt this topic"),
         BotCommand("context", "Show session and context window info"),
         BotCommand("report", "Save a debug case file for this message/topic"),
         BotCommand("schedule", "Create schedules once Sprint 1 reliability is approved"),
@@ -9520,7 +10049,6 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("tree_children", "Render this agent and direct children"),
         BotCommand("tree_ancestors", "Render this agent and all ancestors"),
         BotCommand("fork", "Create a new topic from this head or replied message"),
-        BotCommand("delete", "Delete this topic; use '/delete all' to remove all non-General topics"),
     ])
 
 
@@ -9566,7 +10094,9 @@ async def _shutdown_telegram_runtime(*, app: Application, tg_bot: TelegramBot) -
 
 async def _run_telegram_bot_once(config: OBSConfig) -> None:
     """Run one Telegram runtime instance until cancellation or runtime failure."""
-    app = create_telegram_app(config)
+    startup = StartupProfiler(logger, "telegram-runtime")
+    with startup.phase("create_telegram_app", sender_bot_count=len(config.telegram_sender_bot_tokens)):
+        app = create_telegram_app(config)
     tg_bot: TelegramBot = app.bot_data["obs_telegram_bot"]
     polling_error: asyncio.Queue[TelegramError] = asyncio.Queue(maxsize=1)
 
@@ -9577,20 +10107,27 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
 
     logger.info("Starting Telegram bot...")
     try:
-        await tg_bot.initialize_runtime()
-        await app.initialize()
-        await tg_bot._ensure_background_poller(app.bot)
-        await _clear_secondary_bot_commands(config)
-        await _set_bot_commands(app)
-        await app.start()
+        await tg_bot.initialize_runtime(startup)
+        with startup.phase("telegram_application_initialize"):
+            await app.initialize()
+        with startup.phase("telegram_background_poller_with_bot"):
+            await tg_bot._ensure_background_poller(app.bot)
+        with startup.phase("telegram_secondary_commands", sender_bot_count=max(len(config.telegram_sender_bot_tokens) - 1, 0)):
+            await _clear_secondary_bot_commands(config)
+        with startup.phase("telegram_primary_commands"):
+            await _set_bot_commands(app)
+        with startup.phase("telegram_application_start"):
+            await app.start()
         drop_pending_updates = (
             (os.environ.get("OBS_TELEGRAM_DROP_PENDING_UPDATES") or "").strip().lower()
             in {"1", "true", "yes", "on"}
         )
-        await app.updater.start_polling(
-            drop_pending_updates=drop_pending_updates,
-            error_callback=_record_polling_error,
-        )
+        with startup.phase("telegram_start_polling", drop_pending_updates=drop_pending_updates):
+            await app.updater.start_polling(
+                drop_pending_updates=drop_pending_updates,
+                error_callback=_record_polling_error,
+            )
+        startup.complete(sender_bot_count=len(config.telegram_sender_bot_tokens))
 
         while True:
             await asyncio.sleep(_TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS)

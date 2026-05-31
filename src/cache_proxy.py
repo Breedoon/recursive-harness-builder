@@ -420,6 +420,56 @@ def log(msg: str):
     sys.stderr.flush()
 
 
+def _estimate_input_tokens(body: dict) -> int:
+    """Conservative fallback when non-Claude upstream omits usage."""
+    try:
+        return max(0, len(json.dumps(body, separators=(",", ":"))))
+    except Exception:
+        return 0
+
+
+def _inject_usage_if_missing(sse_chunk: bytes, estimated_input_tokens: int) -> tuple[bytes, bool]:
+    if estimated_input_tokens <= 0:
+        return sse_chunk, False
+    text = sse_chunk.decode("utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+    changed = False
+    for idx, line in enumerate(lines):
+        if not line.startswith("data: "):
+            continue
+        try:
+            event = json.loads(line[6:])
+        except Exception:
+            continue
+        if event.get("type") != "message_start":
+            continue
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+            message["usage"] = usage
+        observed_total = sum(
+            int(usage.get(key) or 0)
+            for key in (
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            )
+        )
+        if observed_total > 0:
+            continue
+        usage["input_tokens"] = estimated_input_tokens
+        usage.setdefault("cache_creation_input_tokens", 0)
+        usage.setdefault("cache_read_input_tokens", 0)
+        lines[idx] = "data: " + json.dumps(event, separators=(",", ":")) + ("\n" if line.endswith("\n") else "")
+        changed = True
+    if not changed:
+        return sse_chunk, False
+    return "".join(lines).encode(), True
+
+
 def log_usage_entry(norm_action: str, usage: dict):
     """Append a usage entry to the structured JSONL log."""
     entry = {
@@ -549,6 +599,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if upstream != ANTHROPIC_UPSTREAM:
                 info["schema_sanitized"] = sanitize_tool_schemas_for_openai(data)
 
+            estimated_input_tokens = _estimate_input_tokens(data)
             body = json.dumps(data, separators=(",", ":")).encode()
 
             # Save post-normalization body
@@ -571,6 +622,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             log(f"normalize error, passing through: {e}")
             body = raw_body
+            estimated_input_tokens = 0
             stats["errors"] += 1
             is_streaming = b'"stream":true' in raw_body or b'"stream": true' in raw_body
 
@@ -582,7 +634,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             with httpx.Client(timeout=timeout) as client:
                 if is_streaming:
-                    self._stream_upstream(client, url, body, headers, norm_action)
+                    self._stream_upstream(
+                        client,
+                        url,
+                        body,
+                        headers,
+                        norm_action,
+                        upstream=upstream,
+                        estimated_input_tokens=estimated_input_tokens,
+                    )
                 else:
                     resp = client.post(url, content=body, headers=headers)
                     self.send_response(resp.status_code)
@@ -610,7 +670,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 pass
 
     def _stream_upstream(self, client: httpx.Client, url: str,
-                         body: bytes, headers: dict, norm_action: str):
+                         body: bytes, headers: dict, norm_action: str,
+                         *, upstream: str, estimated_input_tokens: int):
         with client.stream("POST", url, content=body, headers=headers) as resp:
             self.send_response(resp.status_code)
             for k, v in resp.headers.multi_items():
@@ -620,14 +681,39 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             chunks: list[bytes] = []
+            injected_usage = False
+            pending = b""
             for chunk in resp.iter_raw():
-                self.wfile.write(chunk)
+                if upstream != CLI_PROXY_UPSTREAM:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    chunks.append(chunk)
+                    continue
+
+                pending += chunk
+                while b"\n\n" in pending:
+                    event_chunk, pending = pending.split(b"\n\n", 1)
+                    event_chunk += b"\n\n"
+                    outgoing, injected = _inject_usage_if_missing(
+                        event_chunk,
+                        estimated_input_tokens,
+                    )
+                    injected_usage = injected_usage or injected
+                    self.wfile.write(outgoing)
+                    self.wfile.flush()
+                    chunks.append(outgoing)
+
+            if pending:
+                outgoing, injected = _inject_usage_if_missing(pending, estimated_input_tokens)
+                injected_usage = injected_usage or injected
+                self.wfile.write(outgoing)
                 self.wfile.flush()
-                chunks.append(chunk)
+                chunks.append(outgoing)
 
             usage = parse_sse_usage(chunks)
             if usage:
-                log_usage_entry(norm_action, usage)
+                action = f"{norm_action}+usage_estimate" if injected_usage else norm_action
+                log_usage_entry(action, usage)
             else:
                 # Log chunk sizes for debugging
                 chunk_info = [len(c) for c in chunks]

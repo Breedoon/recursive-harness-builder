@@ -10,6 +10,7 @@ See daemon.py for the original inline implementation.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, AsyncIterator
@@ -288,7 +289,10 @@ class ConversationRunner:
 
         Updates ``self._last_message`` for each message received.
         """
-        async for message in self._client.receive_response():
+        response_stream = self._client.receive_response()
+        if inspect.isawaitable(response_stream):
+            response_stream = await response_stream
+        async for message in response_stream:
             self._last_message = message
             raw_uuid = getattr(message, "_raw_uuid", None)
             message_role = _message_role(message)
@@ -452,8 +456,15 @@ class ConversationRunner:
             except Exception as retry_exc:
                 if not _is_recoverable(retry_exc):
                     raise
+                if self._session_mgr.session_id is not None:
+                    logger.error(
+                        "Reconnect on get_client also failed; preserving session instead of starting fresh: %s",
+                        retry_exc,
+                    )
+                    await self._session_mgr.soft_reset()
+                    raise retry_exc from None
                 logger.warning(
-                    "Reconnect on get_client also failed, dropping session and starting fresh: %s",
+                    "Reconnect on get_client also failed before session creation; starting fresh: %s",
                     retry_exc,
                 )
                 await self._session_mgr.async_reset()
