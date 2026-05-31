@@ -10,8 +10,11 @@ See decisions D014 (SDK cache for continuity) and D022 (no compaction).
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import logging
+import os
 import time
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
@@ -27,6 +30,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger("obs_agent.session")
 
 ensure_raw_uuid_patch()
+
+_ANTHROPIC_AUTH_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
 
 _DEFAULT_SDK_ENV: dict[str, str] = {
     # Disable background tasks (skill auto-improvement, magic docs, plugin autoupdate).
@@ -54,8 +64,24 @@ def _on_cli_stderr(line: str) -> None:
     logger.warning("CLI stderr: %s", line.rstrip())
 
 
+@contextmanager
+def _scrub_process_env(keys: tuple[str, ...]) -> Iterator[None]:
+    previous = {key: os.environ.get(key) for key in keys}
+    for key in keys:
+        os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 _CLIENT_CONNECT_MAX_ATTEMPTS = 3
 _CLIENT_CONNECT_RETRY_DELAY_SECONDS = 1.0
+_CLIENT_CONNECT_ENV_LOCK = asyncio.Lock()
 
 
 class SessionManager:
@@ -169,7 +195,10 @@ class SessionManager:
             effective_env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(pct)
         # For non-Claude models, set the API key to the CLI proxy key so CC
         # authenticates against CLIProxyAPI (the cache proxy forwards it).
-        if not is_claude_model(effective_model):
+        if is_claude_model(effective_model):
+            for key in _ANTHROPIC_AUTH_ENV_KEYS:
+                effective_env.pop(key, None)
+        else:
             effective_env["ANTHROPIC_API_KEY"] = self.config.cli_proxy_api_key
 
         # Route CC API traffic through the cache-normalizing proxy when enabled.
@@ -214,11 +243,19 @@ class SessionManager:
         options: ClaudeAgentOptions,
     ) -> ClaudeSDKClient:
         """Create and connect a new SDK client with bounded retries."""
+        from obs_agent.config import is_claude_model
+
+        scrub_auth_env = is_claude_model(options.model)
         last_error: Exception | None = None
         for attempt in range(1, _CLIENT_CONNECT_MAX_ATTEMPTS + 1):
             client = ClaudeSDKClient(options)
             try:
-                await asyncio.create_task(client.connect())
+                async with _CLIENT_CONNECT_ENV_LOCK:
+                    if scrub_auth_env:
+                        with _scrub_process_env(_ANTHROPIC_AUTH_ENV_KEYS):
+                            await asyncio.create_task(client.connect())
+                    else:
+                        await asyncio.create_task(client.connect())
             except Exception as exc:
                 last_error = exc
                 try:

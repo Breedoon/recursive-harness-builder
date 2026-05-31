@@ -227,6 +227,21 @@ class TestCreateOptions:
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert "ANTHROPIC_API_KEY" not in options.env
 
+    def test_claude_root_removes_auth_keys_from_session_overrides(self, config):
+        config.model = "claude-opus-4-7"
+        mgr = SessionManager(config=config)
+        mgr.set_sdk_env_overrides(
+            {
+                "ANTHROPIC_API_KEY": "stale-key",
+                "ANTHROPIC_AUTH_TOKEN": "stale-token",
+                "CLAUDE_CODE_OAUTH_TOKEN": "stale-oauth-token",
+            }
+        )
+        options = mgr.create_options()
+        assert "ANTHROPIC_API_KEY" not in options.env
+        assert "ANTHROPIC_AUTH_TOKEN" not in options.env
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in options.env
+
     def test_set_sdk_env_overrides_filters_empty_values(self, config):
         mgr = SessionManager(config=config)
         mgr.set_sdk_env_overrides({"A": "1", "B": "", "": "x"})
@@ -287,6 +302,73 @@ class TestClientLifecycle:
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "92"
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+
+    @pytest.mark.asyncio
+    async def test_get_client_scrubs_parent_anthropic_auth_env_for_claude_model(
+        self, config, monkeypatch
+    ):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-key")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "stale-oauth-token")
+        mgr = SessionManager(config=config)
+        observed = {}
+        mock_client = AsyncMock()
+
+        async def connect():
+            import os
+
+            observed["during"] = {
+                "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY"),
+                "ANTHROPIC_AUTH_TOKEN": os.environ.get("ANTHROPIC_AUTH_TOKEN"),
+                "CLAUDE_CODE_OAUTH_TOKEN": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"),
+            }
+
+        mock_client.connect.side_effect = connect
+
+        with patch("obs_agent.session.ClaudeSDKClient", return_value=mock_client):
+            client = await mgr.get_client()
+
+        assert client is mock_client
+        assert observed["during"] == {
+            "ANTHROPIC_API_KEY": None,
+            "ANTHROPIC_AUTH_TOKEN": None,
+            "CLAUDE_CODE_OAUTH_TOKEN": None,
+        }
+        import os
+
+        assert os.environ["ANTHROPIC_API_KEY"] == "stale-key"
+        assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "stale-token"
+        assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "stale-oauth-token"
+
+    @pytest.mark.asyncio
+    async def test_get_client_keeps_parent_anthropic_env_for_non_claude_model(
+        self, config, monkeypatch
+    ):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-key")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "parent-token")
+        config.model = "gpt-5.4-mini"
+        mgr = SessionManager(config=config)
+        observed = {}
+        mock_client = AsyncMock()
+
+        async def connect():
+            import os
+
+            observed["during"] = {
+                "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY"),
+                "ANTHROPIC_AUTH_TOKEN": os.environ.get("ANTHROPIC_AUTH_TOKEN"),
+            }
+
+        mock_client.connect.side_effect = connect
+
+        with patch("obs_agent.session.ClaudeSDKClient", return_value=mock_client):
+            client = await mgr.get_client()
+
+        assert client is mock_client
+        assert observed["during"] == {
+            "ANTHROPIC_API_KEY": "parent-key",
+            "ANTHROPIC_AUTH_TOKEN": "parent-token",
+        }
 
     @pytest.mark.asyncio
     async def test_get_client_passes_explicit_200k_context_options_to_sdk(self, config):
