@@ -10,7 +10,6 @@ See daemon.py for the original inline implementation.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, AsyncIterator
@@ -230,7 +229,6 @@ class ConversationRunner:
         self._last_message = None  # tracks last SDK message for metrics
         self._last_result_message = None  # latest ResultMessage-like payload
         self._last_assistant_usage: dict | None = None  # latest assistant step usage
-        self._last_context_usage: dict | None = None  # latest SDK context usage payload
 
     def _refresh_last_result_data(self) -> None:
         """Refresh hook_state.last_result_data from the latest SDK result-like message."""
@@ -254,19 +252,6 @@ class ConversationRunner:
                 "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
                 "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
             }
-        if isinstance(self._last_context_usage, dict):
-            self._hook_state.last_result_data["context_usage"] = dict(self._last_context_usage)
-
-    async def _refresh_context_usage(self) -> None:
-        if self._client is None or not hasattr(self._client, "get_context_usage"):
-            return
-        try:
-            context_usage = await self._client.get_context_usage()
-        except Exception:
-            logger.debug("Failed to refresh SDK context usage", exc_info=True)
-            return
-        if isinstance(context_usage, dict):
-            self._last_context_usage = dict(context_usage)
 
     def _sync_session_id_from_client(self) -> None:
         if self._client is None:
@@ -289,10 +274,7 @@ class ConversationRunner:
 
         Updates ``self._last_message`` for each message received.
         """
-        response_stream = self._client.receive_response()
-        if inspect.isawaitable(response_stream):
-            response_stream = await response_stream
-        async for message in response_stream:
+        async for message in self._client.receive_response():
             self._last_message = message
             raw_uuid = getattr(message, "_raw_uuid", None)
             message_role = _message_role(message)
@@ -456,15 +438,8 @@ class ConversationRunner:
             except Exception as retry_exc:
                 if not _is_recoverable(retry_exc):
                     raise
-                if self._session_mgr.session_id is not None:
-                    logger.error(
-                        "Reconnect on get_client also failed; preserving session instead of starting fresh: %s",
-                        retry_exc,
-                    )
-                    await self._session_mgr.soft_reset()
-                    raise retry_exc from None
                 logger.warning(
-                    "Reconnect on get_client also failed before session creation; starting fresh: %s",
+                    "Reconnect on get_client also failed, dropping session and starting fresh: %s",
                     retry_exc,
                 )
                 await self._session_mgr.async_reset()
@@ -488,7 +463,6 @@ class ConversationRunner:
         self._last_message = None
         self._last_result_message = None
         self._last_assistant_usage = None
-        self._last_context_usage = None
         async for event in self._stream_or_reconnect(
             _RECOVERY_PROMPT
         ):
@@ -496,7 +470,6 @@ class ConversationRunner:
 
         if self._last_message is not None:
             log_result(self._last_message, label="conversation")
-            await self._refresh_context_usage()
             self._refresh_last_result_data()
 
         # 4. Continuation loop: process queued messages inline
@@ -533,7 +506,6 @@ class ConversationRunner:
                 _RECOVERY_PROMPT
             ):
                 yield event
-            await self._refresh_context_usage()
             self._refresh_last_result_data()
 
         # 5. Background fork wait loop
@@ -579,7 +551,6 @@ class ConversationRunner:
                 _RECOVERY_PROMPT
             ):
                 yield event
-            await self._refresh_context_usage()
             self._refresh_last_result_data()
 
         # 6. Drain remaining queue for next turn

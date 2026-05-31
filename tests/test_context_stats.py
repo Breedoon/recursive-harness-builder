@@ -130,76 +130,9 @@ def test_apply_context_probe_none_preserves_existing_source() -> None:
 def test_format_context_snapshot_compact_rounds_for_telegram() -> None:
     snapshot = {
         "estimated_context_used_tokens": 24_825,
-        "estimated_context_remaining_tokens": 175_175,
         "estimated_context_window_tokens": 200_000,
     }
-    assert format_context_snapshot_compact(snapshot) == "context: 175k remaining (24k / 200k, 88%)"
-
-
-def test_format_context_snapshot_compact_shows_unavailable_for_zero_context() -> None:
-    snapshot = {
-        "estimated_context_used_tokens": 0,
-        "estimated_context_window_tokens": 1_000_000,
-    }
-    assert format_context_snapshot_compact(snapshot) == "context: context unavailable"
-
-
-def test_build_context_snapshot_prefers_sdk_context_usage_when_available(tmp_path: Path) -> None:
-    projects_root = tmp_path / ".claude" / "projects"
-    session_id = "sid-sdk-context"
-    session_file = projects_root / "-workspace-recursive-harness" / f"{session_id}.jsonl"
-    session_file.parent.mkdir(parents=True, exist_ok=True)
-    session_file.write_text(
-        json.dumps(
-            {
-                "type": "assistant",
-                "sessionId": session_id,
-                "message": {
-                    "usage": {
-                        "input_tokens": 11,
-                        "output_tokens": 3,
-                        "cache_creation_input_tokens": 222,
-                        "cache_read_input_tokens": 3333,
-                    }
-                },
-            }
-        )
-        + "\n"
-    )
-
-    snapshot = build_context_snapshot(
-        session_id=session_id,
-        data={
-            "session_id": session_id,
-            "num_turns": 7,
-            "usage": {
-                "input_tokens": 1,
-                "output_tokens": 1,
-                "cache_creation_input_tokens": 2,
-                "cache_read_input_tokens": 99999,
-            },
-            "context_usage": {
-                "totalTokens": 180_000,
-                "maxTokens": 190_000,
-                "rawMaxTokens": 200_000,
-                "percentage": 90.0,
-                "model": "gpt-5.5[200k]",
-                "isAutoCompactEnabled": True,
-                "autoCompactThreshold": 167_000,
-            },
-        },
-        context_window_estimate_tokens=200_000,
-        cwd=Path("/workspace/recursive-harness"),
-        projects_root=projects_root,
-    )
-
-    assert snapshot["context_estimate_source"] == "sdk_context_usage"
-    assert snapshot["estimated_context_used_tokens"] == 180_000
-    assert snapshot["estimated_context_remaining_tokens"] == 20_000
-    assert snapshot["estimated_context_remaining_pct"] == pytest.approx(10.0)
-    assert snapshot["sdk_context_auto_compact_enabled"] is True
-    assert snapshot["sdk_context_auto_compact_threshold"] == 167_000
-
+    assert format_context_snapshot_compact(snapshot) == "context: 24k / 200k"
 
 
 def test_build_context_snapshot_prefers_jsonl_triplet_for_context_estimate(tmp_path: Path) -> None:

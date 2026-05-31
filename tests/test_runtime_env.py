@@ -213,7 +213,6 @@ def test_env_profile_prod_does_not_map_prod_prefixed_env(monkeypatch, tmp_path: 
 
     assert profile == "test"
     assert os.environ["OBS_TELEGRAM_BOT_TOKEN"] == "test-primary"
-    assert "OBS_PROD_TELEGRAM_BOT_TOKEN" not in os.environ
 
 
 def test_profile_prod_arg_does_not_map_prod_prefixed_env(monkeypatch, tmp_path: Path) -> None:
@@ -260,7 +259,6 @@ def test_prod_flag_maps_prod_prefixed_env(monkeypatch, tmp_path: Path) -> None:
     )
 
     assert profile == "prod"
-    assert os.environ["OBS_PROD_TELEGRAM_BOT_TOKEN"] == "prod-primary"
     assert os.environ["OBS_TELEGRAM_BOT_TOKEN"] == "prod-primary"
     assert OBSConfig.from_env().cache_proxy_port == 18923
 

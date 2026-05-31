@@ -155,8 +155,8 @@ async def test_cap_prunes_oldest_idle_overage_and_preserves_identity_maps(bot):
     pruned = await bot._prune_idle_claude_processes()
 
     assert pruned == 2
-    assert managers[0].disconnect_calls == [False]
-    assert managers[1].disconnect_calls == [False]
+    assert managers[0].disconnect_calls == [True]
+    assert managers[1].disconnect_calls == [True]
     assert managers[2].disconnect_calls == []
     assert managers[3].disconnect_calls == []
     assert bot._fork_task_by_child_route == {record.child_route: record.task_id for record in records}
@@ -185,26 +185,8 @@ async def test_active_records_are_exempt_even_when_active_count_exceeds_cap(bot)
     assert pruned == 1
     assert managers[0].disconnect_calls == []
     assert managers[1].disconnect_calls == []
-    assert managers[2].disconnect_calls == [False]
+    assert managers[2].disconnect_calls == [True]
     assert managers[3].disconnect_calls == []
-
-
-@pytest.mark.asyncio
-async def test_wake_requested_records_are_exempt_from_pruning(bot):
-    bot._config.claude_idle_process_cap = 0
-    route = _route(1)
-    manager = FakeSessionManager()
-    bot._states_by_route[route] = _state(route, manager)
-    record = _record("wake-requested", route, completed_at=10)
-    record.wake_requested = True
-    bot._fork_tasks_by_id = {record.task_id: record}
-
-    assert bot._idle_claude_process_candidates() == []
-
-    pruned = await bot._prune_idle_claude_processes(completing_task_id=record.task_id)
-
-    assert pruned == 0
-    assert manager.disconnect_calls == []
 
 
 @pytest.mark.asyncio
@@ -266,8 +248,8 @@ async def test_cap_prunes_current_overage_when_completion_triggers_prune(bot):
     pruned = await bot._prune_idle_claude_processes(completing_task_id="completing")
 
     assert pruned == 2
-    assert managers[0].disconnect_calls == [False]
-    assert managers[1].disconnect_calls == [False]
+    assert managers[0].disconnect_calls == [True]
+    assert managers[1].disconnect_calls == [True]
     assert managers[2].disconnect_calls == []
     assert managers[3].disconnect_calls == []
 
@@ -302,4 +284,4 @@ async def test_cap_zero_prunes_idle_without_being_required_for_direct_kill(bot):
     pruned = await bot._prune_idle_claude_processes()
 
     assert pruned == 1
-    assert manager.disconnect_calls == [False]
+    assert manager.disconnect_calls == [True]

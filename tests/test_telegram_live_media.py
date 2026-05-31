@@ -31,14 +31,6 @@ def _has_telegram_credentials() -> bool:
     return all(os.environ.get(name) for name in _REQUIRED_ENV)
 
 
-def _has_eval_vault_template() -> bool:
-    template_raw = os.environ.get("OBS_EVAL_TEMPLATE_VAULT", "").strip()
-    if template_raw:
-        return Path(template_raw).is_dir()
-    project_root = Path(__file__).resolve().parents[1]
-    return (project_root / "fixture_vault").is_dir() or (project_root / "scripts" / "clone_vault.sh").exists()
-
-
 def _require_file(path: Path) -> Path:
     if not path.exists():
         pytest.skip(f"Required test file not found: {path}")
@@ -120,13 +112,10 @@ class _LiveTelegramHarness:
 
 
 @pytest_asyncio.fixture
-async def live_tg_media(request: pytest.FixtureRequest, tmp_path: Path) -> _LiveTelegramHarness:
+async def live_tg_media(eval_vault: Path, tmp_path: Path) -> _LiveTelegramHarness:
     if not _has_telegram_credentials():
         pytest.skip("Telegram credentials not configured in environment")
-    if not _has_eval_vault_template():
-        pytest.skip("Eval fixture vault template not configured")
 
-    eval_vault = request.getfixturevalue("eval_vault")
     temp_root = tmp_path / "obs-agent-temp"
     proc, log_file = _start_bot(eval_vault, temp_root)
     platform = TelegramPlatform(

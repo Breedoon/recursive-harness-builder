@@ -46,8 +46,7 @@ def skill_vault(tmp_path):
 
 @pytest.fixture
 def skill_config(skill_vault):
-    vault = Path(skill_vault)
-    return OBSConfig(vault_path=vault, team_storage_root=vault / ".claude" / "teams")
+    return OBSConfig(vault_path=Path(skill_vault))
 
 
 class TestAgentTaskTools:
@@ -80,7 +79,7 @@ class TestAgentTaskTools:
         assert "ForkTaskOutput" not in tool_names
         assert "ForkTaskStop" not in tool_names
 
-    def test_send_inbox_message_schema_marks_only_recipient_and_content_required_with_optional_reply_flags(
+    def test_send_inbox_message_schema_marks_only_recipient_and_content_required(
         self,
         monkeypatch,
         skill_config,
@@ -97,7 +96,7 @@ class TestAgentTaskTools:
         assert "team_name" in schema["properties"]
         assert "sender" in schema["properties"]
         assert "needs_reply" in schema["properties"]
-        assert "question" in schema["properties"]["needs_reply"]["description"].lower()
+        assert "question" in schema["properties"]["needs_reply"]["description"]
         assert "must_reply" in schema["properties"]
 
     @pytest.mark.asyncio
@@ -126,7 +125,7 @@ class TestAgentTaskTools:
         payload = json.loads(result["content"][0]["text"])
         assert payload["success"] is True
 
-        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
         persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
         assert persisted[-1]["must_reply"] is True
         assert persisted[-1]["replied"] is False
@@ -157,7 +156,7 @@ class TestAgentTaskTools:
         payload = json.loads(result["content"][0]["text"])
         assert payload["success"] is True
 
-        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
         persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
         assert persisted[-1]["must_reply"] is True
         assert persisted[-1]["replied"] is False
@@ -189,71 +188,6 @@ class TestAgentTaskTools:
         assert "Mutually exclusive" not in prompt_file_description
         assert "May be combined" in prompt_description
         assert "May be combined" in prompt_file_description
-
-    def test_agent_task_schema_includes_session_source(self, monkeypatch, skill_config):
-        from obs_agent.tools import create_obs_tools
-
-        captured = _capture_tools(monkeypatch)
-        create_obs_tools(skill_config, lambda: "sid-123")
-
-        tool = next(tool for tool in captured["tools"] if tool.name == "AgentTask")
-        schema = tool.input_schema
-        assert "session_source" in schema["properties"]
-        assert "JSONL file path" in schema["properties"]["session_source"]["description"]
-        assert "session_source" not in schema["required"]
-
-    @pytest.mark.asyncio
-    async def test_agent_task_passes_session_source_to_transport(self, monkeypatch, skill_config):
-        from obs_agent.tools import create_obs_tools
-
-        captured = _capture_tools(monkeypatch)
-        state = HookState()
-        state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
-        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "AgentTask")
-
-        result = await handler({"prompt": "Do work", "session_source": "source-session"})
-
-        assert result["content"][0]["text"] == "ok"
-        launch_args = state.fork_task_launcher.await_args.args[0]
-        assert launch_args["session_source"] == "source-session"
-        assert launch_args["fork"] is True
-
-    @pytest.mark.asyncio
-    async def test_agent_task_rejects_session_source_with_resume(self, monkeypatch, skill_config):
-        from obs_agent.tools import create_obs_tools
-
-        captured = _capture_tools(monkeypatch)
-        state = HookState()
-        state.fork_task_launcher = AsyncMock()
-        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "AgentTask")
-
-        result = await handler(
-            {"prompt": "Do work", "resume": "agent-1", "session_source": "source-session"}
-        )
-
-        assert result["is_error"] is True
-        assert "resume and session_source are mutually exclusive" in result["content"][0]["text"]
-        state.fork_task_launcher.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_agent_task_rejects_session_source_with_fork_false(self, monkeypatch, skill_config):
-        from obs_agent.tools import create_obs_tools
-
-        captured = _capture_tools(monkeypatch)
-        state = HookState()
-        state.fork_task_launcher = AsyncMock()
-        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        handler = _tool_handler(captured["tools"], "AgentTask")
-
-        result = await handler(
-            {"prompt": "Do work", "fork": False, "session_source": "source-session"}
-        )
-
-        assert result["is_error"] is True
-        assert "session_source is only supported with fork=true" in result["content"][0]["text"]
-        state.fork_task_launcher.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_agent_task_requires_prompt(self, monkeypatch, skill_config):
@@ -368,7 +302,6 @@ class TestAgentTaskTools:
                 "prompt": "Read the file and report back",
                 "description": "Audit",
                 "resume": None,
-                "session_source": None,
                 "run_in_background": True,
                 "timeout_ms": 5000,
                 "max_turns": 12,
@@ -725,7 +658,7 @@ class TestAgentTaskTools:
         assert payload["messages"][0]["text"] == "hello team"
         assert payload["messages"][0]["from"] == "lead"
 
-        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
         persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
         assert persisted[0]["read"] is True
 
@@ -764,7 +697,9 @@ class TestAgentTaskTools:
         assert json.loads(send_result["content"][0]["text"])["success"] is True
 
         inbox_path = (
-            skill_config.team_storage_root
+            tmp_path
+            / ".claude"
+            / "teams"
             / "obs-tree-root-123"
             / "inboxes"
             / "obs-agent-peer-999.json"
@@ -773,7 +708,9 @@ class TestAgentTaskTools:
         assert persisted[0]["from"] == "obs-agent-child-123"
 
         self_inbox = (
-            skill_config.team_storage_root
+            tmp_path
+            / ".claude"
+            / "teams"
             / "obs-tree-root-123"
             / "inboxes"
             / "obs-agent-child-123.json"
@@ -907,7 +844,9 @@ class TestAgentTaskTools:
         assert payload["success"] is True
 
         inbox_path = (
-            skill_config.team_storage_root
+            tmp_path
+            / ".claude"
+            / "teams"
             / "2026-03-31-10-00-root"
             / "inboxes"
             / "2026-03-31-10-00-root.json"
@@ -942,7 +881,7 @@ class TestAgentTaskTools:
         payload = json.loads(result["content"][0]["text"])
         assert payload["success"] is True
 
-        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
         persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
         assert "must_reply" not in persisted[-1]
         assert "replied" not in persisted[-1]
@@ -1083,7 +1022,7 @@ class TestAgentTaskTools:
 
         assert result["is_error"] is True
         assert "underdelivered" in result["content"][0]["text"]
-        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
         assert not inbox_path.exists()
 
     @pytest.mark.asyncio
@@ -1115,7 +1054,7 @@ class TestAgentTaskTools:
         payload = json.loads(result["content"][0]["text"])
         assert payload["success"] is True
         assert payload["delivered"] is True
-        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
         assert inbox_path.exists()
 
     @pytest.mark.asyncio
@@ -1149,43 +1088,7 @@ class TestAgentTaskTools:
 
         assert result["is_error"] is True
         assert "underdelivered" in result["content"][0]["text"]
-        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
-        assert not inbox_path.exists()
-
-    @pytest.mark.asyncio
-    async def test_send_inbox_message_returns_underdelivered_when_notifier_raises(
-        self,
-        monkeypatch,
-        skill_config,
-        tmp_path,
-    ):
-        from obs_agent.tools import create_obs_tools
-
-        captured = _capture_tools(monkeypatch)
-        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
-        state = HookState()
-        state.inbox_recipient_validator = AsyncMock(return_value={"deliverable": True})
-        state.inbox_message_notifier = AsyncMock(side_effect=RuntimeError("wake failed"))
-        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
-        send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
-
-        result = await send_handler(
-            {
-                "team_name": "team-alpha",
-                "recipient": "worker-a",
-                "content": "hello team",
-                "summary": "greeting",
-                "sender": "lead",
-            }
-        )
-
-        assert result["is_error"] is True
-        assert "underdelivered" in result["content"][0]["text"]
-        payload = result["tool_use_result"]
-        assert payload["success"] is False
-        assert payload["delivered"] is False
-        assert payload["reason"] == "recipient wake failed"
-        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
         assert not inbox_path.exists()
 
     @pytest.mark.asyncio
@@ -1219,7 +1122,7 @@ class TestAgentTaskTools:
         send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
 
         child_name = "e96857c58f-alpha-child"
-        child_path = skill_config.team_storage_root / "2026-03-30-10-10-root" / "inboxes" / f"{child_name}.json"
+        child_path = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "inboxes" / f"{child_name}.json"
         child_path.parent.mkdir(parents=True, exist_ok=True)
         child_path.write_text("[]", encoding="utf-8")
 
@@ -1266,7 +1169,7 @@ class TestAgentTaskTools:
                 parent_display_name=None,
             ),
         )
-        team_dir = skill_config.team_storage_root / root_agent
+        team_dir = tmp_path / ".claude" / "teams" / root_agent
         inbox_dir = team_dir / "inboxes"
         inbox_dir.mkdir(parents=True)
         for agent_name in (root_agent, older_child, newer_child):
@@ -1291,151 +1194,6 @@ class TestAgentTaskTools:
         payload = json.loads(result["content"][0]["text"])
         assert payload["mode"] == "children"
         assert payload["children"] == [newer_child, older_child]
-
-    @pytest.mark.asyncio
-    async def test_search_team_tree_applies_limit_before_runtime_status_lookup(
-        self,
-        monkeypatch,
-        skill_config,
-        tmp_path,
-    ):
-        from obs_agent.tools import create_obs_tools
-
-        captured = _capture_tools(monkeypatch)
-        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
-        root_agent = "2026-03-30-10-10-root"
-        child_a = "e96857c58f-a"
-        child_b = "e96857c58f-b"
-        child_c = "e96857c58f-c"
-        monkeypatch.setattr(
-            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
-            lambda **_: ObsBootstrap(
-                raw_xml="<obs-bootstrap version='2' />",
-                lineage=("Root",),
-                origin="trunk_start",
-                is_fork=False,
-                session_id="sid-root",
-                agent_id=None,
-                parent_session_id=None,
-                root_team_key=root_agent,
-                agent_name=root_agent,
-                parent_agent_name=None,
-                parent_display_name=None,
-            ),
-        )
-        team_dir = skill_config.team_storage_root / root_agent
-        inbox_dir = team_dir / "inboxes"
-        inbox_dir.mkdir(parents=True)
-        for agent_name in (root_agent, child_a, child_b, child_c):
-            (inbox_dir / f"{agent_name}.json").write_text("[]", encoding="utf-8")
-        (team_dir / "config.json").write_text(
-            json.dumps(
-                {
-                    "members": [
-                        {"name": root_agent, "agentType": "general-purpose", "model": "claude-opus-4-7", "obs": {"display_name": "Root", "lineage": ["Root"], "lineage_length": 1, "updated_at": 1}},
-                        {"name": child_a, "agentType": "general-purpose", "model": "claude-haiku-4-5", "obs": {"display_name": "A", "status": "completed", "lineage": ["Root", "A"], "lineage_length": 2, "parent_agent_name": root_agent, "created_at": 30}},
-                        {"name": child_b, "agentType": "general-purpose", "model": "claude-sonnet-4-6", "obs": {"display_name": "B", "status": "failed", "lineage": ["Root", "B"], "lineage_length": 2, "parent_agent_name": root_agent, "created_at": 20}},
-                        {"name": child_c, "agentType": "general-purpose", "model": "claude-sonnet-4-6", "obs": {"display_name": "C", "status": "failed", "lineage": ["Root", "C"], "lineage_length": 2, "parent_agent_name": root_agent, "created_at": 10}},
-                    ]
-                }
-            ),
-            encoding="utf-8",
-        )
-        state = HookState()
-        status_lookups = []
-
-        async def status_provider(payload):
-            status_lookups.append(payload["agent_name"])
-            if payload["agent_name"] == child_a:
-                return {"running": True, "status": "running", "model": "claude-haiku-4-5", "last_active_at": 40}
-            return {"running": False}
-
-        state.team_status_provider = status_provider
-        create_obs_tools(skill_config, lambda: "sid-root", hook_state=state)
-        handler = _tool_handler(captured["tools"], "search_team")
-
-        result = await handler({"mode": "tree", "limit": 2})
-
-        payload = json.loads(result["content"][0]["text"])
-        assert payload["limit"] == 2
-        assert payload["tree"] == [child_a, child_b]
-        assert [member["agent_name"] for member in payload["tree_members"]] == [child_a, child_b]
-        assert status_lookups == [child_a, child_b]
-        assert payload["omitted"] == 2
-        assert payload["tree_members"][0]["running"] is True
-        assert payload["tree_members"][0]["status"] == "running"
-        assert payload["tree_members"][0]["model"] == "claude-haiku-4-5"
-
-    @pytest.mark.asyncio
-    async def test_search_team_family_member_metadata_respects_team_name_limit_and_status(
-        self,
-        monkeypatch,
-        skill_config,
-        tmp_path,
-    ):
-        from obs_agent.tools import create_obs_tools
-
-        captured = _capture_tools(monkeypatch)
-        monkeypatch.setattr("obs_agent.tools.Path.home", lambda: tmp_path)
-        default_root = "2026-03-30-10-10-default-root"
-        requested_team = "team-beta"
-        child_a = "e96857c58f-a"
-        child_b = "e96857c58f-b"
-        monkeypatch.setattr(
-            "obs_agent.tools.find_latest_obs_bootstrap_for_session",
-            lambda **_: ObsBootstrap(
-                raw_xml="<obs-bootstrap version='2' />",
-                lineage=("Root",),
-                origin="trunk_start",
-                is_fork=False,
-                session_id="sid-root",
-                agent_id=None,
-                parent_session_id=None,
-                root_team_key=default_root,
-                agent_name=default_root,
-                parent_agent_name=None,
-                parent_display_name=None,
-            ),
-        )
-        requested_team_dir = skill_config.team_storage_root / requested_team
-        requested_inbox_dir = requested_team_dir / "inboxes"
-        requested_inbox_dir.mkdir(parents=True)
-        for agent_name in (default_root, child_a, child_b):
-            (requested_inbox_dir / f"{agent_name}.json").write_text("[]", encoding="utf-8")
-        (requested_team_dir / "config.json").write_text(
-            json.dumps(
-                {
-                    "members": [
-                        {"name": default_root, "obs": {"display_name": "Root", "lineage": ["Root"], "lineage_length": 1, "created_at": 1}},
-                        {"name": child_a, "agentType": "general-purpose", "obs": {"display_name": "A", "lineage": ["Root", "A"], "lineage_length": 2, "parent_agent_name": default_root, "created_at": 30}},
-                        {"name": child_b, "agentType": "general-purpose", "obs": {"display_name": "B", "lineage": ["Root", "B"], "lineage_length": 2, "parent_agent_name": default_root, "created_at": 20}},
-                    ]
-                }
-            ),
-            encoding="utf-8",
-        )
-        state = HookState()
-
-        async def status_provider(payload):
-            assert payload["team_name"] == requested_team
-            if payload["agent_name"] == child_a:
-                return {"running": True, "status": "running", "model": "claude-sonnet-4-6", "last_active_at": 40}
-            return {"running": False}
-
-        state.team_status_provider = status_provider
-        create_obs_tools(skill_config, lambda: "sid-root", hook_state=state)
-        handler = _tool_handler(captured["tools"], "search_team")
-
-        result = await handler({"mode": "family", "team_name": requested_team, "limit": 1})
-
-        payload = json.loads(result["content"][0]["text"])
-        assert payload["team_name"] == requested_team
-        assert payload["limit"] == 1
-        assert payload["children"] == [child_a]
-        assert [member["agent_name"] for member in payload["children_members"]] == [child_a]
-        assert payload["children_members"][0]["running"] is True
-        assert payload["children_members"][0]["status"] == "running"
-        assert payload["children_members"][0]["model"] == "claude-sonnet-4-6"
 
     @pytest.mark.asyncio
     async def test_send_inbox_message_does_not_resolve_parent_alias(
@@ -1474,7 +1232,7 @@ class TestAgentTaskTools:
         create_obs_tools(skill_config, lambda: "sid-child", hook_state=state)
         send_handler = _tool_handler(captured["tools"], "SendInboxMessage")
 
-        root_path = skill_config.team_storage_root / "2026-03-30-10-10-root" / "inboxes" / "2026-03-30-10-10-root.json"
+        root_path = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "inboxes" / "2026-03-30-10-10-root.json"
         root_path.parent.mkdir(parents=True, exist_ok=True)
         root_path.write_text("[]", encoding="utf-8")
 
@@ -1502,7 +1260,7 @@ class TestAgentTaskTools:
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=HookState())
         read_handler = _tool_handler(captured["tools"], "ReadInbox")
 
-        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
@@ -1560,7 +1318,7 @@ class TestAgentTaskTools:
         create_obs_tools(skill_config, lambda: "sid-leaf", hook_state=HookState())
         handler = _tool_handler(captured["tools"], "search_team")
 
-        inboxes = skill_config.team_storage_root / "2026-03-30-10-10-root" / "inboxes"
+        inboxes = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "inboxes"
         inboxes.mkdir(parents=True, exist_ok=True)
         for name in [
             "2026-03-30-10-10-root",
@@ -1572,7 +1330,7 @@ class TestAgentTaskTools:
             "aaaaaaaaaa-cousin",
         ]:
             (inboxes / f"{name}.json").write_text("[]", encoding="utf-8")
-        team_config = skill_config.team_storage_root / "2026-03-30-10-10-root" / "config.json"
+        team_config = tmp_path / ".claude" / "teams" / "2026-03-30-10-10-root" / "config.json"
         team_config.write_text(
             json.dumps(
                 {
@@ -1730,7 +1488,7 @@ class TestAgentTaskTools:
 
         await asyncio.gather(*[_send(i) for i in range(40)])
 
-        inbox_path = skill_config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
         persisted = json.loads(inbox_path.read_text(encoding="utf-8"))
         assert len(persisted) == 40
         assert all(isinstance(item, dict) for item in persisted)

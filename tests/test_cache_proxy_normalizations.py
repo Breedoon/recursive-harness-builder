@@ -43,7 +43,6 @@ from conftest_cache_proxy import (
     get_proxy_usage_for_turns,
     make_sdk_options,
     proxy_log_length,
-    proxy_body_dir,
     read_proxy_bodies,
     read_proxy_usage_log,
     run_turn,
@@ -307,7 +306,7 @@ async def test_string_to_list_normalization(
         )
 
     # ── Verify Rule 4 fired: inspect pre/post bodies for string→list conversion ──
-    body_dir = proxy_body_dir()
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
     assert body_dir.exists(), "Body directory not found — SAVE_BODIES may not be active"
 
     pre_files = sorted(body_dir.glob("req*_pre.json"))
@@ -391,7 +390,7 @@ async def test_normalization_idempotency(proxy_with_bodies: int, test_project: P
     time.sleep(0.5)
 
     # Read saved request bodies — check structural invariants on post bodies
-    body_dir = proxy_body_dir()
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
     assert body_dir.exists(), "Body directory not found — SAVE_BODIES may not be active"
 
     post_files = sorted(body_dir.glob("req*_post.json"))
@@ -862,7 +861,7 @@ async def test_git_status_divergence_normalized(
 
     # ── Verify: check post-normalization bodies ──
     time.sleep(0.5)
-    body_dir = proxy_body_dir()
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
     post_files = sorted(body_dir.glob("req*_post.json"))
 
     # Check if any body has gitStatus (CC may not include it via SDK)
@@ -1096,7 +1095,7 @@ def test_git_status_normalization_via_raw_http(proxy_with_bodies: int):
             ],
         }
 
-    body_dir = proxy_body_dir()
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
 
     # Clear old bodies
     if body_dir.exists():
@@ -1217,7 +1216,7 @@ def test_billing_header_normalization_via_raw_http(proxy_with_bodies: int):
             ],
         }
 
-    body_dir = proxy_body_dir()
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
     if body_dir.exists():
         for f in body_dir.iterdir():
             try:
@@ -1328,7 +1327,7 @@ def test_string_to_list_conversion_via_raw_http(proxy_with_bodies: int):
         ],
     }
 
-    body_dir = proxy_body_dir()
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
     if body_dir.exists():
         for f in body_dir.iterdir():
             try:
@@ -1437,7 +1436,7 @@ def test_tool_sorting_via_raw_http(proxy_with_bodies: int):
             "tools": tools,
         }
 
-    body_dir = proxy_body_dir()
+    body_dir = Path(TEST_LOG_DIR) / "bodies"
     if body_dir.exists():
         for f in body_dir.iterdir():
             try:

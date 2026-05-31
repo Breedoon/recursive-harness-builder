@@ -129,15 +129,13 @@ def telegram_scenario_ids() -> list[str]:
 
 @pytest.mark.eval
 @pytest.mark.parametrize("scenario_name", cli_scenario_ids() or ["_no_scenarios_found"])
-async def test_eval(scenario_name: str, request) -> None:
+async def test_eval(scenario_name: str, eval_vault: Path, eval_config) -> None:
     """Run a single CLI eval scenario via its configured lane."""
     if scenario_name == "_no_scenarios_found":
         if not _CLI_EVALS_ENABLED:
             pytest.skip("CLI evals disabled. Set OBS_EVAL_ENABLE_CLI=1 to run.")
         pytest.skip("No CLI scenario files found in tests/evals/scenarios/")
 
-    eval_vault = request.getfixturevalue("eval_vault")
-    eval_config = request.getfixturevalue("eval_config")
     scenario_path = SCENARIO_DIR / f"{scenario_name}.md"
     scenario = parse_scenario(scenario_path)
 

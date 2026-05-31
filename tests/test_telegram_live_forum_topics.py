@@ -41,11 +41,6 @@ _SESSION_ID_RE = re.compile(
 _AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-f-]+)", re.IGNORECASE)
 _TOPIC_LINK_RE = re.compile(r"https://t\.me/c/\d+/(\d+)/(\d+)")
 _MESSAGE_LINK_RE = re.compile(r"https://t\.me/c/\d+/(?:\d+/)?\d+")
-_LINEAGE_FACT_RE = re.compile(
-    r"root_team_key=(?P<root_team_key>[^|\n]+)\|"
-    r"agent_name=(?P<agent_name>[^|\n]+)\|"
-    r"lineage_length=(?P<lineage_length>\d+)"
-)
 _CACHED_FORUM_CHAT_ID: int | None = None
 
 
@@ -245,18 +240,10 @@ def _message_containing(
 
 
 def _extract_json_object(text: str) -> dict[str, object]:
-    decoder = json.JSONDecoder()
     start = text.find("{")
-    while start != -1:
-        try:
-            value, _ = decoder.raw_decode(text[start:])
-        except json.JSONDecodeError:
-            start = text.find("{", start + 1)
-            continue
-        if isinstance(value, dict):
-            return value
-        start = text.find("{", start + 1)
-    raise AssertionError(f"missing JSON object in:\n{text}")
+    end = text.rfind("}")
+    assert start != -1 and end != -1 and end > start, f"missing JSON object in:\n{text}"
+    return json.loads(text[start : end + 1])
 
 
 async def _wait_for_message_containing(
@@ -332,46 +319,6 @@ async def _wait_for_report_with_sections(
         await asyncio.sleep(1.0)
 
 
-async def _query_session_lineage_fact(
-    harness: _LiveForumHarness,
-    *,
-    thread_id: int,
-    timeout: float = 240.0,
-) -> dict[str, str]:
-    baseline = await harness.platform.latest_bot_message_id(thread_id=thread_id)
-    token = f"LINEAGE-{uuid.uuid4().hex[:8]}"
-    await harness.platform.send(
-        (
-            "This is a deterministic lineage test. "
-            "Call session_lineage exactly once. "
-            f"Then reply with exactly {token}|root_team_key=<value>|agent_name=<value>|lineage_length=<value> "
-            "using the literal values returned by the tool. Do not explain or add other text."
-        ),
-        thread_id=thread_id,
-        require_done=False,
-        timeout=timeout,
-    )
-    deadline = asyncio.get_running_loop().time() + timeout + 120.0
-    while True:
-        recent = await harness.platform.get_recent_messages(thread_id=thread_id, limit=60)
-        for message in recent:
-            if message.message_id <= baseline or f"{token}|" not in message.text:
-                continue
-            match = _LINEAGE_FACT_RE.search(message.text)
-            if match:
-                return {
-                    "root_team_key": match.group("root_team_key").strip(),
-                    "agent_name": match.group("agent_name").strip(),
-                    "lineage_length": match.group("lineage_length").strip(),
-                }
-        if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError(
-                f"Timed out waiting for parseable lineage fact after message {baseline}\n"
-                f"{harness.failure_context()}"
-            )
-        await asyncio.sleep(1.0)
-
-
 async def _send_and_wait_for_token(
     harness: _LiveForumHarness,
     *,
@@ -420,7 +367,6 @@ def _append_unread_inbox_message(
     content: str,
     summary: str,
     sender: str,
-    timestamp: str | None = None,
 ) -> None:
     inbox_path = Path.home() / ".claude" / "teams" / team_name / "inboxes" / f"{recipient}.json"
     inbox_path.parent.mkdir(parents=True, exist_ok=True)
@@ -437,7 +383,7 @@ def _append_unread_inbox_message(
             "from": sender,
             "text": content,
             "summary": summary,
-            "timestamp": timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "read": False,
         }
     )
@@ -504,7 +450,7 @@ class _LiveForumHarness:
 
 
 async def _warm_platform(harness: _LiveForumHarness) -> None:
-    clear_cmd = f"/clear@{harness.bot_username}"
+    clear_cmd = f"/clear@{harness.bot_username} all"
     for _ in range(6):
         trace = await harness.platform.send_control(clear_cmd, timeout=25.0)
         if "cleared" in trace.output.lower():
@@ -517,11 +463,11 @@ async def _warm_platform(harness: _LiveForumHarness) -> None:
                 await asyncio.sleep(2.0)
             return
         await asyncio.sleep(1.0)
-    raise AssertionError("Forum bot did not respond to warmup /clear")
+    raise AssertionError("Forum bot did not respond to warmup /clear all")
 
 
 async def _reset_general(harness: _LiveForumHarness) -> None:
-    clear_cmd = f"/clear@{harness.bot_username}"
+    clear_cmd = f"/clear@{harness.bot_username} all"
     for _ in range(6):
         baseline = await harness.platform.latest_bot_message_id(thread_id=None)
         trace = await harness.platform.send_control(
@@ -547,7 +493,7 @@ async def _reset_general(harness: _LiveForumHarness) -> None:
                 await asyncio.sleep(2.0)
             return
         await asyncio.sleep(1.0)
-    raise AssertionError("Forum bot did not confirm /clear")
+    raise AssertionError("Forum bot did not confirm /clear all")
 
 
 async def _session_id_for_route(
@@ -851,176 +797,7 @@ def test_build_bot_env_preserves_anthropic_env_for_non_claude_model(
 
 @pytest.mark.integration
 @pytest.mark.telegram
-@pytest.mark.skipif(
-    os.environ.get("OBS_RUN_EXPENSIVE_TELEGRAM_FORUM_LIVE") != "1",
-    reason="expensive Telegram forum live smokes require explicit opt-in",
-)
 class TestTelegramLiveForumTopics:
-    @pytest.mark.telegram_core_smoke
-    async def test_live_command_help_and_deprecations(
-        self,
-        live_tg_forum: _LiveForumHarness,
-    ) -> None:
-        await _reset_general(live_tg_forum)
-        tag = uuid.uuid4().hex[:8]
-        thread_id = await live_tg_forum.platform.create_topic(f"Command UX {tag}")
-
-        help_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
-        await live_tg_forum.platform.send_nowait("help", thread_id=thread_id)
-        help_msg = await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=thread_id,
-            after_message_id=help_baseline,
-            token="usage",
-            timeout=45.0,
-        )
-
-        delete_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
-        await live_tg_forum.platform.send_nowait(
-            f"/delete@{live_tg_forum.bot_username}",
-            thread_id=thread_id,
-        )
-        delete_msg = await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=thread_id,
-            after_message_id=delete_baseline,
-            token="deprecated and disabled",
-            timeout=45.0,
-        )
-
-        stop_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=thread_id)
-        await live_tg_forum.platform.send_nowait(
-            f"/stop@{live_tg_forum.bot_username} all",
-            thread_id=thread_id,
-        )
-        stop_msg = await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=thread_id,
-            after_message_id=stop_baseline,
-            token="arguments are deprecated",
-            timeout=45.0,
-        )
-
-        assert "/help" in help_msg.text and "usage" in help_msg.text.lower(), live_tg_forum.failure_context()
-        assert "deprecated and disabled" in delete_msg.text, live_tg_forum.failure_context()
-        assert "arguments are deprecated" in stop_msg.text, live_tg_forum.failure_context()
-        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
-
-    @pytest.mark.telegram_special
-    async def test_live_completion_summary_omits_context_window_suffix(
-        self,
-        live_tg_forum: _LiveForumHarness,
-    ) -> None:
-        await _reset_general(live_tg_forum)
-        tag = uuid.uuid4().hex[:8]
-        baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
-        trace = await live_tg_forum.platform.send(
-            f"This is a deterministic integration test. Reply with only CTX-SUMMARY-{tag}.",
-            timeout=180.0,
-            require_done=True,
-        )
-
-        assert f"CTX-SUMMARY-{tag}" in trace.output, live_tg_forum.failure_context()
-        recent = await live_tg_forum.platform.get_recent_messages(thread_id=None, limit=40)
-        context_messages = [
-            message.text
-            for message in recent
-            if message.message_id > baseline and "context:" in message.text
-        ]
-        assert context_messages, live_tg_forum.failure_context()
-        assert all(" / " not in text for text in context_messages), live_tg_forum.failure_context()
-
-    @pytest.mark.telegram_special
-    async def test_live_new_removes_schedule_for_topic_only(
-        self,
-        live_tg_forum: _LiveForumHarness,
-    ) -> None:
-        await _reset_general(live_tg_forum)
-        tag = uuid.uuid4().hex[:8]
-        reset_thread_id = await live_tg_forum.platform.create_topic(f"New Reset {tag}")
-        other_thread_id = await live_tg_forum.platform.create_topic(f"New Other {tag}")
-
-        await _send_and_wait_for_token(
-            live_tg_forum,
-            text=f"This is a deterministic integration test. Reply with only NEW-RESET-PRIME-{tag}.",
-            thread_id=reset_thread_id,
-            token=f"NEW-RESET-PRIME-{tag}",
-            timeout=240.0,
-        )
-        await _send_and_wait_for_token(
-            live_tg_forum,
-            text=f"This is a deterministic integration test. Reply with only NEW-OTHER-PRIME-{tag}.",
-            thread_id=other_thread_id,
-            token=f"NEW-OTHER-PRIME-{tag}",
-            timeout=240.0,
-        )
-
-        await _send_and_wait_for_token(
-            live_tg_forum,
-            text=(
-                "This is a deterministic integration test for /new reset. "
-                "Call CronCreate exactly once with schedule_mode=interval, interval_seconds=3600, "
-                f"prompt='reset schedule {tag}', description='reset schedule {tag}', max_runs=5, inherit=none. "
-                f"Then reply with only RESET-SCHEDULE-CREATED-{tag}."
-            ),
-            thread_id=reset_thread_id,
-            token=f"RESET-SCHEDULE-CREATED-{tag}",
-            timeout=240.0,
-        )
-        await _send_and_wait_for_token(
-            live_tg_forum,
-            text=(
-                "This is a deterministic integration test for /new reset isolation. "
-                "Call CronCreate exactly once with schedule_mode=interval, interval_seconds=3600, "
-                f"prompt='other schedule {tag}', description='other schedule {tag}', max_runs=5, inherit=none. "
-                f"Then reply with only OTHER-SCHEDULE-CREATED-{tag}."
-            ),
-            thread_id=other_thread_id,
-            token=f"OTHER-SCHEDULE-CREATED-{tag}",
-            timeout=240.0,
-        )
-
-        baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=reset_thread_id)
-        await live_tg_forum.platform.send_control(
-            f"/new@{live_tg_forum.bot_username} Fresh Reset {tag}",
-            thread_id=reset_thread_id,
-            timeout=45.0,
-        )
-        await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=reset_thread_id,
-            after_message_id=baseline,
-            token="new trunk session created",
-            timeout=120.0,
-        )
-
-        schedule_after_reset = await _send_and_wait_for_token(
-            live_tg_forum,
-            text=(
-                "This is a deterministic integration test after /new. "
-                "Call CronList exactly once. If it returns no schedules, reply with only RESET-SCHEDULES-GONE-"
-                f"{tag}; otherwise reply with RESET-SCHEDULES-REMAIN-{tag}."
-            ),
-            thread_id=reset_thread_id,
-            token=f"RESET-SCHEDULES-GONE-{tag}",
-            timeout=240.0,
-        )
-        assert f"RESET-SCHEDULES-GONE-{tag}" in schedule_after_reset.text, live_tg_forum.failure_context()
-
-        other_schedule = await _send_and_wait_for_token(
-            live_tg_forum,
-            text=(
-                "This is a deterministic integration test for topic isolation. "
-                "Call CronList exactly once. If at least one schedule exists, reply with only OTHER-SCHEDULE-KEPT-"
-                f"{tag}; otherwise reply with OTHER-SCHEDULE-MISSING-{tag}."
-            ),
-            thread_id=other_thread_id,
-            token=f"OTHER-SCHEDULE-KEPT-{tag}",
-            timeout=240.0,
-        )
-        assert f"OTHER-SCHEDULE-KEPT-{tag}" in other_schedule.text, live_tg_forum.failure_context()
-        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
-
     @pytest.mark.telegram_core_smoke
     async def test_live_general_and_topic_routes_are_isolated(
         self,
@@ -1096,7 +873,7 @@ class TestTelegramLiveForumTopics:
             live_tg_forum,
             thread_id=None,
             after_message_id=baseline,
-            token="fork created",
+            token="fork topic created",
             timeout=120.0,
         )
         child_thread_id, service_message_id = _extract_topic_link(launch_msg.text)
@@ -1105,10 +882,9 @@ class TestTelegramLiveForumTopics:
             limit=6,
         )
 
-        child_text = "\n".join(message.text for message in child_recent)
-        assert "fork created" in child_text.lower(), launch_msg.text + live_tg_forum.failure_context()
-        assert "fork session ready" in child_text.lower(), child_text + live_tg_forum.failure_context()
-        assert "session forked:" not in child_text.lower(), child_text + live_tg_forum.failure_context()
+        assert any("fork created" in message.text.lower() for message in child_recent), (
+            launch_msg.text + live_tg_forum.failure_context()
+        )
         assert any(str(service_message_id) == str(message.message_id) for message in child_recent), (
             launch_msg.text + live_tg_forum.failure_context()
         )
@@ -1132,80 +908,6 @@ class TestTelegramLiveForumTopics:
         assert general_session_after == general_session_before, live_tg_forum.failure_context()
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
 
-    @pytest.mark.telegram_core_smoke
-    async def test_live_fork_command_child_can_send_inbox_message_to_parent(
-        self,
-        live_tg_forum: _LiveForumHarness,
-    ) -> None:
-        await _reset_general(live_tg_forum)
-        tag = uuid.uuid4().hex[:8]
-        inbox_token = f"FORK-PARENT-INBOX-{tag}"
-
-        await _send_and_wait_for_token(
-            live_tg_forum,
-            text=f"This is a deterministic integration test. Reply with only PRIME-{tag}.",
-            token=f"PRIME-{tag}",
-            timeout=240.0,
-        )
-        parent_lineage = await _query_session_lineage_fact(
-            live_tg_forum,
-            thread_id=None,
-        )
-        parent_agent_name = parent_lineage["agent_name"]
-        baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
-
-        await live_tg_forum.platform.send_control(
-            f"/fork@{live_tg_forum.bot_username} Child-{tag}",
-            timeout=30.0,
-        )
-        launch_msg = await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=None,
-            after_message_id=baseline,
-            token="fork created",
-            timeout=120.0,
-        )
-        child_thread_id, _ = _extract_topic_link(launch_msg.text)
-        child_lineage = await _query_session_lineage_fact(
-            live_tg_forum,
-            thread_id=child_thread_id,
-        )
-        assert child_lineage["root_team_key"] == parent_lineage["root_team_key"], live_tg_forum.failure_context()
-
-        child_done = await _send_and_wait_for_token(
-            live_tg_forum,
-            text=(
-                "This is a deterministic integration test. "
-                "Call SendInboxMessage exactly once with "
-                f"team_name={child_lineage['root_team_key']}, recipient={parent_agent_name}, "
-                f"content={inbox_token}, summary=child-to-parent, sender={child_lineage['agent_name']}. "
-                f"Then reply with only CHILD-SENT-{tag}."
-            ),
-            thread_id=child_thread_id,
-            token=f"CHILD-SENT-{tag}",
-            timeout=300.0,
-        )
-        assert f"CHILD-SENT-{tag}" in child_done.text, live_tg_forum.failure_context()
-
-        parent_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=None)
-        parent_read = await _send_and_wait_for_token(
-            live_tg_forum,
-            text=(
-                "This is a deterministic integration test. "
-                "Call ReadInbox exactly once with "
-                f"team_name={parent_lineage['root_team_key']}, agent={parent_agent_name}, "
-                "include_read=false, mark_read=true, limit=20. "
-                f"If the inbox contains {inbox_token}, reply with only PARENT-RECEIVED-{tag}; "
-                f"otherwise reply with only PARENT-MISSING-{tag}."
-            ),
-            thread_id=None,
-            token=f"PARENT-RECEIVED-{tag}",
-            timeout=240.0,
-        )
-        assert f"PARENT-RECEIVED-{tag}" in parent_read.text, live_tg_forum.failure_context()
-        assert parent_read.message_id > parent_baseline, live_tg_forum.failure_context()
-        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
-
     async def test_live_inline_reply_fork_stays_in_same_topic_and_plain_followup_uses_it(
         self,
         live_tg_forum: _LiveForumHarness,
@@ -1220,10 +922,6 @@ class TestTelegramLiveForumTopics:
         )
         alpha_message_id = _message_containing(alpha_trace, f"ALPHA-{tag}").message_id
         session_before = await _session_id_for_route(live_tg_forum, thread_id=thread_id)
-        lineage_before = await _query_session_lineage_fact(
-            live_tg_forum,
-            thread_id=thread_id,
-        )
 
         beta_trace = await live_tg_forum.platform.send(
             f"This is a deterministic integration test. Reply with only BETA-{tag}.",
@@ -1241,10 +939,6 @@ class TestTelegramLiveForumTopics:
             reply_to_message_id=alpha_message_id,
         )
         session_after = await _session_id_for_route(live_tg_forum, thread_id=thread_id)
-        lineage_after = await _query_session_lineage_fact(
-            live_tg_forum,
-            thread_id=thread_id,
-        )
         plain_followup = await live_tg_forum.platform.send(
             (
                 "This is a deterministic integration test. "
@@ -1256,7 +950,6 @@ class TestTelegramLiveForumTopics:
 
         assert "NO" in reply_fork_trace.output, live_tg_forum.failure_context()
         assert session_after != session_before, live_tg_forum.failure_context()
-        assert lineage_after == lineage_before, live_tg_forum.failure_context()
         assert "NO" in plain_followup.output, live_tg_forum.failure_context()
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
 
@@ -2700,7 +2393,7 @@ class TestTelegramLiveForumTopics:
             live_tg_forum,
             thread_id=None,
             after_message_id=fork_baseline,
-            token="fork created",
+            token="fork topic created",
             timeout=120.0,
         )
         child_thread_id, service_message_id = _extract_topic_link(fork_message.text)
@@ -3015,138 +2708,6 @@ class TestTelegramLiveForumTopics:
             timeout=240.0,
         )
         assert "agent task wake: teammate message received" in wake_message.text.lower(), (
-            live_tg_forum.failure_context()
-        )
-        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
-
-    @pytest.mark.telegram_special
-    async def test_live_idle_team_worker_ignores_pre_restart_polled_inbox(
-        self,
-        live_tg_forum: _LiveForumHarness,
-    ) -> None:
-        await _reset_general(live_tg_forum)
-        tag = uuid.uuid4().hex[:8]
-        team_name = f"live-restart-team-{tag}"
-        worker_name = f"live-restart-worker-{tag[:4]}"
-        old_token = f"OLD-RESTART-WAKE-{tag}"
-        new_token = f"NEW-RESTART-WAKE-{tag}"
-        parent_thread_id = await live_tg_forum.platform.create_topic(f"Team Restart Wake {tag}")
-
-        await _send_and_wait_for_token(
-            live_tg_forum,
-            text=f"This is a deterministic integration test. Reply with only RESTART-PRIME-{tag}.",
-            thread_id=parent_thread_id,
-            token=f"RESTART-PRIME-{tag}",
-            timeout=240.0,
-        )
-
-        launch_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
-        await live_tg_forum.platform.send(
-            (
-                "This is a deterministic integration test for restart inbox wake filtering. "
-                "Use AgentTask exactly once with fork=false, "
-                f"team_name={team_name}, name={worker_name}, description RESTART-WORKER-{tag}, and prompt "
-                "'Call TeamCreate with team_name="
-                f"{team_name}. "
-                f"Then reply with only RESTART-IDLE-{tag}.' "
-                f"After launch, reply with only RESTART-LAUNCHED-{tag}."
-            ),
-            thread_id=parent_thread_id,
-            require_done=False,
-            timeout=180.0,
-        )
-        await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=parent_thread_id,
-            after_message_id=launch_baseline,
-            token=f"RESTART-LAUNCHED-{tag}",
-            timeout=240.0,
-        )
-        launch_message = await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=parent_thread_id,
-            after_message_id=launch_baseline,
-            token="agent task launched",
-            timeout=240.0,
-        )
-        worker_thread_id, _ = _extract_topic_link(launch_message.text)
-        await asyncio.sleep(2.0)
-        await _wait_for_message_containing(
-            live_tg_forum,
-            thread_id=worker_thread_id,
-            token=f"RESTART-IDLE-{tag}",
-            timeout=420.0,
-        )
-        lineage = await _query_session_lineage_fact(
-            live_tg_forum,
-            thread_id=worker_thread_id,
-        )
-        actual_team_name = lineage["root_team_key"]
-        actual_worker_name = lineage["agent_name"]
-
-        old_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=worker_thread_id)
-        _append_unread_inbox_message(
-            team_name=actual_team_name,
-            recipient=actual_worker_name,
-            content=old_token,
-            summary="pre-restart wake",
-            sender="external-live-test",
-        )
-        await asyncio.sleep(4.0)
-        old_wake = await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=worker_thread_id,
-            after_message_id=old_baseline,
-            token="agent task wake: teammate message received",
-            timeout=240.0,
-        )
-        assert "agent task wake: teammate message received" in old_wake.text.lower(), (
-            live_tg_forum.failure_context()
-        )
-
-        _stop_bot(live_tg_forum.proc)
-        assert live_tg_forum.temp_root is not None
-        restart_cutoff = time.time()
-        _append_unread_inbox_message(
-            team_name=actual_team_name,
-            recipient=actual_worker_name,
-            content=f"{old_token}-AFTER-STOP",
-            summary="old after stop",
-            sender="external-live-test",
-            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(restart_cutoff - 5.0)),
-        )
-        live_tg_forum.proc, live_tg_forum.log_file = _start_bot(
-            live_tg_forum.vault_path,
-            live_tg_forum.temp_root,
-            state_db_path=live_tg_forum.state_db_path,
-        )
-        await asyncio.sleep(8.0)
-        recent_after_restart = await live_tg_forum.platform.get_recent_messages(
-            thread_id=worker_thread_id,
-            limit=20,
-        )
-        assert not any(
-            old_token in message.text and message.message_id > old_wake.message_id
-            for message in recent_after_restart
-        ), live_tg_forum.failure_context()
-
-        new_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=worker_thread_id)
-        _append_unread_inbox_message(
-            team_name=actual_team_name,
-            recipient=actual_worker_name,
-            content=new_token,
-            summary="post-restart wake",
-            sender="external-live-test",
-            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1.0)),
-        )
-        new_wake = await _wait_for_message_after_containing(
-            live_tg_forum,
-            thread_id=worker_thread_id,
-            after_message_id=new_baseline,
-            token="agent task wake: teammate message received",
-            timeout=240.0,
-        )
-        assert "agent task wake: teammate message received" in new_wake.text.lower(), (
             live_tg_forum.failure_context()
         )
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()

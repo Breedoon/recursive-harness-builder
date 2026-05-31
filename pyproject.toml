@@ -43,7 +43,6 @@ markers = [
     "telegram_special: live Telegram tests requiring special resources or setup (provider/model, cache, multi-bot, restart, schedule, provisioning, soak)",
     "telegram_parallel: live Telegram tests or orchestrators intended for isolated parallel execution",
     "telegram_soak: long-running Telegram soak scenarios (around one hour)",
-    "live: live tests that require external services or credentials",
     "real_get_client: opt out of the autouse get_client mock (for tests that test client lifecycle)",
     "serial: tests that must run in isolation (e.g. stops/restarts external services)",
 ]

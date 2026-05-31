@@ -117,78 +117,28 @@ def _transport_unavailable(tool_name: str) -> dict:
     )
 
 
-def _coerce_activity_timestamp(value: object) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        timestamp = float(value)
-        return timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed.timestamp()
-    return None
-
-
-def _member_activity_timestamp(member: dict[str, Any]) -> float | None:
-    for candidate in (
+def _member_activity_sort_key(member: dict[str, Any], agent_name: str) -> tuple[float, str]:
+    candidates = [
         member.get("last_active_at"),
         member.get("last_activity_at"),
         member.get("completed_at"),
         member.get("created_at"),
         member.get("updated_at"),
-        member.get("joinedAt"),
-        member.get("joined_at"),
-    ):
-        timestamp = _coerce_activity_timestamp(candidate)
-        if timestamp is not None:
-            return timestamp
-    return None
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, (int, float)):
+            return (-float(candidate), str(agent_name))
+        if isinstance(candidate, str) and candidate.strip():
+            try:
+                parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            return (-parsed.timestamp(), str(agent_name))
+    return (0.0, str(agent_name))
 
 
-def _member_activity_sort_key(member: dict[str, Any], agent_name: str) -> tuple[float, str]:
-    timestamp = _member_activity_timestamp(member)
-    if timestamp is None:
-        return (0.0, str(agent_name))
-    return (-timestamp, str(agent_name))
-
-
-def _coerce_limit_arg(value: object, *, default: int = 50, maximum: int = 200) -> int:
-    if value is None or value == "":
-        return default
-    if isinstance(value, bool):
-        raise ValueError("limit must be an integer")
-    try:
-        limit = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("limit must be an integer") from exc
-    if limit < 1:
-        raise ValueError("limit must be at least 1")
-    return min(limit, maximum)
-
-
-def _copy_text_value(target: dict[str, Any], source: dict[str, Any], key: str) -> None:
-    value = source.get(key)
-    if isinstance(value, str) and value.strip():
-        target[key] = value.strip()
-
-
-def _copy_numeric_value(target: dict[str, Any], source: dict[str, Any], key: str) -> None:
-    value = source.get(key)
-    if isinstance(value, bool):
-        return
-    if isinstance(value, (int, float)):
-        target[key] = value
-
-
-def _team_dir(config: OBSConfig, team_name: str) -> Path:
-    return config.team_storage_root / team_name
-
-
-def _load_team_projection_metadata(config: OBSConfig, team_name: str) -> dict[str, dict[str, Any]]:
-    config_path = _team_dir(config, team_name) / "config.json"
+def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
+    config_path = Path.home() / ".claude" / "teams" / team_name / "config.json"
     if not config_path.exists():
         return {}
     try:
@@ -210,17 +160,15 @@ def _load_team_projection_metadata(config: OBSConfig, team_name: str) -> dict[st
         if not isinstance(obs, dict):
             continue
         entry: dict[str, Any] = {"agent_name": agent_name}
-        for text_key in (
-            "display_name",
-            "parent_agent_name",
-            "parent_display_name",
-            "root_team_key",
-        ):
-            _copy_text_value(entry, obs, text_key)
-        for member_text_key in ("agentType", "agent_type", "model", "status"):
-            _copy_text_value(entry, member, member_text_key)
-        for obs_text_key in ("model", "status"):
-            _copy_text_value(entry, obs, obs_text_key)
+        display_name = obs.get("display_name")
+        if isinstance(display_name, str) and display_name.strip():
+            entry["display_name"] = display_name.strip()
+        parent_agent_name = obs.get("parent_agent_name")
+        if isinstance(parent_agent_name, str) and parent_agent_name.strip():
+            entry["parent_agent_name"] = parent_agent_name.strip()
+        parent_display_name = obs.get("parent_display_name")
+        if isinstance(parent_display_name, str) and parent_display_name.strip():
+            entry["parent_display_name"] = parent_display_name.strip()
         lineage = obs.get("lineage")
         if isinstance(lineage, list):
             normalized_lineage = [
@@ -231,25 +179,6 @@ def _load_team_projection_metadata(config: OBSConfig, team_name: str) -> dict[st
             if normalized_lineage:
                 entry["lineage"] = normalized_lineage
                 entry["lineage_length"] = len(normalized_lineage)
-        if isinstance(obs.get("lineage_length"), int):
-            entry["lineage_length"] = int(obs["lineage_length"])
-        for int_key in ("topic_chat_id", "topic_thread_id"):
-            value = obs.get(int_key)
-            if isinstance(value, int):
-                entry[int_key] = value
-        for activity_key in (
-            "last_active_at",
-            "last_activity_at",
-            "completed_at",
-            "created_at",
-            "updated_at",
-            "joinedAt",
-            "joined_at",
-        ):
-            _copy_numeric_value(entry, obs, activity_key)
-            _copy_numeric_value(entry, member, activity_key)
-            _copy_text_value(entry, obs, activity_key)
-            _copy_text_value(entry, member, activity_key)
         metadata[agent_name] = entry
     return metadata
 
@@ -267,17 +196,6 @@ def _coerce_bool_arg(value, *, name: str) -> bool:
 
 
 def _normalize_resume_arg(value: object) -> str | None:
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    if not normalized:
-        return None
-    if normalized.lower() in {"false", "none", "null", "nil", "0", "no"}:
-        return None
-    return normalized
-
-
-def _normalize_session_source_arg(value: object) -> str | None:
     if value is None:
         return None
     normalized = str(value).strip()
@@ -360,7 +278,6 @@ def create_obs_tools(
         ).strip() or None
         description = display_name  # Internal payload still uses "description" key
         resume = _normalize_resume_arg(args.get("resume"))
-        session_source = _normalize_session_source_arg(args.get("session_source"))
         run_in_background = args.get("run_in_background")
         team_name = str(args.get("team_name", "")).strip() or None
         agent_name = str(args.get("agent_name") or "").strip() or None
@@ -370,14 +287,6 @@ def create_obs_tools(
                 fork = _coerce_bool_arg(args.get("fork"), name="fork")
             except ValueError:
                 return _error_result(f"Cannot launch {tool_name}: fork must be true or false")
-        if session_source and not fork:
-            return _error_result(
-                f"Cannot launch {tool_name}: session_source is only supported with fork=true"
-            )
-        if session_source and resume:
-            return _error_result(
-                f"Cannot launch {tool_name}: resume and session_source are mutually exclusive"
-            )
         # Model selection — "inherit" or empty means use parent's model.
         model_raw = str(args.get("model", "")).strip()
         model: str | None = None
@@ -493,7 +402,6 @@ def create_obs_tools(
                 "prompt": prompt,
                 "description": description,
                 "resume": resume,
-                "session_source": session_source,
                 "run_in_background": True,
                 "timeout_ms": timeout_ms,
                 "max_turns": max_turns,
@@ -551,13 +459,6 @@ def create_obs_tools(
             "resume": {
                 "type": "string",
                 "description": "Optional agentId to resume an existing child task",
-            },
-            "session_source": {
-                "type": "string",
-                "description": (
-                    "Optional Claude session source to fork from when fork=true. "
-                    "Accepts a stored session ID or JSONL file path. Not supported with fork=false."
-                ),
             },
             "fork": {
                 "type": "boolean",
@@ -999,7 +900,7 @@ def create_obs_tools(
         def _is_deliverable(validation: dict[str, Any] | None) -> bool:
             return bool(validation and validation.get("deliverable"))
 
-        inbox_dir = _team_dir(config, team_name) / "inboxes"
+        inbox_dir = Path.home() / ".claude" / "teams" / team_name / "inboxes"
         resolved_recipient = recipient
         inbox_path = inbox_dir / f"{resolved_recipient}.json"
         validation = await _validate_recipient(resolved_recipient)
@@ -1122,7 +1023,6 @@ def create_obs_tools(
                     notifier_result = raw_notifier_result
             except Exception:
                 logger.warning("SendInboxMessage notifier failed", exc_info=True)
-                notifier_result = {"delivered": False, "reason": "recipient wake failed"}
         if notifier_result is not None and notifier_result.get("delivered") is False:
             await _rollback_written_message()
             reason = str(notifier_result.get("reason") or "recipient wake failed")
@@ -1145,7 +1045,10 @@ def create_obs_tools(
         # delete the reply_wake schedule.
         if sender and sender != resolved_recipient:
             sender_inbox_path = (
-                _team_dir(config, team_name)
+                Path.home()
+                / ".claude"
+                / "teams"
+                / team_name
                 / "inboxes"
                 / f"{sender}.json"
             )
@@ -1216,7 +1119,14 @@ def create_obs_tools(
         if limit <= 0:
             return _error_result("Cannot use ReadInbox: limit must be positive")
 
-        inbox_path = _team_dir(config, team_name) / "inboxes" / f"{agent}.json"
+        inbox_path = (
+            Path.home()
+            / ".claude"
+            / "teams"
+            / team_name
+            / "inboxes"
+            / f"{agent}.json"
+        )
         lock = _inbox_lock(inbox_path)
         async with lock:
             entries: list[dict] = []
@@ -1405,14 +1315,6 @@ def create_obs_tools(
                 "type": "string",
                 "description": "One of: parent, children, siblings, ancestors, descendants, family, tree",
             },
-            "team_name": {
-                "type": "string",
-                "description": "Optional team name to inspect; defaults to the current root team.",
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Maximum number of agents returned for list outputs. Defaults to 50, maximum 200.",
-            },
         },
     )
     async def search_team(args: dict) -> dict:
@@ -1421,10 +1323,6 @@ def create_obs_tools(
             mode = "family"
         if mode == "tree_children":
             mode = "children"
-        try:
-            limit = _coerce_limit_arg(args.get("limit"))
-        except ValueError as exc:
-            return _error_result(f"search_team: {exc}")
         if mode not in {"children", "siblings", "parent", "ancestors", "descendants", "family", "tree"}:
             return _error_result(
                 "search_team: 'mode' must be one of: parent, children, siblings, ancestors, descendants, family, tree, tree_children"
@@ -1437,14 +1335,18 @@ def create_obs_tools(
         if not bootstrap.lineage:
             return _error_result("Cannot use search_team: empty lineage")
 
-        team_name = str(args.get("team_name") or "").strip() or bootstrap.root_team_key
-        inboxes_dir = _team_dir(config, team_name) / "inboxes"
-        team_projection_metadata = _load_team_projection_metadata(config, team_name)
+        inboxes_dir = (
+            Path.home()
+            / ".claude"
+            / "teams"
+            / bootstrap.root_team_key
+            / "inboxes"
+        )
+        team_projection_metadata = _load_team_projection_metadata(bootstrap.root_team_key)
         result: dict[str, Any] = {
             "mode": mode,
-            "team_name": team_name,
+            "team_name": bootstrap.root_team_key,
             "current_agent": bootstrap.agent_name,
-            "limit": limit,
         }
         all_agents = []
         if inboxes_dir.is_dir():
@@ -1466,63 +1368,26 @@ def create_obs_tools(
                 ),
             )
 
-        def _limited(names: list[str]) -> list[str]:
-            return names[:limit]
-
-        async def _augment_runtime_status(details: dict[str, Any]) -> None:
-            provider = hook_state.team_status_provider if hook_state is not None else None
-            if provider is None:
-                return
-            try:
-                status_payload = await provider(
-                    {"team_name": team_name, "agent_name": details.get("agent_name")}
-                )
-            except Exception:
-                logger.warning("Failed resolving team runtime status", exc_info=True)
-                return
-            if not isinstance(status_payload, dict):
-                return
-            for key, value in status_payload.items():
-                if value is not None:
-                    details[key] = value
-
-        async def _member_details(agent_name: str, relation: str | None = None) -> dict[str, Any]:
-            details = dict(team_projection_metadata.get(agent_name) or {})
-            details["agent_name"] = agent_name
-            if relation is not None:
-                details["relation"] = relation
-            activity_timestamp = _member_activity_timestamp(details)
-            if activity_timestamp is not None:
-                details["last_activity_at"] = activity_timestamp
-            await _augment_runtime_status(details)
-            return details
-
-        async def _member_details_list(names: list[str], relation: str) -> list[dict[str, Any]]:
-            return [await _member_details(name, relation) for name in names]
-
         children = _sort_member_names([
             name for name in all_agents
             if name.startswith(f"{my_hash}-") and name != my_agent_name
         ])
         if mode in {"children", "family"}:
-            limited_children = _limited(children)
-            result["children"] = limited_children
-            result["children_members"] = await _member_details_list(limited_children, "child")
+            result["children"] = children
 
         parent: str | None = None
-        if len(my_lineage) > 1:
-            parent_name = bootstrap.parent_agent_name
-            if not parent_name:
-                parent_lineage = my_lineage[:-1]
-                parent_name = agent_name_for_lineage(
-                    parent_lineage,
-                    team_key=team_name,
-                )
-            if parent_name in all_agents:
-                parent = parent_name
         if mode in {"parent", "family"}:
+            if len(my_lineage) > 1:
+                parent_name = bootstrap.parent_agent_name
+                if not parent_name:
+                    parent_lineage = my_lineage[:-1]
+                    parent_name = agent_name_for_lineage(
+                        parent_lineage,
+                        team_key=bootstrap.root_team_key,
+                    )
+                if parent_name in all_agents:
+                    parent = parent_name
             result["parent"] = parent
-            result["parent_member"] = await _member_details(parent, "parent") if parent is not None else None
 
         siblings: list[str] = []
         if len(my_lineage) > 1:
@@ -1533,21 +1398,17 @@ def create_obs_tools(
                 if name.startswith(f"{parent_hash}-") and name != my_agent_name
             ])
         if mode in {"siblings", "family"}:
-            limited_siblings = _limited(siblings)
-            result["siblings"] = limited_siblings
-            result["siblings_members"] = await _member_details_list(limited_siblings, "sibling")
+            result["siblings"] = siblings
 
         if mode == "ancestors":
             ancestors = [
                 agent_name_for_lineage(
                     my_lineage[: idx + 1],
-                    team_key=team_name,
+                    team_key=bootstrap.root_team_key,
                 )
                 for idx in range(len(my_lineage) - 1)
             ]
-            limited_ancestors = _limited(ancestors)
-            result["ancestors"] = limited_ancestors
-            result["ancestors_members"] = await _member_details_list(limited_ancestors, "ancestor")
+            result["ancestors"] = ancestors
 
         if mode == "descendants":
             descendants: list[str] = []
@@ -1564,47 +1425,34 @@ def create_obs_tools(
                     continue
                 if normalized_lineage[: len(my_lineage)] == my_lineage:
                     descendants.append(agent_name)
-            limited_descendants = _limited(_sort_member_names(list(set(descendants))))
-            result["descendants"] = limited_descendants
-            result["descendants_members"] = await _member_details_list(limited_descendants, "descendant")
+            result["descendants"] = _sort_member_names(list(set(descendants)))
 
         if mode == "tree":
+            result["tree"] = all_agents
             child_set = set(children)
             sibling_set = set(siblings)
-            sort_key_by_name: dict[str, tuple[float, str]] = {}
-            for agent_name in all_agents:
-                sort_key_by_name[agent_name] = _member_activity_sort_key(
-                    team_projection_metadata.get(agent_name) or {},
-                    agent_name,
-                )
-            limited_tree_names = sorted(
-                all_agents,
-                key=lambda name: sort_key_by_name[name],
-            )[:limit]
             tree_members: list[dict[str, Any]] = []
-            for agent_name in limited_tree_names:
+            for agent_name in all_agents:
+                details = dict(team_projection_metadata.get(agent_name) or {})
+                details["agent_name"] = agent_name
                 if agent_name == my_agent_name:
-                    relation = "self"
+                    details["relation"] = "self"
                 elif parent is not None and agent_name == parent:
-                    relation = "parent"
+                    details["relation"] = "parent"
                 elif agent_name in child_set:
-                    relation = "child"
+                    details["relation"] = "child"
                 elif agent_name in sibling_set:
-                    relation = "sibling"
+                    details["relation"] = "sibling"
                 else:
-                    relation = "tree"
-                tree_members.append(await _member_details(agent_name, relation))
+                    details["relation"] = "tree"
+                tree_members.append(details)
             tree_members.sort(
                 key=lambda item: _member_activity_sort_key(
                     item,
                     str(item.get("agent_name") or ""),
                 )
             )
-            result["tree"] = [str(member["agent_name"]) for member in tree_members]
             result["tree_members"] = tree_members
-            omitted = max(0, len(all_agents) - len(tree_members))
-            if omitted:
-                result["omitted"] = omitted
 
         return {
             "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=True)}],
