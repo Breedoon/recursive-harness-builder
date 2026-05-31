@@ -93,15 +93,11 @@ def normalizer(tmp_path: Path) -> TelegramInboundNormalizer:
 
 
 class TestTelegramInboundNormalizer:
-    def test_initialize_purges_only_temp_root(self, tmp_path: Path) -> None:
+    def test_initialize_purges_temp_root(self, tmp_path: Path) -> None:
         temp_root = tmp_path / "obs-agent"
         stale = temp_root / "stale.txt"
-        team_storage = tmp_path / "obs-agent-teams" / "team-alpha" / "inboxes"
-        team_inbox = team_storage / "worker-a.json"
         stale.parent.mkdir(parents=True)
-        team_storage.mkdir(parents=True)
         stale.write_text("old")
-        team_inbox.write_text("[]")
 
         normalizer = TelegramInboundNormalizer(
             temp_root=temp_root,
@@ -110,7 +106,6 @@ class TestTelegramInboundNormalizer:
         normalizer.initialize()
 
         assert not stale.exists()
-        assert team_inbox.exists()
         assert normalizer.boot_root.exists()
 
     async def test_document_message_includes_caption_and_stored_path(

@@ -25,12 +25,6 @@ from obs_agent.daemon import create_app
 logger = logging.getLogger(__name__)
 
 
-def _skip_if_upstream_limit(text: str) -> None:
-    lowered = text.lower()
-    if "hit your limit" in lowered or "rate_limit" in lowered or "rate limit" in lowered:
-        pytest.skip("Upstream live model limit prevented integration response evidence")
-
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -162,7 +156,6 @@ async def collect_sse_response(
 
 
 @pytest.mark.integration
-@pytest.mark.real_get_client
 class TestLiveIntegration:
     """Live integration tests with real uvicorn + real Claude SDK.
 
@@ -266,7 +259,6 @@ class TestLiveIntegration:
         assert enqueue_data["queued"] is True, "Enqueue should report queued=True"
 
         assert len(stream_result) > 0, "Streaming response must be non-empty"
-        _skip_if_upstream_limit(stream_result)
 
         raw_text = "\n".join(raw_lines)
         has_queue_event = "queue_delivered" in raw_text

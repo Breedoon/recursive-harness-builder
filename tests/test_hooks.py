@@ -1084,9 +1084,6 @@ class TestMakeUserHookCheck:
         assert obs["launch_agent"] is launcher
         assert obs["agent_output"] is outputter
         assert obs["agent_stop"] is stopper
-        assert obs["send_user_message"] is None
-        assert obs["prompt_user"] is None
-        assert obs["read_user_commands"] is None
         assert obs["session_id"] == "sess-123"
         assert obs["runtime"] == {
             "schedule_run_active": True,
@@ -1212,9 +1209,6 @@ class TestMakeUserHookCheck:
         assert obs["launch_agent"] is None
         assert obs["agent_output"] is None
         assert obs["agent_stop"] is None
-        assert obs["send_user_message"] is None
-        assert obs["prompt_user"] is None
-        assert obs["read_user_commands"] is None
         assert obs["session_id"] is None
         assert obs["runtime"] == {
             "schedule_run_active": False,

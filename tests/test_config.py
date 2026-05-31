@@ -309,20 +309,6 @@ class TestVaultValidation:
         with pytest.raises(ValueError, match="outside OBS_TELEGRAM_TEMP_ROOT"):
             cfg.validate()
 
-    def test_validate_fails_when_team_storage_inside_temp_root(self, tmp_path):
-        vault = tmp_path / "vault"
-        (vault / ".claude").mkdir(parents=True)
-        (vault / "CLAUDE.md").write_text("# context")
-        temp_root = tmp_path / "tg-temp"
-        cfg = OBSConfig(
-            vault_path=vault,
-            telegram_temp_root=temp_root,
-            telegram_state_db_path=tmp_path / "telegram-state.sqlite3",
-            team_storage_root=temp_root / "teams",
-        )
-        with pytest.raises(ValueError, match="OBS_TEAM_STORAGE_ROOT must be outside"):
-            cfg.validate()
-
 
 # --- Telegram Settings ---
 
@@ -377,17 +363,6 @@ class TestTelegramSettings:
     def test_temp_root_default(self):
         cfg = OBSConfig()
         assert cfg.telegram_temp_root == Path("/tmp/obs-agent")
-
-    def test_team_storage_root_default_is_temp_sibling(self):
-        cfg = OBSConfig()
-        assert cfg.team_storage_root == Path("/tmp/obs-agent-teams")
-        assert cfg.telegram_temp_root not in cfg.team_storage_root.parents
-
-    def test_team_storage_root_from_env(self, monkeypatch, tmp_path):
-        team_root = tmp_path / "teams"
-        monkeypatch.setenv("OBS_TEAM_STORAGE_ROOT", str(team_root))
-        cfg = OBSConfig.from_env()
-        assert cfg.team_storage_root == team_root
 
     def test_temp_root_from_env(self, monkeypatch, tmp_path):
         monkeypatch.setenv("OBS_TELEGRAM_TEMP_ROOT", str(tmp_path / "tg-temp"))

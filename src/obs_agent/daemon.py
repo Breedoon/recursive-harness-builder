@@ -23,7 +23,6 @@ from obs_agent.hooks import HookState
 from obs_agent.runtime_env import bootstrap_runtime_env
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent
 from obs_agent.session import SessionManager
-from obs_agent.startup_logging import StartupProfiler
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -47,35 +46,22 @@ def create_default_app() -> FastAPI:
 
     Usage: uvicorn obs_agent.daemon:create_default_app --factory
     """
-    startup = StartupProfiler(logger, "http-daemon")
+    from obs_agent.config import OBSConfig
 
-    with startup.phase("import_config"):
-        from obs_agent.config import OBSConfig
+    bootstrap_runtime_env(mutate_argv=False)
+    config = OBSConfig.from_env()
+    config.validate()
 
-    with startup.phase("bootstrap_runtime_env"):
-        bootstrap_runtime_env(mutate_argv=False)
-    with startup.phase("load_config"):
-        config = OBSConfig.from_env()
-    with startup.phase("validate_config"):
-        config.validate()
-
+    # Start cache-normalizing proxy before any CC sessions
     from obs_agent.cache_proxy_lifecycle import should_attempt_proxy_start, start_cache_proxy
-    with startup.phase(
-        "cache_proxy",
-        enabled=config.cache_proxy_enabled,
-        port=config.cache_proxy_port,
-    ):
-        if should_attempt_proxy_start(cache_proxy_enabled=config.cache_proxy_enabled):
-            proxy_proc = start_cache_proxy(config.cache_proxy_port)
-            if proxy_proc is None:
-                logger.warning(
-                    "Cache proxy failed to start — sessions will use direct Anthropic API"
-                )
+    if should_attempt_proxy_start(cache_proxy_enabled=config.cache_proxy_enabled):
+        proxy_proc = start_cache_proxy(config.cache_proxy_port)
+        if proxy_proc is None:
+            logger.warning(
+                "Cache proxy failed to start — sessions will use direct Anthropic API"
+            )
 
-    with startup.phase("create_app"):
-        app = create_app(config)
-    startup.complete(port=config.daemon_port)
-    return app
+    return create_app(config)
 
 
 def create_app(config: OBSConfig) -> FastAPI:

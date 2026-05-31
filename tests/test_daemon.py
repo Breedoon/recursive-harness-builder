@@ -91,7 +91,6 @@ class TestAppFactory:
     @patch("obs_agent.config.OBSConfig.from_env")
     def test_create_default_app_uses_from_env(self, mock_from_env, config):
         """create_default_app() calls OBSConfig.from_env() and returns a configured app."""
-        config.cache_proxy_enabled = False
         mock_from_env.return_value = config
         application = create_default_app()
         mock_from_env.assert_called_once()
@@ -104,24 +103,10 @@ class TestAppFactory:
     @patch("obs_agent.config.OBSConfig.from_env")
     def test_create_default_app_validates_config(self, mock_from_env, config):
         """create_default_app() calls config.validate() to fail fast on bad vault."""
-        config.cache_proxy_enabled = False
         mock_from_env.return_value = config
         with patch.object(config, "validate") as mock_validate:
             create_default_app()
             mock_validate.assert_called_once()
-
-    @patch("obs_agent.config.OBSConfig.from_env")
-    def test_create_default_app_logs_startup_phases(self, mock_from_env, config, caplog):
-        """create_default_app() emits bounded startup phase progress logs."""
-        config.cache_proxy_enabled = False
-        mock_from_env.return_value = config
-        with caplog.at_level("INFO", logger="obs_agent.daemon"):
-            create_default_app()
-
-        messages = [record.getMessage() for record in caplog.records]
-        assert any("startup phase_start component=http-daemon phase=bootstrap_runtime_env" in msg for msg in messages)
-        assert any("startup phase_complete component=http-daemon phase=validate_config" in msg for msg in messages)
-        assert any("startup complete component=http-daemon phase=startup" in msg for msg in messages)
 
 
 # --- Health Endpoint ---

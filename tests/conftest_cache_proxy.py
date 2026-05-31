@@ -52,16 +52,12 @@ except ImportError:
 # Follows the same manual parsing pattern as tests/conftest.py (no python-dotenv dep).
 # ---------------------------------------------------------------------------
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
-_ENV_PROFILE = "prod" if "--prod" in sys.argv[1:] else "test"
-_ENV_ALLOWED_PROFILE_PREFIX = f"OBS_{_ENV_PROFILE.upper()}_"
 if _ENV_FILE.exists():
     for _line in _ENV_FILE.read_text().splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _key, _, _val = _line.partition("=")
             _key, _val = _key.strip(), _val.strip()
-            if _key.startswith("OBS_PROD_") and not _key.startswith(_ENV_ALLOWED_PROFILE_PREFIX):
-                continue
             if _key and _val and _key not in os.environ:
                 os.environ[_key] = _val
 
@@ -96,7 +92,6 @@ _PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 # Log directory: matches the production default in src/cache_proxy.py
 TEST_LOG_DIR = str(_PROJECT_ROOT / ".obs-agent" / "cache-proxy-log")
-_ACTIVE_USAGE_LOG_BY_PORT: dict[int, Path] = {}
 
 # Proxy port range: pick something unlikely to collide
 _PROXY_PORT_MIN = 18200
@@ -345,36 +340,25 @@ async def run_turn(client: ClaudeSDKClient, prompt: str) -> tuple[str | None, di
         t = getattr(msg, "subtype", None)
         if t in ("success", "error_max_turns"):
             break
-    if session_id and not last_usage:
-        pytest.skip("Upstream live model request returned no usage, likely due rate limiting")
     return session_id, last_usage
 
 
 def get_proxy_usage_for_turns(
     start_offset: int = 0,
-    log_path: str | Path | None = None,
-    *,
-    proxy_port: int | None = None,
-    min_rows: int = 0,
-    timeout: float = 5.0,
+    log_path: str | Path = os.path.join(TEST_LOG_DIR, "usage.jsonl"),
 ) -> list[dict]:
-    """Read proxy usage log entries starting from offset."""
-    if log_path is None:
-        if proxy_port is None and len(_ACTIVE_USAGE_LOG_BY_PORT) == 1:
-            log_path = next(iter(_ACTIVE_USAGE_LOG_BY_PORT.values()))
-        else:
-            log_path = _ACTIVE_USAGE_LOG_BY_PORT.get(proxy_port) or Path(TEST_LOG_DIR) / "usage.jsonl"
-    log_path = Path(log_path)
-    deadline = time.monotonic() + timeout
-    raw: list[dict] = []
-    while True:
-        raw = read_proxy_usage_log(log_path)
-        if len(raw) - start_offset >= min_rows or time.monotonic() >= deadline:
-            break
-        time.sleep(0.05)
-    if min_rows and len(raw) - start_offset < min_rows:
-        _skip_if_proxy_saw_rate_limit(log_path.parent)
+    """Read proxy usage log entries starting from offset.
 
+    Returns list of dicts with keys matching extract_usage() format:
+    cr, cc, ip, tot.
+
+    The proxy log records one entry per API request, in chronological order.
+    Use start_offset to skip entries from previous turns/tests.
+
+    This is the reliable way to get per-turn usage — the SDK only returns real
+    usage on the first turn within a client connection (turns 2+ return zeros).
+    """
+    raw = read_proxy_usage_log(log_path)
     rows = []
     for entry in raw[start_offset:]:
         rows.append({
@@ -389,27 +373,10 @@ def get_proxy_usage_for_turns(
     return rows
 
 
-def _skip_if_proxy_saw_rate_limit(log_dir: Path) -> None:
-    for path in log_dir.glob("**/*.json"):
-        try:
-            text = path.read_text(errors="replace")
-        except OSError:
-            continue
-        if "rate_limit_error" in text:
-            pytest.skip("Anthropic upstream rate limit prevented live cache-proxy usage evidence")
-
-
 def proxy_log_length(
-    log_path: str | Path | None = None,
-    *,
-    proxy_port: int | None = None,
+    log_path: str | Path = os.path.join(TEST_LOG_DIR, "usage.jsonl"),
 ) -> int:
     """Return current number of entries in the proxy usage log."""
-    if log_path is None:
-        if proxy_port is None and len(_ACTIVE_USAGE_LOG_BY_PORT) == 1:
-            log_path = next(iter(_ACTIVE_USAGE_LOG_BY_PORT.values()))
-        else:
-            log_path = _ACTIVE_USAGE_LOG_BY_PORT.get(proxy_port) or Path(TEST_LOG_DIR) / "usage.jsonl"
     return len(read_proxy_usage_log(log_path))
 
 
@@ -478,16 +445,8 @@ def read_proxy_usage_log(log_path: str | Path = os.path.join(TEST_LOG_DIR, "usag
     return entries
 
 
-def proxy_body_dir(proxy_port: int | None = None) -> Path:
-    if proxy_port is None and len(_ACTIVE_USAGE_LOG_BY_PORT) == 1:
-        usage_log = next(iter(_ACTIVE_USAGE_LOG_BY_PORT.values()))
-    else:
-        usage_log = _ACTIVE_USAGE_LOG_BY_PORT.get(proxy_port) or Path(TEST_LOG_DIR) / "usage.jsonl"
-    return usage_log.parent / "bodies"
-
-
 def read_proxy_bodies(
-    body_dir: str | Path | None = None,
+    body_dir: str | Path = os.path.join(TEST_LOG_DIR, "bodies"),
     req_num: int | None = None,
 ) -> tuple[dict | None, dict | None]:
     """Read pre/post normalization request bodies for a specific request.
@@ -495,7 +454,7 @@ def read_proxy_bodies(
     If req_num is None, returns the latest pair.
     Returns (pre_body, post_body) or (None, None) if not found.
     """
-    bd = Path(body_dir) if body_dir is not None else proxy_body_dir()
+    bd = Path(body_dir)
     if not bd.exists():
         return None, None
 
@@ -542,30 +501,27 @@ def proxy(proxy_port: int, proxy_script: Path) -> Generator[int, None, None]:
 
     Usage log is cleared at start to avoid cross-test contamination.
     """
-    log_dir = Path(TEST_LOG_DIR) / f"port-{proxy_port}"
+    # Clear previous proxy logs
+    log_dir = Path(TEST_LOG_DIR)
     usage_log = log_dir / "usage.jsonl"
     body_dir = log_dir / "bodies"
-    log_dir.mkdir(parents=True, exist_ok=True)
     for f in [usage_log]:
         try:
             f.unlink()
         except FileNotFoundError:
             pass
+    # Clear body dir
     if body_dir.exists():
         for f in body_dir.iterdir():
             try:
                 f.unlink()
             except Exception:
                 pass
-    _ACTIVE_USAGE_LOG_BY_PORT[proxy_port] = usage_log
 
-    env = os.environ.copy()
-    env["CACHE_PROXY_LOG_DIR"] = str(log_dir)
     proc = subprocess.Popen(
         [sys.executable, str(proxy_script), str(proxy_port)],
         stderr=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        env=env,
     )
 
     # Health check: wait for TCP port to accept connections
@@ -574,16 +530,12 @@ def proxy(proxy_port: int, proxy_script: Path) -> Generator[int, None, None]:
         if proc.poll() is not None and proc.stderr:
             stderr_out = proc.stderr.read().decode(errors="replace")
         proc.kill()
-        _ACTIVE_USAGE_LOG_BY_PORT.pop(proxy_port, None)
         pytest.fail(
             f"Cache proxy failed to start on port {proxy_port} within 10s. "
             f"Script: {proxy_script}, stderr: {stderr_out}"
         )
 
-    try:
-        yield proxy_port
-    finally:
-        _ACTIVE_USAGE_LOG_BY_PORT.pop(proxy_port, None)
+    yield proxy_port
 
     # Teardown: capture proxy logs before stopping
     proc.terminate()
@@ -608,10 +560,9 @@ def proxy_with_bodies(proxy_port: int, proxy_script: Path) -> Generator[int, Non
     Sets CACHE_PROXY_SAVE_BODIES=1 env var. The production proxy should check this;
     the spike proxy has SAVE_BODIES=True hardcoded so bodies are always saved there.
     """
-    log_dir = Path(TEST_LOG_DIR) / f"port-{proxy_port}"
+    log_dir = Path(TEST_LOG_DIR)
     usage_log = log_dir / "usage.jsonl"
     body_dir = log_dir / "bodies"
-    log_dir.mkdir(parents=True, exist_ok=True)
     for f in [usage_log]:
         try:
             f.unlink()
@@ -623,11 +574,9 @@ def proxy_with_bodies(proxy_port: int, proxy_script: Path) -> Generator[int, Non
                 f.unlink()
             except Exception:
                 pass
-    _ACTIVE_USAGE_LOG_BY_PORT[proxy_port] = usage_log
 
     env = os.environ.copy()
     env["CACHE_PROXY_SAVE_BODIES"] = "1"
-    env["CACHE_PROXY_LOG_DIR"] = str(log_dir)
 
     proc = subprocess.Popen(
         [sys.executable, str(proxy_script), str(proxy_port)],
@@ -638,13 +587,9 @@ def proxy_with_bodies(proxy_port: int, proxy_script: Path) -> Generator[int, Non
 
     if not _wait_for_port("127.0.0.1", proxy_port, timeout=10.0):
         proc.kill()
-        _ACTIVE_USAGE_LOG_BY_PORT.pop(proxy_port, None)
         pytest.fail(f"Cache proxy (with bodies) failed to start on port {proxy_port}")
 
-    try:
-        yield proxy_port
-    finally:
-        _ACTIVE_USAGE_LOG_BY_PORT.pop(proxy_port, None)
+    yield proxy_port
 
     # Teardown: capture proxy logs before stopping
     proc.terminate()
