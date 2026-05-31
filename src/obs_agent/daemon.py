@@ -23,6 +23,7 @@ from obs_agent.hooks import HookState
 from obs_agent.runtime_env import bootstrap_runtime_env
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent
 from obs_agent.session import SessionManager
+from obs_agent import tracing
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -70,6 +71,8 @@ def create_app(config: OBSConfig) -> FastAPI:
     Wires up session manager and all hooks.
     Uses ConversationRunner for the core conversation loop.
     """
+    tracing.init_weave()
+
     application = FastAPI(title="OBS Agent", version="0.1.0")
 
     # Shared hook state for message queuing and interrupt
@@ -81,6 +84,37 @@ def create_app(config: OBSConfig) -> FastAPI:
     application.state.session_manager = SessionManager(config=config, hook_state=hook_state)
     application.state.commands = CommandRegistry(hook_state)
     application.state.pending_messages: list[str] = []
+
+    # Traced turn driver: captures turn inputs/outputs as a Weave span.
+    # ForkRunner calls during the turn nest automatically via asyncio contextvars.
+    # When tracing is disabled, traced_op returns the function unchanged.
+    async def _drive_turn(message: str, session_id: str | None, model: str) -> dict:
+        session_mgr: SessionManager = application.state.session_manager
+        pending = list(getattr(application.state, "pending_messages", []))
+        runner = ConversationRunner(session_mgr, hook_state, config, pending_messages=pending)
+        text_parts: list[str] = []
+        tool_uses: list[str] = []
+        async for event in runner.run(message):
+            if isinstance(event, TextEvent):
+                text_parts.append(event.text)
+            elif isinstance(event, StatusEvent) and event.type == "tool_use":
+                tool_uses.append(event.summary)
+        application.state.pending_messages = runner.remaining_pending
+        last = hook_state.last_result_data or {}
+        usage = last.get("usage") or {}
+        return {
+            "response": "".join(text_parts),
+            "tool_uses": tool_uses,
+            "cost_usd": last.get("total_cost_usd"),
+            "duration_ms": last.get("duration_ms"),
+            "num_turns": last.get("num_turns"),
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_creation_tokens": usage.get("cache_creation_input_tokens"),
+            "cache_read_tokens": usage.get("cache_read_input_tokens"),
+        }
+
+    _drive_turn_traced = tracing.traced_op(_drive_turn)
 
     @application.get("/health")
     async def health():
@@ -127,19 +161,14 @@ def create_app(config: OBSConfig) -> FastAPI:
         Collects all text events into a single response string.
         """
         session_mgr: SessionManager = application.state.session_manager
-        cfg: OBSConfig = application.state.config
-        pending = getattr(application.state, "pending_messages", [])
-
-        runner = ConversationRunner(
-            session_mgr, hook_state, cfg,
-            pending_messages=pending,
-        )
-
-        result_parts: list[str] = []
+        identity = tracing.resolve_identity(session_mgr.session_id, hook_state, config)
         try:
-            async for event in runner.run(request.message):
-                if isinstance(event, TextEvent):
-                    result_parts.append(event.text)
+            async with tracing.weave_attributes(identity):
+                result = await _drive_turn_traced(
+                    request.message,
+                    session_mgr.session_id,
+                    config.model,
+                )
         except Exception as exc:
             logger.exception("Error in /chat")
             return JSONResponse(
@@ -147,10 +176,8 @@ def create_app(config: OBSConfig) -> FastAPI:
                 content={"error": f"{type(exc).__name__}: {str(exc)[:200]}"},
             )
 
-        application.state.pending_messages = runner.remaining_pending
-
         return ChatResponse(
-            response="\n".join(result_parts),
+            response=result["response"],
             session_id=session_mgr.session_id,
         )
 
@@ -170,22 +197,24 @@ def create_app(config: OBSConfig) -> FastAPI:
         )
 
         async def event_generator():
-            try:
-                async for event in runner.run(request.message):
-                    if isinstance(event, TextEvent):
-                        for text_line in event.text.split("\n"):
-                            yield f"data: {text_line}\n"
-                        yield "\n"
-                    elif isinstance(event, StatusEvent):
-                        yield event.to_sse()
-                    elif isinstance(event, DoneEvent):
-                        application.state.pending_messages = runner.remaining_pending
-                        yield "data: [DONE]\n\n"
-            except Exception as exc:
-                logger.exception("Error in SSE stream")
-                error_msg = f"{type(exc).__name__}: {str(exc)[:200]}"
-                yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
-                yield "data: [DONE]\n\n"
+            async with tracing.TurnTracer(request.message, session_mgr, hook_state, config) as tracer:
+                try:
+                    async for event in runner.run(request.message):
+                        tracer.record_event(event)
+                        if isinstance(event, TextEvent):
+                            for text_line in event.text.split("\n"):
+                                yield f"data: {text_line}\n"
+                            yield "\n"
+                        elif isinstance(event, StatusEvent):
+                            yield event.to_sse()
+                        elif isinstance(event, DoneEvent):
+                            application.state.pending_messages = runner.remaining_pending
+                            yield "data: [DONE]\n\n"
+                except Exception as exc:
+                    logger.exception("Error in SSE stream")
+                    error_msg = f"{type(exc).__name__}: {str(exc)[:200]}"
+                    yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
+                    yield "data: [DONE]\n\n"
 
         return StreamingResponse(
             event_generator(),
