@@ -1097,6 +1097,58 @@ class TestParseSSEUsage:
         assert usage == {}
 
 
+class TestEstimateInputTokens:
+    def test_uses_conservative_character_count_not_json_divided_by_four(self):
+        body = {"messages": [{"role": "user", "content": "x" * 80}]}
+        compact_json = json.dumps(body, separators=(",", ":"))
+        assert cache_proxy._estimate_input_tokens(body) == len(compact_json)
+        assert cache_proxy._estimate_input_tokens(body) > int(len(compact_json) / 4)
+
+
+class TestInjectUsageIfMissing:
+    def test_injects_estimated_usage_into_zero_usage_message_start(self):
+        event = {
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                }
+            },
+        }
+        chunk = f"event: message_start\ndata: {json.dumps(event)}\n\n".encode()
+
+        outgoing, injected = cache_proxy._inject_usage_if_missing(chunk, 123456)
+
+        assert injected is True
+        usage = cache_proxy.parse_sse_usage([outgoing])
+        assert usage["input_tokens"] == 123456
+        assert usage["cache_creation_input_tokens"] == 0
+        assert usage["cache_read_input_tokens"] == 0
+
+    def test_preserves_real_usage(self):
+        event = {
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": 5}},
+        }
+        chunk = f"event: message_start\ndata: {json.dumps(event)}\n\n".encode()
+
+        outgoing, injected = cache_proxy._inject_usage_if_missing(chunk, 123456)
+
+        assert injected is False
+        assert outgoing == chunk
+        usage = cache_proxy.parse_sse_usage([outgoing])
+        assert usage["input_tokens"] == 10
+        assert usage["cache_read_input_tokens"] == 5
+
+    def test_ignores_non_message_start(self):
+        chunk = b"event: content_block_start\ndata: {\"type\":\"content_block_start\"}\n\n"
+        outgoing, injected = cache_proxy._inject_usage_if_missing(chunk, 123456)
+        assert injected is False
+        assert outgoing == chunk
+
+
 # ── Model Routing ────────────────────────────────────────────────────────
 
 

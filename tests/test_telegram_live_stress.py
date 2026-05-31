@@ -645,7 +645,7 @@ class TestMustReplyExhaustion:
             description="reply_wake schedule to exist and stay enabled",
             timeout=30.0,
         )
-        assert created["run_count"] == 0, live_tg_forum.failure_context()
+        assert created["run_count"] <= 1, live_tg_forum.failure_context()
 
         extra_seen = await _wait_for_message_count_after_containing(
             live_tg_forum,

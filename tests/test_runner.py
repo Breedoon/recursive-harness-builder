@@ -128,6 +128,31 @@ class TestRunnerBasicResponse:
 
         assert session_mgr.session_id == "sess-42"
 
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_accepts_coroutine_returning_response_stream(self, mock_get_client, config):
+        mock_msg = MagicMock()
+        mock_msg.content = [TextBlock(text="Hello!")]
+        mock_msg.session_id = None
+
+        async def response_stream():
+            yield mock_msg
+
+        client = AsyncMock()
+        client.receive_response = AsyncMock(return_value=response_stream())
+        client.query = AsyncMock()
+        client.interrupt = AsyncMock()
+        mock_get_client.return_value = client
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        events = await _collect_events(runner, "hi")
+
+        text_events = [e for e in events if isinstance(e, TextEvent)]
+        assert [event.text for event in text_events] == ["Hello!"]
+
 
 # --- Status events ---
 
@@ -299,6 +324,46 @@ class TestRunnerUsageSnapshot:
         # Usage should come from the latest assistant step, not aggregated ResultMessage usage.
         assert data["usage"]["cache_read_input_tokens"] == 2000
         assert data["usage"]["cache_creation_input_tokens"] == 100
+
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_last_result_data_includes_sdk_context_usage(self, mock_get_client, config):
+        assistant_msg = MagicMock()
+        assistant_msg.content = [TextBlock(text="ok")]
+        assistant_msg.session_id = "sess-ctx"
+        assistant_msg.usage = {"input_tokens": 4, "output_tokens": 20}
+
+        result_msg = MagicMock()
+        result_msg.content = []
+        result_msg.session_id = "sess-ctx"
+        result_msg.num_turns = 2
+        result_msg.total_cost_usd = 0.12
+        result_msg.duration_ms = 1234
+
+        client = _make_mock_client([assistant_msg, result_msg])
+        client.get_context_usage = AsyncMock(
+            return_value={
+                "totalTokens": 180_000,
+                "maxTokens": 190_000,
+                "rawMaxTokens": 200_000,
+                "percentage": 90.0,
+                "model": "gpt-5.5[200k]",
+                "isAutoCompactEnabled": True,
+                "autoCompactThreshold": 167_000,
+            }
+        )
+        mock_get_client.return_value = client
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        await _collect_events(runner, "hello")
+
+        data = hook_state.last_result_data
+        assert data is not None
+        assert data["context_usage"]["totalTokens"] == 180_000
+        assert data["context_usage"]["rawMaxTokens"] == 200_000
+        assert data["context_usage"]["autoCompactThreshold"] == 167_000
 
 
 # --- Pending messages ---
@@ -654,7 +719,33 @@ class TestRunnerReconnectOnStreamError:
 class TestRunnerGetClientRecovery:
     @patch("obs_agent.session.SessionManager.async_reset")
     @patch("obs_agent.session.SessionManager.get_client")
-    async def test_second_recoverable_get_client_failure_drops_session_and_starts_fresh(
+    async def test_second_recoverable_get_client_failure_preserves_existing_session(
+        self, mock_get_client, mock_async_reset, config
+    ):
+        failing = CLIJSONDecodeError("big json", ValueError("too big"))
+        mock_get_client.side_effect = [failing, failing]
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr.set_session_id("sess-existing")
+        with (
+            patch.object(session_mgr, "disconnect", new_callable=AsyncMock) as mock_disconnect,
+            patch.object(session_mgr, "soft_reset", new_callable=AsyncMock) as mock_soft_reset,
+        ):
+            runner = ConversationRunner(session_mgr, hook_state, config)
+            with pytest.raises(CLIJSONDecodeError, match="big json"):
+                await _collect_events(runner, "hello")
+
+        assert session_mgr.session_id == "sess-existing"
+        mock_disconnect.assert_awaited_once()
+        mock_soft_reset.assert_awaited_once()
+        mock_async_reset.assert_not_awaited()
+
+    @patch("obs_agent.session.SessionManager.async_reset")
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_second_recoverable_get_client_failure_before_session_starts_fresh(
         self, mock_get_client, mock_async_reset, config
     ):
         failing = CLIJSONDecodeError("big json", ValueError("too big"))

@@ -141,7 +141,7 @@ class TestCreateOptions:
         assert mgr.effective_model == config.model
         mgr.model_override = "gpt-5.5"
         assert mgr.effective_model == "gpt-5.5"
-        assert mgr.create_options().model == "gpt-5.5[400k]"
+        assert mgr.create_options().model == "gpt-5.5[256k]"
 
     def test_passes_hook_state_to_obs_tools(self, config):
         state = HookState()

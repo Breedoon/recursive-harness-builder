@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -39,12 +40,16 @@ def _mock_session_get_client(request):
 # Only sets variables not already in the environment.
 # ---------------------------------------------------------------------------
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+_ENV_PROFILE = "prod" if "--prod" in sys.argv[1:] else "test"
+_ENV_ALLOWED_PROFILE_PREFIX = f"OBS_{_ENV_PROFILE.upper()}_"
 if _ENV_FILE.exists():
     for _line in _ENV_FILE.read_text().splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _key, _, _val = _line.partition("=")
             _key, _val = _key.strip(), _val.strip()
+            if _key.startswith("OBS_PROD_") and not _key.startswith(_ENV_ALLOWED_PROFILE_PREFIX):
+                continue
             if _key and _val and _key not in os.environ:
                 os.environ[_key] = _val
 
@@ -105,6 +110,7 @@ def config(fixture_vault: Path) -> OBSConfig:
         vault_path=fixture_vault,
         telegram_allowed_user_ids=[12345],
         telegram_state_db_path=fixture_vault / ".claude" / "telegram-state.sqlite3",
+        team_storage_root=fixture_vault / ".claude" / "teams",
     )
 
 
@@ -222,6 +228,7 @@ def e2e_config(e2e_vault: Path) -> OBSConfig:
     return OBSConfig(
         vault_path=e2e_vault,
         telegram_state_db_path=e2e_vault / ".claude" / "telegram-state.sqlite3",
+        team_storage_root=e2e_vault / ".claude" / "teams",
     )
 
 
@@ -230,7 +237,7 @@ def _ensure_fixture_vault() -> Path:
     if _FIXTURE_VAULT.is_dir():
         return _FIXTURE_VAULT
     if not _CLONE_SCRIPT.exists():
-        raise FileNotFoundError(f"Clone script not found: {_CLONE_SCRIPT}")
+        pytest.skip(f"Eval fixture vault bootstrap unavailable: {_CLONE_SCRIPT}")
     result = subprocess.run(
         [str(_CLONE_SCRIPT)],
         capture_output=True,

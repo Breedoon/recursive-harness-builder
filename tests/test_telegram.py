@@ -9,6 +9,7 @@ Covers the simplified Telegram runtime:
 """
 
 import asyncio
+import logging
 import json
 import uuid
 from contextlib import suppress
@@ -28,12 +29,14 @@ from obs_agent.lineage import (
 )
 from obs_agent.queueing import QueuedMessage
 from obs_agent.runner import DoneEvent, TextEvent, TurnEndEvent
+from obs_agent.startup_logging import StartupProfiler
 from obs_agent.telegram import (
     FragmentBuffer,
     TelegramRoute,
     TelegramBot,
     _ForkTaskRecord,
     _TELEGRAM_HELP_TEXT,
+    _TELEGRAM_DM_GUIDE_TEXT,
     _PRIORITY_ASSISTANT,
     _TopicScheduleRecord,
     _RunOutcome,
@@ -56,6 +59,7 @@ def _make_update(
     chat_id: int = 67890,
     message_id: int = 1,
     thread_id: int | None = None,
+    chat_type: str | None = None,
 ) -> MagicMock:
     """Create a mock Telegram Update object."""
     update = MagicMock()
@@ -76,6 +80,7 @@ def _make_update(
     update.effective_message.photo = []
     update.effective_message.effective_attachment = None
     update.effective_message.reply_text = AsyncMock()
+    update.effective_message.chat = SimpleNamespace(type=chat_type or ("private" if chat_id > 0 else "supergroup"))
     update.effective_user.id = user_id
     return update
 
@@ -117,6 +122,13 @@ class TestTelegramBotAuth:
         with pytest.raises(ValueError, match="outside OBS_TELEGRAM_TEMP_ROOT"):
             TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
 
+    def test_team_storage_inside_temp_root_is_rejected(self, config, tmp_path):
+        config.telegram_temp_root = tmp_path / "tg-temp"
+        config.telegram_state_db_path = tmp_path / "telegram-state.sqlite3"
+        config.team_storage_root = config.telegram_temp_root / "teams"
+        with pytest.raises(ValueError, match="OBS_TEAM_STORAGE_ROOT must be outside"):
+            TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
     async def test_allowed_user_passes(self, config):
         config.telegram_allowed_user_ids = [12345]
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -149,6 +161,22 @@ class TestTelegramBotAuth:
         await bot.handle_message(update, ctx)
 
         ctx.bot.send_message.assert_not_called()
+
+
+class TestTelegramRuntimeStartup:
+    async def test_initialize_runtime_logs_startup_phases(self, config, caplog):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        profiler = StartupProfiler(logging.getLogger("tests.telegram.startup"), "telegram-runtime")
+
+        with caplog.at_level(logging.INFO, logger="tests.telegram.startup"):
+            await bot.initialize_runtime(profiler)
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("startup phase_complete component=telegram-runtime phase=telegram_normalizer" in msg for msg in messages)
+        assert any("startup phase_complete component=telegram-runtime phase=telegram_state_restore" in msg for msg in messages)
+        assert any("startup phase_complete component=telegram-runtime phase=telegram_background_poller" in msg for msg in messages)
+
+        await bot.shutdown()
 
 
 class TestTelegramMessageFlow:
@@ -431,7 +459,7 @@ class TestTelegramMessageFlow:
         assert calls[2]["disable_notification"] is True
         assert "<i>Read: CLAUDE.md</i>" in calls[2]["text"]
         assert "Hello from tool run" in calls[2]["text"]
-        assert calls[3]["text"] == "<u><i>context: 0 / 1m</i></u>"
+        assert calls[3]["text"] == "<u><i>context: context unavailable</i></u>"
         assert calls[3]["disable_notification"] is False
 
     async def test_thinking_content_is_rendered_verbatim(self, config):
@@ -552,7 +580,7 @@ class TestTelegramMessageFlow:
         assert calls[1] == "<u><i>working</i></u>"
         assert "turn one" in calls[2]
         assert "turn two" in calls[3]
-        assert calls[4] == "<u><i>context: 0 / 1m</i></u>"
+        assert calls[4] == "<u><i>context: context unavailable</i></u>"
 
     async def test_completion_summary_omits_username_when_configured(self, config):
         config.telegram_notify_username = "breedoon"
@@ -574,7 +602,7 @@ class TestTelegramMessageFlow:
             await bot.handle_message(update, ctx)
 
         calls = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
-        assert calls[-1] == "<u><i>context: 0 / 1m</i></u>"
+        assert calls[-1] == "<u><i>context: context unavailable</i></u>"
 
     async def test_attachment_receipt_is_sent_before_normalization(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -798,7 +826,7 @@ class TestBackgroundPoller:
         bot._fork_task_by_child_route[child_route] = "task-team"
         bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
 
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
@@ -807,7 +835,7 @@ class TestBackgroundPoller:
                         "from": "worker-b",
                         "text": "poll wake message",
                         "summary": "handoff",
-                        "timestamp": "2026-03-13T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                         "read": False,
                     }
                 ],
@@ -1036,6 +1064,26 @@ class TestBackgroundPoller:
         assert env["CLAUDE_CODE_TEAM_NAME"].endswith("-root")
         assert state.hook_state.sdk_env_overrides["AF_SERVICE_WRITE_FILE"] == "/tmp/report.md"
 
+    async def test_prime_obs_bootstrap_writes_team_projection_under_configured_root(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=224)
+        state = bot._get_state(route, topic_title="Alpha")
+        assert state is not None
+
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root", "Alpha"),
+            origin="agent_task_fresh",
+            is_fork=False,
+            session_id="sid-child",
+        )
+
+        team_name = state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"]
+        agent_name = state.session_manager.sdk_env_overrides["CLAUDE_CODE_AGENT_NAME"]
+        expected_inbox = config.team_storage_root / team_name / "inboxes" / f"{agent_name}.json"
+        assert expected_inbox.exists()
+        assert bot._team_inbox_path(team_name, agent_name) == expected_inbox
+
     async def test_run_and_send_injects_pending_child_bootstrap_even_when_fork_session_has_parent_head(
         self,
         config,
@@ -1238,6 +1286,36 @@ class TestBackgroundPoller:
         summary_texts = [str(call.kwargs.get("text", "")) for call in mock_send_system.await_args_list]
         assert any("interrupted" in text and "context:" in text for text in summary_texts)
         assert all("queued messages discarded" not in text for text in summary_texts)
+
+    async def test_run_and_send_completion_summary_reports_unavailable_for_zero_context(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=604))
+
+        with (
+            patch("obs_agent.telegram.ConversationRunner") as mock_runner,
+            patch.object(bot, "_send_system_message", new_callable=AsyncMock) as mock_send_system,
+        ):
+            mock_send_system.return_value = MagicMock(message_id=904)
+            instance = mock_runner.return_value
+            instance.remaining_pending = []
+
+            async def mock_run(msg):
+                _ = msg
+                yield DoneEvent()
+
+            instance.run = mock_run
+            await bot._run_and_send(
+                state=state,
+                user_text="hello",
+                bot=fake_bot,
+            )
+
+        summary_texts = [str(call.kwargs.get("text", "")) for call in mock_send_system.await_args_list]
+        assert any("context: context unavailable" in text for text in summary_texts)
+        assert all("context: 0" not in text and " / 1m" not in text for text in summary_texts)
 
     async def test_route_warning_is_deprecated(self, config):
         config.telegram_notify_username = "breedoon"
@@ -2275,6 +2353,30 @@ class TestTopicScheduling:
         next_local = _expected_local_schedule_time(1060.0, now_ts=1000.0, include_seconds=False)
         assert f"next_schedule: First at {next_local}" in summary
 
+    async def test_completion_summary_shows_context_remaining_from_sdk_usage(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=821)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.set_session_id("sid-sdk-summary")
+        state.hook_state.last_result_data = {
+            "session_id": "sid-sdk-summary",
+            "num_turns": 2,
+            "context_usage": {
+                "totalTokens": 180_000,
+                "maxTokens": 190_000,
+                "rawMaxTokens": 200_000,
+                "percentage": 90.0,
+                "model": "gpt-5.5[200k]",
+                "isAutoCompactEnabled": True,
+                "autoCompactThreshold": 167_000,
+            },
+        }
+
+        summary = bot._build_completion_summary(state)
+
+        assert summary.startswith("context: 20k remaining (180k / 200k, 10%)")
+
     async def test_completion_summary_includes_next_schedule_line(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=82)
@@ -2485,6 +2587,69 @@ class TestForkViaReply:
         assert reply_to_user_message_id == 11
         assert state.session_id == "sid-fork"
         mock_fork.assert_called_once()
+
+    async def test_inline_reply_fork_preserves_route_identity_projection(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.topic_title = "Root"
+        state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(state)
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root",),
+            origin="trunk_start",
+            is_fork=False,
+            session_id="sid-root",
+            team_name="team-inline",
+            agent_name="agent-inline",
+        )
+        bot._message_map[(67890, 5)] = _TelegramMessageBinding(
+            jsonl_uuid="assistant-1",
+            session_id="sid-root",
+            role="assistant",
+            route=state.route,
+        )
+        bot._session_heads["sid-root"] = "assistant-latest"
+        trigger = QueuedMessage(
+            text="follow up",
+            telegram_message_id=11,
+            reply_to_message_id=5,
+        )
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        original_activate = bot._activate_route_session
+        observed: dict[str, object] = {}
+
+        async def observe_activation(route_state, session_id):
+            observed["projection_before_activation"] = bot._state_inbox_projection(route_state)
+            observed["bootstrap_before_activation"] = route_state.pending_obs_bootstrap
+            await original_activate(route_state, session_id)
+
+        with patch.object(bot, "_activate_route_session", side_effect=observe_activation):
+            with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-fork"):
+                proceed, _ = await bot._resolve_session_for_trigger(
+                    state=state,
+                    trigger_message=trigger,
+                    bot=fake_bot,
+                )
+
+        assert proceed is True
+        assert state.session_id == "sid-fork"
+        assert observed["projection_before_activation"] == ("team-inline", "agent-inline")
+        assert "<origin>inline_fork</origin>" in observed["bootstrap_before_activation"]
+        assert "<is_fork>true</is_fork>" in observed["bootstrap_before_activation"]
+        assert state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] == "team-inline"
+        assert state.session_manager.sdk_env_overrides["CLAUDE_CODE_AGENT_NAME"] == "agent-inline"
+        assert bot._resolve_route_inbox_target(
+            team_name="team-inline",
+            agent_name="agent-inline",
+        ) is state
 
     async def test_reply_to_old_user_message_forks_session(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -2873,6 +3038,83 @@ class TestCommands:
             == "<u><i>new trunk session created: ⚡ Fresh Start</i></u>"
         )
 
+    async def test_new_clears_route_hooks_model_override_and_schedules(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        other_route = TelegramRoute(chat_id=67890, thread_id=654)
+        state = bot._get_state(route, topic_title="Old Topic")
+        assert state is not None
+        other_state = bot._get_state(other_route, topic_title="Other Topic")
+        assert other_state is not None
+        state.session_manager.user_hooks = {"PreToolUse": "guards/check.py::validate"}
+        state.session_manager.model_override = "gpt-5.5"
+        state.topic_icon_custom_emoji_id = "emoji-old"
+        bot._set_topic_metadata(route=route, title="Old Topic", icon_custom_emoji_id="emoji-old")
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Old Topic",),
+            origin="trunk_start",
+            is_fork=False,
+        )
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="old-topic-schedule",
+                route=route,
+                description="old topic schedule",
+                schedule_mode="interval",
+                cron_expr=None,
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="old prompt",
+            )
+        )
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="other-topic-schedule",
+                route=other_route,
+                description="other topic schedule",
+                schedule_mode="interval",
+                cron_expr=None,
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="other prompt",
+            )
+        )
+
+        update = _make_update("/new Fresh Start", thread_id=321)
+        ctx = _make_context()
+        ctx.args = ["Fresh", "Start"]
+        ctx.bot.edit_forum_topic = AsyncMock(return_value=True)
+
+        with (
+            patch.object(state.session_manager, "async_reset", new_callable=AsyncMock) as mock_reset,
+            patch.object(
+                bot,
+                "_resolve_new_topic_visibility",
+                AsyncMock(return_value=("Fresh Start", None, None)),
+            ),
+        ):
+            await bot.handle_new(update, ctx)
+
+        mock_reset.assert_called_once()
+        assert state.session_manager.user_hooks is None
+        assert state.session_manager.model_override is None
+        assert "old-topic-schedule" not in bot._topic_schedules_by_id
+        assert route not in bot._schedule_ids_by_route
+        assert bot._topic_schedules_by_id["other-topic-schedule"].route == other_route
+        assert bot._schedule_ids_by_route[other_route] == {"other-topic-schedule"}
+
+        snapshot = bot._state_store.load_snapshot()
+        assert all(schedule.schedule_id != "old-topic-schedule" for schedule in snapshot.topic_schedules)
+        assert any(schedule.schedule_id == "other-topic-schedule" for schedule in snapshot.topic_schedules)
+        persisted_state = next(
+            entry
+            for entry in snapshot.route_states
+            if entry.chat_id == route.chat_id and entry.thread_id == route.thread_id
+        )
+        assert persisted_state.model_override is None
+        assert persisted_state.user_hooks_json is None
+
     async def test_new_visibility_uses_requested_valid_emoji_and_name(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=321)
@@ -2921,7 +3163,7 @@ class TestCommands:
         child_agent_name = agent_name_for_lineage(("Root", "Branch", "Child"), team_key=team_name)
         grandchild_agent_name = agent_name_for_lineage(("Root", "Branch", "Child", "Grandchild"), team_key=team_name)
         sibling_agent_name = agent_name_for_lineage(("Root", "Sibling"), team_key=team_name)
-        team_dir = tmp_path / ".claude" / "teams" / team_name
+        team_dir = config.team_storage_root / team_name
         (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
         for agent_name in (
             root_agent_name,
@@ -3023,6 +3265,46 @@ class TestCommands:
         assert "- <a href=\"https://t.me/c/67890/555\">Sibling</a>" in html_text
         await bot.shutdown()
 
+    async def test_tree_renders_metadata_and_limit_notice(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        team_name = "team-root"
+        current_agent_name = "root-agent"
+        members = {
+            current_agent_name: {
+                "agent_name": current_agent_name,
+                "display_name": "Root",
+                "lineage": ["Root"],
+                "lineage_length": 1,
+            }
+        }
+        for idx in range(3):
+            agent_name = f"child-{idx}"
+            members[agent_name] = {
+                "agent_name": agent_name,
+                "display_name": f"Child {idx}",
+                "lineage": ["Root", f"Child {idx}"],
+                "lineage_length": 2,
+                "parent_agent_name": current_agent_name,
+                "status": "completed",
+                "model": "claude-haiku-4-5",
+                "created_at": idx,
+            }
+
+        html_text = bot._render_tree_html(
+            team_name=team_name,
+            current_agent_name=current_agent_name,
+            current_lineage=("Root",),
+            members=members,
+            mode="tree",
+            limit=2,
+        )
+
+        assert "Child 2 [completed / claude-haiku-4-5]" in html_text
+        assert "Child 1 [completed / claude-haiku-4-5]" in html_text
+        assert "Child 0" not in html_text
+        assert "... 1 more agents omitted" in html_text
+        await bot.shutdown()
+
     async def test_tree_ancestors_and_descendants_filters(
         self,
         config,
@@ -3045,7 +3327,7 @@ class TestCommands:
         child_agent_name = agent_name_for_lineage(("Root", "Branch", "Child"), team_key=team_name)
         grandchild_agent_name = agent_name_for_lineage(("Root", "Branch", "Child", "Grandchild"), team_key=team_name)
         sibling_agent_name = agent_name_for_lineage(("Root", "Sibling"), team_key=team_name)
-        team_dir = tmp_path / ".claude" / "teams" / team_name
+        team_dir = config.team_storage_root / team_name
         (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
         for agent_name in (
             root_agent_name,
@@ -3137,7 +3419,7 @@ class TestCommands:
         child_agent_name = agent_name_for_lineage(("Root", "Branch", "Child"), team_key=team_name)
         bot._route_inbox_targets[(team_name.lower(), current_agent_name.lower())] = route
         bot._route_inbox_target_keys_by_route[route] = (team_name.lower(), current_agent_name.lower())
-        team_dir = tmp_path / ".claude" / "teams" / team_name
+        team_dir = config.team_storage_root / team_name
         (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
         (team_dir / "config.json").write_text(
             json.dumps(
@@ -3264,13 +3546,42 @@ class TestCommands:
         assert "Grandchild" in descendants_html
         await bot.shutdown()
 
-    async def test_schedule_command_is_gated_until_schedule_sprint_approval(self, config):
+    async def test_schedule_command_lists_topic_schedules(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
-        update = _make_update("/schedule every hour", chat_id=67890, thread_id=321)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        assert bot._get_state(route) is not None
+        bot._register_topic_schedule(
+            _TopicScheduleRecord(
+                schedule_id="sched-visible",
+                route=route,
+                description="Visible",
+                schedule_mode="interval",
+                cron_expr=None,
+                trigger_kind="interval",
+                interval_seconds=60,
+                prompt="run",
+                max_runs=3,
+                next_run_at=1060.0,
+            )
+        )
+        update = _make_update("/schedule", chat_id=67890, thread_id=321)
         ctx = _make_context()
-        with patch.object(bot, "_send_system_message", new_callable=AsyncMock) as send_system:
+        with patch("obs_agent.telegram.time.time", return_value=1000.0):
             await bot.handle_schedule(update, ctx)
-        assert "gated until Sprint 1" in send_system.await_args.kwargs["text"]
+        text = ctx.bot.send_message.call_args.kwargs["text"]
+        next_local = _expected_local_schedule_time(1060.0, now_ts=1000.0, include_seconds=False)
+        assert "schedules for this topic: 1" in text
+        assert "sched-visible" in text
+        assert f"next_schedule: Visible at {next_local}" in text
+        assert "remaining=3" in text
+        await bot.shutdown()
+
+    async def test_schedule_command_reports_empty_topic(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/schedule", chat_id=67890, thread_id=321)
+        ctx = _make_context()
+        await bot.handle_schedule(update, ctx)
+        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>no schedules attached to this topic</i></u>"
         await bot.shutdown()
 
     async def test_new_visibility_generates_random_title_and_non_current_emoji(self, config):
@@ -3526,7 +3837,7 @@ class TestCommands:
         msg = ctx.bot.send_message.call_args.kwargs["text"]
         assert "unscheduled" in msg.lower() or "sched-only" in msg
 
-    async def test_unschedule_all_removes_chat_schedules(self, config):
+    async def test_unschedule_all_is_deprecated(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route_a = TelegramRoute(chat_id=67890, thread_id=1)
         route_b = TelegramRoute(chat_id=67890, thread_id=2)
@@ -3561,13 +3872,14 @@ class TestCommands:
             )
         )
 
-        update = _make_update("/unschedule all", thread_id=1)
+        update = _make_update("/unschedule all", message_id=88, thread_id=1)
         ctx = _make_context()
         ctx.args = ["all"]
         await bot.handle_unschedule(update, ctx)
-        assert bot._schedule_ids_by_route.get(route_a, set()) == set()
-        assert bot._schedule_ids_by_route.get(route_b, set()) == set()
-        assert "unscheduled 2 schedule(s) across this chat" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert bot._schedule_ids_by_route.get(route_a, set()) == {"sched-a"}
+        assert bot._schedule_ids_by_route.get(route_b, set()) == {"sched-b"}
+        assert "Cross-topic &#x27;all&#x27; arguments are deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert ctx.bot.send_message.call_args.kwargs["reply_to_message_id"] == 88
 
     async def test_stop_sets_interrupt_flag_and_calls_sdk_interrupt(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -3589,7 +3901,7 @@ class TestCommands:
         ctx.bot.send_message.assert_called_once()
         assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent</i></u>"
 
-    async def test_stop_all_sets_interrupt_flag_for_all_routes(self, config):
+    async def test_stop_all_is_deprecated(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         general = _state(bot)
         topic = _state(bot, thread_id=321)
@@ -3602,22 +3914,19 @@ class TestCommands:
         topic.session_manager._client = topic_client
         topic.session_manager._connected = True
 
-        update = _make_update("/stop all")
+        update = _make_update("/stop all", message_id=89)
         ctx = _make_context()
         ctx.args = ["all"]
         await bot.handle_stop(update, ctx)
 
-        assert general.hook_state.interrupt_flag is True
-        assert topic.hook_state.interrupt_flag is True
-        assert general.hook_state.interrupt_notice_pending is True
-        assert topic.hook_state.interrupt_notice_pending is True
-        assert general.hook_state.pause_queue_delivery is False
-        assert topic.hook_state.pause_queue_delivery is False
-        general_client.interrupt.assert_awaited_once()
-        topic_client.interrupt.assert_awaited_once()
-        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
+        assert general.hook_state.interrupt_flag is False
+        assert topic.hook_state.interrupt_flag is False
+        general_client.interrupt.assert_not_awaited()
+        topic_client.interrupt.assert_not_awaited()
+        assert "Cross-topic &#x27;all&#x27; arguments are deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert ctx.bot.send_message.call_args.kwargs["reply_to_message_id"] == 89
 
-    async def test_stop_all_with_mention_suffix_targets_all_routes(self, config):
+    async def test_stop_all_with_mention_suffix_is_deprecated(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         general = _state(bot)
         topic = _state(bot, thread_id=321)
@@ -3635,13 +3944,13 @@ class TestCommands:
         ctx.args = ["all@obs_bot"]
         await bot.handle_stop(update, ctx)
 
-        assert general.hook_state.interrupt_flag is True
-        assert topic.hook_state.interrupt_flag is True
-        general_client.interrupt.assert_awaited_once()
-        topic_client.interrupt.assert_awaited_once()
-        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
+        assert general.hook_state.interrupt_flag is False
+        assert topic.hook_state.interrupt_flag is False
+        general_client.interrupt.assert_not_awaited()
+        topic_client.interrupt.assert_not_awaited()
+        assert "Cross-topic &#x27;all&#x27; arguments are deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
 
-    async def test_stop_with_command_mention_targets_all_routes(self, config):
+    async def test_stop_with_command_mention_all_is_deprecated(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         general = _state(bot)
         topic = _state(bot, thread_id=321)
@@ -3659,11 +3968,11 @@ class TestCommands:
         ctx.args = ["all"]
         await bot.handle_stop(update, ctx)
 
-        assert general.hook_state.interrupt_flag is True
-        assert topic.hook_state.interrupt_flag is True
-        general_client.interrupt.assert_awaited_once()
-        topic_client.interrupt.assert_awaited_once()
-        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
+        assert general.hook_state.interrupt_flag is False
+        assert topic.hook_state.interrupt_flag is False
+        general_client.interrupt.assert_not_awaited()
+        topic_client.interrupt.assert_not_awaited()
+        assert "Cross-topic &#x27;all&#x27; arguments are deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
 
     async def test_stop_does_not_mark_parent_agent_task_terminal_request(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -3725,10 +4034,7 @@ class TestCommands:
             bot._fork_tasks_by_id["task-agent-all"] = record
             bot._fork_task_tasks["task-agent-all"] = running
 
-            update = _make_update("/stop all", thread_id=None)
-            ctx = _make_context()
-            ctx.args = ["all"]
-            await bot.handle_stop(update, ctx)
+            await bot._cancel_route_fork_tasks(child_route, status="stopped")
             await asyncio.sleep(0)
 
         assert record.terminal_request == "stopped"
@@ -3794,10 +4100,8 @@ class TestCommands:
             bot._fork_task_tasks["task-agent-a"] = task_a
             bot._fork_task_tasks["task-agent-b"] = task_b
 
-            update = _make_update("/stop all", thread_id=None)
-            ctx = _make_context()
-            ctx.args = ["all"]
-            await bot.handle_stop(update, ctx)
+            await bot._cancel_route_fork_tasks(child_a_route, status="stopped")
+            await bot._cancel_route_fork_tasks(child_b_route, status="stopped")
             await asyncio.sleep(0)
 
         assert record_a.terminal_request == "stopped"
@@ -3974,6 +4278,145 @@ class TestTopicCommands:
         assert ctx.bot.send_message.call_args_list[1].kwargs["message_thread_id"] == 321
         assert ctx.bot.send_message.call_args_list[2].kwargs["message_thread_id"] is None
 
+    async def test_fork_command_registers_parent_for_child_inbox_delivery(self, config, tmp_path, monkeypatch):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.topic_title = "Root"
+        state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(state)
+        bot._session_heads["sid-root"] = "head-uuid"
+        bot._record_message_binding(
+            route=state.route,
+            message_id=55,
+            jsonl_uuid="head-uuid",
+            session_id="sid-root",
+            role="assistant",
+        )
+
+        update = _make_update("/fork Child", message_id=77)
+        ctx = _make_context()
+        ctx.args = ["Child"]
+        ctx.bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=321))
+        ctx.bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=900), MagicMock(message_id=901), MagicMock(message_id=902)]
+        )
+
+        with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-child"):
+            await bot.handle_fork(update, ctx)
+
+        child_state = _state(bot, thread_id=321)
+        assert child_state is not None
+        team_name = child_state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"]
+        parent_agent_name = agent_name_for_lineage(("Root",), team_key=team_name)
+        child_agent_name = agent_name_for_lineage(("Root", "Child"), team_key=team_name)
+
+        assert bot._resolve_route_inbox_target(
+            team_name=team_name,
+            agent_name=parent_agent_name,
+        ) is state
+        assert bot._recipient_delivery_status(
+            team_name=team_name,
+            agent_name=parent_agent_name,
+        )["deliverable"] is True
+        assert bot._recipient_delivery_status(
+            team_name=team_name,
+            agent_name=child_agent_name,
+        )["deliverable"] is True
+
+        team_config = config.team_storage_root / team_name / "config.json"
+        members = json.loads(team_config.read_text(encoding="utf-8"))["members"]
+        member_names = {member["name"] for member in members}
+        assert parent_agent_name in member_names
+        assert child_agent_name in member_names
+
+    async def test_fork_command_primes_child_before_route_activation_yields(self, config, tmp_path, monkeypatch):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.topic_title = "Root"
+        state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(state)
+        bot._session_heads["sid-root"] = "head-uuid"
+        bot._record_message_binding(
+            route=state.route,
+            message_id=55,
+            jsonl_uuid="head-uuid",
+            session_id="sid-root",
+            role="assistant",
+        )
+
+        update = _make_update("/fork Child", message_id=77)
+        ctx = _make_context()
+        ctx.args = ["Child"]
+        ctx.bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=321))
+        ctx.bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=900), MagicMock(message_id=901), MagicMock(message_id=902)]
+        )
+        original_activate = bot._activate_route_session
+        observed: dict[str, object] = {}
+
+        async def observe_activation(child_state, session_id):
+            observed["lineage"] = child_state.agent_lineage
+            observed["bootstrap"] = child_state.pending_obs_bootstrap
+            observed["projection"] = bot._state_inbox_projection(child_state)
+            await original_activate(child_state, session_id)
+
+        with patch.object(bot, "_activate_route_session", side_effect=observe_activation):
+            with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-child"):
+                await bot.handle_fork(update, ctx)
+
+        team_name, agent_name = observed["projection"]
+        assert observed["lineage"] == ("Root", "Child")
+        assert team_name == root_team_key_for_lineage(("Root", "Child"))
+        assert agent_name == agent_name_for_lineage(("Root", "Child"))
+        assert "<is_fork>true</is_fork>" in observed["bootstrap"]
+
+    async def test_fork_command_preserves_existing_parent_inbox_projection(self, config, tmp_path, monkeypatch):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.topic_title = "Root"
+        state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(state)
+        bot._prime_obs_bootstrap(
+            state,
+            lineage=("Root",),
+            origin="trunk_start",
+            is_fork=False,
+            session_id="sid-root",
+            team_name="team-custom",
+            agent_name="parent-custom",
+        )
+        bot._session_heads["sid-root"] = "head-uuid"
+        bot._record_message_binding(
+            route=state.route,
+            message_id=55,
+            jsonl_uuid="head-uuid",
+            session_id="sid-root",
+            role="assistant",
+        )
+
+        update = _make_update("/fork Child", message_id=77)
+        ctx = _make_context()
+        ctx.args = ["Child"]
+        ctx.bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=321))
+        ctx.bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=900), MagicMock(message_id=901), MagicMock(message_id=902)]
+        )
+
+        with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-child"):
+            await bot.handle_fork(update, ctx)
+
+        child_state = _state(bot, thread_id=321)
+        assert child_state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] == "team-custom"
+        assert state.session_manager.sdk_env_overrides["CLAUDE_CODE_AGENT_NAME"] == "parent-custom"
+        assert bot._resolve_route_inbox_target(
+            team_name="team-custom",
+            agent_name="parent-custom",
+        ) is state
+        assert "<parent_agent_name>parent-custom</parent_agent_name>" in (child_state.pending_obs_bootstrap or "")
+
     async def test_fork_command_resets_unnamed_counter_when_topic_title_changes(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         state = _state(bot)
@@ -4120,35 +4563,38 @@ class TestTopicCommands:
         assert bot._message_map[(67890, 77)].jsonl_uuid == "late-uuid"
         assert bot._session_heads["sid-late"] == "late-uuid"
 
-    async def test_delete_current_topic_drops_route_state(self, config):
+    async def test_delete_current_topic_is_deprecated(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         topic_state = _state(bot, thread_id=321)
         topic_state.session_manager.set_session_id("sid-topic")
 
-        update = _make_update("/delete", thread_id=321)
+        update = _make_update("/delete", message_id=77, thread_id=321)
         ctx = _make_context()
         ctx.bot.delete_forum_topic = AsyncMock(return_value=True)
 
         await bot.handle_delete(update, ctx)
 
-        ctx.bot.delete_forum_topic.assert_awaited_once_with(chat_id=67890, message_thread_id=321)
-        assert TelegramRoute(chat_id=67890, thread_id=321) not in bot._states_by_route
+        ctx.bot.delete_forum_topic.assert_not_awaited()
+        assert TelegramRoute(chat_id=67890, thread_id=321) in bot._states_by_route
+        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>/delete is deprecated and disabled; manage Telegram topics directly in Telegram.</i></u>"
+        assert ctx.bot.send_message.call_args.kwargs["reply_to_message_id"] == 77
 
-    async def test_delete_all_replies_in_general_route(self, config):
+    async def test_delete_all_is_deprecated_in_topic(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         _state(bot)
         _state(bot, thread_id=321)
 
-        update = _make_update("/delete all", thread_id=321)
+        update = _make_update("/delete all", message_id=78, thread_id=321)
         ctx = _make_context()
         ctx.args = ["all"]
         ctx.bot.delete_forum_topic = AsyncMock(return_value=True)
 
         await bot.handle_delete(update, ctx)
 
-        assert ctx.bot.send_message.call_args.kwargs["message_thread_id"] is None
-        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>all non-General topics deleted</i></u>"
-        assert ctx.bot.send_message.call_args.kwargs["disable_notification"] is False
+        ctx.bot.delete_forum_topic.assert_not_awaited()
+        assert ctx.bot.send_message.call_args.kwargs["message_thread_id"] == 321
+        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>/delete is deprecated and disabled; manage Telegram topics directly in Telegram.</i></u>"
+        assert ctx.bot.send_message.call_args.kwargs["disable_notification"] is True
 
 
 class TestForkTaskRuntime:
@@ -4262,6 +4708,8 @@ class TestForkTaskRuntime:
         )
         launch_text = launched["content"][0]["text"]
         assert "ForkTask launched." in launch_text
+        assert "```text\nagentId:" in launch_text
+        assert "```" in launch_text
         assert "Working in the background; completion will be posted here." in launch_text
         task_id = launch_text.split("agentId: ", 1)[1].splitlines()[0]
         assert "output_file:" in launch_text
@@ -4275,15 +4723,20 @@ class TestForkTaskRuntime:
         assert record.max_turns is None
         assert task_id in state.active_fork_task_ids
         send_calls = state.last_bot.send_message.await_args_list
-        assert "fork task launched by agent" in send_calls[0].kwargs["text"]
-        assert "source message" in send_calls[0].kwargs["text"]
-        assert "https://t.me/c/67890/55" in send_calls[0].kwargs["text"]
-        assert "session forked: sid-child" in send_calls[1].kwargs["text"]
+        child_launch_text = send_calls[0].kwargs["text"]
+        assert "fork task launched by agent" in child_launch_text
+        assert "<pre>" in child_launch_text
+        assert "agentId:" in child_launch_text
+        assert "source message" in child_launch_text
+        assert "https://t.me/c/67890/55" in child_launch_text
+        assert "sid-child" not in child_launch_text
+        assert send_calls[1].kwargs["text"] == "<u><i>fork session ready</i></u>"
+        assert "sid-child" not in send_calls[1].kwargs["text"]
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=321))
         assert child_state is not None
         assert child_state.notify_on_completion is True
         assert child_state.session_manager.model_override == "gpt-5.5"
-        assert child_state.session_manager.create_options().model == "gpt-5.5[400k]"
+        assert child_state.session_manager.create_options().model == "gpt-5.5[256k]"
         assert (
             child_state.session_manager.create_options().env["ANTHROPIC_API_KEY"]
             == config.cli_proxy_api_key
@@ -4327,6 +4780,7 @@ class TestForkTaskRuntime:
         )
         launch_text = launched["content"][0]["text"]
         assert "AgentTask launched." in launch_text
+        assert "```text\nagentId: 11111111-1111-1111-1111-111111111111" in launch_text
         assert "Working in the background; completion will be posted here." in launch_text
         assert "agentId: 11111111-1111-1111-1111-111111111111" in launch_text
         record = bot._fork_tasks_by_id["11111111-1111-1111-1111-111111111111"]
@@ -4350,9 +4804,9 @@ class TestForkTaskRuntime:
         assert child_state.session_id is None
         assert child_state.session_manager.model_override == "gpt-5.5"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[400k]"
+        assert child_options.model == "gpt-5.5[256k]"
         child_env = child_options.env
-        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
+        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "256000"
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
         assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == unique_team
@@ -4397,10 +4851,10 @@ class TestForkTaskRuntime:
         assert child_state is not None
         assert child_state.session_manager.model_override == "gpt-5.5"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[400k]"
-        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "400000"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
-        assert child_options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "86"
+        assert child_options.model == "gpt-5.5[256k]"
+        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "256000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "256000"
+        assert child_options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "84"
         assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
         await bot.shutdown()
 
@@ -4573,7 +5027,7 @@ class TestForkTaskRuntime:
                 },
             )
 
-        team_config = tmp_path / ".claude" / "teams" / "team-alpha" / "config.json"
+        team_config = config.team_storage_root / "team-alpha" / "config.json"
         assert team_config.exists()
         payload = json.loads(team_config.read_text(encoding="utf-8"))
         members = payload.get("members") or []
@@ -5030,6 +5484,9 @@ class TestForkTaskRuntime:
         bot._fork_tasks_by_id["task-team"] = record
         bot._fork_task_by_child_route[child_route] = "task-team"
         bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        child_state.last_bot = fake_bot
         running = asyncio.create_task(asyncio.sleep(30))
         bot._fork_task_tasks["task-team"] = running
         try:
@@ -5048,6 +5505,11 @@ class TestForkTaskRuntime:
             with suppress(asyncio.CancelledError):
                 await running
 
+        assert fake_bot.send_message.await_count == 1
+        sent_text = fake_bot.send_message.await_args.kwargs["text"]
+        assert "agent task active: teammate message queued for current turn" in sent_text
+        assert "team_name: team-alpha" in sent_text
+        assert "agent_name: worker-a" in sent_text
         queued = child_state.hook_state.message_queue.get_nowait()
         assert isinstance(queued, QueuedMessage)
         assert "System notification: New teammate messages arrived while you were still running." in queued.text
@@ -5063,10 +5525,13 @@ class TestForkTaskRuntime:
         route = TelegramRoute(chat_id=-10067890, thread_id=222)
         state = bot._get_state(route, topic_title="Busy Root")
         assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
         state.busy = True
         bot._route_inbox_targets[("team-alpha", "root-agent")] = route
 
-        await bot._handle_inbox_message_notification(
+        result = await bot._handle_inbox_message_notification(
             sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
             payload={
                 "team_name": "team-alpha",
@@ -5077,6 +5542,12 @@ class TestForkTaskRuntime:
             },
         )
 
+        assert result == {"delivered": True}
+        assert fake_bot.send_message.await_count == 1
+        sent_text = fake_bot.send_message.await_args.kwargs["text"]
+        assert "topic active: teammate message queued for current turn" in sent_text
+        assert "team_name: team-alpha" in sent_text
+        assert "agent_name: root-agent" in sent_text
         queued = state.hook_state.message_queue.get_nowait()
         assert isinstance(queued, QueuedMessage)
         assert "System notification: New teammate messages arrived while you were still running." in queued.text
@@ -5084,6 +5555,33 @@ class TestForkTaskRuntime:
         assert "Latest sender: worker-b." in queued.text
         assert "Latest summary: handoff." in queued.text
         assert "Latest content preview: process root item 3" in queued.text
+        await bot.shutdown()
+
+    async def test_inbox_message_reports_deferred_when_idle_route_cannot_wake_due_chat_pending_ops(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=222)
+        state = bot._get_state(route, topic_title="Idle Root")
+        assert state is not None
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock()
+        state.last_bot = fake_bot
+        bot._route_inbox_targets[("team-alpha", "root-agent")] = route
+        bot._chat_pending_ops[route.chat_id] = 1
+
+        result = await bot._handle_inbox_message_notification(
+            sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
+            payload={
+                "team_name": "team-alpha",
+                "recipient": "root-agent",
+                "sender": "worker-b",
+                "summary": "handoff",
+                "content": "process root item 3",
+            },
+        )
+
+        assert result == {"delivered": False, "reason": "recipient route is temporarily busy; wake deferred"}
+        assert fake_bot.send_message.await_count == 0
+        assert state.hook_state.message_queue.empty()
         await bot.shutdown()
 
     async def test_poll_team_worker_inbox_queues_notice_when_worker_is_running(
@@ -5114,7 +5612,7 @@ class TestForkTaskRuntime:
         bot._fork_tasks_by_id["task-team"] = record
         bot._fork_task_by_child_route[child_route] = "task-team"
         bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
-        inbox_path = tmp_path / ".claude" / "teams" / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path = config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
@@ -5123,7 +5621,7 @@ class TestForkTaskRuntime:
                         "from": "worker-b",
                         "text": "process item 8",
                         "summary": "handoff",
-                        "timestamp": "2026-03-13T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                         "read": False,
                     }
                 ],
@@ -5149,6 +5647,91 @@ class TestForkTaskRuntime:
         assert "Latest summary: handoff." in queued.text
         assert "Latest content preview: process item 8" in queued.text
         assert record.wake_requested is False
+        await bot.shutdown()
+
+    async def test_poll_team_worker_inbox_skips_messages_from_before_daemon_start(
+        self,
+        config,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        bot._daemon_start_time = datetime(2026, 3, 13, 0, 0, 0, tzinfo=timezone.utc)
+        child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        child_state = bot._get_state(child_route, topic_title="Worker Topic")
+        assert child_state is not None
+        record = _ForkTaskRecord(
+            task_id="task-team",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=child_route,
+            child_session_id="sid-child",
+            prompt="Old prompt",
+            description="Team Worker",
+            team_name="team-alpha",
+            agent_name="worker-a",
+            is_fork=False,
+            status="launched",
+        )
+        bot._fork_tasks_by_id["task-team"] = record
+        bot._fork_task_by_child_route[child_route] = "task-team"
+        bot._team_worker_records[("team-alpha", "worker-a")] = "task-team"
+        inbox_path = config.team_storage_root / "team-alpha" / "inboxes" / "worker-a.json"
+        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "from": "worker-b",
+                        "text": "old restart message",
+                        "summary": "old-handoff",
+                        "timestamp": "2026-03-12T23:59:59Z",
+                        "read": False,
+                    }
+                ],
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(bot, "_handle_inbox_message_notification", new_callable=AsyncMock) as notify_mock:
+            await bot._poll_team_worker_inbox_wakes()
+
+        notify_mock.assert_not_awaited()
+        assert bot._notified_inbox_keys == set()
+
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "from": "worker-b",
+                        "text": "old restart message",
+                        "summary": "old-handoff",
+                        "timestamp": "2026-03-12T23:59:59Z",
+                        "read": False,
+                    },
+                    {
+                        "from": "worker-b",
+                        "text": "new post-restart message",
+                        "summary": "new-handoff",
+                        "timestamp": "2026-03-13T00:00:01Z",
+                        "read": False,
+                    },
+                ],
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(bot, "_handle_inbox_message_notification", new_callable=AsyncMock) as notify_mock:
+            await bot._poll_team_worker_inbox_wakes()
+
+        notify_mock.assert_awaited_once()
+        payload = notify_mock.await_args.kwargs["payload"]
+        assert payload["content"] == "new post-restart message"
+        assert payload["summary"] == "new-handoff"
         await bot.shutdown()
 
     async def test_poll_team_worker_inbox_keeps_team_scopes_separate(
@@ -5209,7 +5792,7 @@ class TestForkTaskRuntime:
         bot._team_worker_records[("team-alpha", "worker-shared")] = record_a.task_id
         bot._team_worker_records[("team-beta", "worker-shared")] = record_b.task_id
 
-        inbox_path = tmp_path / ".claude" / "teams" / "team-beta" / "inboxes" / "worker-shared.json"
+        inbox_path = config.team_storage_root / "team-beta" / "inboxes" / "worker-shared.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
@@ -5218,7 +5801,7 @@ class TestForkTaskRuntime:
                         "from": "worker-peer",
                         "text": "team-beta message",
                         "summary": "beta-summary",
-                        "timestamp": "2026-03-13T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                         "read": False,
                     }
                 ],
@@ -5320,7 +5903,7 @@ class TestForkTaskRuntime:
             session_id="sid-route-child",
         )
 
-        inbox_path = tmp_path / ".claude" / "teams" / team_name / "inboxes" / f"{agent_name}.json"
+        inbox_path = config.team_storage_root / team_name / "inboxes" / f"{agent_name}.json"
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
         inbox_path.write_text(
             json.dumps(
@@ -5329,7 +5912,7 @@ class TestForkTaskRuntime:
                         "from": "worker-peer",
                         "text": "poll wake payload",
                         "summary": "poll-handoff",
-                        "timestamp": "2026-03-14T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                         "read": False,
                     }
                 ],
@@ -5944,6 +6527,51 @@ class TestForkTaskRuntime:
         fake_client_a.interrupt.assert_awaited_once()
         fake_client_b.interrupt.assert_not_awaited()
 
+    async def test_fork_task_child_service_message_uses_code_block_without_session_id(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        html_text = bot._build_fork_task_child_service_html(
+            agent_id="task-123",
+            description="Audit",
+            prompt="Inspect the docs",
+            source_link="https://t.me/c/67890/55",
+            is_fork=True,
+            team_name="team-a",
+            agent_name="agent-a",
+        )
+
+        assert "fork task launched by agent" in html_text
+        assert "<pre>" in html_text
+        assert "agentId: task-123" in html_text
+        assert "team_name: team-a" in html_text
+        assert "agent_name: agent-a" in html_text
+        assert "prompt:\nInspect the docs" in html_text
+        assert "source message" in html_text
+        assert "session_id" not in html_text
+        assert "session forked" not in html_text
+
+    async def test_fork_task_parent_launch_message_uses_code_block(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+
+        text = bot._build_fork_task_launch_text(
+            task_id="task-123",
+            output_file="/tmp/task-123.jsonl",
+            topic_link="https://t.me/c/1/2",
+            task_label="AgentTask",
+            agent_name="agent-a",
+            team_name="team-a",
+        )
+
+        assert text.startswith("AgentTask launched.\n```text\n")
+        assert "agentId: task-123" in text
+        assert "agent_name: agent-a" in text
+        assert "team_name: team-a" in text
+        assert "output_file: /tmp/task-123.jsonl" in text
+        assert "telegram_topic: https://t.me/c/1/2" in text
+        assert "\n```\nWorking in the background; completion will be posted here." in text
+        assert "session_id" not in text
+        assert "session forked" not in text
+
     async def test_fork_task_notification_includes_tool_use_id_and_usage(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         record = _ForkTaskRecord(
@@ -6182,7 +6810,8 @@ class TestForkTaskRuntime:
         delete_ctx = _make_context()
         delete_ctx.bot.delete_forum_topic = AsyncMock(return_value=True)
         await bot.handle_delete(delete_update, delete_ctx)
-        assert record.terminal_request == "failed"
+        assert record.terminal_request is None
+        delete_ctx.bot.delete_forum_topic.assert_not_awaited()
 
     async def test_active_fork_tasks_still_emit_completion_summary(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -6396,25 +7025,23 @@ class TestCreateTelegramApp:
         app = create_telegram_app(config)
         handlers = app.handlers[0]
 
-        command_map = {
-            next(iter(handler.commands)): handler.callback.__name__
+        command_names = {
+            next(iter(handler.commands))
             for handler in handlers
             if getattr(handler, "commands", None)
         }
-        assert command_map["help"] == "handle_help"
-        assert command_map["new_group"] == "handle_new_group"
-        assert command_map["new_bot"] == "handle_new_bot"
+        assert "help" in command_names
+        assert "guide" in command_names
+        assert "new_group" in command_names
+        assert "new_bot" in command_names
 
-        callback_names = [getattr(getattr(handler, "callback", None), "__name__", None) for handler in handlers]
-        assert "handle_new_group_alias" in callback_names
-        assert "handle_new_bot_alias" in callback_names
-        assert "handle_unknown_command" in callback_names
+        assert len(command_names) >= 4
 
 
 class TestTelegramCommandHelp:
-    async def test_help_command_sends_usage(self, config):
+    async def test_help_command_sends_group_usage_in_group(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
-        update = _make_update("/help", message_id=42)
+        update = _make_update("/help", chat_id=-10067890, message_id=42, chat_type="supergroup")
         ctx = _make_context()
 
         await bot.handle_help(update, ctx)
@@ -6423,6 +7050,61 @@ class TestTelegramCommandHelp:
         assert _TELEGRAM_HELP_TEXT in kwargs["text"]
         assert "Bare commands are not supported" in kwargs["text"]
         assert kwargs["reply_to_message_id"] == 42
+        assert kwargs["disable_notification"] is True
+        await bot.shutdown()
+
+    async def test_help_command_sends_dm_guide_in_private_chat(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/help", message_id=42)
+        ctx = _make_context()
+
+        await bot.handle_help(update, ctx)
+
+        kwargs = ctx.bot.send_message.call_args.kwargs
+        assert "OBS setup guide" in kwargs["text"]
+        assert "/new-group &lt;group title&gt;" in kwargs["text"]
+        assert "/new-bot [display name]" in kwargs["text"]
+        assert kwargs["reply_to_message_id"] == 42
+        assert kwargs["disable_notification"] is True
+        await bot.shutdown()
+
+    async def test_guide_command_sends_guide_in_private_chat(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/guide", message_id=45)
+        ctx = _make_context()
+
+        await bot.handle_guide(update, ctx)
+
+        kwargs = ctx.bot.send_message.call_args.kwargs
+        assert "OBS setup guide" in kwargs["text"]
+        assert kwargs["reply_to_message_id"] == 45
+        await bot.shutdown()
+
+    async def test_guide_command_sends_guide_in_group(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/guide", chat_id=-10067890, message_id=46, chat_type="supergroup")
+        ctx = _make_context()
+
+        await bot.handle_guide(update, ctx)
+
+        kwargs = ctx.bot.send_message.call_args.kwargs
+        assert "OBS setup guide" in kwargs["text"]
+        assert "Bare commands are not supported" not in kwargs["text"]
+        assert kwargs["reply_to_message_id"] == 46
+        await bot.shutdown()
+
+    async def test_bare_command_sends_usage_without_running_agent(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("stop", message_id=44)
+        ctx = _make_context()
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            await bot.handle_message(update, ctx)
+
+        mock_runner.assert_not_called()
+        kwargs = ctx.bot.send_message.call_args.kwargs
+        assert "Use /stop to interrupt this topic." in kwargs["text"]
+        assert kwargs["reply_to_message_id"] == 44
         assert kwargs["disable_notification"] is True
         await bot.shutdown()
 
@@ -6451,8 +7133,10 @@ class TestTelegramCommandRegistration:
         commands = app.bot.set_my_commands.await_args.args[0]
         names = [command.command for command in commands]
         assert "help" in names
+        assert "guide" in names
         assert "new_group" in names
         assert "new_bot" in names
+        assert "delete" not in names
 
     async def test_set_bot_commands_describes_tree_children_as_direct_children(self):
         app = MagicMock()
@@ -6563,6 +7247,22 @@ class TestTelegramProvisioningCommands:
             await bot.handle_new(update, ctx)
 
         alias_mock.assert_awaited_once_with(update, ctx)
+
+    async def test_new_group_without_title_in_dm_sends_guide(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("/new-group", thread_id=None)
+        ctx = _make_context()
+
+        with (
+            patch.object(bot, "_provision_new_group", new=AsyncMock()) as provision_mock,
+            patch.object(bot, "_send_system_message", new=AsyncMock()) as send_mock,
+        ):
+            await bot.handle_new_group_alias(update, ctx)
+
+        provision_mock.assert_not_awaited()
+        send_mock.assert_awaited_once()
+        assert _TELEGRAM_DM_GUIDE_TEXT in send_mock.await_args.kwargs["text"]
+        assert send_mock.await_args.kwargs["reply_to_message_id"] == update.effective_message.message_id
 
     async def test_new_group_delegates_to_userbot_helper(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -6984,7 +7684,7 @@ class TestTelegramErrorHandling:
 
             texts = [c.kwargs.get("text", "") for c in ctx.bot.send_message.call_args_list]
             assert any("FINAL_MARKER" in t for t in texts)
-            assert texts[-1] == "<u><i>context: 0 / 1m</i></u>"
+            assert texts[-1] == "<u><i>context: context unavailable</i></u>"
 
 
 class TestTelegramStatePersistence:
