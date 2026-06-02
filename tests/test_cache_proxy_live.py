@@ -74,6 +74,10 @@ async def _run_parent_session(
         await client.disconnect()
 
     assert parent_sid, "Failed to get parent session ID"
+    # Anthropic prompt-cache writes can take a short moment to become readable
+    # by a fresh fork process. Keep this test focused on prefix stability rather
+    # than propagation timing.
+    await asyncio.sleep(1.0)
     # Get usage from proxy log (reliable source)
     usage_rows = get_proxy_usage_for_turns(start_offset=log_start)
     return parent_sid, usage_rows, log_start

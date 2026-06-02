@@ -11,6 +11,7 @@ import pytest
 
 from obs_agent.config import (
     MODEL_RESOLUTION,
+    auto_compact_window_for_context,
     compaction_threshold,
     is_claude_model,
     normalize_model_for_claude_code,
@@ -90,6 +91,17 @@ class TestModelContextBoundary:
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):
         assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.5[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
+
+    def test_auto_compact_window_is_capped_separately_from_context(self):
+        assert auto_compact_window_for_context(1_000_000) == 200_000
+        assert auto_compact_window_for_context(256_000) == 200_000
+        assert auto_compact_window_for_context(128_000) == 128_000
+
+    def test_auto_compact_window_cap_can_be_disabled(self):
+        assert auto_compact_window_for_context(
+            1_000_000,
+            auto_compact_window_tokens=0,
+        ) == 1_000_000
 
 
 # ---------------------------------------------------------------------------

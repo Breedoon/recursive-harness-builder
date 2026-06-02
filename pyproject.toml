@@ -34,6 +34,7 @@ obs-agent = "obs_agent.cli:main"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
+    "live: tests that spend live model/provider calls",
     "eval: eval scenarios run by SDK judge agent against real CLI + vault",
     "integration: live HTTP + SDK integration tests",
     "telegram: Telegram-specific eval scenarios (require OBS_TELEGRAM_BOT_USERNAME)",

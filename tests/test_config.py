@@ -175,6 +175,15 @@ class TestSessionSettings:
         cfg = OBSConfig.from_env()
         assert cfg.context_probe_claude_cli is True
 
+    def test_auto_compact_window_default(self):
+        cfg = OBSConfig()
+        assert cfg.auto_compact_window_tokens == 200_000
+
+    def test_auto_compact_window_from_env(self, monkeypatch):
+        monkeypatch.setenv("OBS_AUTO_COMPACT_WINDOW_TOKENS", "150000")
+        cfg = OBSConfig.from_env()
+        assert cfg.auto_compact_window_tokens == 150_000
+
     def test_claude_idle_process_management_defaults_off(self):
         cfg = OBSConfig()
         assert cfg.claude_idle_process_cap is None
@@ -186,6 +195,11 @@ class TestSessionSettings:
         cfg = OBSConfig.from_env()
         assert cfg.claude_idle_process_cap == 20
         assert cfg.claude_kill_on_idle is True
+
+    def test_fork_cache_warmup_delay_from_env(self, monkeypatch):
+        monkeypatch.setenv("OBS_FORK_CACHE_WARMUP_DELAY_SECONDS", "1.5")
+        cfg = OBSConfig.from_env()
+        assert cfg.fork_cache_warmup_delay_seconds == 1.5
 
 
 class TestBgForkTimeout:

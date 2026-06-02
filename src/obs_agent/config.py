@@ -50,6 +50,7 @@ MODEL_RESOLUTION: dict[str, str] = {
 _CONTEXT_SUFFIX_RE = re.compile(r"\[(\d+)([mk])\]$", re.IGNORECASE)
 
 _DEFAULT_CONTEXT_TOKENS = 1_000_000
+_DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 200_000
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-5.5": 256_000,
     "gpt-5.4": 1_000_000,
@@ -171,6 +172,26 @@ def compaction_threshold(context_tokens: int) -> int:
     return min(threshold, context_tokens - 10_000)
 
 
+def auto_compact_window_for_context(
+    context_tokens: int,
+    *,
+    auto_compact_window_tokens: int = _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS,
+) -> int:
+    """Return the Claude Code auto-compact window to pass for a model context.
+
+    This is intentionally separate from the model context estimate.  Passing a
+    large model context directly to Claude Code can defer compaction until the
+    prompt is already too large for the active harness/provider.  Keep the
+    context estimate for user-facing telemetry and model suffixes, but cap the
+    compaction trigger to a conservative window unless explicitly overridden.
+    """
+    if context_tokens <= 0:
+        return 0
+    if auto_compact_window_tokens <= 0:
+        return context_tokens
+    return min(context_tokens, auto_compact_window_tokens)
+
+
 def is_claude_model(model: str) -> bool:
     """Return True if *model* is an Anthropic Claude model."""
     clean = model.split("[")[0].strip().lower()
@@ -211,9 +232,11 @@ class OBSConfig:
     bg_fork_timeout: float = 600.0  # seconds to wait for background forks
     max_buffer_size: int = 10 * 1024 * 1024  # 10 MB SDK JSON buffer limit
     context_window_estimate_tokens: int = 1_000_000
+    auto_compact_window_tokens: int = _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS
     context_probe_claude_cli: bool = False
     claude_idle_process_cap: int | None = None
     claude_kill_on_idle: bool = False
+    fork_cache_warmup_delay_seconds: float = 1.0
 
     # Cache proxy
     cache_proxy_port: int = 18923
@@ -276,12 +299,16 @@ class OBSConfig:
             kwargs["max_buffer_size"] = int(buf_size)
         if context_est := os.environ.get("OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"):
             kwargs["context_window_estimate_tokens"] = int(context_est)
+        if compact_window := os.environ.get("OBS_AUTO_COMPACT_WINDOW_TOKENS"):
+            kwargs["auto_compact_window_tokens"] = int(compact_window)
         if probe_cli := os.environ.get("OBS_CONTEXT_PROBE_CLAUDE_CLI"):
             kwargs["context_probe_claude_cli"] = probe_cli.strip().lower() in {"1", "true", "yes", "on"}
         if idle_cap := os.environ.get("OBS_CLAUDE_IDLE_PROCESS_CAP"):
             kwargs["claude_idle_process_cap"] = int(idle_cap)
         if kill_on_idle := os.environ.get("OBS_CLAUDE_KILL_ON_IDLE"):
             kwargs["claude_kill_on_idle"] = kill_on_idle.strip().lower() in {"1", "true", "yes", "on"}
+        if fork_cache_delay := os.environ.get("OBS_FORK_CACHE_WARMUP_DELAY_SECONDS"):
+            kwargs["fork_cache_warmup_delay_seconds"] = float(fork_cache_delay)
         if proxy_port := os.environ.get("OBS_CACHE_PROXY_PORT"):
             kwargs["cache_proxy_port"] = int(proxy_port)
         if proxy_enabled := os.environ.get("OBS_CACHE_PROXY_ENABLED"):

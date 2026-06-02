@@ -164,7 +164,7 @@ class SessionManager:
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with hooks, MCP tools, and resume."""
         from obs_agent.config import (
-            compaction_threshold,
+            auto_compact_window_for_context,
             is_claude_model,
             normalize_model_for_claude_code,
             parse_context_suffix,
@@ -187,12 +187,13 @@ class SessionManager:
         self.hook_state.vault_path = self.config.vault_path
 
         _clean_model, ctx_tokens = parse_context_suffix(effective_model)
-        compact_at = compaction_threshold(ctx_tokens)
+        auto_compact_window = auto_compact_window_for_context(
+            ctx_tokens,
+            auto_compact_window_tokens=self.config.auto_compact_window_tokens,
+        )
         effective_env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = str(ctx_tokens)
-        effective_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx_tokens)
-        if ctx_tokens > 0:
-            pct = int(round(compact_at / ctx_tokens * 100))
-            effective_env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(pct)
+        effective_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
+        effective_env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
         # For non-Claude models, set the API key to the CLI proxy key so CC
         # authenticates against CLIProxyAPI (the cache proxy forwards it).
         if is_claude_model(effective_model):

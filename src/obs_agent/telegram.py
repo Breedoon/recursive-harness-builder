@@ -4854,6 +4854,8 @@ class TelegramBot:
             cwd=self._config.vault_path,
             new_session_id=str(uuid.uuid4()),
         )
+        if self._config.fork_cache_warmup_delay_seconds > 0:
+            await asyncio.sleep(self._config.fork_cache_warmup_delay_seconds)
         self._set_session_head(
             session_id=fork_session_id,
             jsonl_uuid=binding.jsonl_uuid,
@@ -8873,6 +8875,8 @@ class TelegramBot:
             )
         try:
             async with child_lock:
+                if record.is_fork and self._config.fork_cache_warmup_delay_seconds > 0:
+                    await asyncio.sleep(self._config.fork_cache_warmup_delay_seconds)
                 child_prompt = self._compose_prompt_file_context(
                     prompt=record.prompt,
                     prompt_file=record.prompt_file,
