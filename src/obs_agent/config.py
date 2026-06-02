@@ -50,8 +50,14 @@ MODEL_RESOLUTION: dict[str, str] = {
 _CONTEXT_SUFFIX_RE = re.compile(r"\[(\d+)([mk])\]$", re.IGNORECASE)
 
 _DEFAULT_CONTEXT_TOKENS = 1_000_000
-_DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 200_000
+_DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 120_000
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    # Claude Code's modelUsage currently reports a 200k operational context for
+    # these native Claude models. Treat that as authoritative for compaction and
+    # telemetry; assuming 1M lets forked sessions fail before auto-compact.
+    "claude-opus-4-7": 200_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-haiku-4-5": 200_000,
     "gpt-5.5": 256_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.4-mini": 1_000_000,

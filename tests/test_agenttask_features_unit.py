@@ -93,9 +93,10 @@ class TestModelContextBoundary:
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
     def test_auto_compact_window_is_capped_separately_from_context(self):
-        assert auto_compact_window_for_context(1_000_000) == 200_000
-        assert auto_compact_window_for_context(256_000) == 200_000
-        assert auto_compact_window_for_context(128_000) == 128_000
+        assert auto_compact_window_for_context(1_000_000) == 120_000
+        assert auto_compact_window_for_context(256_000) == 120_000
+        assert auto_compact_window_for_context(128_000) == 120_000
+        assert auto_compact_window_for_context(100_000) == 100_000
 
     def test_auto_compact_window_cap_can_be_disabled(self):
         assert auto_compact_window_for_context(
@@ -128,6 +129,11 @@ class TestContextSuffixParsing:
         clean, tokens = parse_context_suffix("gemini-3.1-flash-lite-preview")
         assert clean == "gemini-3.1-flash-lite-preview"
         assert tokens == 1_000_000
+
+    def test_claude_alias_uses_observed_operational_window(self):
+        clean, tokens = parse_context_suffix("claude")
+        assert clean == "claude-opus-4-7"
+        assert tokens == 200_000
 
     def test_uppercase_suffix(self):
         clean, tokens = parse_context_suffix("model[1M]")

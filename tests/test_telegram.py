@@ -4352,7 +4352,7 @@ class TestForkTaskRuntime:
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.5[256k]"
         child_env = child_options.env
-        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
         assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == unique_team
@@ -4399,7 +4399,7 @@ class TestForkTaskRuntime:
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.5[256k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "256000"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in child_options.env
         assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
         await bot.shutdown()
@@ -4440,7 +4440,7 @@ class TestForkTaskRuntime:
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.5[200k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in child_options.env
         await bot.shutdown()
 
@@ -4480,7 +4480,7 @@ class TestForkTaskRuntime:
         assert child_state.session_manager.model_override == "gpt-5.4-mini"
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.4-mini[1m]"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
         await bot.shutdown()
 
     async def test_scheduled_run_uses_route_model_context_semantics(
@@ -4514,7 +4514,7 @@ class TestForkTaskRuntime:
 
         options = state.session_manager.create_options()
         assert options.model == "gpt-5.4-mini[1m]"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
         run_text = run_mock.await_args.kwargs["user_text"]
         assert run_text.startswith("(System: scheduled execution.)")
         await bot.shutdown()

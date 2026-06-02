@@ -8,19 +8,27 @@ OBS passed a too-large auto-compact window and sessions died with
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from pathlib import Path
+import shutil
+import uuid
+from typing import Any
 
 import pytest
 
 from obs_agent.config import OBSConfig
-from obs_agent.context_jsonl import load_jsonl_usage_snapshot
+from obs_agent.context_jsonl import find_session_jsonl, load_jsonl_usage_snapshot
 from obs_agent.hooks import HookState
+from obs_agent.jsonl_fork import fork_session_jsonl
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent
 from obs_agent.session import SessionManager
 from tests.live_test_vault import ensure_live_test_vault
 
 pytestmark = [pytest.mark.live, pytest.mark.asyncio, pytest.mark.real_get_client]
+
+_DEFAULT_BROKEN_OPUS_SESSION_ID = "5d85d993-6134-4b0c-8590-bfe305d16e3b"
 
 
 def _load_dotenv() -> None:
@@ -91,7 +99,7 @@ async def _run_haiku_compaction_probe(
     try:
         options = session_manager.create_options()
         assert options.model == "claude-haiku-4-5"
-        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == str(auto_compact_window_tokens)
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
 
@@ -145,3 +153,204 @@ async def _run_haiku_compaction_probe(
         )
     finally:
         await session_manager.disconnect()
+
+
+@pytest.mark.skipif(
+    os.environ.get("OBS_RUN_BROKEN_OPUS_RECOVERY_LIVE") != "1",
+    reason="set OBS_RUN_BROKEN_OPUS_RECOVERY_LIVE=1 to spend live Opus tokens on recovery",
+)
+async def test_existing_broken_opus_session_compacts_and_recovers() -> None:
+    _load_dotenv()
+    session_id = os.environ.get(
+        "OBS_BROKEN_OPUS_SESSION_ID",
+        _DEFAULT_BROKEN_OPUS_SESSION_ID,
+    )
+    cwd = Path(
+        os.environ.get(
+            "OBS_BROKEN_OPUS_CWD",
+            str(OBSConfig().vault_path),
+        )
+    )
+    source_path = find_session_jsonl(session_id=session_id, cwd=cwd)
+    if source_path is None:
+        pytest.skip(f"broken Opus JSONL not found for {session_id}")
+
+    target_uuid = _last_good_assistant_before_prompt_too_long(source_path)
+    assert _context_triplet_at_uuid(source_path, target_uuid) >= 160_000
+    recovery_session_id = fork_session_jsonl(
+        session_id=session_id,
+        target_uuid=target_uuid,
+        cwd=cwd,
+        new_session_id=str(uuid.uuid4()),
+    )
+
+    first = await _run_claude_resume(
+        session_id=recovery_session_id,
+        cwd=cwd,
+        prompt=(
+            "Stop prior work. Compact if needed, then reply briefly that the "
+            "session is usable."
+        ),
+        timeout_seconds=360,
+    )
+    assert _contains_prompt_too_long_error(session_id=recovery_session_id, cwd=cwd) is False
+
+    snapshot = load_jsonl_usage_snapshot(session_id=recovery_session_id, cwd=cwd)
+    assert snapshot is not None
+    assert snapshot.latest_context_triplet_tokens < 120_000
+
+    second = await _run_claude_resume(
+        session_id=recovery_session_id,
+        cwd=cwd,
+        prompt="Reply with exactly BROKEN-OPUS-RECOVERED.",
+        timeout_seconds=180,
+    )
+    assert "BROKEN-OPUS-RECOVERED" in second
+    assert _contains_prompt_too_long_error(session_id=recovery_session_id, cwd=cwd) is False
+
+
+def _last_good_assistant_before_prompt_too_long(source_path: Path) -> str:
+    entries: list[dict[str, Any]] = []
+    by_uuid: dict[str, dict[str, Any]] = {}
+    with source_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            obj = json.loads(raw)
+            if not isinstance(obj, dict):
+                continue
+            entries.append(obj)
+            entry_uuid = obj.get("uuid")
+            if isinstance(entry_uuid, str) and entry_uuid:
+                by_uuid[entry_uuid] = obj
+
+    for entry in entries:
+        if entry.get("type") != "assistant":
+            continue
+        if "Prompt is too long" not in _entry_text(entry):
+            continue
+        failing_user_uuid = entry.get("parentUuid")
+        failing_user = by_uuid.get(failing_user_uuid) if isinstance(failing_user_uuid, str) else None
+        if failing_user is not None and failing_user.get("type") == "user":
+            last_good_uuid = failing_user.get("parentUuid")
+            if isinstance(last_good_uuid, str) and last_good_uuid:
+                return last_good_uuid
+        if isinstance(failing_user_uuid, str) and failing_user_uuid:
+            return failing_user_uuid
+        break
+
+    raise AssertionError(f"no Prompt is too long assistant entry found in {source_path}")
+
+
+def _entry_text(entry: dict[str, Any]) -> str:
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    return "\n".join(parts)
+
+
+def _contains_prompt_too_long_error(*, session_id: str, cwd: Path) -> bool:
+    path = find_session_jsonl(session_id=session_id, cwd=cwd)
+    if path is None:
+        return False
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            obj = json.loads(raw)
+            if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                continue
+            message = obj.get("message")
+            if not isinstance(message, dict):
+                continue
+            if message.get("error") == "invalid_request" and _entry_text(obj).strip() == "Prompt is too long":
+                return True
+    return False
+
+
+def _context_triplet_at_uuid(source_path: Path, target_uuid: str) -> int:
+    with source_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            obj = json.loads(raw)
+            if not isinstance(obj, dict) or obj.get("uuid") != target_uuid:
+                continue
+            message = obj.get("message")
+            if not isinstance(message, dict):
+                break
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                break
+            return (
+                _as_int(usage.get("input_tokens"))
+                + _as_int(usage.get("cache_creation_input_tokens"))
+                + _as_int(usage.get("cache_read_input_tokens"))
+            )
+    raise AssertionError(f"no usage found at {target_uuid} in {source_path}")
+
+
+def _as_int(value: Any) -> int:
+    return value if isinstance(value, int) else 0
+
+
+async def _run_claude_resume(
+    *,
+    session_id: str,
+    cwd: Path,
+    prompt: str,
+    timeout_seconds: int,
+) -> str:
+    claude_bin = shutil.which("claude")
+    if claude_bin is None:
+        pytest.skip("claude CLI not found")
+
+    env = os.environ.copy()
+    env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(OBSConfig().auto_compact_window_tokens)
+    env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = "200000"
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+    env["CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"] = "1"
+
+    proc = await asyncio.create_subprocess_exec(
+        claude_bin,
+        "-r",
+        session_id,
+        "-p",
+        prompt,
+        "--model",
+        "claude-opus-4-7",
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "json",
+        cwd=str(cwd),
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise
+
+    output = stdout.decode("utf-8", errors="replace")
+    err = stderr.decode("utf-8", errors="replace")
+    assert proc.returncode == 0, f"claude exited {proc.returncode}\nSTDOUT:\n{output}\nSTDERR:\n{err}"
+    return output + "\n" + err

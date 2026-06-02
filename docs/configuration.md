@@ -142,13 +142,15 @@ OBS_MAX_QUEUE_CONTINUATIONS=3
 OBS_BG_FORK_TIMEOUT=600
 OBS_MAX_BUFFER_SIZE=10485760
 OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS=1000000
-OBS_AUTO_COMPACT_WINDOW_TOKENS=200000
+OBS_AUTO_COMPACT_WINDOW_TOKENS=120000
 OBS_FORK_CACHE_WARMUP_DELAY_SECONDS=1.0
 ```
 
 `OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS` is telemetry for context reporting and
-model suffix resolution. `OBS_AUTO_COMPACT_WINDOW_TOKENS` is the conservative
-Claude Code auto-compact trigger window; leave it at `200000` unless a live
+model suffix resolution. Native Claude aliases use the 200k operational window
+reported by Claude Code model usage, even when subscription/model marketing
+suggests a larger maximum. `OBS_AUTO_COMPACT_WINDOW_TOKENS` is the conservative
+Claude Code auto-compact trigger window; leave it at `120000` unless a live
 long-session test proves the active provider/harness can compact safely later.
 Set it to `0` to pass the full model context through to Claude Code.
 `OBS_FORK_CACHE_WARMUP_DELAY_SECONDS` gives parent prompt-cache writes a short
