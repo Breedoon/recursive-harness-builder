@@ -177,7 +177,7 @@ class TestSessionSettings:
 
     def test_auto_compact_window_default(self):
         cfg = OBSConfig()
-        assert cfg.auto_compact_window_tokens == 120_000
+        assert cfg.auto_compact_window_tokens == 0
 
     def test_auto_compact_window_from_env(self, monkeypatch):
         monkeypatch.setenv("OBS_AUTO_COMPACT_WINDOW_TOKENS", "150000")

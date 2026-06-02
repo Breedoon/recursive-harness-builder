@@ -58,6 +58,7 @@ class TurnEndEvent:
     jsonl_uuid: str | None = None
     message_role: str | None = None
     has_text: bool = False
+    is_error: bool = False
 
 
 @dataclass
@@ -116,6 +117,16 @@ def _message_role(message) -> str | None:
     if type_name == "SystemMessage":
         return "system"
     return None
+
+
+def _is_error_message(message, text_parts: list[str]) -> bool:
+    if bool(getattr(message, "isApiErrorMessage", False)):
+        return True
+    error = getattr(message, "error", None)
+    if isinstance(error, str) and error:
+        return True
+    text = "\n".join(part for part in text_parts if part).strip()
+    return text == "Prompt is too long"
 
 
 def _system_message_to_status_event(message) -> StatusEvent | None:
@@ -279,6 +290,7 @@ class ConversationRunner:
             raw_uuid = getattr(message, "_raw_uuid", None)
             message_role = _message_role(message)
             has_text = False
+            text_parts: list[str] = []
             if (
                 getattr(message, "num_turns", None) is not None
                 and getattr(message, "total_cost_usd", None) is not None
@@ -307,6 +319,7 @@ class ConversationRunner:
                         )
                     elif isinstance(block, TextBlock):
                         has_text = True
+                        text_parts.append(block.text)
                         yield TextEvent(text=block.text)
 
             system_status = _system_message_to_status_event(message)
@@ -324,6 +337,7 @@ class ConversationRunner:
                 jsonl_uuid=raw_uuid if isinstance(raw_uuid, str) and raw_uuid else None,
                 message_role=message_role,
                 has_text=has_text,
+                is_error=_is_error_message(message, text_parts),
             )
 
     async def _stream_or_reconnect(

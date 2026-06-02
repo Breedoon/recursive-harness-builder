@@ -83,9 +83,9 @@ class TestModelContextBoundary:
         assert split_context_suffix("gpt-5.4-mini") == ("gpt-5.4-mini", None)
         assert split_context_suffix("gpt-5.4-mini[200k]") == ("gpt-5.4-mini", 200_000)
 
-    def test_claude_code_boundary_adds_default_suffix_for_non_claude(self):
+    def test_claude_code_boundary_adds_resolved_context_suffix(self):
         assert normalize_model_for_claude_code("gpt") == "gpt-5.5[256k]"
-        assert normalize_model_for_claude_code("claude") == "claude-opus-4-7"
+        assert normalize_model_for_claude_code("claude") == "claude-opus-4-7[1m]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
 
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):
@@ -93,9 +93,9 @@ class TestModelContextBoundary:
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
     def test_auto_compact_window_is_capped_separately_from_context(self):
-        assert auto_compact_window_for_context(1_000_000) == 120_000
-        assert auto_compact_window_for_context(256_000) == 120_000
-        assert auto_compact_window_for_context(128_000) == 120_000
+        assert auto_compact_window_for_context(1_000_000) == 1_000_000
+        assert auto_compact_window_for_context(256_000) == 256_000
+        assert auto_compact_window_for_context(128_000) == 128_000
         assert auto_compact_window_for_context(100_000) == 100_000
 
     def test_auto_compact_window_cap_can_be_disabled(self):
@@ -130,10 +130,10 @@ class TestContextSuffixParsing:
         assert clean == "gemini-3.1-flash-lite-preview"
         assert tokens == 1_000_000
 
-    def test_claude_alias_uses_observed_operational_window(self):
+    def test_claude_alias_uses_default_obs_context_window(self):
         clean, tokens = parse_context_suffix("claude")
         assert clean == "claude-opus-4-7"
-        assert tokens == 200_000
+        assert tokens == 1_000_000
 
     def test_uppercase_suffix(self):
         clean, tokens = parse_context_suffix("model[1M]")

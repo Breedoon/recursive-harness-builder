@@ -6364,6 +6364,7 @@ class TelegramBot:
                 # bootstrap until the child session JSONL actually contains it.
                 pending_bootstrap_active = state.pending_obs_bootstrap
                 run_user_text = f"{pending_bootstrap_active}\n\n{run_user_text}"
+            last_good_turn_uuid = self._session_heads.get(state.session_id or "")
             # Prepend server timestamp + context stats to user messages
             _now_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
             _ctx_snapshot = build_context_snapshot(
@@ -6436,6 +6437,16 @@ class TelegramBot:
                     continue
 
                 if isinstance(event, TurnEndEvent):
+                    if event.is_error:
+                        if state.session_id and last_good_turn_uuid:
+                            self._set_session_head(
+                                session_id=state.session_id,
+                                jsonl_uuid=last_good_turn_uuid,
+                            )
+                            latest_turn_uuid = last_good_turn_uuid
+                        turn_items.clear()
+                        trigger_status_ids.clear()
+                        continue
                     if (
                         event.jsonl_uuid
                         and event.message_role == "user"
@@ -6479,7 +6490,7 @@ class TelegramBot:
                     )
                     mapped_uuid = (
                         event.jsonl_uuid
-                        if event.jsonl_uuid and turn_items
+                        if event.jsonl_uuid and turn_items and not event.is_error
                         else None
                     )
                     if mapped_uuid and trigger_status_ids:
@@ -6493,6 +6504,7 @@ class TelegramBot:
                         trigger_status_ids.clear()
                     if mapped_uuid:
                         latest_turn_uuid = mapped_uuid
+                        last_good_turn_uuid = mapped_uuid
                         self._refresh_session_head(
                             state=state,
                             latest_turn_uuid=latest_turn_uuid,

@@ -123,11 +123,11 @@ class TestCreateOptions:
         assert options.mcp_servers is not None
         assert "obs-agent" in options.mcp_servers
 
-    def test_uses_configured_claude_model_without_implicit_long_context_suffix(self, config):
+    def test_uses_configured_claude_model_with_default_context_suffix(self, config):
         config.model = "haiku"
         mgr = SessionManager(config=config)
         options = mgr.create_options()
-        assert options.model == "claude-haiku-4-5"
+        assert options.model == "claude-haiku-4-5[1m]"
 
     def test_exposes_effective_model_to_hook_state(self, config):
         state = HookState()
@@ -187,7 +187,7 @@ class TestCreateOptions:
         options = mgr.create_options()
         assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
@@ -197,7 +197,7 @@ class TestCreateOptions:
         options = mgr.create_options()
         assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
@@ -207,7 +207,7 @@ class TestCreateOptions:
         options = mgr.create_options()
         assert options.model == "gpt-5.4-mini[200k]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
@@ -217,15 +217,15 @@ class TestCreateOptions:
         options = mgr.create_options()
         assert mgr.model_override is None
         assert options.model == "gpt-5.4-mini[1m]"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
 
-    def test_claude_root_uses_observed_context_without_proxy_key(self, config):
+    def test_claude_root_uses_default_1m_context_without_proxy_key(self, config):
         config.model = "claude-opus-4-7"
         mgr = SessionManager(config=config)
         options = mgr.create_options()
-        assert options.model == "claude-opus-4-7"
-        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert options.model == "claude-opus-4-7[1m]"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert "ANTHROPIC_API_KEY" not in options.env
 
     def test_claude_root_removes_auth_keys_from_session_overrides(self, config):
@@ -300,7 +300,7 @@ class TestClientLifecycle:
         options = captured["options"]
         assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
@@ -389,7 +389,7 @@ class TestClientLifecycle:
         options = captured["options"]
         assert options.model == "gpt-5.5[200k]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 

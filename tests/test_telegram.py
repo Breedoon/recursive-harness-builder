@@ -250,6 +250,47 @@ class TestTelegramMessageFlow:
         assert binding.session_id == "sid-1"
         assert bot._session_heads["sid-1"] == "assistant-uuid"
 
+    async def test_prompt_too_long_error_does_not_replace_session_head(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        bot._set_session_head(session_id="sid-1", jsonl_uuid="previous-good-uuid")
+        events = [
+            TextEvent(text="Prompt is too long"),
+            TurnEndEvent(
+                jsonl_uuid="error-uuid",
+                message_role="assistant",
+                has_text=True,
+                is_error=True,
+            ),
+            DoneEvent(),
+        ]
+
+        async def send_side_effect(**kwargs):
+            message = MagicMock()
+            message.message_id = 100 + len(bot._message_map)
+            return message
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                _state(bot).session_manager.set_session_id("sid-1")
+                for event in events:
+                    yield event
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            update = _make_update("test")
+            ctx = _make_context()
+            ctx.bot.send_message = AsyncMock(side_effect=send_side_effect)
+            await bot.handle_message(update, ctx)
+
+        assert bot._session_heads["sid-1"] == "previous-good-uuid"
+        assert all(
+            binding.jsonl_uuid != "error-uuid"
+            for binding in bot._message_map.values()
+        )
+
     async def test_status_only_assistant_message_is_mapped(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         events = [
@@ -4352,7 +4393,7 @@ class TestForkTaskRuntime:
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.5[256k]"
         child_env = child_options.env
-        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "256000"
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
         assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == unique_team
@@ -4399,7 +4440,7 @@ class TestForkTaskRuntime:
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.5[256k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "256000"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "256000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in child_options.env
         assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
         await bot.shutdown()
@@ -4440,7 +4481,7 @@ class TestForkTaskRuntime:
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.5[200k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in child_options.env
         await bot.shutdown()
 
@@ -4480,7 +4521,7 @@ class TestForkTaskRuntime:
         assert child_state.session_manager.model_override == "gpt-5.4-mini"
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.4-mini[1m]"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         await bot.shutdown()
 
     async def test_scheduled_run_uses_route_model_context_semantics(
@@ -4514,7 +4555,7 @@ class TestForkTaskRuntime:
 
         options = state.session_manager.create_options()
         assert options.model == "gpt-5.4-mini[1m]"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         run_text = run_mock.await_args.kwargs["user_text"]
         assert run_text.startswith("(System: scheduled execution.)")
         await bot.shutdown()

@@ -17,9 +17,11 @@ import uuid
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
 from obs_agent.config import OBSConfig
 from obs_agent.context_jsonl import find_session_jsonl, load_jsonl_usage_snapshot
+from obs_agent.daemon import create_app
 from obs_agent.hooks import HookState
 from obs_agent.jsonl_fork import fork_session_jsonl
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent
@@ -29,6 +31,7 @@ from tests.live_test_vault import ensure_live_test_vault
 pytestmark = [pytest.mark.live, pytest.mark.asyncio, pytest.mark.real_get_client]
 
 _DEFAULT_BROKEN_OPUS_SESSION_ID = "5d85d993-6134-4b0c-8590-bfe305d16e3b"
+_DEFAULT_TRUST_SESSION_ID = "137406cb-965d-4488-97ba-7aca104a3d45"
 
 
 def _load_dotenv() -> None:
@@ -75,6 +78,50 @@ async def test_haiku_200k_auto_compacts_and_remains_usable(tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    os.environ.get("OBS_RUN_TRUST_DAEMON_LIVE") != "1",
+    reason="set OBS_RUN_TRUST_DAEMON_LIVE=1 to spend live Opus tokens on the TRUST daemon route",
+)
+async def test_trust_session_runs_via_daemon_with_default_1m_context() -> None:
+    _load_dotenv()
+    session_id = os.environ.get("OBS_TRUST_SESSION_ID", _DEFAULT_TRUST_SESSION_ID)
+    config = OBSConfig(
+        vault_path=Path(
+            os.environ.get(
+                "OBS_TRUST_CWD",
+                str(OBSConfig().vault_path),
+            )
+        ),
+        model="claude-opus-4-7",
+        cache_proxy_enabled=False,
+    )
+    app = create_app(config)
+    app.state.session_manager.set_session_id(session_id)
+    options = app.state.session_manager.create_options()
+    assert options.resume == session_id
+    assert options.model == "claude-opus-4-7[1m]"
+    assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
+    assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+
+    prompt = (
+        "This is a live OBS daemon recovery check for the TRUST session. "
+        "Do not continue prior delegated work. Reply with exactly "
+        "TRUST-DAEMON-1M-RUNNABLE."
+    )
+    with TestClient(app) as client:
+        response = await asyncio.to_thread(
+            client.post,
+            "/chat",
+            json={"message": prompt},
+        )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["session_id"] == session_id
+    assert "TRUST-DAEMON-1M-RUNNABLE" in payload["response"]
+    assert "Prompt is too long" not in payload["response"]
+
+
 async def _run_haiku_compaction_probe(
     *,
     tmp_path: Path,
@@ -98,8 +145,8 @@ async def _run_haiku_compaction_probe(
 
     try:
         options = session_manager.create_options()
-        assert options.model == "claude-haiku-4-5"
-        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
+        assert options.model == "claude-haiku-4-5[1m]"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == str(auto_compact_window_tokens)
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
 
@@ -318,8 +365,8 @@ async def _run_claude_resume(
         pytest.skip("claude CLI not found")
 
     env = os.environ.copy()
-    env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(OBSConfig().auto_compact_window_tokens)
-    env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = "200000"
+    env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "1000000"
+    env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = "1000000"
     env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     env["CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"] = "1"
 
@@ -330,7 +377,7 @@ async def _run_claude_resume(
         "-p",
         prompt,
         "--model",
-        "claude-opus-4-7",
+        "claude-opus-4-7[1m]",
         "--permission-mode",
         "bypassPermissions",
         "--output-format",

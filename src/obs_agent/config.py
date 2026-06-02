@@ -50,18 +50,25 @@ MODEL_RESOLUTION: dict[str, str] = {
 _CONTEXT_SUFFIX_RE = re.compile(r"\[(\d+)([mk])\]$", re.IGNORECASE)
 
 _DEFAULT_CONTEXT_TOKENS = 1_000_000
-_DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 120_000
+_DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 0
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    # Claude Code's modelUsage currently reports a 200k operational context for
-    # these native Claude models. Treat that as authoritative for compaction and
-    # telemetry; assuming 1M lets forked sessions fail before auto-compact.
-    "claude-opus-4-7": 200_000,
-    "claude-sonnet-4-6": 200_000,
-    "claude-haiku-4-5": 200_000,
     "gpt-5.5": 256_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.4-mini": 1_000_000,
 }
+
+
+@dataclass(frozen=True)
+class ModelContext:
+    """Resolved model identity plus OBS context-window metadata."""
+
+    model: str
+    context_tokens: int
+    explicit_context: bool
+
+    @property
+    def model_for_claude_code(self) -> str:
+        return self.model + _context_suffix_for_tokens(self.context_tokens)
 
 
 def _context_suffix_for_tokens(context_tokens: int) -> str:
@@ -98,18 +105,35 @@ def resolve_model(shorthand: str) -> str:
     return resolved
 
 
+def resolve_model_context(
+    model_str: str,
+    *,
+    default_context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+) -> ModelContext:
+    """Resolve model identity and OBS context window as separate fields."""
+    resolved = resolve_model(model_str)
+    clean, ctx_tokens = split_context_suffix(resolved)
+    clean = clean.strip()
+    if ctx_tokens is not None:
+        return ModelContext(clean, ctx_tokens, True)
+    return ModelContext(
+        clean,
+        MODEL_CONTEXT_WINDOWS.get(clean.lower(), default_context_tokens),
+        False,
+    )
+
+
 def context_window_for_model(
     model_str: str,
     *,
     default_context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
 ) -> tuple[str, int, bool]:
     """Return (resolved_clean_model, context_tokens, explicit_suffix)."""
-    resolved = resolve_model(model_str)
-    clean, ctx_tokens = split_context_suffix(resolved)
-    clean = clean.strip()
-    if ctx_tokens is not None:
-        return clean, ctx_tokens, True
-    return clean, MODEL_CONTEXT_WINDOWS.get(clean.lower(), default_context_tokens), False
+    resolved = resolve_model_context(
+        model_str,
+        default_context_tokens=default_context_tokens,
+    )
+    return resolved.model, resolved.context_tokens, resolved.explicit_context
 
 
 def normalize_model_for_claude_code(
@@ -117,21 +141,17 @@ def normalize_model_for_claude_code(
     *,
     default_context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
 ) -> str:
-    """Resolve model identity and add a context suffix when OBS must override CC.
+    """Resolve model identity and append OBS's context window suffix.
 
-    Claude Code already knows Claude model context windows and some subscriptions
-    reject explicit long-context suffixes. Preserve explicit suffixes, but only
-    add OBS's default suffix automatically for non-Claude models.
+    OBS treats context length as runtime metadata, not part of model identity.
+    At the Claude Code boundary we always pass the resolved context suffix,
+    including the default ``[1m]`` for native Claude models.
     """
-    clean, ctx_tokens, explicit_context = context_window_for_model(
+    resolved = resolve_model_context(
         model_str,
         default_context_tokens=default_context_tokens,
     )
-    if explicit_context:
-        return clean + _context_suffix_for_tokens(ctx_tokens)
-    if is_claude_model(clean):
-        return clean
-    return clean + _context_suffix_for_tokens(ctx_tokens)
+    return resolved.model_for_claude_code
 
 
 def parse_context_suffix(model_str: str) -> tuple[str, int]:
@@ -146,8 +166,8 @@ def parse_context_suffix(model_str: str) -> tuple[str, int]:
     >>> parse_context_suffix("gemini-3.1-flash-lite-preview")
     ('gemini-3.1-flash-lite-preview', 1000000)
     """
-    clean, ctx_tokens, _explicit_context = context_window_for_model(model_str)
-    return clean, ctx_tokens
+    resolved = resolve_model_context(model_str)
+    return resolved.model, resolved.context_tokens
 
 
 def compaction_threshold(context_tokens: int) -> int:
