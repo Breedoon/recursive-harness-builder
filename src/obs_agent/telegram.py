@@ -47,6 +47,10 @@ from obs_agent.config import parse_context_suffix
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
 from obs_agent.context_jsonl import find_session_jsonl
+from obs_agent.jsonl_health import (
+    JsonlSessionHealth,
+    resolve_safe_jsonl_target,
+)
 from obs_agent.jsonl_fork import fork_session_jsonl
 from obs_agent.lineage import (
     agent_name_for_lineage,
@@ -1569,68 +1573,40 @@ class TelegramBot:
                         agent_name=agent_name,
                     )
                 )
-            else:
-                session_bootstrap = find_latest_obs_bootstrap_for_session(
-                    session_id=entry.session_id,
-                    cwd=self._config.vault_path,
-                )
-                if state.agent_lineage is None and session_bootstrap is not None and session_bootstrap.lineage:
-                    state.agent_lineage = session_bootstrap.lineage
-                # On restore without bootstrap: check SDK env overrides for
-                # persisted team key.  NEVER regenerate a timestamp — the
-                # team key was set once at creation and must be restored.
+            elif state.agent_lineage:
+                # Keep restore cheap: do not scan session JSONL for thousands of
+                # historical routes at daemon startup. If a route lacks persisted
+                # bootstrap/env metadata, the active run path resolves it lazily.
                 env = state.session_manager.sdk_env_overrides
-                persisted_team = (
-                    env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
-                    or (session_bootstrap.root_team_key if session_bootstrap is not None else "")
-                )
-                persisted_agent = (
-                    env.get("CLAUDE_CODE_AGENT_NAME", "").strip()
-                    or (session_bootstrap.agent_name if session_bootstrap is not None else "")
-                )
+                persisted_team = env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
+                persisted_agent = env.get("CLAUDE_CODE_AGENT_NAME", "").strip()
                 if persisted_team and persisted_agent:
-                    state.session_manager.set_sdk_env_overrides(
-                        self._build_team_worker_env(
-                            team_name=persisted_team,
-                            agent_name=persisted_agent,
-                        )
-                    )
+                    default_team_name = persisted_team
+                    default_agent_name = persisted_agent
                 elif persisted_team:
-                    # Have team but no agent name — derive it
-                    restore_lineage = state.agent_lineage or self._ensure_state_lineage(
-                        state,
-                        session_id=entry.session_id,
-                    )
+                    default_team_name = persisted_team
                     default_agent_name = agent_name_for_lineage(
-                        restore_lineage,
+                        state.agent_lineage,
                         team_key=persisted_team,
                     )
-                    state.session_manager.set_sdk_env_overrides(
-                        self._build_team_worker_env(
-                            team_name=persisted_team,
-                            agent_name=default_agent_name,
-                        )
-                    )
                 else:
-                    # No persisted team key at all — this is truly first
-                    # creation (not a restart).  Generate a new team key.
-                    restore_lineage = state.agent_lineage or self._ensure_state_lineage(
-                        state,
-                        session_id=entry.session_id,
-                    )
                     default_team_name, default_agent_name = self._default_team_projection(
-                        restore_lineage
+                        state.agent_lineage
                     )
-                    state.session_manager.set_sdk_env_overrides(
-                        self._build_team_worker_env(
-                            team_name=default_team_name,
-                            agent_name=default_agent_name,
-                        )
+                state.session_manager.set_sdk_env_overrides(
+                    self._build_team_worker_env(
+                        team_name=default_team_name,
+                        agent_name=default_agent_name,
                     )
+                )
             if entry.session_id:
                 state.session_manager.set_session_id(entry.session_id)
                 self._route_by_session_id[entry.session_id] = route
-            self._upsert_route_inbox_target(state)
+            self._upsert_route_inbox_target(
+                state,
+                allow_jsonl_lookup=False,
+                persist_projection_config=False,
+            )
             self._states_by_route[route] = state
             if entry.last_inbound_message_id is not None:
                 self._last_inbound_message_id_by_route[route] = entry.last_inbound_message_id
@@ -1697,12 +1673,13 @@ class TelegramBot:
                 chat_id=entry.parent_chat_id,
                 thread_id=entry.parent_thread_id,
             )
-            child_state = self._get_state(child_route, create=True)
-            assert child_state is not None
+            child_state = self._states_by_route.get(child_route)
+            if child_state is None:
+                child_state = self._build_session_state(child_route)
+                self._states_by_route[child_route] = child_state
             if entry.child_session_id and child_state.session_id != entry.child_session_id:
                 child_state.session_manager.set_session_id(entry.child_session_id)
                 self._route_by_session_id[entry.child_session_id] = child_route
-                self._persist_state_for_route(child_route)
 
             record = _ForkTaskRecord(
                 task_id=entry.task_id,
@@ -1738,7 +1715,6 @@ class TelegramBot:
             key = self._team_worker_key(record.team_name, record.agent_name)
             if key is not None:
                 self._team_worker_records[key] = record.task_id
-            self._persist_task_handle_record(record)
 
         for entry in snapshot.team_worker_states:
             if entry.task_id in self._fork_tasks_by_id:
@@ -1750,12 +1726,13 @@ class TelegramBot:
                 chat_id=entry.child_chat_id,
                 thread_id=entry.child_thread_id,
             )
-            child_state = self._get_state(child_route, create=True)
-            assert child_state is not None
+            child_state = self._states_by_route.get(child_route)
+            if child_state is None:
+                child_state = self._build_session_state(child_route)
+                self._states_by_route[child_route] = child_state
             if entry.child_session_id and child_state.session_id != entry.child_session_id:
                 child_state.session_manager.set_session_id(entry.child_session_id)
                 self._route_by_session_id[entry.child_session_id] = child_route
-                self._persist_state_for_route(child_route)
 
             restored_idle_ready = entry.idle_ready
             if not restored_idle_ready and entry.status not in {"failed", "stopped"}:
@@ -1784,8 +1761,6 @@ class TelegramBot:
             self._team_worker_records[key] = record.task_id
             if record.idle_ready and record.status not in {"failed", "stopped"}:
                 self._fork_task_by_child_route[child_route] = record.task_id
-            self._persist_team_worker_record(record)
-            self._persist_task_handle_record(record)
 
     def _set_topic_metadata(
         self,
@@ -2288,6 +2263,8 @@ class TelegramBot:
     def _state_inbox_projection(
         self,
         state: TelegramSessionState,
+        *,
+        allow_jsonl_lookup: bool = True,
     ) -> tuple[str, str] | None:
         bootstrap = None
         if state.pending_obs_bootstrap:
@@ -2298,9 +2275,13 @@ class TelegramBot:
         lineage = state.agent_lineage
         if not lineage and bootstrap is not None and bootstrap.lineage:
             lineage = bootstrap.lineage
-        session_bootstrap = find_latest_obs_bootstrap_for_session(
-            session_id=state.session_id,
-            cwd=self._config.vault_path,
+        session_bootstrap = (
+            find_latest_obs_bootstrap_for_session(
+                session_id=state.session_id,
+                cwd=self._config.vault_path,
+            )
+            if allow_jsonl_lookup
+            else None
         )
         if session_bootstrap is not None and not lineage and session_bootstrap.lineage:
             lineage = session_bootstrap.lineage
@@ -2338,8 +2319,17 @@ class TelegramBot:
         if mapped_route == route:
             self._route_inbox_targets.pop(existing_key, None)
 
-    def _upsert_route_inbox_target(self, state: TelegramSessionState) -> None:
-        key = self._state_inbox_projection(state)
+    def _upsert_route_inbox_target(
+        self,
+        state: TelegramSessionState,
+        *,
+        allow_jsonl_lookup: bool = True,
+        persist_projection_config: bool = True,
+    ) -> None:
+        key = self._state_inbox_projection(
+            state,
+            allow_jsonl_lookup=allow_jsonl_lookup,
+        )
         if key is None:
             self._remove_route_inbox_target(state.route)
             return
@@ -2363,6 +2353,8 @@ class TelegramBot:
         self._remove_route_inbox_target(state.route)
         self._route_inbox_targets[key] = state.route
         self._route_inbox_target_keys_by_route[state.route] = key
+        if not persist_projection_config:
+            return
         self._upsert_team_projection_config(
             team_name=key[0],
             agent_name=key[1],
@@ -3578,6 +3570,112 @@ class TelegramBot:
             return []
         return self._persisted_jsonl_uuids(path)
 
+    def _resolve_safe_jsonl_target(
+        self,
+        *,
+        session_id: str,
+        preferred_uuid: str | None,
+        purpose: str,
+    ) -> tuple[str | None, JsonlSessionHealth | None]:
+        target = resolve_safe_jsonl_target(
+            session_id=session_id,
+            cwd=self._config.vault_path,
+            preferred_uuid=preferred_uuid,
+        )
+        if target is None:
+            persisted = self._persisted_session_uuids(session_id)
+            if preferred_uuid and preferred_uuid in persisted:
+                return preferred_uuid, None
+            if persisted:
+                return persisted[-1], None
+            return preferred_uuid, None
+        if target.changed:
+            logger.warning(
+                "[jsonl_health] purpose=%s session_id=%s preferred_uuid=%s "
+                "resolved_uuid=%s reason=%s first_poison=%s safe_line=%s",
+                purpose,
+                session_id,
+                preferred_uuid,
+                target.target_uuid,
+                target.reason,
+                target.health.first_poison_uuid,
+                target.health.safe_recovery_line,
+            )
+        return target.target_uuid, target.health
+
+    async def _recover_route_session_if_needed(
+        self,
+        *,
+        state: TelegramSessionState,
+        source: str,
+    ) -> str | None:
+        session_id = state.session_id
+        if not session_id:
+            return None
+        preferred_uuid = self._session_heads.get(session_id)
+        target = resolve_safe_jsonl_target(
+            session_id=session_id,
+            cwd=self._config.vault_path,
+            preferred_uuid=preferred_uuid,
+        )
+        if target is None or not target.health.needs_recovery or not target.target_uuid:
+            return None
+
+        old_model_override = state.session_manager.model_override
+        old_user_hooks = (
+            dict(state.session_manager.user_hooks)
+            if state.session_manager.user_hooks is not None
+            else None
+        )
+        old_env = state.session_manager.sdk_env_overrides
+        old_lineage = self._ensure_state_lineage(state, session_id=session_id)
+        old_projection = self._state_inbox_projection(state)
+
+        recovery_session_id = fork_session_jsonl(
+            session_id=session_id,
+            target_uuid=target.target_uuid,
+            cwd=self._config.vault_path,
+            new_session_id=str(uuid.uuid4()),
+        )
+        logger.warning(
+            "[jsonl_recovery] route=%s source=%s old_session_id=%s "
+            "new_session_id=%s recovery_uuid=%s first_poison=%s",
+            state.route,
+            source,
+            session_id,
+            recovery_session_id,
+            target.target_uuid,
+            target.health.first_poison_uuid,
+        )
+
+        self._set_session_head(session_id=session_id, jsonl_uuid=target.target_uuid)
+        self._set_session_head(session_id=recovery_session_id, jsonl_uuid=target.target_uuid)
+        await self._activate_route_session(state, recovery_session_id)
+        state.session_manager.model_override = old_model_override
+        state.session_manager.user_hooks = old_user_hooks
+        state.session_manager.set_sdk_env_overrides(old_env)
+
+        self._prime_obs_bootstrap(
+            state,
+            lineage=old_lineage,
+            origin="session_recovery",
+            is_fork=True,
+            parent_session_id=session_id,
+            session_id=recovery_session_id,
+            team_name=old_projection[0] if old_projection is not None else None,
+            agent_name=old_projection[1] if old_projection is not None else None,
+        )
+
+        record = self._find_task_by_child_route(state.route)
+        if record is not None:
+            record.child_session_id = recovery_session_id
+            record.parent_source_uuid = target.target_uuid
+            self._persist_team_worker_record(record)
+            self._persist_task_handle_record(record)
+
+        self._persist_state_for_route(state.route)
+        return recovery_session_id
+
     def _resolve_persisted_fork_source(
         self,
         *,
@@ -3585,12 +3683,13 @@ class TelegramBot:
         preferred_uuid: str,
         preferred_route: TelegramRoute,
     ) -> tuple[str, TelegramRoute, int | None]:
-        persisted_uuids = self._persisted_session_uuids(session_id)
-        if not persisted_uuids:
-            return preferred_uuid, preferred_route, None
-        resolved_uuid = (
-            preferred_uuid if preferred_uuid in persisted_uuids else persisted_uuids[-1]
+        resolved_uuid, _health = self._resolve_safe_jsonl_target(
+            session_id=session_id,
+            preferred_uuid=preferred_uuid,
+            purpose="fork_source",
         )
+        if not resolved_uuid:
+            return preferred_uuid, preferred_route, None
         located = self._find_bound_message_id(
             session_id=session_id,
             jsonl_uuid=resolved_uuid,
@@ -4076,10 +4175,14 @@ class TelegramBot:
         source_route = state.route
         if source_session_id and not source_uuid:
             # Tool callbacks can race slightly ahead of session-head bookkeeping.
-            # Fall back to the latest persisted UUID for this session.
-            persisted = self._persisted_session_uuids(source_session_id)
-            if persisted:
-                source_uuid = persisted[-1]
+            # Fall back to the latest safe persisted UUID for this session.
+            safe_uuid, _health = self._resolve_safe_jsonl_target(
+                session_id=source_session_id,
+                preferred_uuid=None,
+                purpose="missing_head",
+            )
+            if safe_uuid:
+                source_uuid = safe_uuid
         located = (
             self._find_bound_message_id(
                 session_id=source_session_id,
@@ -4844,13 +4947,28 @@ class TelegramBot:
             return False, reply_to_user_message_id
 
         latest_uuid = self._session_heads.get(binding.session_id)
-        if latest_uuid == binding.jsonl_uuid:
+        safe_uuid, _health = self._resolve_safe_jsonl_target(
+            session_id=binding.session_id,
+            preferred_uuid=binding.jsonl_uuid,
+            purpose="reply_fork",
+        )
+        if not safe_uuid:
+            await self._send_system_message(
+                route=state.route,
+                bot=bot,
+                text="can't fork from this message",
+                disable_notification=True,
+                reply_to_message_id=reply_to_user_message_id,
+            )
+            return False, reply_to_user_message_id
+
+        if latest_uuid == binding.jsonl_uuid and safe_uuid == binding.jsonl_uuid:
             await self._activate_route_session(state, binding.session_id)
             return True, reply_to_user_message_id
 
         fork_session_id = fork_session_jsonl(
             session_id=binding.session_id,
-            target_uuid=binding.jsonl_uuid,
+            target_uuid=safe_uuid,
             cwd=self._config.vault_path,
             new_session_id=str(uuid.uuid4()),
         )
@@ -4858,7 +4976,7 @@ class TelegramBot:
             await asyncio.sleep(self._config.fork_cache_warmup_delay_seconds)
         self._set_session_head(
             session_id=fork_session_id,
-            jsonl_uuid=binding.jsonl_uuid,
+            jsonl_uuid=safe_uuid,
         )
         await self._activate_route_session(state, fork_session_id)
         lineage = self._ensure_state_lineage(state, session_id=binding.session_id)
@@ -6270,6 +6388,10 @@ class TelegramBot:
         )
         if not proceed:
             return _RunOutcome(assistant_text="")
+        await self._recover_route_session_if_needed(
+            state=state,
+            source="run_start",
+        )
 
         runner = ConversationRunner(
             state.session_manager,
@@ -7370,6 +7492,14 @@ class TelegramBot:
         if is_fork:
             if not source_session_id or not source_uuid:
                 raise RuntimeError("Cannot create fork child topic: source session head is unavailable")
+            safe_uuid, _health = self._resolve_safe_jsonl_target(
+                session_id=source_session_id,
+                preferred_uuid=source_uuid,
+                purpose="create_child_fork",
+            )
+            if not safe_uuid:
+                raise RuntimeError("Cannot create fork child topic: source session has no safe JSONL head")
+            source_uuid = safe_uuid
             child_session_id = fork_session_jsonl(
                 session_id=source_session_id,
                 target_uuid=source_uuid,

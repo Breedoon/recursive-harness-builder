@@ -51,10 +51,16 @@ _CONTEXT_SUFFIX_RE = re.compile(r"\[(\d+)([mk])\]$", re.IGNORECASE)
 
 _DEFAULT_CONTEXT_TOKENS = 1_000_000
 _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 0
+_DEFAULT_NON_CLAUDE_AUTO_COMPACT_WINDOW_TOKENS = 200_000
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-5.5": 256_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.4-mini": 1_000_000,
+}
+MODEL_AUTO_COMPACT_WINDOWS: dict[str, int] = {
+    "gpt-5.5": 200_000,
+    "gpt-5.4": 200_000,
+    "gpt-5.4-mini": 200_000,
 }
 
 
@@ -216,6 +222,48 @@ def auto_compact_window_for_context(
     if auto_compact_window_tokens <= 0:
         return context_tokens
     return min(context_tokens, auto_compact_window_tokens)
+
+
+def default_auto_compact_window_for_model(
+    model_str: str,
+    context_tokens: int,
+) -> int:
+    """Return OBS's built-in auto-compact window for a resolved model.
+
+    Native Claude sessions should use their full advertised context so Opus can
+    reach the 1M path. Proxied providers go through Claude Code's Anthropic
+    harness and have historically needed a lower compaction lane even when the
+    model suffix advertises a larger context.
+    """
+    if context_tokens <= 0:
+        return 0
+    clean, _ctx = split_context_suffix(resolve_model(model_str))
+    if is_claude_model(clean):
+        return context_tokens
+    default_window = MODEL_AUTO_COMPACT_WINDOWS.get(
+        clean.lower(),
+        _DEFAULT_NON_CLAUDE_AUTO_COMPACT_WINDOW_TOKENS,
+    )
+    return min(context_tokens, default_window)
+
+
+def auto_compact_window_for_model(
+    model_str: str,
+    context_tokens: int,
+    *,
+    auto_compact_window_tokens: int = _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS,
+) -> int:
+    """Return the Claude Code auto-compact window for a model/context pair.
+
+    ``auto_compact_window_tokens`` is an explicit operator override. A value of
+    0 means "use OBS's model-aware default", not "disable the conservative
+    proxied-provider window".
+    """
+    if context_tokens <= 0:
+        return 0
+    if auto_compact_window_tokens > 0:
+        return min(context_tokens, auto_compact_window_tokens)
+    return default_auto_compact_window_for_model(model_str, context_tokens)
 
 
 def is_claude_model(model: str) -> bool:

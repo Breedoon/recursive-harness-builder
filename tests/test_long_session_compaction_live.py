@@ -17,12 +17,15 @@ import uuid
 from typing import Any
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 
+from obs_agent.cache_proxy_lifecycle import start_cache_proxy
 from obs_agent.config import OBSConfig
 from obs_agent.context_jsonl import find_session_jsonl, load_jsonl_usage_snapshot
 from obs_agent.daemon import create_app
 from obs_agent.hooks import HookState
+from obs_agent.jsonl_health import analyze_jsonl_path
 from obs_agent.jsonl_fork import fork_session_jsonl
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent
 from obs_agent.session import SessionManager
@@ -31,6 +34,7 @@ from tests.live_test_vault import ensure_live_test_vault
 pytestmark = [pytest.mark.live, pytest.mark.asyncio, pytest.mark.real_get_client]
 
 _DEFAULT_BROKEN_OPUS_SESSION_ID = "5d85d993-6134-4b0c-8590-bfe305d16e3b"
+_DEFAULT_BROKEN_GPT_SESSION_ID = "226b1adc-5a6d-44e6-8ae4-557572912fd8"
 _DEFAULT_TRUST_SESSION_ID = "137406cb-965d-4488-97ba-7aca104a3d45"
 
 
@@ -222,7 +226,9 @@ async def test_existing_broken_opus_session_compacts_and_recovers() -> None:
     if source_path is None:
         pytest.skip(f"broken Opus JSONL not found for {session_id}")
 
-    target_uuid = _last_good_assistant_before_prompt_too_long(source_path)
+    health = analyze_jsonl_path(path=source_path, session_id=session_id)
+    target_uuid = health.safe_recovery_uuid
+    assert target_uuid is not None
     assert _context_triplet_at_uuid(source_path, target_uuid) >= 160_000
     recovery_session_id = fork_session_jsonl(
         session_id=session_id,
@@ -253,6 +259,51 @@ async def test_existing_broken_opus_session_compacts_and_recovers() -> None:
         timeout_seconds=180,
     )
     assert "BROKEN-OPUS-RECOVERED" in second
+    assert _contains_prompt_too_long_error(session_id=recovery_session_id, cwd=cwd) is False
+
+
+@pytest.mark.skipif(
+    os.environ.get("OBS_RUN_BROKEN_GPT_RECOVERY_LIVE") != "1",
+    reason="set OBS_RUN_BROKEN_GPT_RECOVERY_LIVE=1 to spend live GPT tokens on recovery",
+)
+async def test_existing_broken_gpt_session_compacts_and_recovers() -> None:
+    _load_dotenv()
+    session_id = os.environ.get(
+        "OBS_BROKEN_GPT_SESSION_ID",
+        _DEFAULT_BROKEN_GPT_SESSION_ID,
+    )
+    cwd = Path(
+        os.environ.get(
+            "OBS_BROKEN_GPT_CWD",
+            str(OBSConfig().vault_path),
+        )
+    )
+    source_path = find_session_jsonl(session_id=session_id, cwd=cwd)
+    if source_path is None:
+        pytest.skip(f"broken GPT JSONL not found for {session_id}")
+
+    health = analyze_jsonl_path(path=source_path, session_id=session_id)
+    target_uuid = health.safe_recovery_uuid
+    assert target_uuid is not None
+    assert _context_triplet_at_uuid(source_path, target_uuid) >= 160_000
+    recovery_session_id = fork_session_jsonl(
+        session_id=session_id,
+        target_uuid=target_uuid,
+        cwd=cwd,
+        new_session_id=str(uuid.uuid4()),
+    )
+
+    output = await _run_gpt_resume(
+        session_id=recovery_session_id,
+        cwd=cwd,
+        prompt=(
+            "Ignore prior task state. Reply with exactly "
+            "BROKEN-GPT-RECOVERED."
+        ),
+        timeout_seconds=360,
+    )
+    assert "compact_boundary" in output
+    assert '"subtype":"success"' in output or '"subtype": "success"' in output
     assert _contains_prompt_too_long_error(session_id=recovery_session_id, cwd=cwd) is False
 
 
@@ -396,6 +447,84 @@ async def _run_claude_resume(
         proc.kill()
         await proc.communicate()
         raise
+
+    output = stdout.decode("utf-8", errors="replace")
+    err = stderr.decode("utf-8", errors="replace")
+    assert proc.returncode == 0, f"claude exited {proc.returncode}\nSTDOUT:\n{output}\nSTDERR:\n{err}"
+    return output + "\n" + err
+
+
+def _ensure_cache_proxy(port: int):
+    try:
+        response = httpx.get(f"http://127.0.0.1:{port}/health", timeout=0.5)
+        if response.status_code == 200:
+            return None
+    except Exception:
+        pass
+    return start_cache_proxy(port)
+
+
+async def _run_gpt_resume(
+    *,
+    session_id: str,
+    cwd: Path,
+    prompt: str,
+    timeout_seconds: int,
+) -> str:
+    claude_bin = shutil.which("claude")
+    if claude_bin is None:
+        pytest.skip("claude CLI not found")
+
+    _load_dotenv()
+    config = OBSConfig.from_env()
+    proxy_proc = _ensure_cache_proxy(config.cache_proxy_port)
+    env = os.environ.copy()
+    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{config.cache_proxy_port}"
+    env["ANTHROPIC_API_KEY"] = env.get("OBS_CLI_PROXY_API_KEY", config.cli_proxy_api_key)
+    env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "200000"
+    env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = "256000"
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+    env["CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"] = "1"
+
+    proc = await asyncio.create_subprocess_exec(
+        claude_bin,
+        "--bare",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "-r",
+        session_id,
+        "-p",
+        prompt,
+        "--model",
+        os.environ.get("OBS_BROKEN_GPT_MODEL", "gpt-5.5[256k]"),
+        "--permission-mode",
+        "bypassPermissions",
+        "--output-format",
+        "json",
+        cwd=str(cwd),
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise
+    finally:
+        if proxy_proc is not None:
+            proxy_proc.terminate()
+            try:
+                proxy_proc.wait(timeout=3)
+            except Exception:
+                proxy_proc.kill()
 
     output = stdout.decode("utf-8", errors="replace")
     err = stderr.decode("utf-8", errors="replace")

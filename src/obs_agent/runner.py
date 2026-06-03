@@ -438,6 +438,7 @@ class ConversationRunner:
             )
 
         # 2. Get client and send query (with reconnect on connection loss)
+        await self._session_mgr.recover_poisoned_session_if_needed()
         try:
             self._client = await self._session_mgr.get_client()
             self._sync_session_id_from_client()

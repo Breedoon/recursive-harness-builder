@@ -164,7 +164,7 @@ class SessionManager:
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with hooks, MCP tools, and resume."""
         from obs_agent.config import (
-            auto_compact_window_for_context,
+            auto_compact_window_for_model,
             is_claude_model,
             normalize_model_for_claude_code,
             parse_context_suffix,
@@ -187,7 +187,8 @@ class SessionManager:
         self.hook_state.vault_path = self.config.vault_path
 
         _clean_model, ctx_tokens = parse_context_suffix(effective_model)
-        auto_compact_window = auto_compact_window_for_context(
+        auto_compact_window = auto_compact_window_for_model(
+            effective_model,
             ctx_tokens,
             auto_compact_window_tokens=self.config.auto_compact_window_tokens,
         )
@@ -396,6 +397,59 @@ class SessionManager:
             self.last_activity = time.time()
             options = self._build_options()
             return await self._connect_client_with_retry(options=options)
+
+    async def recover_poisoned_session_if_needed(self) -> tuple[str, str, str] | None:
+        """Fork away from a synthetic API-error JSONL tail before resuming.
+
+        Returns ``(old_session_id, new_session_id, recovery_uuid)`` when a new
+        session was created. The original JSONL is left untouched.
+        """
+        if not self._session_id:
+            return None
+
+        from obs_agent.jsonl_fork import fork_session_jsonl
+        from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+        target = resolve_safe_jsonl_target(
+            session_id=self._session_id,
+            cwd=self.config.vault_path,
+            preferred_uuid=None,
+        )
+        if target is None or not target.health.needs_recovery or not target.target_uuid:
+            return None
+
+        async with self._lock:
+            old_session_id = self._session_id
+            # The session may have changed while waiting on the lock.
+            if not old_session_id:
+                return None
+            target = resolve_safe_jsonl_target(
+                session_id=old_session_id,
+                cwd=self.config.vault_path,
+                preferred_uuid=None,
+            )
+            if target is None or not target.health.needs_recovery or not target.target_uuid:
+                return None
+            await self._disconnect_unlocked()
+            import uuid
+
+            new_session_id = fork_session_jsonl(
+                session_id=old_session_id,
+                target_uuid=target.target_uuid,
+                cwd=self.config.vault_path,
+                new_session_id=str(uuid.uuid4()),
+            )
+            logger.warning(
+                "Recovered poisoned session JSONL old_session_id=%s new_session_id=%s "
+                "recovery_uuid=%s first_poison=%s",
+                old_session_id,
+                new_session_id,
+                target.target_uuid,
+                target.health.first_poison_uuid,
+            )
+            self._session_id = new_session_id
+            self.last_activity = time.time()
+            return old_session_id, new_session_id, target.target_uuid
 
     async def soft_reset(self) -> None:
         """Disconnect client but preserve session_id for future reconnect.

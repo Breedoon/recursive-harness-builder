@@ -12,6 +12,7 @@ import pytest
 from obs_agent.config import (
     MODEL_RESOLUTION,
     auto_compact_window_for_context,
+    auto_compact_window_for_model,
     compaction_threshold,
     is_claude_model,
     normalize_model_for_claude_code,
@@ -103,6 +104,16 @@ class TestModelContextBoundary:
             1_000_000,
             auto_compact_window_tokens=0,
         ) == 1_000_000
+
+    def test_model_aware_auto_compact_defaults_keep_claude_long_and_gpt_conservative(self):
+        assert auto_compact_window_for_model("claude", 1_000_000) == 1_000_000
+        assert auto_compact_window_for_model("gpt", 256_000) == 200_000
+        assert auto_compact_window_for_model("gpt[128k]", 128_000) == 128_000
+        assert auto_compact_window_for_model(
+            "claude",
+            1_000_000,
+            auto_compact_window_tokens=150_000,
+        ) == 150_000
 
 
 # ---------------------------------------------------------------------------

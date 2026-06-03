@@ -187,7 +187,7 @@ class TestCreateOptions:
         options = mgr.create_options()
         assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
@@ -197,7 +197,7 @@ class TestCreateOptions:
         options = mgr.create_options()
         assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
@@ -217,7 +217,7 @@ class TestCreateOptions:
         options = mgr.create_options()
         assert mgr.model_override is None
         assert options.model == "gpt-5.4-mini[1m]"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
 
     def test_claude_root_uses_default_1m_context_without_proxy_key(self, config):
         config.model = "claude-opus-4-7"
@@ -300,7 +300,7 @@ class TestClientLifecycle:
         options = captured["options"]
         assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 

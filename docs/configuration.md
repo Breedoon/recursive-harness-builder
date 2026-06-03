@@ -151,8 +151,10 @@ model suffix resolution. The default OBS context is 1M; at the Claude Code
 boundary, a model without an explicit suffix is sent with the resolved context
 suffix, for example `claude` becomes `claude-opus-4-7[1m]`.
 `OBS_AUTO_COMPACT_WINDOW_TOKENS` optionally caps the Claude Code auto-compact
-trigger window. Leave it at `0` to pass the full resolved context through to
-Claude Code.
+trigger window. Leave it at `0` to use OBS's model-aware default: native
+Claude models use their resolved context window, while proxied GPT/Gemini-style
+models use a conservative 200k compaction lane unless the model context is
+smaller.
 `OBS_FORK_CACHE_WARMUP_DELAY_SECONDS` gives parent prompt-cache writes a short
 propagation window before a fork sends its first request.
 

@@ -291,6 +291,194 @@ class TestTelegramMessageFlow:
             for binding in bot._message_map.values()
         )
 
+    async def test_run_start_recovers_poisoned_jsonl_tail_before_runner(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        project_dir = tmp_path / ".claude" / "projects" / "-fixture"
+        project_dir.mkdir(parents=True)
+        source_path = project_dir / "sid-poisoned.jsonl"
+        source_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "uuid": "u1",
+                            "parentUuid": None,
+                            "sessionId": "sid-poisoned",
+                            "message": {"role": "user", "content": "start"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": "a-safe",
+                            "parentUuid": "u1",
+                            "sessionId": "sid-poisoned",
+                            "message": {
+                                "role": "assistant",
+                                "model": "gpt-5.5",
+                                "content": [{"type": "text", "text": "safe"}],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "uuid": "u2",
+                            "parentUuid": "a-safe",
+                            "sessionId": "sid-poisoned",
+                            "message": {"role": "user", "content": "too much"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": "err",
+                            "parentUuid": "u2",
+                            "sessionId": "sid-poisoned",
+                            "isApiErrorMessage": True,
+                            "message": {
+                                "role": "assistant",
+                                "model": "<synthetic>",
+                                "content": [{"type": "text", "text": "Prompt is too long"}],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.session_manager.set_session_id("sid-poisoned")
+        state.session_manager.model_override = "gpt-5.5"
+        bot._bind_state_session(state)
+        bot._set_session_head(session_id="sid-poisoned", jsonl_uuid="err")
+
+        sent_id = 100
+
+        async def send_side_effect(**kwargs):
+            nonlocal sent_id
+            sent_id += 1
+            message = MagicMock()
+            message.message_id = sent_id
+            return message
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                assert state.session_id != "sid-poisoned"
+                assert state.session_manager.model_override == "gpt-5.5"
+                yield TextEvent(text="RECOVERED")
+                yield TurnEndEvent(
+                    jsonl_uuid="a-new",
+                    message_role="assistant",
+                    has_text=True,
+                )
+                yield DoneEvent()
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            update = _make_update("continue")
+            ctx = _make_context()
+            ctx.bot.send_message = AsyncMock(side_effect=send_side_effect)
+            await bot.handle_message(update, ctx)
+
+        assert state.session_id is not None
+        assert state.session_id != "sid-poisoned"
+        assert bot._session_heads["sid-poisoned"] == "a-safe"
+        assert bot._session_heads[state.session_id] == "a-new"
+        recovered_path = project_dir / f"{state.session_id}.jsonl"
+        assert recovered_path.exists()
+        recovered_lines = recovered_path.read_text(encoding="utf-8").splitlines()
+        assert len(recovered_lines) == 2
+        assert all("Prompt is too long" not in line for line in recovered_lines)
+
+    def test_fork_source_resolution_uses_safe_uuid_instead_of_latest_poison(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        project_dir = tmp_path / ".claude" / "projects" / "-fixture"
+        project_dir.mkdir(parents=True)
+        (project_dir / "sid-poisoned.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "uuid": "u1",
+                            "parentUuid": None,
+                            "sessionId": "sid-poisoned",
+                            "message": {"role": "user", "content": "start"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": "a-safe",
+                            "parentUuid": "u1",
+                            "sessionId": "sid-poisoned",
+                            "message": {
+                                "role": "assistant",
+                                "model": "gpt-5.5",
+                                "content": [{"type": "text", "text": "safe"}],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "uuid": "u2",
+                            "parentUuid": "a-safe",
+                            "sessionId": "sid-poisoned",
+                            "message": {"role": "user", "content": "too much"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": "err",
+                            "parentUuid": "u2",
+                            "sessionId": "sid-poisoned",
+                            "isApiErrorMessage": True,
+                            "message": {
+                                "role": "assistant",
+                                "model": "<synthetic>",
+                                "content": [{"type": "text", "text": "Prompt is too long"}],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=None)
+
+        resolved_uuid, resolved_route, message_id = bot._resolve_persisted_fork_source(
+            session_id="sid-poisoned",
+            preferred_uuid="missing-head",
+            preferred_route=route,
+        )
+
+        assert resolved_uuid == "a-safe"
+        assert resolved_route == route
+        assert message_id is None
+
     async def test_status_only_assistant_message_is_mapped(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         events = [
@@ -4393,7 +4581,7 @@ class TestForkTaskRuntime:
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.5[256k]"
         child_env = child_options.env
-        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "256000"
+        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
         assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == unique_team
@@ -4440,7 +4628,7 @@ class TestForkTaskRuntime:
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.5[256k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "256000"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "256000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in child_options.env
         assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
         await bot.shutdown()
@@ -4521,7 +4709,7 @@ class TestForkTaskRuntime:
         assert child_state.session_manager.model_override == "gpt-5.4-mini"
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.4-mini[1m]"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         await bot.shutdown()
 
     async def test_scheduled_run_uses_route_model_context_semantics(
@@ -4555,7 +4743,7 @@ class TestForkTaskRuntime:
 
         options = state.session_manager.create_options()
         assert options.model == "gpt-5.4-mini[1m]"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         run_text = run_mock.await_args.kwargs["user_text"]
         assert run_text.startswith("(System: scheduled execution.)")
         await bot.shutdown()
@@ -7178,6 +7366,38 @@ class TestTelegramStatePersistence:
         assert restored_env["CLAUDE_CODE_AGENT_NAME"] == team_key
         await restored.shutdown()
 
+    async def test_initialize_runtime_does_not_scan_jsonl_for_stale_routes(self, config):
+        route = TelegramRoute(chat_id=67890, thread_id=777)
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        bot._state_store.upsert_route_state(
+            chat_id=route.chat_id,
+            thread_id=route.thread_id,
+            session_id="sid-stale",
+            topic_title="Stale Worker",
+            topic_icon_custom_emoji_id=None,
+            child_fork_count=0,
+            child_fork_base_title=None,
+            notify_on_completion=False,
+            last_inbound_message_id=None,
+            agent_lineage=None,
+            pending_obs_bootstrap=None,
+        )
+        await bot.shutdown()
+
+        restored = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        with patch(
+            "obs_agent.telegram.find_latest_obs_bootstrap_for_session",
+            side_effect=AssertionError("restore should not scan JSONL"),
+        ):
+            await restored.initialize_runtime()
+
+        restored_state = restored._get_state(route, create=False)
+        assert restored_state is not None
+        assert restored_state.session_id == "sid-stale"
+        assert restored_state.session_manager.sdk_env_overrides == {}
+        await restored.shutdown()
+
     async def test_pre_restart_message_remains_forkable(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=None)
@@ -7612,11 +7832,28 @@ class TestTelegramStatePersistence:
                 agent_name="2026-03-31-05-03-smoke-restart-wake",
                 lineage=("Smoke Restart Wake",),
             ),
-        ):
+        ) as find_bootstrap:
             await restored.initialize_runtime()
 
+        find_bootstrap.assert_not_called()
         restored_state = restored._get_state(route, create=False)
         assert restored_state is not None
+        assert restored_state.agent_lineage is None
+
+        with patch(
+            "obs_agent.telegram.find_latest_obs_bootstrap_for_session",
+            return_value=SimpleNamespace(
+                root_team_key="2026-03-31-05-03-smoke-restart-wake",
+                agent_name="2026-03-31-05-03-smoke-restart-wake",
+                lineage=("Smoke Restart Wake",),
+            ),
+        ):
+            assert restored._ensure_state_lineage(
+                restored_state,
+                session_id="sid-missing-lineage",
+            ) == ("Smoke Restart Wake",)
+            restored._upsert_route_inbox_target(restored_state)
+
         assert restored_state.agent_lineage == ("Smoke Restart Wake",)
         assert (
             restored._resolve_route_inbox_target(
@@ -7625,9 +7862,6 @@ class TestTelegramStatePersistence:
             )
             is restored_state
         )
-        restored_env = restored_state.session_manager.sdk_env_overrides
-        assert restored_env["CLAUDE_CODE_TEAM_NAME"] == "2026-03-31-05-03-smoke-restart-wake"
-        assert restored_env["CLAUDE_CODE_AGENT_NAME"] == "2026-03-31-05-03-smoke-restart-wake"
         await restored.shutdown()
 
     async def test_initialize_runtime_restores_route_without_lineage_or_bootstrap_by_falling_back_to_title(
@@ -7655,17 +7889,24 @@ class TestTelegramStatePersistence:
         with patch(
             "obs_agent.telegram.find_latest_obs_bootstrap_for_session",
             return_value=None,
-        ):
+        ) as find_bootstrap:
             await restored.initialize_runtime()
 
+        find_bootstrap.assert_not_called()
         restored_state = restored._get_state(route, create=False)
         assert restored_state is not None
         expected_lineage = ("General - Title Fallback",)
         expected_team_key = root_team_key_for_lineage(expected_lineage)
+        assert restored_state.agent_lineage is None
+
+        with patch(
+            "obs_agent.telegram.find_latest_obs_bootstrap_for_session",
+            return_value=None,
+        ):
+            assert restored._ensure_state_lineage(restored_state) == expected_lineage
+            restored._upsert_route_inbox_target(restored_state, allow_jsonl_lookup=False)
+
         assert restored_state.agent_lineage == expected_lineage
-        restored_env = restored_state.session_manager.sdk_env_overrides
-        assert restored_env["CLAUDE_CODE_TEAM_NAME"] == expected_team_key
-        assert restored_env["CLAUDE_CODE_AGENT_NAME"] == expected_team_key
         assert (
             restored._resolve_route_inbox_target(
                 team_name=expected_team_key,
