@@ -93,7 +93,7 @@ class TestModelContextBoundary:
         assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.5[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
-    def test_auto_compact_window_is_capped_separately_from_context(self):
+    def test_auto_compact_window_tracks_context_by_default(self):
         assert auto_compact_window_for_context(1_000_000) == 1_000_000
         assert auto_compact_window_for_context(256_000) == 256_000
         assert auto_compact_window_for_context(128_000) == 128_000
@@ -105,9 +105,10 @@ class TestModelContextBoundary:
             auto_compact_window_tokens=0,
         ) == 1_000_000
 
-    def test_model_aware_auto_compact_defaults_keep_claude_long_and_gpt_conservative(self):
+    def test_model_aware_auto_compact_defaults_track_resolved_context(self):
         assert auto_compact_window_for_model("claude", 1_000_000) == 1_000_000
-        assert auto_compact_window_for_model("gpt", 400_000) == 200_000
+        assert auto_compact_window_for_model("gpt", 400_000) == 400_000
+        assert compaction_threshold(auto_compact_window_for_model("gpt", 400_000)) == 342_500
         assert auto_compact_window_for_model("gpt[128k]", 128_000) == 128_000
         assert auto_compact_window_for_model(
             "claude",
@@ -183,6 +184,9 @@ class TestCompactionThreshold:
         threshold = compaction_threshold(200_000)
         # Should be around 167K (83.5%)
         assert 160_000 <= threshold <= 175_000
+
+    def test_400k_context_interpolates_between_200k_and_1m(self):
+        assert compaction_threshold(400_000) == 342_500
 
     def test_128k_context(self):
         threshold = compaction_threshold(128_000)

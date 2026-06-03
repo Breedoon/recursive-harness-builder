@@ -51,16 +51,10 @@ _CONTEXT_SUFFIX_RE = re.compile(r"\[(\d+)([mk])\]$", re.IGNORECASE)
 
 _DEFAULT_CONTEXT_TOKENS = 1_000_000
 _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 0
-_DEFAULT_NON_CLAUDE_AUTO_COMPACT_WINDOW_TOKENS = 200_000
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-5.5": 400_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.4-mini": 1_000_000,
-}
-MODEL_AUTO_COMPACT_WINDOWS: dict[str, int] = {
-    "gpt-5.5": 200_000,
-    "gpt-5.4": 200_000,
-    "gpt-5.4-mini": 200_000,
 }
 
 
@@ -211,11 +205,10 @@ def auto_compact_window_for_context(
 ) -> int:
     """Return the Claude Code auto-compact window to pass for a model context.
 
-    This is intentionally separate from the model context estimate.  Passing a
-    large model context directly to Claude Code can defer compaction until the
-    prompt is already too large for the active harness/provider.  Keep the
-    context estimate for user-facing telemetry and model suffixes, but cap the
-    compaction trigger to a conservative window unless explicitly overridden.
+    The window should match the resolved model context so Claude Code's own
+    compaction trigger tracks the same percentage curve as native Claude
+    sessions. Operators can set ``OBS_AUTO_COMPACT_WINDOW_TOKENS`` as an
+    emergency cap for a provider with a smaller observed prompt limit.
     """
     if context_tokens <= 0:
         return 0
@@ -230,21 +223,14 @@ def default_auto_compact_window_for_model(
 ) -> int:
     """Return OBS's built-in auto-compact window for a resolved model.
 
-    Native Claude sessions should use their full advertised context so Opus can
-    reach the 1M path. Proxied providers go through Claude Code's Anthropic
-    harness and have historically needed a lower compaction lane even when the
-    model suffix advertises a larger context.
+    By default, OBS passes the resolved context window through to Claude Code.
+    That lets Claude Code apply its built-in compaction curve consistently:
+    about 167K for a 200K window, about 342K for a 400K window, and about
+    920K for a 1M window.
     """
     if context_tokens <= 0:
         return 0
-    clean, _ctx = split_context_suffix(resolve_model(model_str))
-    if is_claude_model(clean):
-        return context_tokens
-    default_window = MODEL_AUTO_COMPACT_WINDOWS.get(
-        clean.lower(),
-        _DEFAULT_NON_CLAUDE_AUTO_COMPACT_WINDOW_TOKENS,
-    )
-    return min(context_tokens, default_window)
+    return context_tokens
 
 
 def auto_compact_window_for_model(
