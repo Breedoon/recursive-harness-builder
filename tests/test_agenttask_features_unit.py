@@ -85,7 +85,7 @@ class TestModelContextBoundary:
         assert split_context_suffix("gpt-5.4-mini[200k]") == ("gpt-5.4-mini", 200_000)
 
     def test_claude_code_boundary_adds_resolved_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt") == "gpt-5.5[256k]"
+        assert normalize_model_for_claude_code("gpt") == "gpt-5.5[400k]"
         assert normalize_model_for_claude_code("claude") == "claude-opus-4-7[1m]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
 
@@ -107,7 +107,7 @@ class TestModelContextBoundary:
 
     def test_model_aware_auto_compact_defaults_keep_claude_long_and_gpt_conservative(self):
         assert auto_compact_window_for_model("claude", 1_000_000) == 1_000_000
-        assert auto_compact_window_for_model("gpt", 256_000) == 200_000
+        assert auto_compact_window_for_model("gpt", 400_000) == 200_000
         assert auto_compact_window_for_model("gpt[128k]", 128_000) == 128_000
         assert auto_compact_window_for_model(
             "claude",

@@ -482,7 +482,7 @@ async def _run_gpt_resume(
     env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{config.cache_proxy_port}"
     env["ANTHROPIC_API_KEY"] = env.get("OBS_CLI_PROXY_API_KEY", config.cli_proxy_api_key)
     env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = "200000"
-    env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = "256000"
+    env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = "400000"
     env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     env["CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"] = "1"
 
@@ -499,7 +499,7 @@ async def _run_gpt_resume(
         "-p",
         prompt,
         "--model",
-        os.environ.get("OBS_BROKEN_GPT_MODEL", "gpt-5.5[256k]"),
+        os.environ.get("OBS_BROKEN_GPT_MODEL", "gpt-5.5[400k]"),
         "--permission-mode",
         "bypassPermissions",
         "--output-format",
