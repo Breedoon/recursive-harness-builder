@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -47,7 +48,8 @@ def _read_log_tail(log_file: Path) -> str:
     if not log_file.exists():
         return ""
     text = log_file.read_text(errors="replace")
-    return text[-4000:]
+    tail = text[-4000:]
+    return re.sub(r"(https://api\.telegram\.org/bot)[^/\s\"]+", r"\1<redacted>", tail)
 
 
 def _start_bot(vault_path: Path, temp_root: Path) -> tuple[subprocess.Popen, Path]:
@@ -59,6 +61,8 @@ def _start_bot(vault_path: Path, temp_root: Path) -> tuple[subprocess.Popen, Pat
         "5129431382",
     )
     env["OBS_TELEGRAM_TEMP_ROOT"] = str(temp_root)
+    env["OBS_TELEGRAM_STATE_DB_PATH"] = str(temp_root.parent / "telegram-state.sqlite3")
+    env["OBS_TELEGRAM_DROP_PENDING_UPDATES"] = "1"
 
     log_file = Path(tempfile.mktemp(prefix="obs_tg_media_", suffix=".log"))
     log_fh = open(log_file, "w")
@@ -77,6 +81,11 @@ def _start_bot(vault_path: Path, temp_root: Path) -> tuple[subprocess.Popen, Pat
     return proc, log_file
 
 
+def _is_new_session_confirmation(text: str) -> bool:
+    lowered = text.lower()
+    return "session cleared" in lowered or "new trunk session created" in lowered
+
+
 def _stop_bot(proc: subprocess.Popen, log_file: Path) -> None:
     if proc.poll() is None:
         proc.send_signal(signal.SIGINT)
@@ -90,7 +99,7 @@ def _stop_bot(proc: subprocess.Popen, log_file: Path) -> None:
 async def _warm_platform(platform: TelegramPlatform) -> None:
     for _ in range(6):
         reply = await platform.send_control("/new", timeout=20.0)
-        if "session cleared" in reply.lower():
+        if _is_new_session_confirmation(reply):
             await platform.rebaseline()
             return
         await asyncio.sleep(1.0)
@@ -99,7 +108,7 @@ async def _warm_platform(platform: TelegramPlatform) -> None:
 
 async def _reset(platform: TelegramPlatform) -> None:
     reply = await platform.send_control("/new", timeout=20.0)
-    assert "session cleared" in reply.lower()
+    assert _is_new_session_confirmation(reply)
     await platform.rebaseline()
     await asyncio.sleep(1.0)
 

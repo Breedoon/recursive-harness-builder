@@ -46,7 +46,8 @@ def _read_log_tail(log_file: Path) -> str:
     if not log_file.exists():
         return ""
     text = log_file.read_text(errors="replace")
-    return text[-8000:]
+    tail = text[-8000:]
+    return re.sub(r"(https://api\.telegram\.org/bot)[^/\s\"]+", r"\1<redacted>", tail)
 
 
 def _resolve_allowed_users() -> str:
@@ -87,6 +88,7 @@ def _start_bot(
     env["OBS_TELEGRAM_BOT_TOKENS"] = os.environ["OBS_TEST_TELEGRAM_BOT_TOKEN"]
     env["OBS_TELEGRAM_ALLOWED_USERS"] = _resolve_allowed_users()
     env["OBS_TELEGRAM_TEMP_ROOT"] = str(temp_root)
+    env["OBS_TELEGRAM_STATE_DB_PATH"] = str(temp_root.parent / "telegram-state.sqlite3")
     env["OBS_TELEGRAM_DROP_PENDING_UPDATES"] = "1"
     if cache_window_seconds is not None:
         env["OBS_CACHE_WINDOW"] = str(cache_window_seconds)
@@ -108,6 +110,11 @@ def _start_bot(
     return proc, log_file
 
 
+def _is_new_session_confirmation(text: str) -> bool:
+    lowered = text.lower()
+    return "session cleared" in lowered or "new trunk session created" in lowered
+
+
 def _stop_bot(proc: subprocess.Popen, log_file: Path) -> None:
     if proc.poll() is None:
         proc.send_signal(signal.SIGINT)
@@ -121,7 +128,7 @@ def _stop_bot(proc: subprocess.Popen, log_file: Path) -> None:
 async def _warm_platform(platform: TelegramPlatform) -> None:
     for _ in range(6):
         reply = await platform.send_control("/new", timeout=20.0)
-        if "session cleared" in reply.lower():
+        if _is_new_session_confirmation(reply):
             await platform.rebaseline()
             return
         await asyncio.sleep(1.0)
@@ -130,7 +137,7 @@ async def _warm_platform(platform: TelegramPlatform) -> None:
 
 async def _reset(platform: TelegramPlatform) -> None:
     reply = await platform.send_control("/new", timeout=20.0)
-    assert "session cleared" in reply.lower(), reply
+    assert _is_new_session_confirmation(reply), reply
     await platform.rebaseline()
     await asyncio.sleep(1.0)
 

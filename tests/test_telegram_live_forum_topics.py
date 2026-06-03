@@ -52,7 +52,8 @@ def _read_log_tail(log_file: Path) -> str:
     if not log_file.exists():
         return ""
     text = log_file.read_text(errors="replace")
-    return text[-12000:]
+    tail = text[-12000:]
+    return re.sub(r"(https://api\.telegram\.org/bot)[^/\s\"]+", r"\1<redacted>", tail)
 
 
 def _resolve_allowed_users() -> str:

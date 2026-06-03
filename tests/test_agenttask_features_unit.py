@@ -87,6 +87,7 @@ class TestModelContextBoundary:
     def test_claude_code_boundary_adds_resolved_context_suffix(self):
         assert normalize_model_for_claude_code("gpt") == "gpt-5.5[400k]"
         assert normalize_model_for_claude_code("claude") == "claude-opus-4-7[1m]"
+        assert normalize_model_for_claude_code("haiku") == "claude-haiku-4-5[200k]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
 
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):

@@ -3592,12 +3592,13 @@ class TelegramBot:
         if target.changed:
             logger.warning(
                 "[jsonl_health] purpose=%s session_id=%s preferred_uuid=%s "
-                "resolved_uuid=%s reason=%s first_poison=%s safe_line=%s",
+                "resolved_uuid=%s reason=%s first_unsafe=%s first_poison=%s safe_line=%s",
                 purpose,
                 session_id,
                 preferred_uuid,
                 target.target_uuid,
                 target.reason,
+                target.health.first_unsafe_tail_uuid,
                 target.health.first_poison_uuid,
                 target.health.safe_recovery_line,
             )
@@ -3639,12 +3640,14 @@ class TelegramBot:
         )
         logger.warning(
             "[jsonl_recovery] route=%s source=%s old_session_id=%s "
-            "new_session_id=%s recovery_uuid=%s first_poison=%s",
+            "new_session_id=%s recovery_uuid=%s reason=%s first_unsafe=%s first_poison=%s",
             state.route,
             source,
             session_id,
             recovery_session_id,
             target.target_uuid,
+            target.health.unsafe_tail_reason,
+            target.health.first_unsafe_tail_uuid,
             target.health.first_poison_uuid,
         )
 

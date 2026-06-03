@@ -441,10 +441,12 @@ class SessionManager:
             )
             logger.warning(
                 "Recovered poisoned session JSONL old_session_id=%s new_session_id=%s "
-                "recovery_uuid=%s first_poison=%s",
+                "recovery_uuid=%s reason=%s first_unsafe=%s first_poison=%s",
                 old_session_id,
                 new_session_id,
                 target.target_uuid,
+                target.health.unsafe_tail_reason,
+                target.health.first_unsafe_tail_uuid,
                 target.health.first_poison_uuid,
             )
             self._session_id = new_session_id

@@ -24,6 +24,7 @@ from obs_agent.queueing import QueuedMessage
 from obs_agent.runner import (
     ConversationRunner,
     DoneEvent,
+    SilentResponseError,
     TextEvent,
     TurnEndEvent,
     _RECOVERY_PROMPT,
@@ -44,6 +45,26 @@ def _make_mock_client(messages: list) -> AsyncMock:
     client.query = AsyncMock()
     client.interrupt = AsyncMock()
     return client
+
+
+def _make_result_message(*, session_id: str = "sess-1") -> MagicMock:
+    result_msg = MagicMock()
+    result_msg.content = []
+    result_msg.session_id = session_id
+    result_msg.num_turns = 1
+    result_msg.total_cost_usd = 0.01
+    result_msg.duration_ms = 100
+    result_msg.usage = {}
+    return result_msg
+
+
+def _make_empty_turn_message(*, session_id: str = "sess-1") -> MagicMock:
+    msg = MagicMock()
+    msg.content = []
+    msg.session_id = session_id
+    msg.num_turns = None
+    msg.total_cost_usd = None
+    return msg
 
 
 async def _collect_events(runner, message):
@@ -649,6 +670,110 @@ class TestRunnerReconnectOnStreamError:
         assert any("Recovered" in e.text for e in text_events)
         mock_reconnect.assert_called_once()
         recovery_client.query.assert_awaited_once_with(f"(System: {_RECOVERY_PROMPT})")
+
+
+class TestRunnerSilentCompletionRecovery:
+    async def test_silent_result_forks_and_resends_original_prompt(self, config):
+        silent_client = _make_mock_client([_make_result_message(session_id="sid-old")])
+        recovery_msg = MagicMock()
+        recovery_msg.content = [TextBlock(text="Recovered answer")]
+        recovery_msg.session_id = "sid-new"
+        recovery_client = _make_mock_client([recovery_msg])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr.recover_poisoned_session_if_needed = AsyncMock(
+            return_value=("sid-old", "sid-new", "a-safe")
+        )
+        with patch.object(
+            session_mgr,
+            "get_client",
+            new=AsyncMock(side_effect=[silent_client, recovery_client]),
+        ):
+            runner = ConversationRunner(session_mgr, hook_state, config)
+            events = await _collect_events(runner, "original user prompt")
+
+        text_events = [event for event in events if isinstance(event, TextEvent)]
+        assert [event.text for event in text_events] == ["Recovered answer"]
+        session_mgr.recover_poisoned_session_if_needed.assert_awaited()
+        recovery_client.query.assert_awaited_once_with("original user prompt")
+
+    async def test_silent_result_without_jsonl_recovery_nudges_same_session(self, config):
+        silent_client = _make_mock_client([_make_result_message(session_id="sid-1")])
+        recovery_msg = MagicMock()
+        recovery_msg.content = [TextBlock(text="Answered after nudge")]
+        recovery_msg.session_id = "sid-1"
+        recovery_client = _make_mock_client([recovery_msg])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr.recover_poisoned_session_if_needed = AsyncMock(return_value=None)
+        with patch.object(session_mgr, "soft_reset", new=AsyncMock()) as soft_reset, patch.object(
+            session_mgr,
+            "get_client",
+            new=AsyncMock(side_effect=[silent_client, recovery_client]),
+        ):
+            runner = ConversationRunner(session_mgr, hook_state, config)
+            events = await _collect_events(runner, "original user prompt")
+
+        assert any(
+            isinstance(event, TextEvent) and event.text == "Answered after nudge"
+            for event in events
+        )
+        soft_reset.assert_awaited_once()
+        retry_prompt = recovery_client.query.await_args.args[0]
+        assert "previous turn ended without any visible assistant text" in retry_prompt
+        assert "original user prompt" not in retry_prompt
+
+    async def test_empty_non_result_stream_without_status_is_retried(self, config):
+        silent_client = _make_mock_client([_make_empty_turn_message(session_id="sid-1")])
+        recovery_msg = MagicMock()
+        recovery_msg.content = [TextBlock(text="Answered after empty stream")]
+        recovery_msg.session_id = "sid-1"
+        recovery_client = _make_mock_client([recovery_msg])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr.recover_poisoned_session_if_needed = AsyncMock(return_value=None)
+        with patch.object(session_mgr, "soft_reset", new=AsyncMock()) as soft_reset, patch.object(
+            session_mgr,
+            "get_client",
+            new=AsyncMock(side_effect=[silent_client, recovery_client]),
+        ):
+            runner = ConversationRunner(session_mgr, hook_state, config)
+            events = await _collect_events(runner, "original user prompt")
+
+        assert any(
+            isinstance(event, TextEvent) and event.text == "Answered after empty stream"
+            for event in events
+        )
+        soft_reset.assert_awaited_once()
+        retry_prompt = recovery_client.query.await_args.args[0]
+        assert "previous turn ended without any visible assistant text" in retry_prompt
+
+    async def test_repeated_silent_result_fails_loudly(self, config):
+        first_client = _make_mock_client([_make_result_message(session_id="sid-1")])
+        second_client = _make_mock_client([_make_result_message(session_id="sid-1")])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr.recover_poisoned_session_if_needed = AsyncMock(return_value=None)
+        with patch.object(session_mgr, "soft_reset", new=AsyncMock()), patch.object(
+            session_mgr,
+            "get_client",
+            new=AsyncMock(side_effect=[first_client, second_client]),
+        ):
+            runner = ConversationRunner(session_mgr, hook_state, config)
+            with pytest.raises(SilentResponseError, match="without visible assistant text"):
+                await _collect_events(runner, "hello")
 
 
 class TestRunnerGetClientRecovery:

@@ -39,6 +39,10 @@ _RECOVERY_PROMPT = (
     "Resume the interrupted response only. "
     "Do not treat this as a new user message or as part of the conversation history."
 )
+_SILENT_RESPONSE_PROMPT = (
+    "Your previous turn ended without any visible assistant text. "
+    "Answer the previous user request now. Do not say that you produced an empty response."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +72,10 @@ class DoneEvent:
 
 
 RunnerEvent = TextEvent | StatusEvent | TurnEndEvent | DoneEvent
+
+
+class SilentResponseError(RuntimeError):
+    """Raised when Claude Code completes a turn without visible assistant text."""
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +135,12 @@ def _is_error_message(message, text_parts: list[str]) -> bool:
         return True
     text = "\n".join(part for part in text_parts if part).strip()
     return text == "Prompt is too long"
+
+
+def _is_result_message(message) -> bool:
+    num_turns = getattr(message, "num_turns", None)
+    total_cost = getattr(message, "total_cost_usd", None)
+    return isinstance(num_turns, int) and isinstance(total_cost, (int, float))
 
 
 def _system_message_to_status_event(message) -> StatusEvent | None:
@@ -291,10 +305,7 @@ class ConversationRunner:
             message_role = _message_role(message)
             has_text = False
             text_parts: list[str] = []
-            if (
-                getattr(message, "num_turns", None) is not None
-                and getattr(message, "total_cost_usd", None) is not None
-            ):
+            if _is_result_message(message):
                 self._last_result_message = message
             if hasattr(message, "session_id") and message.session_id:
                 self._session_mgr.set_session_id(message.session_id)
@@ -402,6 +413,67 @@ class ConversationRunner:
             await self._client.query(prompt)
             self._sync_session_id_from_client()
 
+    async def _retry_after_silent_response(self, original_prompt: str) -> str:
+        """Reconnect after an SDK result with no visible assistant text.
+
+        If JSONL health can identify an unsafe tail, fork back to the last
+        complete assistant response and resend the original user prompt. If no
+        unsafe tail is visible, keep the same session and send a system nudge
+        so Claude Code answers the already-recorded user request.
+        """
+        recovered = await self._session_mgr.recover_poisoned_session_if_needed()
+        if recovered is None:
+            await self._session_mgr.soft_reset()
+            retry_query = f"(System: {_SILENT_RESPONSE_PROMPT})"
+        else:
+            retry_query = original_prompt
+        self._client = await self._session_mgr.get_client()
+        self._sync_session_id_from_client()
+        await self._client.query(retry_query)
+        self._sync_session_id_from_client()
+        return "forked" if recovered is not None else "reconnected"
+
+    async def _stream_with_silent_recovery(
+        self,
+        *,
+        original_prompt: str,
+        retry_prompt: str,
+        stage: str,
+    ) -> AsyncIterator[RunnerEvent]:
+        """Stream a response and retry once if Claude Code silently completes."""
+        for attempt in range(2):
+            self._last_message = None
+            self._last_result_message = None
+            self._last_assistant_usage = None
+            saw_visible_text = False
+            saw_status_event = False
+            async for event in self._stream_or_reconnect(retry_prompt):
+                if isinstance(event, TextEvent) and event.text.strip():
+                    saw_visible_text = True
+                elif isinstance(event, StatusEvent):
+                    saw_status_event = True
+                yield event
+
+            silent_completion = self._last_result_message is not None or not saw_status_event
+            if saw_visible_text or not silent_completion:
+                return
+
+            if attempt >= 1:
+                raise SilentResponseError(
+                    f"Claude Code completed {stage} without visible assistant text"
+                )
+
+            logger.warning(
+                "Claude Code completed %s without visible assistant text; attempting recovery",
+                stage,
+            )
+            recovery_mode = await self._retry_after_silent_response(original_prompt)
+            logger.warning(
+                "Retrying %s after silent response via %s recovery",
+                stage,
+                recovery_mode,
+            )
+
     # ------------------------------------------------------------------
     # Main orchestration
     # ------------------------------------------------------------------
@@ -475,11 +547,10 @@ class ConversationRunner:
             self._sync_session_id_from_client()
 
         # 3. Stream response (with reconnect on recoverable errors)
-        self._last_message = None
-        self._last_result_message = None
-        self._last_assistant_usage = None
-        async for event in self._stream_or_reconnect(
-            _RECOVERY_PROMPT
+        async for event in self._stream_with_silent_recovery(
+            original_prompt=actual_message,
+            retry_prompt=_RECOVERY_PROMPT,
+            stage="initial response",
         ):
             yield event
 
@@ -517,8 +588,10 @@ class ConversationRunner:
             )
 
             await self._query_or_reconnect(continuation_prompt)
-            async for event in self._stream_or_reconnect(
-                _RECOVERY_PROMPT
+            async for event in self._stream_with_silent_recovery(
+                original_prompt=continuation_prompt,
+                retry_prompt=_RECOVERY_PROMPT,
+                stage="queued continuation",
             ):
                 yield event
             self._refresh_last_result_data()
@@ -562,8 +635,10 @@ class ConversationRunner:
             )
 
             await self._query_or_reconnect(bg_prompt)
-            async for event in self._stream_or_reconnect(
-                _RECOVERY_PROMPT
+            async for event in self._stream_with_silent_recovery(
+                original_prompt=bg_prompt,
+                retry_prompt=_RECOVERY_PROMPT,
+                stage="background result continuation",
             ):
                 yield event
             self._refresh_last_result_data()

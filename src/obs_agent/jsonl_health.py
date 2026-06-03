@@ -36,10 +36,13 @@ class JsonlSessionHealth:
     safe_recovery_line: int | None
     uuid_line_numbers: Mapping[str, int]
     unsafe_uuids: frozenset[str]
+    first_unsafe_tail_uuid: str | None = None
+    first_unsafe_tail_line: int | None = None
+    unsafe_tail_reason: str | None = None
 
     @property
     def needs_recovery(self) -> bool:
-        return self.first_poison_uuid is not None and self.safe_recovery_uuid is not None
+        return self.first_unsafe_tail_uuid is not None and self.safe_recovery_uuid is not None
 
     def has_uuid(self, uuid: str | None) -> bool:
         return bool(uuid) and str(uuid) in self.uuid_line_numbers
@@ -146,6 +149,10 @@ def _is_real_assistant(entry: _ParsedEntry) -> bool:
     )
 
 
+def _is_complete_assistant_boundary(entry: _ParsedEntry) -> bool:
+    return _is_real_assistant(entry) and entry.has_text and not entry.has_tool_use
+
+
 def _is_poison(entry: _ParsedEntry) -> bool:
     if not entry.uuid:
         return False
@@ -155,11 +162,11 @@ def _is_poison(entry: _ParsedEntry) -> bool:
 
 
 def _is_preferred_safe_boundary(entry: _ParsedEntry) -> bool:
-    return _is_real_assistant(entry) and entry.has_text and not entry.has_tool_use
+    return _is_complete_assistant_boundary(entry)
 
 
 def _is_fallback_safe_boundary(entry: _ParsedEntry) -> bool:
-    return _is_real_assistant(entry) and not entry.has_tool_use
+    return _is_real_assistant(entry) and entry.has_text
 
 
 def _choose_safe_recovery(entries: list[_ParsedEntry], before_index: int) -> _ParsedEntry | None:
@@ -174,6 +181,18 @@ def _choose_safe_recovery(entries: list[_ParsedEntry], before_index: int) -> _Pa
         if entry.uuid and not entry.is_error and not entry.is_synthetic:
             return entry
     return None
+
+
+def _tail_reason(entry: _ParsedEntry) -> str:
+    if _is_poison(entry):
+        return "poisoned_tail"
+    if entry.type == "user" or entry.role == "user":
+        return "dangling_user_tail"
+    if _is_real_assistant(entry) and entry.has_tool_use:
+        return "incomplete_tool_use_tail"
+    if _is_real_assistant(entry) and not entry.has_text:
+        return "empty_assistant_tail"
+    return "incomplete_tail"
 
 
 def _collect_chain_unsafe(
@@ -234,29 +253,59 @@ def analyze_jsonl_path(*, path: Path, session_id: str | None = None) -> JsonlSes
     last_uuid_entry = next((entry for entry in reversed(entries) if entry.uuid), None)
     real_assistant_entries = [entry for entry in entries if _is_real_assistant(entry)]
     last_real_assistant = real_assistant_entries[-1] if real_assistant_entries else None
+    complete_assistant_entries = [
+        entry for entry in entries if _is_complete_assistant_boundary(entry)
+    ]
+    last_complete_assistant = (
+        complete_assistant_entries[-1] if complete_assistant_entries else None
+    )
 
     first_poison: _ParsedEntry | None = None
     last_poison: _ParsedEntry | None = None
     safe_recovery: _ParsedEntry | None = None
     all_poison_uuids = {entry.uuid for entry in entries if _is_poison(entry) and entry.uuid}
     poison_uuids: set[str] = set()
-    if last_real_assistant is not None:
-        last_real_index = entries.index(last_real_assistant)
-        for idx, entry in enumerate(entries[last_real_index + 1 :], last_real_index + 1):
-            if not _is_poison(entry):
+    first_unsafe_tail: _ParsedEntry | None = None
+    unsafe_tail_reason: str | None = None
+
+    if last_complete_assistant is not None:
+        last_complete_index = entries.index(last_complete_assistant)
+        for entry in entries[last_complete_index + 1 :]:
+            if not entry.uuid:
                 continue
-            first_poison = first_poison or entry
-            last_poison = entry
-            if entry.uuid:
+            first_unsafe_tail = entry
+            unsafe_tail_reason = _tail_reason(entry)
+            safe_recovery = last_complete_assistant
+            break
+
+    if last_complete_assistant is not None:
+        last_complete_index = entries.index(last_complete_assistant)
+        poison_search = entries[last_complete_index + 1 :]
+    elif last_real_assistant is not None:
+        poison_search = entries[entries.index(last_real_assistant) + 1 :]
+    else:
+        poison_search = entries
+    for idx, entry in enumerate(poison_search):
+        if not _is_poison(entry):
+            continue
+        first_poison = first_poison or entry
+        last_poison = entry
+        if entry.uuid:
+            poison_uuids.add(entry.uuid)
+        if first_unsafe_tail is None:
+            first_unsafe_tail = entry
+            unsafe_tail_reason = "poisoned_tail"
+        if safe_recovery is None:
+            safe_recovery = _choose_safe_recovery(
+                entries,
+                entries.index(entry) if entry in entries else idx,
+            )
+    if first_unsafe_tail is not None:
+        # Once a run ends without a complete assistant answer, every later UUID
+        # is part of a tail that should not be inherited by resumes or forks.
+        for entry in entries:
+            if entry.uuid and entry.line_no >= first_unsafe_tail.line_no:
                 poison_uuids.add(entry.uuid)
-            if safe_recovery is None:
-                safe_recovery = _choose_safe_recovery(entries, idx)
-        if first_poison is not None:
-            # Once a poison appears after the latest real assistant, every later
-            # UUID is part of a tail that should not be inherited by forks.
-            for entry in entries:
-                if entry.uuid and entry.line_no >= first_poison.line_no:
-                    poison_uuids.add(entry.uuid)
 
     unsafe = _collect_chain_unsafe(by_uuid=by_uuid, poison_uuids=poison_uuids) | frozenset(
         all_poison_uuids
@@ -281,6 +330,13 @@ def analyze_jsonl_path(*, path: Path, session_id: str | None = None) -> JsonlSes
         safe_recovery_line=safe_recovery.line_no if safe_recovery is not None else None,
         uuid_line_numbers=MappingProxyType(dict(uuid_lines)),
         unsafe_uuids=unsafe,
+        first_unsafe_tail_uuid=(
+            first_unsafe_tail.uuid if first_unsafe_tail is not None else None
+        ),
+        first_unsafe_tail_line=(
+            first_unsafe_tail.line_no if first_unsafe_tail is not None else None
+        ),
+        unsafe_tail_reason=unsafe_tail_reason,
     )
 
 
@@ -313,9 +369,9 @@ def resolve_safe_jsonl_target(
         )
 
     if health.needs_recovery:
-        reason = "poisoned_tail"
+        reason = health.unsafe_tail_reason or "unsafe_tail"
         if preferred_uuid and not health.has_uuid(preferred_uuid):
-            reason = "preferred_uuid_missing_poisoned_tail"
+            reason = f"preferred_uuid_missing_{reason}"
         elif preferred_uuid:
             reason = "preferred_uuid_unsafe"
         return SafeJsonlTarget(

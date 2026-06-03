@@ -149,7 +149,10 @@ OBS_FORK_CACHE_WARMUP_DELAY_SECONDS=1.0
 `OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS` is telemetry for context reporting and
 model suffix resolution. The default OBS context is 1M; at the Claude Code
 boundary, a model without an explicit suffix is sent with the resolved context
-suffix, for example `claude` becomes `claude-opus-4-7[1m]`.
+suffix, for example `claude` becomes `claude-opus-4-7[1m]`. Small/test models
+can have model-specific defaults; `haiku` uses `claude-haiku-4-5[200k]` because
+the 1M long-context beta is not available for that lane in the current provider
+account.
 `OBS_AUTO_COMPACT_WINDOW_TOKENS` optionally caps the Claude Code auto-compact
 trigger window. Leave it at `0` to use OBS's model-aware default: the resolved
 context window is passed through so Claude Code's built-in compaction curve is

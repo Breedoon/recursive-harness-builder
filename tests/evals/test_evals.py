@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 from functools import lru_cache
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -52,6 +53,10 @@ _CLI_EVALS_ENABLED = os.environ.get("OBS_EVAL_ENABLE_CLI", "").strip().lower() i
     "yes",
     "on",
 }
+
+
+def _redact_log_text(text: str) -> str:
+    return re.sub(r"(https://api\.telegram\.org/bot)[^/\s\"]+", r"\1<redacted>", text)
 
 
 def _all_scenario_ids() -> list[str]:
@@ -196,12 +201,17 @@ def _start_telegram_bot(vault_path: Path) -> tuple[subprocess.Popen, Path]:
     """
     env = os.environ.copy()
     env["OBS_VAULT_PATH"] = str(vault_path)
+    runtime_root = vault_path / ".obs-eval-runtime"
+    env["OBS_TELEGRAM_TEMP_ROOT"] = str(runtime_root / "telegram-temp")
+    env["OBS_TELEGRAM_STATE_DB_PATH"] = str(runtime_root / "telegram-state.sqlite3")
     # Map the test bot token to what config.py reads
     env["OBS_TELEGRAM_BOT_TOKEN"] = os.environ["OBS_TEST_TELEGRAM_BOT_TOKEN"]
+    env["OBS_TELEGRAM_BOT_TOKENS"] = os.environ["OBS_TEST_TELEGRAM_BOT_TOKEN"]
     # Set the allowed user to the Telethon test account so auth doesn't block evals.
     # OBS_TEST_TELEGRAM_ALLOWED_USERS should be the Telethon account used during evals.
     test_user_id = os.environ.get("OBS_TEST_TELEGRAM_ALLOWED_USERS", "5129431382")
     env["OBS_TELEGRAM_ALLOWED_USERS"] = test_user_id
+    env["OBS_TELEGRAM_DROP_PENDING_UPDATES"] = "1"
 
     log_file = Path(tempfile.mktemp(prefix="obs_tg_bot_", suffix=".log"))
     log_fh = open(log_file, "w")
@@ -220,7 +230,7 @@ def _start_telegram_bot(vault_path: Path) -> tuple[subprocess.Popen, Path]:
         log_text = log_file.read_text(errors="replace")
         raise RuntimeError(
             f"Telegram bot process exited immediately (rc={proc.returncode}).\n"
-            f"log: {log_text[-2000:]}"
+            f"log: {_redact_log_text(log_text[-2000:])}"
         )
     return proc, log_file
 
@@ -237,6 +247,11 @@ def _telegram_platform_kwargs(scenario) -> dict:
     if scenario.idle_quiescence_timeout is not None:
         kwargs["idle_quiescence_timeout"] = scenario.idle_quiescence_timeout
     return kwargs
+
+
+def _is_new_session_confirmation(text: str) -> bool:
+    lowered = text.lower()
+    return "session cleared" in lowered or "new trunk session created" in lowered
 
 
 def _stop_telegram_bot(proc: subprocess.Popen, log_file: Path | None = None) -> None:
@@ -261,6 +276,7 @@ def _print_bot_logs(log_file: Path | None) -> None:
         text = log_file.read_text(errors="replace")
         if text:
             tail = text[-5000:] if len(text) > 5000 else text
+            tail = _redact_log_text(tail)
             print(f"\n[telegram-eval] BOT LOG ({len(text)} chars, showing last {len(tail)}):")
             print(tail)
         # Clean up temp file
@@ -307,7 +323,7 @@ async def test_eval_telegram_all(eval_vault: Path) -> None:
         bot_ready = False
         for attempt in range(5):
             reply = await warmup_platform.send_control("/new", timeout=10.0)
-            if "session cleared" in reply.lower():
+            if _is_new_session_confirmation(reply):
                 bot_ready = True
                 print(f"[telegram-eval] Bot ready after {attempt + 1} attempt(s)")
                 break
@@ -324,7 +340,7 @@ async def test_eval_telegram_all(eval_vault: Path) -> None:
                 failures.append(
                     f"EVAL FAILED (telegram): {scenario_name}\n\n"
                     f"Bot process CRASHED before scenario started (rc={bot_proc.returncode}).\n"
-                    f"log: {log_text[-500:]}"
+                    f"log: {_redact_log_text(log_text[-500:])}"
                 )
                 print(f"[telegram-eval] FATAL: bot crashed before {scenario_name}")
                 break
@@ -344,7 +360,7 @@ async def test_eval_telegram_all(eval_vault: Path) -> None:
                 reset_ok = False
                 for _attempt in range(3):
                     reset_reply = await platform.send_control("/new", timeout=20.0)
-                    if "session cleared" in reset_reply.lower():
+                    if _is_new_session_confirmation(reset_reply):
                         reset_ok = True
                         break
                     print(f"[telegram-eval] /new retry for {scenario_name}: {reset_reply!r}")

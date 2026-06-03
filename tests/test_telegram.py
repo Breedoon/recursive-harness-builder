@@ -403,6 +403,114 @@ class TestTelegramMessageFlow:
         assert len(recovered_lines) == 2
         assert all("Prompt is too long" not in line for line in recovered_lines)
 
+    async def test_run_start_recovers_silent_dangling_user_tail_before_runner(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        project_dir = tmp_path / ".claude" / "projects" / "-fixture"
+        project_dir.mkdir(parents=True)
+        source_path = project_dir / "sid-silent.jsonl"
+        source_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "uuid": "u1",
+                            "parentUuid": None,
+                            "sessionId": "sid-silent",
+                            "message": {"role": "user", "content": "start"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": "a-safe",
+                            "parentUuid": "u1",
+                            "sessionId": "sid-silent",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-opus-4-7",
+                                "content": [{"type": "text", "text": "safe"}],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "uuid": "u-dead",
+                            "parentUuid": "a-safe",
+                            "sessionId": "sid-silent",
+                            "message": {"role": "user", "content": "no answer"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": "a-empty",
+                            "parentUuid": "u-dead",
+                            "sessionId": "sid-silent",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-opus-4-7",
+                                "content": [],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.session_manager.set_session_id("sid-silent")
+        bot._bind_state_session(state)
+        bot._set_session_head(session_id="sid-silent", jsonl_uuid="a-empty")
+
+        sent_id = 100
+
+        async def send_side_effect(**kwargs):
+            nonlocal sent_id
+            sent_id += 1
+            message = MagicMock()
+            message.message_id = sent_id
+            return message
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                assert state.session_id != "sid-silent"
+                yield TextEvent(text="RECOVERED-SILENT")
+                yield TurnEndEvent(
+                    jsonl_uuid="a-new",
+                    message_role="assistant",
+                    has_text=True,
+                )
+                yield DoneEvent()
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            update = _make_update("continue")
+            ctx = _make_context()
+            ctx.bot.send_message = AsyncMock(side_effect=send_side_effect)
+            await bot.handle_message(update, ctx)
+
+        assert state.session_id is not None
+        assert state.session_id != "sid-silent"
+        assert bot._session_heads["sid-silent"] == "a-safe"
+        assert bot._session_heads[state.session_id] == "a-new"
+        recovered_path = project_dir / f"{state.session_id}.jsonl"
+        recovered_lines = recovered_path.read_text(encoding="utf-8").splitlines()
+        assert len(recovered_lines) == 2
+        assert all("u-dead" not in line and "a-empty" not in line for line in recovered_lines)
+
     def test_fork_source_resolution_uses_safe_uuid_instead_of_latest_poison(
         self,
         config,
@@ -472,6 +580,81 @@ class TestTelegramMessageFlow:
         resolved_uuid, resolved_route, message_id = bot._resolve_persisted_fork_source(
             session_id="sid-poisoned",
             preferred_uuid="missing-head",
+            preferred_route=route,
+        )
+
+        assert resolved_uuid == "a-safe"
+        assert resolved_route == route
+        assert message_id is None
+
+    def test_fork_source_resolution_uses_safe_uuid_instead_of_silent_tail(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        project_dir = tmp_path / ".claude" / "projects" / "-fixture"
+        project_dir.mkdir(parents=True)
+        (project_dir / "sid-silent.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "uuid": "u1",
+                            "parentUuid": None,
+                            "sessionId": "sid-silent",
+                            "message": {"role": "user", "content": "start"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": "a-safe",
+                            "parentUuid": "u1",
+                            "sessionId": "sid-silent",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-opus-4-7",
+                                "content": [{"type": "text", "text": "safe"}],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "uuid": "u-dead",
+                            "parentUuid": "a-safe",
+                            "sessionId": "sid-silent",
+                            "message": {"role": "user", "content": "no answer"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": "a-empty",
+                            "parentUuid": "u-dead",
+                            "sessionId": "sid-silent",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-opus-4-7",
+                                "content": [],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=None)
+
+        resolved_uuid, resolved_route, message_id = bot._resolve_persisted_fork_source(
+            session_id="sid-silent",
+            preferred_uuid="a-empty",
             preferred_route=route,
         )
 

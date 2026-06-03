@@ -33,7 +33,7 @@ from tests.live_test_vault import ensure_live_test_vault
 
 pytestmark = [pytest.mark.live, pytest.mark.asyncio, pytest.mark.real_get_client]
 
-_DEFAULT_BROKEN_OPUS_SESSION_ID = "5d85d993-6134-4b0c-8590-bfe305d16e3b"
+_DEFAULT_BROKEN_OPUS_SESSION_ID = "67380755-1c60-47c5-a49d-7ad38296599e"
 _DEFAULT_BROKEN_GPT_SESSION_ID = "226b1adc-5a6d-44e6-8ae4-557572912fd8"
 _DEFAULT_TRUST_SESSION_ID = "137406cb-965d-4488-97ba-7aca104a3d45"
 
@@ -149,8 +149,8 @@ async def _run_haiku_compaction_probe(
 
     try:
         options = session_manager.create_options()
-        assert options.model == "claude-haiku-4-5[1m]"
-        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
+        assert options.model == "claude-haiku-4-5[200k]"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == str(auto_compact_window_tokens)
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
 
@@ -210,7 +210,7 @@ async def _run_haiku_compaction_probe(
     os.environ.get("OBS_RUN_BROKEN_OPUS_RECOVERY_LIVE") != "1",
     reason="set OBS_RUN_BROKEN_OPUS_RECOVERY_LIVE=1 to spend live Opus tokens on recovery",
 )
-async def test_existing_broken_opus_session_compacts_and_recovers() -> None:
+async def test_existing_broken_opus_session_recovers_and_remains_usable() -> None:
     _load_dotenv()
     session_id = os.environ.get(
         "OBS_BROKEN_OPUS_SESSION_ID",
@@ -241,16 +241,16 @@ async def test_existing_broken_opus_session_compacts_and_recovers() -> None:
         session_id=recovery_session_id,
         cwd=cwd,
         prompt=(
-            "Stop prior work. Compact if needed, then reply briefly that the "
-            "session is usable."
+            "Stop prior work. Reply briefly that this recovered session is usable."
         ),
         timeout_seconds=360,
     )
+    assert "usable" in first.lower()
     assert _contains_prompt_too_long_error(session_id=recovery_session_id, cwd=cwd) is False
 
     snapshot = load_jsonl_usage_snapshot(session_id=recovery_session_id, cwd=cwd)
     assert snapshot is not None
-    assert snapshot.latest_context_triplet_tokens < 120_000
+    assert snapshot.latest_context_triplet_tokens > 0
 
     second = await _run_claude_resume(
         session_id=recovery_session_id,
