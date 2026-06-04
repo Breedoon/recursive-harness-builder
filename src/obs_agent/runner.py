@@ -155,6 +155,20 @@ def _is_result_message(message) -> bool:
     return isinstance(num_turns, int) and isinstance(total_cost, (int, float))
 
 
+def _usage_signal(usage: dict) -> int:
+    total = 0
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ):
+        value = usage.get(key)
+        if isinstance(value, int):
+            total += max(0, value)
+    return total
+
+
 def _system_message_to_status_event(message) -> StatusEvent | None:
     """Convert selected SystemMessage subtypes into visible status events."""
     subtype = getattr(message, "subtype", None)
@@ -324,7 +338,11 @@ class ConversationRunner:
             if hasattr(message, "content") and isinstance(message.content, list):
                 usage = getattr(message, "usage", None)
                 if message.content and isinstance(usage, dict):
-                    self._last_assistant_usage = usage
+                    if (
+                        self._last_assistant_usage is None
+                        or _usage_signal(usage) > 0
+                    ):
+                        self._last_assistant_usage = usage
                 for block in message.content:
                     if isinstance(block, ToolUseBlock):
                         tool_name = getattr(block, "name", "")

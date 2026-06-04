@@ -346,6 +346,54 @@ class TestRunnerUsageSnapshot:
         assert data["usage"]["cache_read_input_tokens"] == 2000
         assert data["usage"]["cache_creation_input_tokens"] == 100
 
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_zero_usage_chunk_does_not_replace_positive_assistant_usage(
+        self, mock_get_client, config
+    ):
+        positive_msg = MagicMock()
+        positive_msg.content = [TextBlock(text="first")]
+        positive_msg.session_id = "sess-1"
+        positive_msg.usage = {
+            "input_tokens": 1200,
+            "output_tokens": 30,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 25_600,
+        }
+
+        zero_msg = MagicMock()
+        zero_msg.content = [TextBlock(text="second")]
+        zero_msg.session_id = "sess-1"
+        zero_msg.usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+
+        result_msg = MagicMock()
+        result_msg.content = []
+        result_msg.session_id = "sess-1"
+        result_msg.num_turns = 2
+        result_msg.total_cost_usd = 0.12
+        result_msg.duration_ms = 1234
+        result_msg.usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+
+        mock_get_client.return_value = _make_mock_client(
+            [positive_msg, zero_msg, result_msg]
+        )
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        await _collect_events(runner, "hello")
+
+        data = hook_state.last_result_data
+        assert data is not None
+        assert data["usage"]["input_tokens"] == 1200
+        assert data["usage"]["cache_read_input_tokens"] == 25_600
+
 
 # --- Pending messages ---
 

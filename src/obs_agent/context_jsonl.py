@@ -24,12 +24,43 @@ class JsonlUsageSnapshot:
     latest_context_triplet_tokens: int
     recent_peak_context_triplet_tokens: int
     session_peak_context_triplet_tokens: int
+    text_estimate_tokens: int = 0
+    context_estimate_source: str = "jsonl_latest_triplet"
 
 
 def _as_int(value: Any) -> int:
     if isinstance(value, int):
         return value
     return 0
+
+
+def _content_char_count(value: Any) -> int:
+    """Approximate text-bearing transcript content length."""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        total = 0
+        for item in value:
+            total += _content_char_count(item)
+        return total
+    if isinstance(value, dict):
+        total = 0
+        for key in ("text", "content", "thinking"):
+            if key in value:
+                total += _content_char_count(value.get(key))
+        if total:
+            return total
+        try:
+            return len(json.dumps(value, ensure_ascii=False))
+        except TypeError:
+            return 0
+    return 0
+
+
+def _estimate_tokens_from_chars(char_count: int) -> int:
+    if char_count <= 0:
+        return 0
+    return max(1, int(round(char_count / 4)))
 
 
 def _encode_project_path(cwd: Path) -> str:
@@ -101,6 +132,7 @@ def load_jsonl_usage_snapshot(
     assistant_entries = 0
     usage_totals: list[tuple[int, int, int, int, int]] = []
     # tuples: (input, output, cache_creation, cache_read, triplet_total)
+    text_char_count = 0
 
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -112,17 +144,16 @@ def load_jsonl_usage_snapshot(
                     obj = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if obj.get("type") != "assistant":
-                    continue
-                assistant_entries += 1
-
-                entry_session_id = obj.get("sessionId")
-                if isinstance(entry_session_id, str) and entry_session_id != session_id:
-                    continue
 
                 message = obj.get("message")
                 if not isinstance(message, dict):
                     continue
+                if obj.get("type") in {"assistant", "user"}:
+                    text_char_count += _content_char_count(message.get("content"))
+                if obj.get("type") != "assistant":
+                    continue
+                assistant_entries += 1
+
                 usage = message.get("usage")
                 if not isinstance(usage, dict):
                     continue
@@ -144,13 +175,24 @@ def load_jsonl_usage_snapshot(
     except OSError:
         return None
 
-    if not usage_totals:
+    text_estimate_tokens = _estimate_tokens_from_chars(text_char_count)
+    informative_usage_totals = [total for total in usage_totals if total[4] > 0]
+    if informative_usage_totals:
+        latest = informative_usage_totals[-1]
+        context_estimate_source = (
+            "jsonl_latest_triplet"
+            if usage_totals and usage_totals[-1] == latest
+            else "jsonl_latest_positive_triplet"
+        )
+    elif text_estimate_tokens > 0:
+        latest = (0, 0, 0, 0, text_estimate_tokens)
+        context_estimate_source = "jsonl_text_estimate"
+    else:
         return None
 
-    latest = usage_totals[-1]
     recent_slice = usage_totals[-max(1, recent_window) :]
-    recent_peak = max(total[4] for total in recent_slice)
-    session_peak = max(total[4] for total in usage_totals)
+    recent_peak = max([total[4] for total in recent_slice] + [latest[4]])
+    session_peak = max([total[4] for total in usage_totals] + [latest[4]])
     latest_total_billed = latest[0] + latest[1] + latest[2] + latest[3]
 
     return JsonlUsageSnapshot(
@@ -165,4 +207,6 @@ def load_jsonl_usage_snapshot(
         latest_context_triplet_tokens=latest[4],
         recent_peak_context_triplet_tokens=recent_peak,
         session_peak_context_triplet_tokens=session_peak,
+        text_estimate_tokens=text_estimate_tokens,
+        context_estimate_source=context_estimate_source,
     )

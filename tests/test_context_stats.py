@@ -180,6 +180,50 @@ def test_build_context_snapshot_prefers_jsonl_triplet_for_context_estimate(tmp_p
     assert snapshot["sdk_cache_read_input_tokens"] == 99999
 
 
+def test_build_context_snapshot_uses_latest_positive_jsonl_usage(tmp_path: Path) -> None:
+    projects_root = tmp_path / ".claude" / "projects"
+    session_id = "sid-jsonl-zero-tail"
+    session_file = projects_root / "-Users-breedoon-Documents-obs-fixture-vault" / f"{session_id}.jsonl"
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        {
+            "type": "assistant",
+            "sessionId": session_id,
+            "message": {
+                "usage": {
+                    "input_tokens": 1200,
+                    "output_tokens": 50,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 25_600,
+                }
+            },
+        },
+        {
+            "type": "assistant",
+            "sessionId": session_id,
+            "message": {
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                }
+            },
+        },
+    ]
+    session_file.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+
+    snapshot = build_context_snapshot(
+        session_id=session_id,
+        data={"session_id": session_id},
+        context_window_estimate_tokens=400_000,
+        cwd=Path("/workspace/recursive-harness/fixture_project"),
+        projects_root=projects_root,
+    )
+
+    assert snapshot["context_estimate_source"] == "jsonl_latest_positive_triplet"
+    assert snapshot["estimated_context_used_tokens"] == 26_800
+    assert format_context_snapshot_compact(snapshot) == "context: 26k / 400k"
+
+
 def test_build_context_snapshot_falls_back_when_jsonl_has_no_usage(tmp_path: Path) -> None:
     projects_root = tmp_path / ".claude" / "projects"
     session_id = "sid-empty"

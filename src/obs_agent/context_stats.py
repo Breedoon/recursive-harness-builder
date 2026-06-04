@@ -116,12 +116,13 @@ def build_context_snapshot(
                 "estimated_context_used_tokens": context_used,
                 "estimated_context_remaining_tokens": context_remaining,
                 "estimated_context_remaining_pct": pct_remaining,
-                "context_estimate_source": "jsonl_latest_triplet",
                 "jsonl_session_file": str(jsonl_usage.source_path),
                 "jsonl_assistant_entries": jsonl_usage.assistant_entries,
                 "jsonl_usage_entries": jsonl_usage.usage_entries,
                 "recent_peak_context_triplet_tokens": jsonl_usage.recent_peak_context_triplet_tokens,
                 "session_peak_context_triplet_tokens": jsonl_usage.session_peak_context_triplet_tokens,
+                "text_estimate_tokens": jsonl_usage.text_estimate_tokens,
+                "context_estimate_source": jsonl_usage.context_estimate_source,
             }
         )
         return snapshot
