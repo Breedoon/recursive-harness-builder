@@ -754,6 +754,58 @@ class TestRunnerSilentCompletionRecovery:
         assert "previous turn ended without any visible assistant text" in retry_prompt
         assert "original user prompt" not in retry_prompt
 
+    async def test_silent_jsonl_api_error_is_visible_and_not_retried(self, config):
+        silent_client = _make_mock_client([_make_result_message(session_id="sid-1")])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr.recover_poisoned_session_if_needed = AsyncMock(return_value=None)
+        session_mgr.latest_jsonl_api_error_text = MagicMock(
+            return_value="You've hit your limit - resets 6:30pm (America/Los_Angeles)"
+        )
+        with patch.object(
+            session_mgr,
+            "get_client",
+            new=AsyncMock(return_value=silent_client),
+        ):
+            runner = ConversationRunner(session_mgr, hook_state, config)
+            events = await _collect_events(runner, "original user prompt")
+
+        text_events = [event for event in events if isinstance(event, TextEvent)]
+        assert [event.text for event in text_events] == [
+            "You've hit your limit - resets 6:30pm (America/Los_Angeles)"
+        ]
+        session_mgr.recover_poisoned_session_if_needed.assert_awaited_once()
+        assert silent_client.query.await_count == 1
+
+    async def test_sdk_api_error_without_text_block_is_visible(self, config):
+        api_error = MagicMock()
+        api_error.content = []
+        api_error.session_id = "sid-1"
+        api_error.isApiErrorMessage = True
+        api_error.error = "rate_limit"
+        api_error.num_turns = None
+        api_error.total_cost_usd = None
+        client = _make_mock_client([api_error])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        with patch.object(session_mgr, "get_client", new=AsyncMock(return_value=client)):
+            runner = ConversationRunner(session_mgr, hook_state, config)
+            events = await _collect_events(runner, "original user prompt")
+
+        assert any(
+            isinstance(event, TextEvent) and event.text == "rate_limit"
+            for event in events
+        )
+        turn_end = next(event for event in events if isinstance(event, TurnEndEvent))
+        assert turn_end.is_error is True
+        assert turn_end.error_text == "rate_limit"
+
     async def test_empty_non_result_stream_without_status_is_retried(self, config):
         silent_client = _make_mock_client([_make_empty_turn_message(session_id="sid-1")])
         recovery_msg = MagicMock()

@@ -191,6 +191,62 @@ class SessionManager:
             return True
         return not self._jsonl_has_entry_file_context(resume_session_id)
 
+    def latest_jsonl_api_error_text(self) -> str | None:
+        """Return the latest synthetic API-error text from the current JSONL tail."""
+        if not self._session_id:
+            return None
+        try:
+            from obs_agent.context_jsonl import find_session_jsonl
+
+            path = find_session_jsonl(
+                session_id=self._session_id,
+                cwd=self.config.vault_path,
+            )
+            if path is None:
+                return None
+            with path.open("r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+            for line in reversed(lines):
+                if "isApiErrorMessage" not in line and '"error"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                if not obj.get("isApiErrorMessage") and not obj.get("error"):
+                    continue
+                message = obj.get("message")
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+                if isinstance(content, list):
+                    texts: list[str] = []
+                    for block in content:
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "text"
+                            and isinstance(block.get("text"), str)
+                        ):
+                            text = block["text"].strip()
+                            if text:
+                                texts.append(text)
+                    if texts:
+                        return "\n".join(texts)
+                error = obj.get("error") or message.get("error")
+                if isinstance(error, str) and error.strip():
+                    return error.strip()
+        except Exception:
+            logger.debug(
+                "Unable to inspect JSONL API error tail session_id=%s",
+                self._session_id,
+                exc_info=True,
+            )
+        return None
+
     def prepare_user_message(self, message: str) -> str:
         """Prepend persisted entry-file context once for the current JSONL.
 

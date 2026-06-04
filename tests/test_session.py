@@ -1,6 +1,7 @@
 """Tests for obs_agent.session SessionManager behavior."""
 
 import asyncio
+import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -135,6 +136,55 @@ class TestCreateOptions:
         mgr = SessionManager(config=config)
         with patch("obs_agent.context_jsonl.find_session_jsonl", return_value=jsonl):
             assert mgr._should_inject_entry_file_context("sess-1") is True
+
+    def test_latest_jsonl_api_error_text_reads_synthetic_tail(self, config, tmp_path):
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": "a-safe",
+                            "sessionId": "sess-1",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "ok"}],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "uuid": "err",
+                            "sessionId": "sess-1",
+                            "isApiErrorMessage": True,
+                            "error": "rate_limit",
+                            "message": {
+                                "role": "assistant",
+                                "model": "<synthetic>",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "You've hit your limit - resets 6:30pm",
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        mgr = SessionManager(config=config)
+        mgr.set_session_id("sess-1")
+
+        with patch("obs_agent.context_jsonl.find_session_jsonl", return_value=jsonl):
+            assert (
+                mgr.latest_jsonl_api_error_text()
+                == "You've hit your limit - resets 6:30pm"
+            )
 
     def test_includes_hooks(self, config):
         mgr = SessionManager(config=config)

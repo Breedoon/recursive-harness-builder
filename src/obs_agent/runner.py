@@ -63,6 +63,7 @@ class TurnEndEvent:
     message_role: str | None = None
     has_text: bool = False
     is_error: bool = False
+    error_text: str | None = None
 
 
 @dataclass
@@ -127,14 +128,25 @@ def _message_role(message) -> str | None:
     return None
 
 
-def _is_error_message(message, text_parts: list[str]) -> bool:
-    if bool(getattr(message, "isApiErrorMessage", False)):
-        return True
+def _error_message_text(message, text_parts: list[str]) -> str | None:
+    text = "\n".join(part for part in text_parts if part).strip()
+    if getattr(message, "isApiErrorMessage", False) is True:
+        if text:
+            return text
+        error = getattr(message, "error", None)
+        if isinstance(error, str) and error.strip():
+            return error.strip()
+        return "API error"
     error = getattr(message, "error", None)
     if isinstance(error, str) and error:
-        return True
-    text = "\n".join(part for part in text_parts if part).strip()
-    return text == "Prompt is too long"
+        return text or error.strip()
+    if text == "Prompt is too long":
+        return text
+    return None
+
+
+def _is_error_message(message, text_parts: list[str]) -> bool:
+    return _error_message_text(message, text_parts) is not None
 
 
 def _is_result_message(message) -> bool:
@@ -337,6 +349,11 @@ class ConversationRunner:
             if system_status is not None:
                 yield system_status
 
+            error_text = _error_message_text(message, text_parts)
+            if error_text and not has_text:
+                has_text = True
+                yield TextEvent(text=error_text)
+
             # Drain status_queue after each message
             while not self._hook_state.status_queue.empty():
                 try:
@@ -348,7 +365,8 @@ class ConversationRunner:
                 jsonl_uuid=raw_uuid if isinstance(raw_uuid, str) and raw_uuid else None,
                 message_role=message_role,
                 has_text=has_text,
-                is_error=_is_error_message(message, text_parts),
+                is_error=error_text is not None,
+                error_text=error_text,
             )
 
     async def _stream_or_reconnect(
@@ -456,6 +474,16 @@ class ConversationRunner:
 
             silent_completion = self._last_result_message is not None or not saw_status_event
             if saw_visible_text or not silent_completion:
+                return
+
+            api_error_text = self._session_mgr.latest_jsonl_api_error_text()
+            if api_error_text:
+                logger.warning(
+                    "Claude Code completed %s with JSONL API error tail: %s",
+                    stage,
+                    api_error_text,
+                )
+                yield TextEvent(text=api_error_text)
                 return
 
             if attempt >= 1:

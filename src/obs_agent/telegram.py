@@ -4886,17 +4886,49 @@ class TelegramBot:
         session_id = state.session_id
         if not session_id or not latest_turn_uuid:
             return
-        if self._session_heads.get(session_id) == latest_turn_uuid:
+        resolved_uuid = latest_turn_uuid
+        target = resolve_safe_jsonl_target(
+            session_id=session_id,
+            cwd=self._config.vault_path,
+            preferred_uuid=latest_turn_uuid,
+        )
+        if target is not None:
+            # During tests and occasional SDK/file timing races, a freshly
+            # streamed UUID may not be discoverable in JSONL yet. Do not roll a
+            # healthy head backward merely because the UUID is missing; do
+            # rewrite heads that are known to be unsafe.
+            missing_but_healthy = (
+                target.changed
+                and target.reason == "preferred_uuid_missing"
+                and not target.health.needs_recovery
+            )
+            if not missing_but_healthy:
+                if target.changed:
+                    logger.warning(
+                        "[jsonl_health] purpose=%s session_id=%s preferred_uuid=%s "
+                        "resolved_uuid=%s reason=%s first_unsafe=%s first_poison=%s "
+                        "safe_line=%s",
+                        f"session_head_{source}",
+                        session_id,
+                        latest_turn_uuid,
+                        target.target_uuid,
+                        target.reason,
+                        target.health.first_unsafe_tail_uuid,
+                        target.health.first_poison_uuid,
+                        target.health.safe_recovery_line,
+                    )
+                resolved_uuid = target.target_uuid or latest_turn_uuid
+        if self._session_heads.get(session_id) == resolved_uuid:
             return
         self._set_session_head(
             session_id=session_id,
-            jsonl_uuid=latest_turn_uuid,
+            jsonl_uuid=resolved_uuid,
         )
         logger.info(
             "[session_head] route=%s session_id=%s uuid=%s source=%s",
             state.route,
             session_id,
-            latest_turn_uuid,
+            resolved_uuid,
             source,
         )
 
@@ -6563,12 +6595,33 @@ class TelegramBot:
 
                 if isinstance(event, TurnEndEvent):
                     if event.is_error:
+                        failed = True
+                        visible_error_text = event.error_text or "\n".join(
+                            item.text.strip()
+                            for item in turn_items
+                            if isinstance(item, TextEvent) and item.text.strip()
+                        ).strip()
+                        if visible_error_text:
+                            error_text = visible_error_text
+                        if event.error_text:
+                            if not any(
+                                isinstance(item, TextEvent) and item.text.strip()
+                                for item in turn_items
+                            ):
+                                turn_items.append(TextEvent(text=event.error_text))
+                                captured_text_parts.append(event.error_text)
                         if state.session_id and last_good_turn_uuid:
                             self._set_session_head(
                                 session_id=state.session_id,
                                 jsonl_uuid=last_good_turn_uuid,
                             )
                             latest_turn_uuid = last_good_turn_uuid
+                        await self._flush_turn(
+                            state=state,
+                            bot=bot,
+                            turn_items=turn_items,
+                            deferred_bindings=deferred_bindings,
+                        )
                         turn_items.clear()
                         trigger_status_ids.clear()
                         continue
@@ -6595,16 +6648,12 @@ class TelegramBot:
                                 deferred_bindings=deferred_bindings,
                             )
                         if state.session_id:
-                            self._set_session_head(
-                                session_id=state.session_id,
-                                jsonl_uuid=event.jsonl_uuid,
+                            self._refresh_session_head(
+                                state=state,
+                                latest_turn_uuid=event.jsonl_uuid,
+                                source="user_turn",
                             )
                         latest_turn_uuid = event.jsonl_uuid
-                        self._refresh_session_head(
-                            state=state,
-                            latest_turn_uuid=latest_turn_uuid,
-                            source="user_turn",
-                        )
                         trigger_user_mapped = True
                         trigger_status_ids.clear()
 

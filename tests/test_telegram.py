@@ -285,6 +285,58 @@ class TestTelegramMessageFlow:
             ctx.bot.send_message = AsyncMock(side_effect=send_side_effect)
             await bot.handle_message(update, ctx)
 
+        sent_texts = [
+            call.kwargs["text"]
+            for call in ctx.bot.send_message.call_args_list
+            if "text" in call.kwargs
+        ]
+        assert any("Prompt is too long" in text for text in sent_texts)
+        assert bot._session_heads["sid-1"] == "previous-good-uuid"
+        assert all(
+            binding.jsonl_uuid != "error-uuid"
+            for binding in bot._message_map.values()
+        )
+
+    async def test_error_turn_text_is_sent_without_mapping_error_uuid(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        bot._set_session_head(session_id="sid-1", jsonl_uuid="previous-good-uuid")
+        events = [
+            TurnEndEvent(
+                jsonl_uuid="error-uuid",
+                message_role="assistant",
+                is_error=True,
+                error_text="rate_limit",
+            ),
+            DoneEvent(),
+        ]
+
+        async def send_side_effect(**kwargs):
+            message = MagicMock()
+            message.message_id = 100 + len(ctx.bot.send_message.call_args_list)
+            return message
+
+        with patch("obs_agent.telegram.ConversationRunner") as mock_runner:
+            instance = mock_runner.return_value
+
+            async def mock_run(msg):
+                _state(bot).session_manager.set_session_id("sid-1")
+                for event in events:
+                    yield event
+
+            instance.run = mock_run
+            instance.remaining_pending = []
+
+            update = _make_update("test")
+            ctx = _make_context()
+            ctx.bot.send_message = AsyncMock(side_effect=send_side_effect)
+            await bot.handle_message(update, ctx)
+
+        sent_texts = [
+            call.kwargs["text"]
+            for call in ctx.bot.send_message.call_args_list
+            if "text" in call.kwargs
+        ]
+        assert any("rate_limit" in text for text in sent_texts)
         assert bot._session_heads["sid-1"] == "previous-good-uuid"
         assert all(
             binding.jsonl_uuid != "error-uuid"
@@ -4531,6 +4583,62 @@ class TestTopicCommands:
 
         assert bot._message_map[(67890, 77)].jsonl_uuid == "late-uuid"
         assert bot._session_heads["sid-late"] == "late-uuid"
+
+    async def test_session_head_refresh_persists_safe_resolved_uuid(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.session_manager.set_session_id("sid-tail")
+        target = SimpleNamespace(
+            changed=True,
+            reason="preferred_uuid_unsafe",
+            target_uuid="safe-assistant-uuid",
+            health=SimpleNamespace(
+                needs_recovery=True,
+                first_unsafe_tail_uuid="dangling-user-uuid",
+                first_poison_uuid=None,
+                safe_recovery_line=2,
+            ),
+        )
+
+        with patch(
+            "obs_agent.telegram.resolve_safe_jsonl_target",
+            return_value=target,
+        ) as resolve_safe:
+            bot._refresh_session_head(
+                state=state,
+                latest_turn_uuid="dangling-user-uuid",
+                source="test",
+            )
+
+        resolve_safe.assert_called_once_with(
+            session_id="sid-tail",
+            cwd=config.vault_path,
+            preferred_uuid="dangling-user-uuid",
+        )
+        assert bot._session_heads["sid-tail"] == "safe-assistant-uuid"
+
+    async def test_session_head_refresh_keeps_missing_uuid_when_jsonl_is_healthy(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.session_manager.set_session_id("sid-healthy")
+        target = SimpleNamespace(
+            changed=True,
+            reason="preferred_uuid_missing",
+            target_uuid="older-uuid",
+            health=SimpleNamespace(needs_recovery=False),
+        )
+
+        with patch(
+            "obs_agent.telegram.resolve_safe_jsonl_target",
+            return_value=target,
+        ):
+            bot._refresh_session_head(
+                state=state,
+                latest_turn_uuid="fresh-streamed-uuid",
+                source="test",
+            )
+
+        assert bot._session_heads["sid-healthy"] == "fresh-streamed-uuid"
 
     async def test_delete_current_topic_drops_route_state(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
