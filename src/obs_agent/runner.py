@@ -533,6 +533,8 @@ class ConversationRunner:
                 self._client = await self._session_mgr.get_client()
                 self._sync_session_id_from_client()
 
+        actual_message = self._session_mgr.prepare_user_message(actual_message)
+
         try:
             await self._client.query(actual_message)
             self._sync_session_id_from_client()

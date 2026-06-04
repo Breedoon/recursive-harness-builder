@@ -20,6 +20,7 @@ from claude_agent_sdk import (
 
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
+from obs_agent.prompt import ENTRY_FILE_SENTINEL
 from obs_agent.queueing import QueuedMessage
 from obs_agent.runner import (
     ConversationRunner,
@@ -148,6 +149,30 @@ class TestRunnerBasicResponse:
         await _collect_events(runner, "test")
 
         assert session_mgr.session_id == "sess-42"
+
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_initial_query_persists_entry_file_context_once(
+        self, mock_get_client, config
+    ):
+        mock_msg = MagicMock()
+        mock_msg.content = [TextBlock(text="Ok")]
+        mock_msg.session_id = "sess-42"
+        client = _make_mock_client([mock_msg])
+        mock_get_client.return_value = client
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+        session_mgr._entry_file_context_pending = True
+
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        await _collect_events(runner, "hi")
+
+        sent = client.query.call_args.args[0]
+        assert sent.count(ENTRY_FILE_SENTINEL) == 1
+        assert "Test context" in sent
+        assert sent.endswith("\n\nhi")
+        assert session_mgr.prepare_user_message("next") == "next"
 
 
 # --- Status events ---

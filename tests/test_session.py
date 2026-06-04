@@ -72,15 +72,69 @@ class TestResumeWindow:
 
 
 class TestCreateOptions:
-    def test_appends_entry_file_and_obs_platform_instructions_to_system_prompt(self, config):
+    def test_system_prompt_uses_claude_code_preset_without_obs_append(self, config):
         mgr = SessionManager(config=config)
         options = mgr.create_options()
         assert options.system_prompt["type"] == "preset"
         assert options.system_prompt["preset"] == "claude_code"
-        append = options.system_prompt["append"]
-        assert append.count(ENTRY_FILE_SENTINEL) == 1
-        assert "Test context" in append
-        assert build_obs_platform_appendix() in append
+        assert "append" not in options.system_prompt
+
+    def test_prepare_user_message_injects_entry_file_context_once(self, config):
+        mgr = SessionManager(config=config)
+        mgr._entry_file_context_pending = True
+
+        prepared = mgr.prepare_user_message("Hello")
+
+        assert prepared.count(ENTRY_FILE_SENTINEL) == 1
+        assert "Test context" in prepared
+        assert build_obs_platform_appendix() in prepared
+        assert prepared.endswith("\n\nHello")
+        assert mgr.prepare_user_message("Next") == "Next"
+
+    def test_prepare_user_message_does_not_duplicate_existing_context(self, config):
+        mgr = SessionManager(config=config)
+        mgr._entry_file_context_pending = True
+        message = f"{ENTRY_FILE_SENTINEL}\nHello"
+
+        assert mgr.prepare_user_message(message) == message
+        assert mgr._entry_file_context_pending is False
+
+    def test_resume_with_existing_entry_file_context_does_not_reinject(
+        self, config, tmp_path
+    ):
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text(
+            '{"type":"user","message":{"content":"'
+            f'{ENTRY_FILE_SENTINEL}\\n# OBS Agent'
+            '"}}\n',
+            encoding="utf-8",
+        )
+        mgr = SessionManager(config=config)
+        with patch("obs_agent.context_jsonl.find_session_jsonl", return_value=jsonl):
+            assert mgr._should_inject_entry_file_context("sess-1") is False
+
+    def test_resume_without_entry_file_context_reinjects(self, config, tmp_path):
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text(
+            '{"type":"user","message":{"content":"Hello"}}\n',
+            encoding="utf-8",
+        )
+        mgr = SessionManager(config=config)
+        with patch("obs_agent.context_jsonl.find_session_jsonl", return_value=jsonl):
+            assert mgr._should_inject_entry_file_context("sess-1") is True
+
+    def test_resume_ignores_queue_operation_entry_file_context(self, config, tmp_path):
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text(
+            '{"type":"queue-operation","operation":"enqueue","content":"'
+            f'{ENTRY_FILE_SENTINEL}\\n# OBS Agent'
+            '"}\n'
+            '{"type":"user","message":{"content":"Hello"}}\n',
+            encoding="utf-8",
+        )
+        mgr = SessionManager(config=config)
+        with patch("obs_agent.context_jsonl.find_session_jsonl", return_value=jsonl):
+            assert mgr._should_inject_entry_file_context("sess-1") is True
 
     def test_includes_hooks(self, config):
         mgr = SessionManager(config=config)

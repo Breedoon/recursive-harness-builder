@@ -585,7 +585,7 @@ class TestMCPToolCountChanges:
         assert names == ["tool_a", "tool_a", "tool_b"]
 
 
-# ── Rule 4: Strip Dynamic Reminders ──────────────────────────────────────
+# ── Rule 3: Strip All System Reminders ───────────────────────────────────
 
 
 class TestStripDynamicReminders:
@@ -605,16 +605,15 @@ class TestStripDynamicReminders:
         ])
         count = cache_proxy.strip_dynamic_reminders(body)
         assert count == 2
-        assert len(body["messages"][0]["content"]) == 0
+        assert body["messages"] == []
 
-    def test_preserves_claudemd(self):
+    def test_strips_claudemd_too(self):
         body = _make_body(messages=[
             _user_msg([_claudemd_block(), _dynamic_reminder_block()]),
         ])
         count = cache_proxy.strip_dynamic_reminders(body)
-        assert count == 1
-        assert len(body["messages"][0]["content"]) == 1
-        assert cache_proxy.CLAUDEMD_MARKER in body["messages"][0]["content"][0]["text"]
+        assert count == 2
+        assert body["messages"] == []
 
     def test_strips_multiple_reminders(self):
         body = _make_body(messages=[
@@ -657,6 +656,19 @@ class TestStripDynamicReminders:
         body = _make_body(messages=[])
         count = cache_proxy.strip_dynamic_reminders(body)
         assert count == 0
+
+    def test_removes_user_message_left_only_with_reminders(self):
+        body = _make_body(messages=[
+            _user_msg([_text_block("first")]),
+            _user_msg([_dynamic_reminder_block(), _skill_block(), _claudemd_block()]),
+            _user_msg([_text_block("last")]),
+        ])
+        count = cache_proxy.strip_dynamic_reminders(body)
+        assert count == 3
+        assert [msg["content"][0]["text"] for msg in body["messages"]] == [
+            "first",
+            "last",
+        ]
 
     def test_across_multiple_messages(self):
         body = _make_body(messages=[
@@ -923,7 +935,7 @@ class TestNormalizeMetadata:
 
 class TestNormalizeRequest:
     def test_applies_all_rules(self):
-        """A body with all normalizable aspects gets all 7 rules applied."""
+        """A body with all normalizable aspects gets every rule applied."""
         body = _make_body(
             system=[
                 _billing_block(),
@@ -955,31 +967,30 @@ class TestNormalizeRequest:
         # Rule 2: string converted
         assert info["strings"] >= 1
 
-        # Rule 3: skill listing stripped entirely
-        assert info["skill"]["action"] == "stripped"
-        # No message content should contain the skill marker
+        # Rule 3: every Claude Code system-reminder is stripped, including
+        # skill listings and CLAUDE.md project-context reminders.
+        assert info["skill"]["action"] == "merged_into_reminders"
+        assert info["reminders"] >= 2
         for msg in result_body["messages"]:
             if msg.get("role") != "user":
                 continue
             for block in msg.get("content", []):
                 if isinstance(block, dict) and block.get("type") == "text":
                     assert cache_proxy.SKILL_MARKER not in block.get("text", "")
+                    assert "<system-reminder>" not in block.get("text", "")
 
-        # Rule 4: dynamic reminders stripped
-        assert info["reminders"] >= 1
-
-        # Rule 5: git status normalized
+        # Rule 4: git status normalized
         assert info["git_status"] >= 1
         assert result_body["system"][2]["text"].endswith("gitStatus: normalized")
 
         # cache_control: not touched (CC handles natively)
         assert "cache_control" not in info
 
-        # Rule 6: tools sorted
+        # Rule 5: tools sorted
         assert info["tools"] >= 1
         assert result_body["tools"][0]["name"] == "a_tool"
 
-        # Rule 7: metadata normalized
+        # Rule 6: metadata normalized
         assert info["metadata"] >= 1
         assert result_body["metadata"]["user_id"] == "user_x_session_0"
 
@@ -1003,8 +1014,7 @@ class TestNormalizeRequest:
         )
 
         _, info = cache_proxy.normalize_request(body)
-        # No skill to strip, no other normalizations needed
-        assert info["skill"]["action"] == "not_found"
+        assert info["skill"]["action"] == "merged_into_reminders"
         assert info["strings"] == 0
         assert info["reminders"] == 0
         assert info["tools"] == 0
@@ -1042,7 +1052,7 @@ class TestNormalizeRequest:
         _, info = cache_proxy.normalize_request(body)
         assert info["billing"] == 0
         assert info["strings"] == 0
-        assert info["skill"]["action"] == "no_messages"
+        assert info["skill"]["action"] == "merged_into_reminders"
 
     def test_action_normalized_on_any_change(self):
         """Action should be 'normalized' if ANY rule fires."""
@@ -1060,7 +1070,8 @@ class TestNormalizeRequest:
             messages=[_user_msg([_text_block("hello")])],
         )
         _, info = cache_proxy.normalize_request(body)
-        assert info["skill"]["action"] == "not_found"
+        assert info["skill"]["action"] == "merged_into_reminders"
+        assert info["action"] == "not_found"
 
 
 # ── parse_sse_usage ───────────────────────────────────────────────────────

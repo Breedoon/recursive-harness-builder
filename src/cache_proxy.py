@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Cache-normalizing proxy for Claude Code API requests.
 
-Intercepts POST /v1/messages requests and applies 7 idempotent normalization
+Intercepts POST /v1/messages requests and applies idempotent normalization
 rules to maximize prompt cache hits across session restarts and forks.
 All other requests are forwarded unmodified. CC's native cache_control
 placement is left untouched — cache_control is not part of the cache key
@@ -11,12 +11,11 @@ placement is left untouched — cache_control is not part of the cache key
 Normalizations (applied in order):
 1. Billing header: replaced with fixed value
 2. String→list: bare-string user content converted to list format
-3. Skill listing: stripped entirely from all messages
-4. Claude Code system-reminders: stripped
-5. Git status: normalized in system prompt to fixed placeholder
-6. Tool sorting: tools[] sorted alphabetically by name
-7. Metadata: session-specific IDs normalized
-8. Tool schema sanitization: array types get ``items`` added (non-Claude only)
+3. Claude Code system-reminders: stripped from all user messages
+4. Git status: normalized in system prompt to fixed placeholder
+5. Tool sorting: tools[] sorted alphabetically by name
+6. Metadata: session-specific IDs normalized
+7. Tool schema sanitization: array types get ``items`` added (non-Claude only)
 
 Usage:
     python cache_proxy.py [port]  # default: 18923
@@ -56,7 +55,6 @@ USAGE_LOG = os.path.join(LOG_DIR, "usage.jsonl")
 
 SKILL_MARKER = "The following skills are available for use with the Skill tool:"
 CLAUDEMD_MARKER = "As you answer the user's questions, you can use the following context:"
-OBS_ENTRY_FILE_MARKER = "<!-- OBS_AGENT_ENTRY_FILE_CONTEXT -->"
 
 SAVE_BODIES = os.environ.get("CACHE_PROXY_SAVE_BODIES", "").lower() in ("1", "true")
 
@@ -149,12 +147,10 @@ def normalize_user_content_structure(body: dict) -> int:
 
 
 def normalize_skill_listing(body: dict) -> dict:
-    """Rule 3: Strip the skill listing block entirely from all messages.
+    """Legacy helper: strip the skill listing block from all user messages.
 
-    CC generates the skill listing once per process and injects it into
-    the latest user message. On restart/fork, it appears at a different
-    position, causing byte-level prefix divergence and cache misses.
-    Stripping it entirely eliminates this source of divergence.
+    normalize_request now strips all Claude Code <system-reminder> blocks in
+    one pass. This helper remains for older focused unit tests and callers.
     """
     messages = body.get("messages", [])
     if not messages:
@@ -185,59 +181,53 @@ def normalize_skill_listing(body: dict) -> dict:
     return {"action": "not_found"}
 
 
-def _is_claudemd_reminder(block: dict) -> bool:
+def _is_strippable_system_reminder(block: dict) -> bool:
     if not isinstance(block, dict) or block.get("type") != "text":
         return False
     text = block.get("text", "")
-    return text.startswith(f"<system-reminder>\n{CLAUDEMD_MARKER}")
+    return "<system-reminder>" in text
 
 
-def _has_obs_entry_file_context(body: dict) -> bool:
-    system = body.get("system")
-    if not isinstance(system, list):
-        return False
-    for block in system:
-        if isinstance(block, dict) and block.get("type") == "text":
-            if OBS_ENTRY_FILE_MARKER in block.get("text", ""):
-                return True
-    return False
-
-
-def _is_strippable_system_reminder(block: dict, *, strip_claudemd: bool = True) -> bool:
-    if not isinstance(block, dict) or block.get("type") != "text":
-        return False
-    text = block.get("text", "")
-    if "<system-reminder>" not in text:
-        return False
-    if _is_claudemd_reminder(block) and not strip_claudemd:
-        return False
-    return True
-
-
-def strip_dynamic_reminders(body: dict) -> int:
-    """Rule 4: Strip dynamic Claude Code <system-reminder> blocks from user messages."""
+def strip_all_system_reminders(body: dict) -> int:
+    """Rule 3: Strip every Claude Code <system-reminder> from user messages."""
     messages = body.get("messages", [])
+    if not isinstance(messages, list):
+        return 0
     count = 0
-    strip_claudemd = _has_obs_entry_file_context(body)
+    kept_messages: list[dict] = []
     for msg in messages:
+        if not isinstance(msg, dict):
+            kept_messages.append(msg)
+            continue
         if msg.get("role") != "user":
+            kept_messages.append(msg)
             continue
         content = msg.get("content")
         if not isinstance(content, list):
+            kept_messages.append(msg)
             continue
         original_len = len(content)
-        msg["content"] = [
-            block for block in content
-            if not _is_strippable_system_reminder(block, strip_claudemd=strip_claudemd)
+        filtered = [
+            block for block in content if not _is_strippable_system_reminder(block)
         ]
-        stripped = original_len - len(msg["content"])
+        stripped = original_len - len(filtered)
         count += stripped
+        if original_len > 0 and stripped == original_len:
+            continue
+        msg["content"] = filtered
+        kept_messages.append(msg)
+    body["messages"] = kept_messages
     stats["reminders_stripped"] += count
     return count
 
 
+def strip_dynamic_reminders(body: dict) -> int:
+    """Backward-compatible alias for strip_all_system_reminders."""
+    return strip_all_system_reminders(body)
+
+
 def normalize_git_status(body: dict) -> int:
-    """Rule 5: Normalize git status section in system prompt.
+    """Rule 4: Normalize git status section in system prompt.
 
     The gitStatus section in sys[2] contains a snapshot of the working tree
     at the time the CC process started. Sessions started at different times
@@ -263,7 +253,7 @@ def normalize_git_status(body: dict) -> int:
 
 
 def normalize_tool_order(body: dict) -> int:
-    """Rule 6: Sort tool definitions alphabetically by name.
+    """Rule 5: Sort tool definitions alphabetically by name.
 
     Tool definitions arrive in filesystem readdir order, which is
     non-deterministic across process restarts and platforms. Different
@@ -282,7 +272,7 @@ def normalize_tool_order(body: dict) -> int:
 
 
 def normalize_metadata(body: dict) -> int:
-    """Rule 7: Normalize session-specific IDs in metadata.
+    """Rule 6: Normalize session-specific IDs in metadata.
 
     metadata.user_id contains the session UUID which differs between
     parent and fork. Normalizing it eliminates a potential divergence
@@ -365,10 +355,10 @@ def sanitize_tool_schemas_for_openai(body: dict) -> int:
 
 
 def normalize_request(body: dict) -> tuple[dict, dict]:
-    """Apply all 7 normalizations to a request body in spec order.
+    """Apply all normalizations to a request body in spec order.
 
-    Order: billing → strings → skill listing → strip reminders →
-           git status → tool sorting → metadata
+    Order: billing → strings → strip all system reminders → git status →
+           tool sorting → metadata
 
     cache_control is deliberately left untouched — it's not part of the cache
     key, and CC's native placement is sufficient.
@@ -383,20 +373,19 @@ def normalize_request(body: dict) -> tuple[dict, dict]:
     # 2. Convert bare string content to list format (before skill listing move)
     info["strings"] = normalize_user_content_structure(body)
 
-    # 3. Strip skill listing entirely
-    skill_info = normalize_skill_listing(body)
-    info["skill"] = skill_info
+    # 3. Strip every Claude Code system-reminder, including skill listings and
+    # CLAUDE.md project-context reminders. OBS-owned project context is injected
+    # into JSONL separately.
+    info["skill"] = {"action": "merged_into_reminders"}
+    info["reminders"] = strip_all_system_reminders(body)
 
-    # 4. Strip dynamic system-reminders (after skill listing is stripped)
-    info["reminders"] = strip_dynamic_reminders(body)
-
-    # 5. Normalize git status in system prompt
+    # 4. Normalize git status in system prompt
     info["git_status"] = normalize_git_status(body)
 
-    # 6. Sort tool definitions
+    # 5. Sort tool definitions
     info["tools"] = normalize_tool_order(body)
 
-    # 7. Normalize metadata
+    # 6. Normalize metadata
     info["metadata"] = normalize_metadata(body)
 
     # Determine overall action label
@@ -404,10 +393,10 @@ def normalize_request(body: dict) -> tuple[dict, dict]:
         info["billing"], info["strings"], info["reminders"],
         info["git_status"], info["tools"], info["metadata"],
     ]
-    if skill_info.get("action") == "stripped" or any(actions_taken):
+    if any(actions_taken):
         info["action"] = "normalized"
     else:
-        info["action"] = skill_info.get("action", "unknown")
+        info["action"] = "not_found"
 
     return body, info
 
@@ -675,8 +664,8 @@ def main():
     log(f"upstream (other):  {CLI_PROXY_UPSTREAM}")
     log(f"logs: {LOG_DIR}")
     log(f"save_bodies: {SAVE_BODIES}")
-    log(f"normalizations: billing, string→list, strip skills, "
-        f"strip reminders, git status, tool sort, metadata (cache_control: passthrough)")
+    log(f"normalizations: billing, string→list, strip all system reminders, "
+        f"git status, tool sort, metadata (cache_control: passthrough)")
     log(f"Set ANTHROPIC_BASE_URL=http://localhost:{port}")
 
     try:

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 ENTRY_FILE_SENTINEL = "<!-- OBS_AGENT_ENTRY_FILE_CONTEXT -->"
+ENTRY_FILE_CONTEXT_TAG = "obs-agent-entry-file-context"
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -40,6 +41,27 @@ def build_entry_file_appendix(config: OBSConfig) -> str:
     if ENTRY_FILE_SENTINEL in content:
         return content
     return f"{ENTRY_FILE_SENTINEL}\n{content}"
+
+
+def build_entry_file_context_message(config: OBSConfig) -> str:
+    """Return persisted session-start context loaded from the entry file.
+
+    This text is prepended to the first user turn of a JSONL instead of being
+    appended to the Claude Code system prompt.  Keeping it in the JSONL makes
+    forks byte-identical with their parents after cache-proxy normalization.
+    """
+    content = build_entry_file_appendix(config)
+    return (
+        f"<{ENTRY_FILE_CONTEXT_TAG} source=\"{config.agent_entry_file}\">\n"
+        "The following persistent project context was loaded by OBS at session "
+        "start. Treat it as system/project instructions and background context, "
+        "not as a user request.\n\n"
+        f"{content}\n"
+        f"</{ENTRY_FILE_CONTEXT_TAG}>\n\n"
+        "<obs-platform-context>\n"
+        f"{build_obs_platform_appendix()}\n"
+        "</obs-platform-context>"
+    )
 
 
 def build_obs_platform_appendix() -> str:

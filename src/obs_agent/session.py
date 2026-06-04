@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+import json
 import logging
 import os
 import time
@@ -21,7 +22,10 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 from obs_agent._sdk_patch import ensure_raw_uuid_patch
 from obs_agent.hooks import HookState, create_hook_matchers
-from obs_agent.prompt import build_entry_file_appendix, build_obs_platform_appendix
+from obs_agent.prompt import (
+    ENTRY_FILE_SENTINEL,
+    build_entry_file_context_message,
+)
 from obs_agent.tools import create_obs_tools
 
 if TYPE_CHECKING:
@@ -101,6 +105,7 @@ class SessionManager:
         self._connected: bool = False
         self._lock = asyncio.Lock()
         self._sdk_env_overrides: dict[str, str] = {}
+        self._entry_file_context_pending: bool = False
         # Per-session model override.  When set, takes precedence over
         # ``self.config.model`` in ``_build_options``.  Used by AgentTask to
         # give child sessions a different model without mutating the shared
@@ -147,6 +152,59 @@ class SessionManager:
     def effective_model(self) -> str:
         """Return the model this session will pass to ClaudeAgentOptions."""
         return self.model_override or self.config.model
+
+    def _jsonl_has_entry_file_context(self, session_id: str | None) -> bool:
+        if not session_id:
+            return False
+        try:
+            from obs_agent.context_jsonl import find_session_jsonl
+
+            path = find_session_jsonl(session_id=session_id, cwd=self.config.vault_path)
+            if path is None:
+                return False
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if ENTRY_FILE_SENTINEL not in line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") != "user":
+                        continue
+                    message = obj.get("message")
+                    if isinstance(message, dict) and ENTRY_FILE_SENTINEL in json.dumps(
+                        message.get("content", ""),
+                        ensure_ascii=False,
+                    ):
+                        return True
+        except Exception:
+            logger.debug(
+                "Unable to inspect JSONL for entry-file context session_id=%s",
+                session_id,
+                exc_info=True,
+            )
+        return False
+
+    def _should_inject_entry_file_context(self, resume_session_id: str | None) -> bool:
+        if resume_session_id is None:
+            return True
+        return not self._jsonl_has_entry_file_context(resume_session_id)
+
+    def prepare_user_message(self, message: str) -> str:
+        """Prepend persisted entry-file context once for the current JSONL.
+
+        Claude Code's own project-context reminder is request-only and is
+        stripped by the cache proxy.  OBS injects the same project context into
+        the first user turn so it is stored in JSONL and inherited verbatim by
+        forks.
+        """
+        if not self._entry_file_context_pending:
+            return message
+        self._entry_file_context_pending = False
+        if ENTRY_FILE_SENTINEL in message:
+            return message
+        return f"{build_entry_file_context_message(self.config)}\n\n{message}"
 
     def should_resume(self) -> bool:
         """Decide whether to resume the existing session.
@@ -225,9 +283,6 @@ class SessionManager:
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
-                "append": "\n\n".join(
-                    [build_entry_file_appendix(self.config), build_obs_platform_appendix()]
-                ),
             },
         )
 
@@ -276,6 +331,9 @@ class SessionManager:
                 continue
             self._client = client
             self._connected = True
+            self._entry_file_context_pending = self._should_inject_entry_file_context(
+                options.resume
+            )
             return client
 
         self._client = None

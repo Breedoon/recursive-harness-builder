@@ -10,7 +10,14 @@ from pathlib import Path
 import pytest
 
 from obs_agent.config import OBSConfig
-from obs_agent.prompt import ENTRY_FILE_SENTINEL, build_entry_file_appendix, build_system_prompt
+from obs_agent.prompt import (
+    ENTRY_FILE_CONTEXT_TAG,
+    ENTRY_FILE_SENTINEL,
+    build_entry_file_appendix,
+    build_entry_file_context_message,
+    build_obs_platform_appendix,
+    build_system_prompt,
+)
 
 
 # --- Basic Contract ---
@@ -120,3 +127,17 @@ class TestPromptFallbacks:
         appendix = build_entry_file_appendix(cfg)
         assert appendix.count(ENTRY_FILE_SENTINEL) == 1
         assert appendix.count("# Entry") == 1
+
+    def test_entry_file_context_message_wraps_persisted_context(self, tmp_path):
+        vault = tmp_path / "vault"
+        vault.mkdir(parents=True)
+        (vault / "CLAUDE.md").write_text("# Entry\n\nUse this context.\n")
+        cfg = OBSConfig(vault_path=vault)
+
+        message = build_entry_file_context_message(cfg)
+
+        assert message.startswith(f"<{ENTRY_FILE_CONTEXT_TAG} source=\"CLAUDE.md\">")
+        assert message.count(ENTRY_FILE_SENTINEL) == 1
+        assert "# Entry" in message
+        assert build_obs_platform_appendix() in message
+        assert message.endswith("</obs-platform-context>")
