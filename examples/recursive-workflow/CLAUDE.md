@@ -1,15 +1,15 @@
-# Recursive Workflow Starter
+# Fund Research Harness
 
-This project demonstrates a flat markdown procedure bundle for recursive agent workflows. Procedures are ordinary markdown files. The router guard hook is at `hooks/router_guard.py`; artifacts should be written under `artifacts/`.
+This harness researches investment funds within a single asset class and identifies long-term winners. It does not build customer profiles or personalize recommendations — the goal is to find objectively strong funds based on performance data, risk metrics, and market context.
 
 ## Default behavior
 
-For any complex request — anything that sounds like it needs decomposition, multiple steps, or multiple concerns — spawn a Router and have it implement the entire request:
+For any fund research request, spawn a Router:
 
 ```json
 {
   "prompt_file": "procedures/router.md",
-  "prompt": "Handle this request: {one-sentence summary of the user's ask}.",
+  "prompt": "Research long-term winning funds for this request: {one-sentence summary}.",
   "fork": true,
   "hooks": {
     "PreToolUse": "hooks/router_guard.py::check"
@@ -17,58 +17,48 @@ For any complex request — anything that sounds like it needs decomposition, mu
 }
 ```
 
-For simple, single-concern tasks that can be handled in one execute/verify cycle, spawn a Loop:
+For simple single-fund lookups (e.g. "analyze VTI"), spawn a Loop directly:
 
 ```json
 {
   "prompt_file": "procedures/loop.md",
-  "prompt": "Handle this task: {one-sentence summary}.",
+  "prompt": "Analyze this fund: {ticker or fund name}.",
   "fork": true
 }
 ```
 
-When in doubt, use Router. It will scope the task and decide whether to decompose further or dispatch directly.
+When in doubt, use Router.
 
-After launching a Router, set yourself a 30-minute recurring schedule to nudge it for status and ask it to continue or unblock downstream agents if progress stalls.
+## Pipeline pattern
+
+Every fund research request follows this two-phase pipeline. Scope and Router must recognize and apply it:
+
+**Phase 1 — parallel:**
+- `market_context`: pull macro and sector data relevant to the asset class
+- `screener`: filter the fund universe and return a shortlist of candidates (50 funds)
+
+**Phase 2 — after screener returns:**
+- `fund_analyzer`: one per fund on the shortlist, run in parallel
+
+**Final step:**
+- Auditor validates the assembled analyses
+- Router writes a ranked artifact: which funds are the strongest long-term candidates and why, grounded in the data
+
+## Asset class focus
+
+Each run targets one asset class (e.g. US large-cap equity, emerging market bonds, real estate). The asset class is specified in the user's request or inherited from context. Do not mix asset classes within a single research run.
+
+## Data source
+
+All quantitative data comes from the Alpha Vantage API. The API key is in the environment variable `ALPHA_VANTAGE_API_KEY`. Agents must not use general knowledge as a substitute for fetched data when making quantitative claims.
+
+## Artifacts
+
+All agents write artifacts under `artifacts/`. The Router's final artifact is the deliverable — a ranked list of funds with supporting evidence from screener, market context, and individual analyses.
 
 ## Contents
 
-- `CLAUDE.md` — this file. Entry point for agents.
-- `procedures/` — flat v1 procedure files: Router, Scope, Loop, Executor, Verifier, Auditor, Unblock, Brainstorm.
-- `hooks/router_guard.py` — Router guard that blocks direct file-writing tools so Routers orchestrate instead of implementing.
-- `artifacts/` — where agents write reports and handoff notes.
-
-## Forking agents
-
-Use `AgentTask` to dispatch subagents.
-
-- Use `fork=true` for most subagents. A fork inherits the current conversation, so the prompt should be short and should not repeat context the fork already has.
-- Use `fork=false` only for clean-slate reviews, fresh-user tests, or unrelated work where inherited context would bias the result.
-- Parallelize independent work instead of serializing it through one agent.
-- Give each subagent a clear ownership boundary so overlapping edits are easier to reconcile.
-
-Good fork prompt: `Review the installation guide as a first-time user and report unclear steps.`
-Bad fork prompt: a long recap of the whole conversation the fork already inherited.
-
-## Agent lifecycle
-
-Agents go idle when a turn completes; they do not disappear.
-
-- Prefer messaging or resuming an existing agent over launching a replacement.
-- Launch a replacement only when the existing agent is unreachable, deleted, or clearly dead.
-- If an agent fails with a terminal runtime error, create a replacement and give it enough context to continue from the previous agent's artifacts.
-
-## Messaging and artifacts
-
-- Send results back through the runtime's messaging channel when another agent is waiting on them.
-- Write durable handoff notes, plans, and review findings under `artifacts/`.
-- Include enough context in artifacts that another agent can continue without reading the full transcript.
-- Do not treat artifact files as a substitute for telling the parent agent that work is ready.
-
-## Scheduling
-
-When creating recurring or delayed runs:
-
-- Preserve session continuity unless the user explicitly asks for a stateless run.
-- Do not let child agents inherit schedules by default.
-- A scheduled watchdog should check for real progress, not just whether a log file changed.
+- `CLAUDE.md` — this file. Entry point for all agents.
+- `procedures/` — Router, Scope, Loop, Executor, Verifier, Auditor, Unblock, Brainstorm (generic); Screener, FundAnalyzer, MarketContext (domain-specific).
+- `hooks/router_guard.py` — prevents Routers from doing implementation work directly.
+- `artifacts/` — all agent outputs land here.
