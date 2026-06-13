@@ -279,12 +279,12 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "claude-fable-5"
+    model: str = "claude-opus-4-8"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
     # Resolved via MODEL_RESOLUTION (e.g. "claude" → "claude-opus-4-8");
     # full model names pass through unchanged.
     # Change this to e.g. "gpt" to make root sessions default to GPT.
-    default_model: str = "claude-fable-5"
+    default_model: str = "claude"
     claude_dir: str = ".claude"
     agent_entry_file: str = "CLAUDE.md"
     daemon_host: str = "127.0.0.1"
@@ -345,7 +345,7 @@ class OBSConfig:
         if model := os.environ.get("OBS_AGENT_MODEL") or os.environ.get("OBS_MODEL"):
             kwargs["model"] = resolve_model(model.strip())
         else:
-            dm = kwargs.get("default_model", "claude-fable-5")
+            dm = kwargs.get("default_model", "claude")
             kwargs["model"] = resolve_model(dm)
         if host := os.environ.get("OBS_DAEMON_HOST"):
             kwargs["daemon_host"] = host
