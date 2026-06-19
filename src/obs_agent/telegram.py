@@ -667,9 +667,10 @@ class TelegramBot:
         self._route_inbox_targets: dict[tuple[str, str], TelegramRoute] = {}
         self._route_inbox_target_keys_by_route: dict[TelegramRoute, tuple[str, str]] = {}
         self._chat_titles: dict[int, str] = {}
+        self._daemon_started_at = time.time()
         # Dedup set for inbox wake polling — prevents re-triggering the same
-        # unread message every poll cycle.  Cleared on daemon restart (correct:
-        # you want to re-notify after restart) and when a NEW message arrives.
+        # unread message every poll cycle within this daemon process. Pre-start
+        # inbox messages are ignored after daemon restart.
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
@@ -1635,6 +1636,9 @@ class TelegramBot:
         self._session_heads.update(snapshot.session_heads)
 
         for entry in snapshot.topic_schedules:
+            if str(entry.schedule_id).startswith("reply-wake-"):
+                self._state_store.delete_topic_schedule(schedule_id=entry.schedule_id)
+                continue
             route = TelegramRoute(chat_id=entry.chat_id, thread_id=entry.thread_id)
             record = _TopicScheduleRecord(
                 schedule_id=entry.schedule_id,
@@ -2518,6 +2522,15 @@ class TelegramBot:
             normalized = f"{normalized[:-1]}+00:00"
         parsed = datetime.fromisoformat(normalized)
         return parsed.timestamp()
+
+    @staticmethod
+    def _try_parse_rfc3339_timestamp(raw_value: object) -> float | None:
+        if not isinstance(raw_value, str):
+            return None
+        try:
+            return TelegramBot._parse_rfc3339_timestamp(raw_value)
+        except Exception:
+            return None
 
     # Schedule overlap validation removed — multiple schedules coexist freely.
     # Shorter intervals fire first; after max_runs exhaustion, longer ones take over.
@@ -8196,6 +8209,9 @@ class TelegramBot:
             if not isinstance(item, dict):
                 continue
             if bool(item.get("read", False)):
+                continue
+            message_ts = self._try_parse_rfc3339_timestamp(item.get("timestamp"))
+            if message_ts is None or message_ts < self._daemon_started_at:
                 continue
             # Skip must_reply messages that have already been replied to —
             # otherwise the poller keeps nagging for them indefinitely.

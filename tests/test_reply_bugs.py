@@ -13,6 +13,7 @@ import asyncio
 import json
 import uuid
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -230,6 +231,96 @@ class TestBug3PollerIgnoresRepliedField:
             "BUG 3: _latest_unread_team_inbox_message has no 'continue' that "
             "checks 'replied'. The poller will keep waking agents for messages "
             "they already replied to."
+        )
+
+    def test_latest_unread_skips_messages_before_daemon_start(self, config, monkeypatch, tmp_path):
+        from obs_agent.telegram import TelegramBot
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bot = TelegramBot(config, enable_background_poller=False)
+        bot._daemon_started_at = 1_800_000_000.0
+        inbox_path = bot._team_inbox_path("team", "agent")
+        inbox_path.parent.mkdir(parents=True)
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "from": "old-sender",
+                        "text": "old wake",
+                        "timestamp": datetime.fromtimestamp(
+                            bot._daemon_started_at - 10,
+                            timezone.utc,
+                        ).isoformat().replace("+00:00", "Z"),
+                        "read": False,
+                    },
+                    {
+                        "from": "new-sender",
+                        "text": "new wake",
+                        "timestamp": datetime.fromtimestamp(
+                            bot._daemon_started_at + 10,
+                            timezone.utc,
+                        ).isoformat().replace("+00:00", "Z"),
+                        "read": False,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        assert bot._latest_unread_team_inbox_message(team_name="team", agent_name="agent") == (
+            "new-sender",
+            None,
+            "new wake",
+        )
+
+    def test_latest_unread_requires_timestamp_after_daemon_start(self, config, monkeypatch, tmp_path):
+        from obs_agent.telegram import TelegramBot
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bot = TelegramBot(config, enable_background_poller=False)
+        bot._daemon_started_at = 1_800_000_000.0
+        inbox_path = bot._team_inbox_path("team", "agent")
+        inbox_path.parent.mkdir(parents=True)
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {"from": "legacy", "text": "missing timestamp", "read": False},
+                    {
+                        "from": "old-sender",
+                        "text": "old wake",
+                        "timestamp": datetime.fromtimestamp(
+                            bot._daemon_started_at - 10,
+                            timezone.utc,
+                        ).isoformat().replace("+00:00", "Z"),
+                        "read": False,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        assert bot._latest_unread_team_inbox_message(team_name="team", agent_name="agent") is None
+
+    def test_restore_drops_persisted_reply_wake_schedules(self, config):
+        from obs_agent.telegram import TelegramBot, TelegramRoute, create_reply_wake_schedule
+
+        bot = TelegramBot(config, enable_background_poller=False)
+        schedule = create_reply_wake_schedule(TelegramRoute(chat_id=-1000, thread_id=5))
+        schedule.next_run_at = 1.0
+        bot._register_topic_schedule(schedule)
+        assert any(
+            entry.schedule_id == schedule.schedule_id
+            for entry in bot._state_store.load_snapshot().topic_schedules
+        )
+
+        bot._topic_schedules_by_id.clear()
+        bot._schedule_ids_by_route.clear()
+        bot._restore_state_from_store()
+
+        assert schedule.schedule_id not in bot._topic_schedules_by_id
+        assert all(
+            entry.schedule_id != schedule.schedule_id
+            for entry in bot._state_store.load_snapshot().topic_schedules
         )
 
 
