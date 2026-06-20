@@ -857,7 +857,12 @@ def create_hook_matchers(
                 _log.warning("Invalid user hook spec for %s (missing '::'): %s", event_name, spec)
                 continue
             fpath, fname = spec.rsplit("::", 1)
-            fn = load_hook_function(fpath, fname)
+            hook_path = Path(fpath)
+            if fpath.startswith("~"):
+                hook_path = hook_path.expanduser()
+            elif not hook_path.is_absolute():
+                hook_path = config.vault_path / hook_path
+            fn = load_hook_function(str(hook_path), fname)
             _resolved_user_checks[event_name] = _make_user_hook_check(fn, state)
         except Exception:
             _log.warning(

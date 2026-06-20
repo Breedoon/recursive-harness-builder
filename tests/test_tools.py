@@ -323,6 +323,36 @@ class TestAgentTaskTools:
         assert "telegram_topic: https://t.me/c/1/2" in result["content"][0]["text"]
 
     @pytest.mark.asyncio
+    async def test_agent_task_resolves_relative_hook_paths_against_vault(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler(
+            {
+                "prompt": "Do work",
+                "hooks": json.dumps(
+                    {
+                        "PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/router_guard.py::check",
+                        "Stop": "~/obs-hooks/feedback.py::spawn_feedback",
+                    }
+                ),
+            }
+        )
+
+        assert result["content"][0]["text"] == "ok"
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["hooks"]["PreToolUse"] == str(
+            skill_config.vault_path
+            / "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/router_guard.py"
+        ) + "::check"
+        assert launch_args["hooks"]["Stop"].endswith("/obs-hooks/feedback.py::spawn_feedback")
+
+    @pytest.mark.asyncio
     async def test_agent_task_alias_maps_to_transport_description(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
@@ -1926,8 +1956,8 @@ class TestHooksParameter:
         state.fork_task_launcher.assert_awaited_once()
         launch_args = state.fork_task_launcher.await_args.args[0]
         assert launch_args["hooks"] == {
-            "PreToolUse": "guard.py::check_access",
-            "PostToolUse": "log.py::log_result",
+            "PreToolUse": str(skill_config.vault_path / "guard.py") + "::check_access",
+            "PostToolUse": str(skill_config.vault_path / "log.py") + "::log_result",
         }
 
     @pytest.mark.asyncio

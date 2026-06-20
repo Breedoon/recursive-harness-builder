@@ -47,6 +47,16 @@ def _error_result(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "is_error": True}
 
 
+def _resolve_hook_spec_path(spec: str, vault_path: Path) -> str:
+    file_part, function_name = spec.rsplit("::", 1)
+    file_path = Path(file_part)
+    if file_part.startswith("~"):
+        file_path = file_path.expanduser()
+    elif not file_path.is_absolute():
+        file_path = vault_path / file_path
+    return f"{file_path}::{function_name}"
+
+
 def validate_must_reply_recipient(
     *, sender: str, recipient: str, must_reply: bool
 ) -> dict[str, Any]:
@@ -341,12 +351,15 @@ def create_obs_tools(
                 return _error_result(
                     f"Cannot launch {tool_name}: hooks must be a JSON object, got {type(user_hooks).__name__}"
                 )
+            resolved_hooks: dict[str, str] = {}
             for event_name, spec in user_hooks.items():
                 if not isinstance(spec, str) or "::" not in spec:
                     return _error_result(
                         f"Cannot launch {tool_name}: hooks['{event_name}'] must be "
                         f"'file_path::function_name', got: {spec!r}"
                     )
+                resolved_hooks[str(event_name)] = _resolve_hook_spec_path(spec, config.vault_path)
+            user_hooks = resolved_hooks
 
         # --- inherit_hooks ---
         inherit_hooks = False
@@ -518,9 +531,9 @@ def create_obs_tools(
                 "type": "string",
                 "description": (
                     "JSON object mapping hook event names to Python function specs. "
-                    "Each value must be 'file_path::function_name'. The function is "
-                    "dynamically loaded and called with (hook_input, tool_use_id, context). "
-                    "Hook functions run AFTER built-in OBS guards. Errors in hooks are "
+                    "Each value must be 'file_path::function_name'; relative paths are resolved "
+                    "against the vault path. The function is dynamically loaded and called with "
+                    "(hook_input, tool_use_id, context). Hook functions run AFTER built-in OBS guards. Errors in hooks are "
                     "logged but never crash the session. "
                     'Example: \'{"PreToolUse": "procedures/hooks/guard.py::check_access"}\''
                 ),

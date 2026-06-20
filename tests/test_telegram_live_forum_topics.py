@@ -7,6 +7,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -2711,6 +2712,149 @@ class TestTelegramLiveForumTopics:
         assert "agent task wake: teammate message received" in wake_message.text.lower(), (
             live_tg_forum.failure_context()
         )
+        assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
+
+    async def test_live_restart_marks_existing_unread_inbox_messages_read_without_wake(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        await _reset_general(live_tg_forum)
+        tag = uuid.uuid4().hex[:8]
+        team_name = f"live-stale-restart-team-{tag}"
+        stale_token = f"STALE-RESTART-WAKE-{tag}"
+        legacy_token = f"STALE-RESTART-LEGACY-{tag}"
+        fresh_token = f"FRESH-RESTART-WAKE-{tag}"
+        parent_thread_id = await live_tg_forum.platform.create_topic(f"Team Restart Stale Wake {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic integration test. Reply with only STALE-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"STALE-PRIME-{tag}",
+            timeout=240.0,
+        )
+
+        launch_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+        await live_tg_forum.platform.send(
+            (
+                "This is a deterministic integration test for stale inbox restart wake suppression. "
+                "Use AgentTask exactly once with fork=false, "
+                f"team_name={team_name}, display_name='STALE-WORKER-{tag}', and prompt "
+                "'Call TeamCreate with team_name="
+                f"{team_name}. "
+                "Then call session_lineage exactly once. "
+                f"Then reply with exactly STALE-IDLE-{tag}|agent_name=<value> "
+                "using the literal agent_name value returned by the tool. Do not add any other text.' "
+                f"After launch, reply with only STALE-LAUNCHED-{tag}."
+            ),
+            thread_id=parent_thread_id,
+            require_done=False,
+            timeout=180.0,
+        )
+        await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=launch_baseline,
+            token=f"STALE-LAUNCHED-{tag}",
+            timeout=240.0,
+        )
+        launch_message = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=parent_thread_id,
+            after_message_id=launch_baseline,
+            token="agent task launched",
+            timeout=240.0,
+        )
+        worker_thread_id, _ = _extract_topic_link(launch_message.text)
+        await _wait_for_message_containing(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+            token=f"STALE-IDLE-{tag}|agent_name=",
+            timeout=420.0,
+        )
+        assert live_tg_forum.state_db_path is not None
+        with sqlite3.connect(live_tg_forum.state_db_path) as conn:
+            worker_row = conn.execute(
+                "select agent_name from team_worker_state where team_name = ? and child_thread_id = ?",
+                (team_name, worker_thread_id),
+            ).fetchone()
+        assert worker_row is not None, live_tg_forum.failure_context()
+        worker_name = str(worker_row[0])
+
+        stale_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=worker_thread_id)
+        _stop_bot(live_tg_forum.proc)
+
+        inbox_path = Path.home() / ".claude" / "teams" / team_name / "inboxes" / f"{worker_name}.json"
+        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        entries: list[dict[str, object]] = []
+        if inbox_path.exists():
+            loaded = json.loads(inbox_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                entries = [item for item in loaded if isinstance(item, dict)]
+        entries.extend(
+            [
+                {
+                    "from": "external-live-test",
+                    "text": stale_token,
+                    "summary": f"stale restart wake {stale_token}",
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "read": False,
+                },
+                {
+                    "from": "external-live-test",
+                    "text": legacy_token,
+                    "summary": f"legacy stale restart wake {legacy_token}",
+                    "read": False,
+                },
+            ]
+        )
+        inbox_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
+
+        assert live_tg_forum.temp_root is not None
+        live_tg_forum.proc, live_tg_forum.log_file = _start_bot(
+            live_tg_forum.vault_path,
+            live_tg_forum.temp_root,
+            state_db_path=live_tg_forum.state_db_path,
+        )
+        await asyncio.sleep(10.0)
+
+        restored_entries = json.loads(inbox_path.read_text(encoding="utf-8"))
+        stale_entries = [
+            item
+            for item in restored_entries
+            if isinstance(item, dict) and item.get("text") in {stale_token, legacy_token}
+        ]
+        assert len(stale_entries) == 2, live_tg_forum.failure_context()
+        assert all(bool(item.get("read")) for item in stale_entries), live_tg_forum.failure_context()
+
+        recent_worker_messages = await live_tg_forum.platform.get_recent_messages(
+            thread_id=worker_thread_id,
+            limit=40,
+        )
+        stale_wakes = [
+            message
+            for message in recent_worker_messages
+            if message.message_id > stale_baseline
+            and "agent task wake: teammate message received" in message.text.lower()
+        ]
+        assert not stale_wakes, live_tg_forum.failure_context()
+
+        fresh_baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=worker_thread_id)
+        _append_unread_inbox_message(
+            team_name=team_name,
+            recipient=worker_name,
+            content=fresh_token,
+            summary=f"fresh restart wake {fresh_token}",
+            sender="external-live-test",
+        )
+        fresh_wake = await _wait_for_message_after_containing(
+            live_tg_forum,
+            thread_id=worker_thread_id,
+            after_message_id=fresh_baseline,
+            token="agent task wake: teammate message received",
+            timeout=240.0,
+        )
+        assert fresh_token in fresh_wake.text, live_tg_forum.failure_context()
         assert live_tg_forum.proc.poll() is None, live_tg_forum.failure_context()
 
     async def test_live_running_team_worker_consumes_polled_pending_wake_after_completion(

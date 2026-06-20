@@ -905,6 +905,27 @@ class TestCreateHookMatchers:
         assert event.type == "notification"
         assert event.summary == "notification: TaskCompleted"
 
+    @pytest.mark.asyncio
+    async def test_user_hook_loads_from_vault_relative_agenttask_spec(self, config):
+        hook_file = config.vault_path / "Projects" / "Hooks" / "relative_hook.py"
+        hook_file.parent.mkdir(parents=True)
+        hook_file.write_text(
+            "def check(hook_input, tool_use_id, context):\n"
+            "    return {'hookSpecificOutput': {'additionalContext': 'relative hook ran'}}\n",
+            encoding="utf-8",
+        )
+        state = HookState()
+        matchers = create_hook_matchers(
+            config,
+            state,
+            user_hooks={"PreToolUse": "Projects/Hooks/relative_hook.py::check"},
+        )
+        pipeline = matchers["PreToolUse"][0].hooks[0]
+
+        result = await pipeline(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
+
+        assert "relative hook ran" in result.get("hookSpecificOutput", {}).get("additionalContext", "")
+
 
 # ---------------------------------------------------------------------------
 # Dynamic User Hook Loading Tests

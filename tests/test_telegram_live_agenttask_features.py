@@ -678,6 +678,72 @@ class TestPythonHooksBasic:
             crash_hook.unlink(missing_ok=True)
             marker_file.unlink(missing_ok=True)
 
+    async def test_live_smoke_agenttask_accepts_vault_relative_hook_path(
+        self,
+        live_tg_forum: _LiveForumHarness,
+    ) -> None:
+        tag = uuid.uuid4().hex[:8]
+        parent_thread_id = await live_tg_forum.platform.create_topic(f"Smoke Relative Hooks {tag}")
+
+        await _send_and_wait_for_token(
+            live_tg_forum,
+            text=f"This is a deterministic smoke test. Reply with only RELHOOK-PRIME-{tag}.",
+            thread_id=parent_thread_id,
+            token=f"RELHOOK-PRIME-{tag}",
+            timeout=180.0,
+        )
+
+        marker_file = Path(f"/tmp/obs_relative_hook_called_{tag}.txt")
+        hook_dir = live_tg_forum.vault_path / "Projects" / "Hooks"
+        hook_dir.mkdir(parents=True, exist_ok=True)
+        hook_file = hook_dir / f"relative_live_hook_{tag}.py"
+        hook_file.write_text(
+            "from pathlib import Path\n"
+            f"MARKER = {str(marker_file)!r}\n"
+            "def allow_all(hook_input, tool_use_id, context):\n"
+            "    Path(MARKER).write_text('relative_hook_called', encoding='utf-8')\n"
+            "    return None\n",
+            encoding="utf-8",
+        )
+        relative_spec = f"Projects/Hooks/{hook_file.name}::allow_all"
+        hooks_json = json.dumps({"PreToolUse": relative_spec})
+
+        try:
+            baseline = await live_tg_forum.platform.latest_bot_message_id(thread_id=parent_thread_id)
+            await live_tg_forum.platform.send(
+                (
+                    "This is a deterministic smoke test for vault-relative AgentTask hooks. "
+                    "Use AgentTask exactly once with fork=false and "
+                    f"hooks='{hooks_json}', "
+                    f"and prompt 'Use Bash to run pwd. Then reply with exactly RELHOOK-GOOD-{tag}.' "
+                    f"After launching, reply with only RELHOOK-LAUNCHED-{tag}."
+                ),
+                thread_id=parent_thread_id,
+                require_done=False,
+                timeout=180.0,
+            )
+            launch_msg = await _wait_for_message_after_containing(
+                live_tg_forum,
+                thread_id=parent_thread_id,
+                after_message_id=baseline,
+                token="task launched",
+                timeout=240.0,
+            )
+            child_thread_id, _ = _extract_topic_link(launch_msg.text)
+
+            child_reply = await _wait_for_message_containing(
+                live_tg_forum,
+                thread_id=child_thread_id,
+                token=f"RELHOOK-GOOD-{tag}",
+                timeout=240.0,
+            )
+            assert f"RELHOOK-GOOD-{tag}" in child_reply.text, live_tg_forum.failure_context()
+            assert marker_file.exists(), live_tg_forum.failure_context()
+            assert marker_file.read_text(encoding="utf-8") == "relative_hook_called"
+        finally:
+            hook_file.unlink(missing_ok=True)
+            marker_file.unlink(missing_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # Test 5: Hooks with agent spawning (evaluator pattern)

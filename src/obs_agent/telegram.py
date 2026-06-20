@@ -1720,6 +1720,12 @@ class TelegramBot:
             if key is not None:
                 self._team_worker_records[key] = record.task_id
 
+        restored_inbox_keys: set[tuple[str, str]] = set()
+        for key in self._team_worker_records:
+            restored_inbox_keys.add(key)
+        for key in self._route_inbox_targets:
+            restored_inbox_keys.add(key)
+
         for entry in snapshot.team_worker_states:
             if entry.task_id in self._fork_tasks_by_id:
                 continue
@@ -1763,8 +1769,40 @@ class TelegramBot:
             )
             self._fork_tasks_by_id[record.task_id] = record
             self._team_worker_records[key] = record.task_id
+            restored_inbox_keys.add(key)
             if record.idle_ready and record.status not in {"failed", "stopped"}:
                 self._fork_task_by_child_route[child_route] = record.task_id
+
+        self._mark_restored_team_inboxes_read(restored_inbox_keys)
+
+    def _mark_restored_team_inboxes_read(self, inbox_keys: set[tuple[str, str]]) -> None:
+        for team_name, agent_name in sorted(inbox_keys):
+            inbox_path = self._team_inbox_path(team_name, agent_name)
+            if not inbox_path.exists():
+                continue
+            try:
+                entries = json.loads(inbox_path.read_text(encoding="utf-8"))
+            except Exception:
+                logger.debug("Failed reading restored team inbox for startup mark-read: %s", inbox_path, exc_info=True)
+                continue
+            if not isinstance(entries, list):
+                continue
+            changed = False
+            for item in entries:
+                if isinstance(item, dict) and not bool(item.get("read", False)):
+                    item["read"] = True
+                    changed = True
+            if not changed:
+                continue
+            try:
+                inbox_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
+                logger.info(
+                    "Marked restored team inbox messages read on daemon startup: team=%s agent=%s",
+                    team_name,
+                    agent_name,
+                )
+            except Exception:
+                logger.debug("Failed writing restored team inbox startup mark-read: %s", inbox_path, exc_info=True)
 
     def _set_topic_metadata(
         self,

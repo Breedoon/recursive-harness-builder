@@ -323,6 +323,52 @@ class TestBug3PollerIgnoresRepliedField:
             for entry in bot._state_store.load_snapshot().topic_schedules
         )
 
+    def test_restore_marks_existing_team_inbox_messages_read(self, config, monkeypatch, tmp_path):
+        from obs_agent.telegram import TelegramBot
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        first_bot = TelegramBot(config, enable_background_poller=False)
+        first_bot._state_store.upsert_team_worker_state(
+            team_name="team",
+            agent_name="agent",
+            task_id="task-1",
+            child_chat_id=-1000,
+            child_thread_id=42,
+            child_session_id="session-1",
+            description="Agent",
+            status="completed",
+            idle_ready=True,
+        )
+        inbox_path = first_bot._team_inbox_path("team", "agent")
+        inbox_path.parent.mkdir(parents=True)
+        inbox_path.write_text(
+            json.dumps(
+                [
+                    {"from": "old", "text": "old unread", "read": False},
+                    {"from": "seen", "text": "already seen", "read": True},
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        restored_bot = TelegramBot(config, enable_background_poller=False)
+        restored_bot._restore_state_from_store()
+
+        entries = json.loads(inbox_path.read_text(encoding="utf-8"))
+        assert all(item["read"] is True for item in entries)
+        assert restored_bot._latest_unread_team_inbox_message(team_name="team", agent_name="agent") is None
+        assert restored_bot._resolve_team_worker_record(team_name="team", agent_name="agent") is not None
+
+        fresh_time = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        entries.append({"from": "fresh", "text": "fresh unread", "timestamp": fresh_time, "read": False})
+        inbox_path.write_text(json.dumps(entries), encoding="utf-8")
+
+        assert restored_bot._latest_unread_team_inbox_message(team_name="team", agent_name="agent") == (
+            "fresh",
+            None,
+            "fresh unread",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Bug 4: Replying only marks first message per sender
