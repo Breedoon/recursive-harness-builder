@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from obs_agent.jsonl_fork import fork_session_jsonl
+from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
 
 
 def _write_lines(path: Path, entries: list[dict]) -> None:
@@ -141,3 +141,60 @@ def test_fork_session_jsonl_raises_for_unknown_uuid(tmp_path: Path) -> None:
             cwd=Path("/workspace/recursive-harness"),
             projects_root=projects_root,
         )
+
+
+def test_resolve_session_source_accepts_explicit_jsonl_path(tmp_path: Path) -> None:
+    source_path = tmp_path / "foreign.jsonl"
+    _write_lines(
+        source_path,
+        [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "sessionId": "foreign-sid",
+                "message": {"role": "user", "content": "start"},
+            }
+        ],
+    )
+
+    descriptor = resolve_session_source(str(source_path), cwd=tmp_path)
+
+    assert descriptor.kind == "jsonl_path"
+    assert descriptor.source_session_id == "foreign-sid"
+    assert descriptor.source_jsonl_path == source_path.resolve(strict=False)
+
+
+def test_fork_session_jsonl_uses_explicit_source_path(tmp_path: Path) -> None:
+    source_path = tmp_path / "foreign.jsonl"
+    _write_lines(
+        source_path,
+        [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": None,
+                "sessionId": "foreign-sid",
+                "message": {"role": "user", "content": "start"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "sessionId": "foreign-sid",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+            },
+        ],
+    )
+
+    fork_session_jsonl(
+        session_id="foreign-sid",
+        target_uuid="a1",
+        cwd=tmp_path,
+        source_path=source_path,
+        new_session_id="seeded-child",
+    )
+
+    assert (tmp_path / "seeded-child.jsonl").exists()
+    forked_entries = _read_lines(tmp_path / "seeded-child.jsonl")
+    assert [entry.get("uuid") for entry in forked_entries] == ["u1", "a1"]
