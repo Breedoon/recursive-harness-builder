@@ -216,6 +216,17 @@ def _normalize_resume_arg(value: object) -> str | None:
     return normalized
 
 
+def _normalize_session_source_arg(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if normalized.lower() in {"false", "none", "null", "nil", "0", "no"}:
+        return None
+    return normalized
+
+
 def _inbox_lock(path: Path) -> asyncio.Lock:
     lock = _INBOX_FILE_LOCKS.get(path)
     if lock is None:
@@ -288,6 +299,7 @@ def create_obs_tools(
         ).strip() or None
         description = display_name  # Internal payload still uses "description" key
         resume = _normalize_resume_arg(args.get("resume"))
+        session_source = _normalize_session_source_arg(args.get("session_source"))
         run_in_background = args.get("run_in_background")
         team_name = str(args.get("team_name", "")).strip() or None
         agent_name = str(args.get("agent_name") or "").strip() or None
@@ -297,6 +309,14 @@ def create_obs_tools(
                 fork = _coerce_bool_arg(args.get("fork"), name="fork")
             except ValueError:
                 return _error_result(f"Cannot launch {tool_name}: fork must be true or false")
+        if session_source and not fork:
+            return _error_result(
+                f"Cannot launch {tool_name}: session_source is only supported with fork=true"
+            )
+        if session_source and resume:
+            return _error_result(
+                f"Cannot launch {tool_name}: resume and session_source are mutually exclusive"
+            )
         # Model selection — "inherit" or empty means use parent's model.
         model_raw = str(args.get("model", "")).strip()
         model: str | None = None
@@ -415,6 +435,7 @@ def create_obs_tools(
                 "prompt": prompt,
                 "description": description,
                 "resume": resume,
+                "session_source": session_source,
                 "run_in_background": True,
                 "timeout_ms": timeout_ms,
                 "max_turns": max_turns,
@@ -472,6 +493,13 @@ def create_obs_tools(
             "resume": {
                 "type": "string",
                 "description": "Optional agentId to resume an existing child task",
+            },
+            "session_source": {
+                "type": "string",
+                "description": (
+                    "Optional Claude session source to fork from when fork=true. "
+                    "Accepts a stored session ID or JSONL file path. Not supported with fork=false."
+                ),
             },
             "fork": {
                 "type": "boolean",

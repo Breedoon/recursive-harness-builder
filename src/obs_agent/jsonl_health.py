@@ -346,6 +346,7 @@ def resolve_safe_jsonl_target(
     cwd: Path,
     preferred_uuid: str | None = None,
     projects_root: Path | None = None,
+    source_path: Path | None = None,
 ) -> SafeJsonlTarget | None:
     """Resolve a preferred UUID to a safe JSONL target.
 
@@ -353,11 +354,14 @@ def resolve_safe_jsonl_target(
     missing or belongs to a poisoned tail, the session's recovery boundary is
     returned instead.
     """
-    health = analyze_session_jsonl(
-        session_id=session_id,
-        cwd=cwd,
-        projects_root=projects_root,
-    )
+    if source_path is not None:
+        health = analyze_jsonl_path(path=source_path, session_id=session_id)
+    else:
+        health = analyze_session_jsonl(
+            session_id=session_id,
+            cwd=cwd,
+            projects_root=projects_root,
+        )
     if health is None:
         return None
 

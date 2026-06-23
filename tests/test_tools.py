@@ -189,6 +189,53 @@ class TestAgentTaskTools:
         assert "May be combined" in prompt_description
         assert "May be combined" in prompt_file_description
 
+    def test_agent_task_schema_exposes_session_source(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        create_obs_tools(skill_config, lambda: "sid-123")
+
+        tool = next(tool for tool in captured["tools"] if tool.name == "AgentTask")
+        session_source = tool.input_schema["properties"]["session_source"]
+        assert session_source["type"] == "string"
+        assert "session ID or JSONL file path" in session_source["description"]
+
+    @pytest.mark.asyncio
+    async def test_agent_task_passes_session_source_to_launcher(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler({"prompt": "Do work", "session_source": "foreign-session", "fork": True})
+
+        assert result["content"][0]["text"] == "ok"
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["session_source"] == "foreign-session"
+        assert launch_args["fork"] is True
+
+    @pytest.mark.asyncio
+    async def test_agent_task_rejects_session_source_with_fork_false_or_resume(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        fork_false = await handler({"prompt": "Do work", "session_source": "foreign", "fork": False})
+        with_resume = await handler({"prompt": "Do work", "session_source": "foreign", "resume": "task-1"})
+
+        assert fork_false["is_error"] is True
+        assert "session_source is only supported with fork=true" in fork_false["content"][0]["text"]
+        assert with_resume["is_error"] is True
+        assert "resume and session_source are mutually exclusive" in with_resume["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_agent_task_requires_prompt(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
@@ -302,6 +349,7 @@ class TestAgentTaskTools:
                 "prompt": "Read the file and report back",
                 "description": "Audit",
                 "resume": None,
+                "session_source": None,
                 "run_in_background": True,
                 "timeout_ms": 5000,
                 "max_turns": 12,
