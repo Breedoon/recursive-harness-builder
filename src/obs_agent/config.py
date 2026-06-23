@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 _DEFAULT_CODEBASE_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_VAULT = Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents" / "T"
+_DEFAULT_VAULT = Path.home() / "Documents" / "obs-vault"
 _DEFAULT_TELEGRAM_TEMP_ROOT = Path("/tmp") / "obs-agent"
 _DEFAULT_TELEGRAM_STATE_DB_PATH = (
     _DEFAULT_CODEBASE_ROOT / ".obs-agent" / "state" / "telegram-state.sqlite3"
