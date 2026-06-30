@@ -395,7 +395,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-agent-sdk", specifier = ">=0.1.33" },
+    { name = "claude-agent-sdk", specifier = "==0.1.44" },
     { name = "croniter", specifier = ">=3.0.3" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.28.0" },
