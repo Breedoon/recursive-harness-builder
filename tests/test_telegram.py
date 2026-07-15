@@ -3283,10 +3283,19 @@ class TestCommands:
         )
 
     async def test_new_reseeds_route_as_new_trunk_identity(self, config):
+        default_hooks = {
+            "PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/new_chat_guard.py::check"
+        }
+        settings_path = config.vault_path / ".claude" / "settings.json"
+        settings_path.write_text(
+            json.dumps({"obs": {"sessions": {"defaults": {"hooks": default_hooks}}}}),
+            encoding="utf-8",
+        )
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=321)
         state = bot._get_state(route, topic_title="Old Topic")
         assert state is not None
+        state.session_manager.user_hooks = {"PreToolUse": "old_guard.py::check"}
         state.topic_icon_custom_emoji_id = "emoji-old"
         bot._set_topic_metadata(route=route, title="Old Topic", icon_custom_emoji_id="emoji-old")
         bot._prime_obs_bootstrap(
@@ -3321,6 +3330,7 @@ class TestCommands:
             icon_custom_emoji_id="emoji-new",
         )
         assert state.agent_lineage == ("Fresh Start",)
+        assert state.session_manager.user_hooks == default_hooks
         assert state.pending_obs_bootstrap is not None
         assert "Fresh Start" in state.pending_obs_bootstrap
         assert bot._resolve_route_inbox_target(

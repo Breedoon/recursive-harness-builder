@@ -686,6 +686,7 @@ class TelegramBot:
             self._load_schedule_retry_policy(self._settings_payload)
         )
         self._default_schedule_template = self._load_default_schedule_template(self._settings_payload)
+        self._default_new_chat_hooks = self._load_default_new_chat_hooks(self._settings_payload)
 
         self._enable_background_poller = enable_background_poller
         self._background_poll_seconds = background_poll_seconds
@@ -1257,6 +1258,39 @@ class TelegramBot:
             logger.warning("Failed parsing settings file at %s", settings_path, exc_info=True)
             return None
         return loaded if isinstance(loaded, dict) else None
+
+    def _load_default_new_chat_hooks(
+        self,
+        settings: dict[str, Any] | None,
+    ) -> dict[str, str] | None:
+        if not isinstance(settings, dict):
+            return None
+        obs = settings.get("obs")
+        if not isinstance(obs, dict):
+            return None
+        sessions = obs.get("sessions")
+        if not isinstance(sessions, dict):
+            return None
+        defaults = sessions.get("defaults")
+        if not isinstance(defaults, dict):
+            return None
+        hooks = defaults.get("hooks")
+        if not isinstance(hooks, dict):
+            return None
+
+        normalized: dict[str, str] = {}
+        for event_name, spec in hooks.items():
+            if not isinstance(event_name, str) or not event_name.strip():
+                logger.warning("Ignoring obs.sessions.defaults.hooks entry with invalid event name")
+                continue
+            if not isinstance(spec, str) or not spec.strip():
+                logger.warning(
+                    "Ignoring obs.sessions.defaults.hooks.%s: hook spec must be a non-empty string",
+                    event_name,
+                )
+                continue
+            normalized[event_name.strip()] = spec.strip()
+        return normalized or None
 
     def _load_schedule_retry_policy(self, settings: dict[str, Any] | None) -> tuple[int, int]:
         max_attempts = 0
@@ -5728,6 +5762,8 @@ class TelegramBot:
             state.agent_lineage = None
             state.pending_obs_bootstrap = None
             await self._reset_route_state(state)
+            if self._default_new_chat_hooks is not None:
+                state.session_manager.user_hooks = dict(self._default_new_chat_hooks)
             await self._apply_topic_visibility(
                 route=route,
                 bot=context.bot,
