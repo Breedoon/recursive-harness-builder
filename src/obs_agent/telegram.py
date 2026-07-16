@@ -43,7 +43,11 @@ from obs_agent.context_stats import (
     format_context_snapshot_compact,
     format_context_snapshot_lines,
 )
-from obs_agent.config import parse_context_suffix
+from obs_agent.config import (
+    normalize_model_for_claude_code,
+    parse_context_suffix,
+    resolve_model,
+)
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
 from obs_agent.context_jsonl import find_session_jsonl
@@ -117,6 +121,7 @@ _TELEGRAM_HELP_TEXT = """Usage:
 /fork [name] — create a new topic from this head or a replied message
 /new [name] — reset this topic into a new trunk agent
 /clear — clear this topic but keep its agent identity
+/model MODEL — select the model before the first message of a new or cleared session
 /context — show session and context info
 
 Bare commands are not supported; use the slash form, e.g. /stop.
@@ -5715,6 +5720,69 @@ class TelegramBot:
             disable_notification=True,
         )
 
+    async def handle_model(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /model - select the model before a session's first message."""
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+
+        await self._ensure_background_poller(context.bot)
+        route = self._route_for_message(update.effective_message)
+        state = self._get_state(route)
+        if state is None:
+            return
+        state.last_bot = context.bot
+
+        args = [str(arg).strip() for arg in context.args if str(arg).strip()]
+        if len(args) != 1:
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=(
+                    "usage: /model <model|inherit>; examples: "
+                    "/model gpt, /model gpt[200k], /model sonnet[1m]"
+                ),
+                disable_notification=True,
+            )
+            return
+
+        requested = args[0]
+        lock = self._get_route_lock(route)
+        async with lock:
+            session_started = (
+                state.busy
+                or state.session_id is not None
+                or bool(state.pending_messages)
+                or not state.hook_state.message_queue.empty()
+            )
+            if session_started:
+                response = (
+                    "model is locked for this active session; use /clear or /new, "
+                    "then /model before sending the first message"
+                )
+            else:
+                state.session_manager.model_override = (
+                    None if requested.lower() == "inherit" else resolve_model(requested)
+                )
+                effective_model = normalize_model_for_claude_code(
+                    state.session_manager.effective_model
+                )
+                state.hook_state.effective_model = effective_model
+                self._persist_state_for_route(route)
+                response = f"model selected for next session: {effective_model}"
+
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=response,
+            disable_notification=True,
+        )
+
     async def handle_new(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -9790,6 +9858,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("new_bot", bot.handle_new_bot))
     app.add_handler(CommandHandler("unschedule", bot.handle_unschedule))
     app.add_handler(CommandHandler("stop", bot.handle_stop))
+    app.add_handler(CommandHandler("model", bot.handle_model))
     app.add_handler(CommandHandler("context", bot.handle_context))
     app.add_handler(CommandHandler("report", bot.handle_report))
     app.add_handler(CommandHandler("schedule", bot.handle_schedule))
@@ -9843,6 +9912,7 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("new_bot", "Create a new Claudia sender bot through BotFather"),
         BotCommand("unschedule", "Remove schedule(s) from this topic; use /unschedule all"),
         BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
+        BotCommand("model", "Select model before the first message of a new or cleared session"),
         BotCommand("context", "Show session and context window info"),
         BotCommand("report", "Save a debug case file for this message/topic"),
         BotCommand("schedule", "Create schedules once Sprint 1 reliability is approved"),

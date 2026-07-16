@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telegram.error import BadRequest, Conflict, TelegramError
 
+from obs_agent.config import normalize_model_for_claude_code, resolve_model
 from obs_agent.events import StatusEvent
 from obs_agent.lineage import (
     ObsBootstrap,
@@ -3252,6 +3253,87 @@ class TestCommands:
         assert (
             ctx.bot.send_message.call_args.kwargs["text"]
             == "<u><i>session cleared; agent identity was kept</i></u>"
+        )
+
+    async def test_model_selects_agenttask_style_spec_before_first_message(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        update = _make_update("/model gpt[200k]", thread_id=321)
+        ctx = _make_context()
+        ctx.args = ["gpt[200k]"]
+
+        await bot.handle_model(update, ctx)
+
+        resolved = resolve_model("gpt[200k]")
+        effective = normalize_model_for_claude_code(resolved)
+        assert state.session_manager.model_override == resolved
+        assert state.hook_state.effective_model == effective
+        persisted = next(
+            entry
+            for entry in bot._state_store.load_snapshot().route_states
+            if entry.chat_id == route.chat_id and entry.thread_id == route.thread_id
+        )
+        assert persisted.model_override == resolved
+        assert ctx.bot.send_message.call_args.kwargs["text"] == (
+            f"<u><i>model selected for next session: {effective}</i></u>"
+        )
+
+    async def test_model_inherit_restores_default_before_first_message(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.model_override = "gpt-5.4-mini[200k]"
+        update = _make_update("/model inherit", thread_id=321)
+        ctx = _make_context()
+        ctx.args = ["inherit"]
+
+        await bot.handle_model(update, ctx)
+
+        effective = normalize_model_for_claude_code(config.model)
+        assert state.session_manager.model_override is None
+        assert state.hook_state.effective_model == effective
+        assert effective in ctx.bot.send_message.call_args.kwargs["text"]
+
+    async def test_model_rejects_change_after_session_starts(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.model_override = "gpt-5.4-mini[200k]"
+        state.session_manager.set_session_id("active-session")
+        update = _make_update("/model sonnet[1m]", thread_id=321)
+        ctx = _make_context()
+        ctx.args = ["sonnet[1m]"]
+
+        await bot.handle_model(update, ctx)
+
+        assert state.session_manager.model_override == "gpt-5.4-mini[200k]"
+        assert "model is locked for this active session" in (
+            ctx.bot.send_message.call_args.kwargs["text"]
+        )
+
+    async def test_model_is_available_again_after_clear(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.set_session_id("active-session")
+        ctx = _make_context()
+
+        await bot.handle_clear(_make_update("/clear", thread_id=321), ctx)
+        ctx.args = ["sonnet[1m]"]
+        await bot.handle_model(
+            _make_update("/model sonnet[1m]", message_id=2, thread_id=321),
+            ctx,
+        )
+
+        assert state.session_id is None
+        assert state.session_manager.model_override == resolve_model("sonnet[1m]")
+        assert "model selected for next session" in (
+            ctx.bot.send_message.call_args.kwargs["text"]
         )
 
     async def test_clear_mentions_unschedule_when_topic_has_schedule(self, config):
@@ -7022,6 +7104,7 @@ class TestCreateTelegramApp:
             if getattr(handler, "commands", None)
         }
         assert command_map["help"] == "handle_help"
+        assert command_map["model"] == "handle_model"
         assert command_map["new_group"] == "handle_new_group"
         assert command_map["new_bot"] == "handle_new_bot"
 
@@ -7041,6 +7124,7 @@ class TestTelegramCommandHelp:
 
         kwargs = ctx.bot.send_message.call_args.kwargs
         assert _TELEGRAM_HELP_TEXT in kwargs["text"]
+        assert "/model MODEL" in kwargs["text"]
         assert "Bare commands are not supported" in kwargs["text"]
         assert kwargs["reply_to_message_id"] == 42
         assert kwargs["disable_notification"] is True
@@ -7071,6 +7155,7 @@ class TestTelegramCommandRegistration:
         commands = app.bot.set_my_commands.await_args.args[0]
         names = [command.command for command in commands]
         assert "help" in names
+        assert "model" in names
         assert "new_group" in names
         assert "new_bot" in names
 
