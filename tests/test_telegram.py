@@ -3255,6 +3255,98 @@ class TestCommands:
             == "<u><i>session cleared; agent identity was kept</i></u>"
         )
 
+    async def test_first_message_in_fresh_topic_applies_default_hooks(self, config):
+        default_hooks = {
+            "PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/new_chat_guard.py::check"
+        }
+        settings_path = config.vault_path / ".claude" / "settings.json"
+        settings_path.write_text(
+            json.dumps({"obs": {"sessions": {"defaults": {"hooks": default_hooks}}}}),
+            encoding="utf-8",
+        )
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        update = _make_update("search apartments", thread_id=321)
+        ctx = _make_context()
+
+        with patch.object(bot, "_run_and_send", new_callable=AsyncMock) as mock_run:
+            await bot._process_message(
+                "search apartments",
+                update,
+                ctx,
+                pre_sent_status_message_ids=[777],
+            )
+
+        state = bot._get_state(route, create=False)
+        assert state is not None
+        assert state.session_manager.user_hooks == default_hooks
+        assert mock_run.await_args.kwargs["state"] is state
+        persisted = next(
+            entry
+            for entry in bot._state_store.load_snapshot().route_states
+            if entry.chat_id == route.chat_id and entry.thread_id == route.thread_id
+        )
+        assert json.loads(persisted.user_hooks_json or "null") == default_hooks
+
+    async def test_agenttask_child_does_not_receive_root_default_hooks(self, config):
+        default_hooks = {
+            "PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/new_chat_guard.py::check"
+        }
+        settings_path = config.vault_path / ".claude" / "settings.json"
+        settings_path.write_text(
+            json.dumps({"obs": {"sessions": {"defaults": {"hooks": default_hooks}}}}),
+            encoding="utf-8",
+        )
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        parent_route = TelegramRoute(chat_id=-10067890, thread_id=55)
+        parent_state = bot._get_state(parent_route, topic_title="Root")
+        assert parent_state is not None
+        assert parent_state.session_manager.user_hooks == default_hooks
+        parent_state.last_bot = MagicMock()
+        parent_state.last_bot.create_forum_topic = AsyncMock(
+            return_value=MagicMock(message_thread_id=333)
+        )
+        parent_state.last_bot.send_message = AsyncMock(
+            side_effect=[
+                MagicMock(message_id=920),
+                MagicMock(message_id=921),
+                MagicMock(message_id=922),
+            ]
+        )
+        parent_state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(parent_state)
+        bot._prime_obs_bootstrap(
+            parent_state,
+            lineage=("Root",),
+            origin="user_thread",
+            is_fork=False,
+            session_id="sid-root",
+        )
+        child_route = TelegramRoute(chat_id=-10067890, thread_id=333)
+        unclaimed_child_state = bot._get_state(child_route, topic_title="Worker")
+        assert unclaimed_child_state is not None
+        assert unclaimed_child_state.session_manager.user_hooks == default_hooks
+
+        fake_task_id = uuid.UUID("11111111-2222-3333-4444-555555555555")
+        with patch("obs_agent.telegram.uuid.uuid4", side_effect=[fake_task_id]), patch.object(
+            bot,
+            "_execute_fork_task",
+            new_callable=AsyncMock,
+        ):
+            await bot._launch_fork_task(
+                route=parent_route,
+                args={
+                    "prompt": "Return READY",
+                    "display_name": "Worker",
+                    "fork": False,
+                },
+            )
+
+        child_state = bot._get_state(child_route, create=False)
+        assert child_state is unclaimed_child_state
+        assert child_state.session_manager.user_hooks is None
+        await bot.shutdown()
+
     async def test_model_selects_agenttask_style_spec_before_first_message(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=321)

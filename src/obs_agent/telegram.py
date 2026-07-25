@@ -2075,10 +2075,13 @@ class TelegramBot:
         *,
         create: bool = True,
         topic_title: str | None = None,
+        apply_default_new_chat_hooks: bool = True,
     ) -> TelegramSessionState | None:
         state = self._states_by_route.get(route)
         if state is None and create:
             state = self._build_session_state(route, topic_title=topic_title)
+            if apply_default_new_chat_hooks and self._default_new_chat_hooks is not None:
+                state.session_manager.user_hooks = dict(self._default_new_chat_hooks)
             self._states_by_route[route] = state
             self._persist_state_for_route(route)
             self._maybe_seed_default_schedule(route=route)
@@ -7758,7 +7761,11 @@ class TelegramBot:
         )
 
         child_route = TelegramRoute(chat_id=parent_state.route.chat_id, thread_id=thread_id)
-        child_state = self._get_state(child_route, topic_title=topic_name)
+        child_state = self._get_state(
+            child_route,
+            topic_title=topic_name,
+            apply_default_new_chat_hooks=False,
+        )
         assert child_state is not None
         child_state.topic_title = topic_name
         child_state.topic_icon_custom_emoji_id = child_icon
@@ -7890,8 +7897,7 @@ class TelegramBot:
         effective_hooks = user_hooks
         if not effective_hooks and inherit_hooks:
             effective_hooks = parent_state.session_manager.user_hooks
-        if effective_hooks:
-            child_state.session_manager.user_hooks = effective_hooks
+        child_state.session_manager.user_hooks = effective_hooks
         if child_lineage is not None:
             self._prime_obs_bootstrap(
                 child_state,
