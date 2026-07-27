@@ -140,7 +140,7 @@ class TestSessionSettings:
     def test_default_model(self):
         """Default config stores model identity without context suffix."""
         cfg = OBSConfig()
-        assert cfg.model == "claude-opus-5"
+        assert cfg.model == "gpt-5.6-sol"
 
     def test_model_from_env_resolves_shorthand_without_context_suffix(self, monkeypatch):
         """OBS_AGENT_MODEL overrides the default session model identity."""
@@ -151,7 +151,7 @@ class TestSessionSettings:
     def test_model_from_env_preserves_explicit_context_suffix(self, monkeypatch):
         monkeypatch.setenv("OBS_AGENT_MODEL", "gpt[200k]")
         cfg = OBSConfig.from_env()
-        assert cfg.model == "gpt-5.5[200k]"
+        assert cfg.model == "gpt-5.6-sol[200k]"
 
     def test_default_cache_window(self):
         """Default cache window is effectively non-expiring for now."""

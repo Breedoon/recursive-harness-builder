@@ -511,10 +511,10 @@ def create_obs_tools(
                 "type": "string",
                 "description": (
                     "Model for the child session. Accepts shorthands "
-                    "(claude, gpt, gemini) which resolve to the latest tier, or full names "
-                    "(gpt-5.5, gemini-2.5-pro). "
+                    "(sol, claude, gpt, gemini) which resolve to the latest tier, or full names "
+                    "(gpt-5.6-sol, gemini-2.5-pro). "
                     "Append a context suffix like [1m] or [200k] to control the context window "
-                    "(default: 1m). 'inherit' or omitted = use the same model as the current "
+                    "(default: model-specific). 'inherit' or omitted = use the same model as the current "
                     "session. When fork=true, the model must be omitted or set to 'inherit' — "
                     "cross-model forking is not supported because the forked JSONL contains "
                     "conversation turns from the parent's model format. Use fork=false to launch "

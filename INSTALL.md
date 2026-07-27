@@ -217,15 +217,15 @@ OBS_TELEGRAM_GROUP_FOLDER_TITLE=Recursive Harness
 
 ## Model/provider setup
 
-### Claude models
+### Default model
 
-Claude models are the default path and should work with Claude Code OAuth/subscription authentication. Set:
+Sol is the default path. Set:
 
 ```env
-OBS_DEFAULT_MODEL=claude
+OBS_DEFAULT_MODEL=sol
 ```
 
-Or use the current Opus model explicitly:
+To use Claude Opus 5 explicitly:
 
 ```env
 OBS_AGENT_MODEL=claude-opus-5

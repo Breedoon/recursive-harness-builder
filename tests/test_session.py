@@ -415,6 +415,7 @@ class TestClientLifecycle:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-key")
         monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "stale-oauth-token")
+        config.model = "claude-opus-4-7"
         mgr = SessionManager(config=config)
         observed = {}
         mock_client = AsyncMock()
@@ -491,7 +492,7 @@ class TestClientLifecycle:
 
         assert client is mock_client
         options = captured["options"]
-        assert options.model == "gpt-5.5[200k]"
+        assert options.model == "gpt-5.6-sol[200k]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env

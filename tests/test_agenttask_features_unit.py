@@ -75,7 +75,7 @@ class TestModelResolution:
         assert result == "gpt-5.4-mini[200k]"
 
     def test_resolution_does_not_add_default_context_suffix(self):
-        assert resolve_model("gpt") == "gpt-5.5"
+        assert resolve_model("gpt") == "gpt-5.6-sol"
         assert resolve_model("claude") == "claude-opus-5"
 
 
@@ -85,13 +85,13 @@ class TestModelContextBoundary:
         assert split_context_suffix("gpt-5.4-mini[200k]") == ("gpt-5.4-mini", 200_000)
 
     def test_claude_code_boundary_adds_resolved_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt") == "gpt-5.5[400k]"
+        assert normalize_model_for_claude_code("gpt") == "gpt-5.6-sol[400k]"
         assert normalize_model_for_claude_code("claude") == "claude-opus-5[1m]"
         assert normalize_model_for_claude_code("haiku") == "claude-haiku-4-5[200k]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
 
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.5[200k]"
+        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.6-sol[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
     def test_auto_compact_window_tracks_context_by_default(self):

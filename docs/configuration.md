@@ -32,7 +32,7 @@ For the first public setup path, aim for a single bot and one human operator:
 
 ```bash
 OBS_VAULT_PATH=/absolute/path/to/repo/examples/recursive-workflow
-OBS_DEFAULT_MODEL=claude
+OBS_DEFAULT_MODEL=sol
 OBS_TELEGRAM_BOT_TOKEN=1234567890:replace-with-bot-token
 OBS_TELEGRAM_ALLOWED_USERS=123456789
 ```
@@ -79,7 +79,7 @@ Use `OBS_DEFAULT_MODEL` for normal defaults and `OBS_AGENT_MODEL` only when you 
 Supported shorthands in current code include:
 
 - `claude`, `opus`, `sonnet`, `haiku`
-- `gpt`, `gpt-mini`, `openai`, `chatgpt`
+- `sol`, `gpt`, `gpt-sol`, `gpt-mini`, `openai`, `chatgpt`
 - `gemini`, `gemini-pro`, `gemini-flash`
 
 Claude models route directly to Anthropic through Claude Code. Non-Claude models route through the local cache proxy and then CLIProxyAPI.
@@ -141,24 +141,21 @@ OBS_DAEMON_PORT=7832
 OBS_MAX_QUEUE_CONTINUATIONS=3
 OBS_BG_FORK_TIMEOUT=600
 OBS_MAX_BUFFER_SIZE=10485760
-OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS=1000000
+OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS=400000
 OBS_AUTO_COMPACT_WINDOW_TOKENS=0
 OBS_FORK_CACHE_WARMUP_DELAY_SECONDS=1.0
 ```
 
 `OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS` is telemetry for context reporting and
-model suffix resolution. The default OBS context is 1M; at the Claude Code
-boundary, a model without an explicit suffix is sent with the resolved context
-suffix, for example `claude` becomes `claude-opus-5[1m]`. Small/test models
-can have model-specific defaults; `haiku` uses `claude-haiku-4-5[200k]` because
-the 1M long-context beta is not available for that lane in the current provider
-account.
+model suffix resolution. The fallback OBS context follows the default Sol model
+at 400k; at the Claude Code boundary, a model without an explicit suffix is sent
+with the resolved model-specific context suffix, for example `sol` becomes
+`gpt-5.6-sol[400k]` and `claude` becomes `claude-opus-5[1m]`.
 `OBS_AUTO_COMPACT_WINDOW_TOKENS` optionally caps the Claude Code auto-compact
 trigger window. Leave it at `0` to use OBS's model-aware default: the resolved
 context window is passed through so Claude Code's built-in compaction curve is
-used consistently. For example, GPT 5.5's default `400k` window should compact
-around `342k` by the same interpolation that makes `200k` compact around
-`167k` and `1m` compact around `920k`.
+used consistently. Sol's `400k` window should compact around `342k`, Opus 5's
+`1m` window around `920k`, and a `200k` window around `167k`.
 `OBS_FORK_CACHE_WARMUP_DELAY_SECONDS` gives parent prompt-cache writes a short
 propagation window before a fork sends its first request.
 

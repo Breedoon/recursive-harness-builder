@@ -35,11 +35,13 @@ MODEL_RESOLUTION: dict[str, str] = {
     "haiku": "claude-haiku-4-5",
     "claude-haiku": "claude-haiku-4-5",
     # OpenAI tiers – "gpt" resolves to main production model
-    "gpt": "gpt-5.5",
-    "gpt-pro": "gpt-5.5",
+    "gpt": "gpt-5.6-sol",
+    "gpt-pro": "gpt-5.6-sol",
+    "sol": "gpt-5.6-sol",
+    "gpt-sol": "gpt-5.6-sol",
     "gpt-mini": "gpt-5.4-mini",
-    "openai": "gpt-5.5",
-    "chatgpt": "gpt-5.5",
+    "openai": "gpt-5.6-sol",
+    "chatgpt": "gpt-5.6-sol",
     # Google tiers
     "gemini": "gemini-3.1-flash-lite-preview",
     "gemini-pro": "gemini-3.1-pro-preview",
@@ -53,6 +55,7 @@ _DEFAULT_CONTEXT_TOKENS = 1_000_000
 _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 0
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5": 200_000,
+    "gpt-5.6-sol": 400_000,
     "gpt-5.5": 400_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.4-mini": 1_000_000,
@@ -279,12 +282,12 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "claude-opus-5"
+    model: str = "gpt-5.6-sol"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
-    # Resolved via MODEL_RESOLUTION (e.g. "claude" → "claude-opus-5");
+    # Resolved via MODEL_RESOLUTION (e.g. "sol" → "gpt-5.6-sol");
     # full model names pass through unchanged.
-    # Change this to e.g. "gpt" to make root sessions default to GPT.
-    default_model: str = "claude"
+    # Change this to e.g. "claude" to make root sessions default to Claude.
+    default_model: str = "sol"
     claude_dir: str = ".claude"
     agent_entry_file: str = "CLAUDE.md"
     daemon_host: str = "127.0.0.1"
@@ -293,7 +296,7 @@ class OBSConfig:
     max_queue_continuations: int = 3
     bg_fork_timeout: float = 600.0  # seconds to wait for background forks
     max_buffer_size: int = 10 * 1024 * 1024  # 10 MB SDK JSON buffer limit
-    context_window_estimate_tokens: int = 1_000_000
+    context_window_estimate_tokens: int = 400_000
     auto_compact_window_tokens: int = _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS
     context_probe_claude_cli: bool = False
     claude_idle_process_cap: int | None = None
@@ -345,7 +348,7 @@ class OBSConfig:
         if model := os.environ.get("OBS_AGENT_MODEL") or os.environ.get("OBS_MODEL"):
             kwargs["model"] = resolve_model(model.strip())
         else:
-            dm = kwargs.get("default_model", "claude")
+            dm = kwargs.get("default_model", "sol")
             kwargs["model"] = resolve_model(dm)
         if host := os.environ.get("OBS_DAEMON_HOST"):
             kwargs["daemon_host"] = host
