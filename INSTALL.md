@@ -225,10 +225,10 @@ Claude models are the default path and should work with Claude Code OAuth/subscr
 OBS_DEFAULT_MODEL=claude
 ```
 
-or a specific model:
+Or use the current Opus model explicitly:
 
 ```env
-OBS_AGENT_MODEL=claude-opus-4-7
+OBS_AGENT_MODEL=claude-opus-5
 ```
 
 Claude traffic goes to Anthropic directly through the cache-normalizing proxy when the proxy is enabled.

@@ -27,9 +27,9 @@ _DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no exp
 # update when new models are released.
 MODEL_RESOLUTION: dict[str, str] = {
     # Anthropic tiers
-    "claude": "claude-opus-4-8",
-    "opus": "claude-opus-4-8",
-    "claude-opus": "claude-opus-4-8",
+    "claude": "claude-opus-5",
+    "opus": "claude-opus-5",
+    "claude-opus": "claude-opus-5",
     "sonnet": "claude-sonnet-4-6",
     "claude-sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5",
@@ -279,9 +279,9 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "claude-opus-4-8"
+    model: str = "claude-opus-5"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
-    # Resolved via MODEL_RESOLUTION (e.g. "claude" → "claude-opus-4-8");
+    # Resolved via MODEL_RESOLUTION (e.g. "claude" → "claude-opus-5");
     # full model names pass through unchanged.
     # Change this to e.g. "gpt" to make root sessions default to GPT.
     default_model: str = "claude"
