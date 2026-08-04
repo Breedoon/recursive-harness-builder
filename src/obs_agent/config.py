@@ -56,6 +56,8 @@ _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 0
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5": 200_000,
     "gpt-5.6-sol": 400_000,
+    "gpt-5.6-luna": 400_000,
+    "gpt-5.6-terra": 400_000,
     "gpt-5.5": 400_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.4-mini": 1_000_000,

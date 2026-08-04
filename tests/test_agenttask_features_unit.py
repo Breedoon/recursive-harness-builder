@@ -90,6 +90,11 @@ class TestModelContextBoundary:
         assert normalize_model_for_claude_code("haiku") == "claude-haiku-4-5[200k]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
 
+    @pytest.mark.parametrize("variant", ["sol", "luna", "terra"])
+    def test_gpt_5_6_variants_default_to_400k(self, variant):
+        model = f"gpt-5.6-{variant}"
+        assert normalize_model_for_claude_code(model) == f"{model}[400k]"
+
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):
         assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.6-sol[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
