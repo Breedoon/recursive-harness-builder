@@ -78,7 +78,7 @@ Use `OBS_DEFAULT_MODEL` for normal defaults and `OBS_AGENT_MODEL` only when you 
 
 Supported shorthands in current code include:
 
-- `claude`, `opus`, `sonnet`, `haiku`
+- `claude`, `opus`, `sonnet`, `fable`, `haiku`
 - `sol`, `gpt`, `gpt-sol`, `gpt-mini`, `openai`, `chatgpt`
 - `gemini`, `gemini-pro`, `gemini-flash`
 

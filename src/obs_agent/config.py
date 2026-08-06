@@ -30,8 +30,10 @@ MODEL_RESOLUTION: dict[str, str] = {
     "claude": "claude-opus-5",
     "opus": "claude-opus-5",
     "claude-opus": "claude-opus-5",
-    "sonnet": "claude-sonnet-4-6",
-    "claude-sonnet": "claude-sonnet-4-6",
+    "sonnet": "claude-sonnet-5",
+    "claude-sonnet": "claude-sonnet-5",
+    "fable": "claude-fable-5",
+    "claude-fable": "claude-fable-5",
     "haiku": "claude-haiku-4-5",
     "claude-haiku": "claude-haiku-4-5",
     # OpenAI tiers – "gpt" resolves to main production model

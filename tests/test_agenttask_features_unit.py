@@ -34,8 +34,12 @@ class TestModelResolution:
         assert resolve_model("claude-opus") == "claude-opus-5"
 
     def test_claude_sonnet_shorthand(self):
-        assert resolve_model("claude-sonnet") == "claude-sonnet-4-6"
-        assert resolve_model("sonnet") == "claude-sonnet-4-6"
+        assert resolve_model("claude-sonnet") == "claude-sonnet-5"
+        assert resolve_model("sonnet") == "claude-sonnet-5"
+
+    def test_claude_fable_shorthand(self):
+        assert resolve_model("claude-fable") == "claude-fable-5"
+        assert resolve_model("fable") == "claude-fable-5"
 
     def test_claude_haiku_shorthand(self):
         assert resolve_model("claude-haiku") == "claude-haiku-4-5"
