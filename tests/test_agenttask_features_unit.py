@@ -94,6 +94,15 @@ class TestModelContextBoundary:
         assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.5[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
+    def test_local_provider_boundary_preserves_canonical_model_id(self):
+        assert normalize_model_for_claude_code("local-gemma4-31b") == "local-gemma4-31b"
+        assert normalize_model_for_claude_code("local-qwen3.5-27b[128k]") == "local-qwen3.5-27b"
+        assert parse_context_suffix("local-gemma4-31b") == ("local-gemma4-31b", 32_000)
+        assert parse_context_suffix("local-qwen3.5-27b[128k]") == (
+            "local-qwen3.5-27b",
+            128_000,
+        )
+
     def test_auto_compact_window_tracks_context_by_default(self):
         assert auto_compact_window_for_context(1_000_000) == 1_000_000
         assert auto_compact_window_for_context(256_000) == 256_000

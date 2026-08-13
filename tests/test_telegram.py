@@ -5164,7 +5164,7 @@ class TestForkTaskRuntime:
         monkeypatch,
     ):
         monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
-        config.cache_proxy_enabled = False
+        config.cache_proxy_enabled = True
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=-10067890, thread_id=None)
         state = bot._get_state(route)
@@ -5196,11 +5196,13 @@ class TestForkTaskRuntime:
         assert child_state is not None
         assert child_state.session_manager.model_override == "local-qwen3.5-27b[128k]"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "local-qwen3.5-27b[128k]"
+        assert child_options.model == "local-qwen3.5-27b"
         assert child_options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
         assert child_options.env["ANTHROPIC_AUTH_TOKEN"] == "local-test-token"
         assert "ANTHROPIC_API_KEY" not in child_options.env
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "128000"
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
+        assert child_state.hook_state.effective_model == "local-qwen3.5-27b[128k]"
         await bot.shutdown()
 
     async def test_launch_agent_task_explicit_shorthand_model_gets_400k_at_sdk_boundary(

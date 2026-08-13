@@ -280,8 +280,7 @@ class SessionManager:
         from obs_agent.config import (
             auto_compact_window_for_model,
             is_claude_model,
-            normalize_model_for_claude_code,
-            parse_context_suffix,
+            resolve_model_context,
         )
 
         hook_matchers = create_hook_matchers(self.config, self.hook_state, user_hooks=self.user_hooks)
@@ -290,8 +289,10 @@ class SessionManager:
         # for background fork result delivery
         tool_server = create_obs_tools(self.config, lambda: self._session_id, hook_state=self.hook_state)
 
-        effective_model = normalize_model_for_claude_code(self.effective_model)
-        self.hook_state.effective_model = effective_model
+        resolved_model = resolve_model_context(self.effective_model)
+        effective_model = resolved_model.model_for_claude_code
+        ctx_tokens = resolved_model.context_tokens
+        self.hook_state.effective_model = resolved_model.model_with_context
 
         effective_env = {
             **_DEFAULT_SDK_ENV,
@@ -300,7 +301,6 @@ class SessionManager:
         self.hook_state.sdk_env_overrides = dict(self._sdk_env_overrides)
         self.hook_state.vault_path = self.config.vault_path
 
-        _clean_model, ctx_tokens = parse_context_suffix(effective_model)
         auto_compact_window = auto_compact_window_for_model(
             effective_model,
             ctx_tokens,

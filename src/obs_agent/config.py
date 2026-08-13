@@ -77,8 +77,16 @@ class ModelContext:
     explicit_context: bool
 
     @property
-    def model_for_claude_code(self) -> str:
+    def model_with_context(self) -> str:
         return self.model + _context_suffix_for_tokens(self.context_tokens)
+
+    @property
+    def model_for_claude_code(self) -> str:
+        # Local Anthropic-compatible providers route on the canonical model ID;
+        # their context limit is passed separately through the SDK environment.
+        if self.model.lower().startswith("local-"):
+            return self.model
+        return self.model_with_context
 
 
 def _context_suffix_for_tokens(context_tokens: int) -> str:
@@ -151,11 +159,11 @@ def normalize_model_for_claude_code(
     *,
     default_context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
 ) -> str:
-    """Resolve model identity and append OBS's context window suffix.
+    """Resolve the model identifier passed to Claude Code.
 
-    OBS treats context length as runtime metadata, not part of model identity.
-    At the Claude Code boundary we always pass the resolved context suffix,
-    including the default ``[1m]`` for native Claude models.
+    OBS passes context suffixes for hosted models. Local Anthropic-compatible
+    providers receive their canonical model ID while OBS supplies the context
+    limit separately through SDK environment metadata.
     """
     resolved = resolve_model_context(
         model_str,

@@ -279,12 +279,13 @@ class TestCreateOptions:
 
         options = mgr.create_options()
 
-        assert options.model == "local-qwen3.5-27b[128k]"
+        assert options.model == "local-qwen3.5-27b"
         assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
         assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-test-token"
         assert "ANTHROPIC_API_KEY" not in options.env
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "128000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
+        assert mgr.hook_state.effective_model == "local-qwen3.5-27b[128k]"
 
     def test_local_provider_base_url_overrides_enabled_cache_proxy(self, config):
         config.cache_proxy_enabled = True
@@ -300,12 +301,13 @@ class TestCreateOptions:
 
         options = mgr.create_options()
 
-        assert options.model == "local-qwen3.5-27b[32k]"
+        assert options.model == "local-qwen3.5-27b"
         assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
         assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-test-token"
         assert "ANTHROPIC_API_KEY" not in options.env
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "32000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "32000"
+        assert mgr.hook_state.effective_model == "local-qwen3.5-27b[32k]"
 
     def test_cache_proxy_remains_default_without_session_base_url(self, config):
         config.cache_proxy_enabled = True
