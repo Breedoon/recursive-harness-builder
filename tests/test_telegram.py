@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telegram.error import BadRequest, Conflict, TelegramError
 
+from obs_agent.config import normalize_model_for_claude_code, resolve_model
 from obs_agent.events import StatusEvent
 from obs_agent.lineage import (
     ObsBootstrap,
@@ -895,7 +896,7 @@ class TestTelegramMessageFlow:
         assert calls[2]["disable_notification"] is True
         assert "<i>Read: CLAUDE.md</i>" in calls[2]["text"]
         assert "Hello from tool run" in calls[2]["text"]
-        assert calls[3]["text"] == "<u><i>context: 0 / 1m</i></u>"
+        assert calls[3]["text"] == "<u><i>context: 0 / 400k</i></u>"
         assert calls[3]["disable_notification"] is False
 
     async def test_thinking_content_is_rendered_verbatim(self, config):
@@ -1016,7 +1017,7 @@ class TestTelegramMessageFlow:
         assert calls[1] == "<u><i>working</i></u>"
         assert "turn one" in calls[2]
         assert "turn two" in calls[3]
-        assert calls[4] == "<u><i>context: 0 / 1m</i></u>"
+        assert calls[4] == "<u><i>context: 0 / 400k</i></u>"
 
     async def test_completion_summary_omits_username_when_configured(self, config):
         config.telegram_notify_username = "breedoon"
@@ -1038,7 +1039,7 @@ class TestTelegramMessageFlow:
             await bot.handle_message(update, ctx)
 
         calls = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
-        assert calls[-1] == "<u><i>context: 0 / 1m</i></u>"
+        assert calls[-1] == "<u><i>context: 0 / 400k</i></u>"
 
     async def test_attachment_receipt_is_sent_before_normalization(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -3254,6 +3255,179 @@ class TestCommands:
             == "<u><i>session cleared; agent identity was kept</i></u>"
         )
 
+    async def test_first_message_in_fresh_topic_applies_default_hooks(self, config):
+        default_hooks = {
+            "PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/new_chat_guard.py::check"
+        }
+        settings_path = config.vault_path / ".claude" / "settings.json"
+        settings_path.write_text(
+            json.dumps({"obs": {"sessions": {"defaults": {"hooks": default_hooks}}}}),
+            encoding="utf-8",
+        )
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        update = _make_update("search apartments", thread_id=321)
+        ctx = _make_context()
+
+        with patch.object(bot, "_run_and_send", new_callable=AsyncMock) as mock_run:
+            await bot._process_message(
+                "search apartments",
+                update,
+                ctx,
+                pre_sent_status_message_ids=[777],
+            )
+
+        state = bot._get_state(route, create=False)
+        assert state is not None
+        assert state.session_manager.user_hooks == default_hooks
+        assert mock_run.await_args.kwargs["state"] is state
+        persisted = next(
+            entry
+            for entry in bot._state_store.load_snapshot().route_states
+            if entry.chat_id == route.chat_id and entry.thread_id == route.thread_id
+        )
+        assert json.loads(persisted.user_hooks_json or "null") == default_hooks
+
+    async def test_agenttask_child_does_not_receive_root_default_hooks(self, config):
+        default_hooks = {
+            "PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/new_chat_guard.py::check"
+        }
+        settings_path = config.vault_path / ".claude" / "settings.json"
+        settings_path.write_text(
+            json.dumps({"obs": {"sessions": {"defaults": {"hooks": default_hooks}}}}),
+            encoding="utf-8",
+        )
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        parent_route = TelegramRoute(chat_id=-10067890, thread_id=55)
+        parent_state = bot._get_state(parent_route, topic_title="Root")
+        assert parent_state is not None
+        assert parent_state.session_manager.user_hooks == default_hooks
+        parent_state.last_bot = MagicMock()
+        parent_state.last_bot.create_forum_topic = AsyncMock(
+            return_value=MagicMock(message_thread_id=333)
+        )
+        parent_state.last_bot.send_message = AsyncMock(
+            side_effect=[
+                MagicMock(message_id=920),
+                MagicMock(message_id=921),
+                MagicMock(message_id=922),
+            ]
+        )
+        parent_state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(parent_state)
+        bot._prime_obs_bootstrap(
+            parent_state,
+            lineage=("Root",),
+            origin="user_thread",
+            is_fork=False,
+            session_id="sid-root",
+        )
+        child_route = TelegramRoute(chat_id=-10067890, thread_id=333)
+        unclaimed_child_state = bot._get_state(child_route, topic_title="Worker")
+        assert unclaimed_child_state is not None
+        assert unclaimed_child_state.session_manager.user_hooks == default_hooks
+
+        fake_task_id = uuid.UUID("11111111-2222-3333-4444-555555555555")
+        with patch("obs_agent.telegram.uuid.uuid4", side_effect=[fake_task_id]), patch.object(
+            bot,
+            "_execute_fork_task",
+            new_callable=AsyncMock,
+        ):
+            await bot._launch_fork_task(
+                route=parent_route,
+                args={
+                    "prompt": "Return READY",
+                    "display_name": "Worker",
+                    "fork": False,
+                },
+            )
+
+        child_state = bot._get_state(child_route, create=False)
+        assert child_state is unclaimed_child_state
+        assert child_state.session_manager.user_hooks is None
+        await bot.shutdown()
+
+    async def test_model_selects_agenttask_style_spec_before_first_message(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        update = _make_update("/model gpt[200k]", thread_id=321)
+        ctx = _make_context()
+        ctx.args = ["gpt[200k]"]
+
+        await bot.handle_model(update, ctx)
+
+        resolved = resolve_model("gpt[200k]")
+        effective = normalize_model_for_claude_code(resolved)
+        assert state.session_manager.model_override == resolved
+        assert state.hook_state.effective_model == effective
+        persisted = next(
+            entry
+            for entry in bot._state_store.load_snapshot().route_states
+            if entry.chat_id == route.chat_id and entry.thread_id == route.thread_id
+        )
+        assert persisted.model_override == resolved
+        assert ctx.bot.send_message.call_args.kwargs["text"] == (
+            f"<u><i>model selected for next session: {effective}</i></u>"
+        )
+
+    async def test_model_inherit_restores_default_before_first_message(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.model_override = "gpt-5.4-mini[200k]"
+        update = _make_update("/model inherit", thread_id=321)
+        ctx = _make_context()
+        ctx.args = ["inherit"]
+
+        await bot.handle_model(update, ctx)
+
+        effective = normalize_model_for_claude_code(config.model)
+        assert state.session_manager.model_override is None
+        assert state.hook_state.effective_model == effective
+        assert effective in ctx.bot.send_message.call_args.kwargs["text"]
+
+    async def test_model_rejects_change_after_session_starts(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.model_override = "gpt-5.4-mini[200k]"
+        state.session_manager.set_session_id("active-session")
+        update = _make_update("/model sonnet[1m]", thread_id=321)
+        ctx = _make_context()
+        ctx.args = ["sonnet[1m]"]
+
+        await bot.handle_model(update, ctx)
+
+        assert state.session_manager.model_override == "gpt-5.4-mini[200k]"
+        assert "model is locked for this active session" in (
+            ctx.bot.send_message.call_args.kwargs["text"]
+        )
+
+    async def test_model_is_available_again_after_clear(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.set_session_id("active-session")
+        ctx = _make_context()
+
+        await bot.handle_clear(_make_update("/clear", thread_id=321), ctx)
+        ctx.args = ["sonnet[1m]"]
+        await bot.handle_model(
+            _make_update("/model sonnet[1m]", message_id=2, thread_id=321),
+            ctx,
+        )
+
+        assert state.session_id is None
+        assert state.session_manager.model_override == resolve_model("sonnet[1m]")
+        assert "model selected for next session" in (
+            ctx.bot.send_message.call_args.kwargs["text"]
+        )
+
     async def test_clear_mentions_unschedule_when_topic_has_schedule(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=1)
@@ -3283,10 +3457,19 @@ class TestCommands:
         )
 
     async def test_new_reseeds_route_as_new_trunk_identity(self, config):
+        default_hooks = {
+            "PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/new_chat_guard.py::check"
+        }
+        settings_path = config.vault_path / ".claude" / "settings.json"
+        settings_path.write_text(
+            json.dumps({"obs": {"sessions": {"defaults": {"hooks": default_hooks}}}}),
+            encoding="utf-8",
+        )
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         route = TelegramRoute(chat_id=67890, thread_id=321)
         state = bot._get_state(route, topic_title="Old Topic")
         assert state is not None
+        state.session_manager.user_hooks = {"PreToolUse": "old_guard.py::check"}
         state.topic_icon_custom_emoji_id = "emoji-old"
         bot._set_topic_metadata(route=route, title="Old Topic", icon_custom_emoji_id="emoji-old")
         bot._prime_obs_bootstrap(
@@ -3321,6 +3504,7 @@ class TestCommands:
             icon_custom_emoji_id="emoji-new",
         )
         assert state.agent_lineage == ("Fresh Start",)
+        assert state.session_manager.user_hooks == default_hooks
         assert state.pending_obs_bootstrap is not None
         assert "Fresh Start" in state.pending_obs_bootstrap
         assert bot._resolve_route_inbox_target(
@@ -4958,9 +5142,9 @@ class TestForkTaskRuntime:
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=333))
         assert child_state is not None
         assert child_state.session_id is None
-        assert child_state.session_manager.model_override == "gpt-5.5"
+        assert child_state.session_manager.model_override == "gpt-5.6-sol"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[400k]"
+        assert child_options.model == "gpt-5.6-sol[400k]"
         child_env = child_options.env
         assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
@@ -4971,6 +5155,52 @@ class TestForkTaskRuntime:
         # Agent name should be computed (hash-prefix + slug), not raw alias
         assert "fresh-child" in child_env["CLAUDE_CODE_AGENT_NAME"].lower(), \
             f"Agent name env var should contain 'fresh-child', got: {child_env['CLAUDE_CODE_AGENT_NAME']}"
+        await bot.shutdown()
+
+    async def test_launch_agent_task_local_provider_env_reaches_sdk_boundary(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        config.cache_proxy_enabled = False
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.last_bot = MagicMock()
+        state.last_bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=337))
+        state.last_bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=960), MagicMock(message_id=961), MagicMock(message_id=962)]
+        )
+        state.session_manager.set_session_id("sid-root")
+
+        with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock):
+            await bot._launch_fork_task(
+                route=route,
+                args={
+                    "prompt": "Reply LOCAL-READY",
+                    "description": "Local child",
+                    "fork": False,
+                    "model": "local-qwen3.5-27b[128k]",
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "http://local-llm:8080",
+                        "ANTHROPIC_AUTH_TOKEN": "local-test-token",
+                    },
+                    "task_tool_name": "AgentTask",
+                },
+            )
+
+        child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=337))
+        assert child_state is not None
+        assert child_state.session_manager.model_override == "local-qwen3.5-27b[128k]"
+        child_options = child_state.session_manager.create_options()
+        assert child_options.model == "local-qwen3.5-27b[128k]"
+        assert child_options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        assert child_options.env["ANTHROPIC_AUTH_TOKEN"] == "local-test-token"
+        assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "128000"
         await bot.shutdown()
 
     async def test_launch_agent_task_explicit_shorthand_model_gets_400k_at_sdk_boundary(
@@ -5005,9 +5235,9 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=334))
         assert child_state is not None
-        assert child_state.session_manager.model_override == "gpt-5.5"
+        assert child_state.session_manager.model_override == "gpt-5.6-sol"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[400k]"
+        assert child_options.model == "gpt-5.6-sol[400k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "400000"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in child_options.env
@@ -5046,9 +5276,9 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=335))
         assert child_state is not None
-        assert child_state.session_manager.model_override == "gpt-5.5[200k]"
+        assert child_state.session_manager.model_override == "gpt-5.6-sol[200k]"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[200k]"
+        assert child_options.model == "gpt-5.6-sol[200k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in child_options.env
@@ -7012,6 +7242,7 @@ class TestCreateTelegramApp:
             if getattr(handler, "commands", None)
         }
         assert command_map["help"] == "handle_help"
+        assert command_map["model"] == "handle_model"
         assert command_map["new_group"] == "handle_new_group"
         assert command_map["new_bot"] == "handle_new_bot"
 
@@ -7031,6 +7262,7 @@ class TestTelegramCommandHelp:
 
         kwargs = ctx.bot.send_message.call_args.kwargs
         assert _TELEGRAM_HELP_TEXT in kwargs["text"]
+        assert "/model MODEL" in kwargs["text"]
         assert "Bare commands are not supported" in kwargs["text"]
         assert kwargs["reply_to_message_id"] == 42
         assert kwargs["disable_notification"] is True
@@ -7061,6 +7293,7 @@ class TestTelegramCommandRegistration:
         commands = app.bot.set_my_commands.await_args.args[0]
         names = [command.command for command in commands]
         assert "help" in names
+        assert "model" in names
         assert "new_group" in names
         assert "new_bot" in names
 
@@ -7594,7 +7827,7 @@ class TestTelegramErrorHandling:
 
             texts = [c.kwargs.get("text", "") for c in ctx.bot.send_message.call_args_list]
             assert any("FINAL_MARKER" in t for t in texts)
-            assert texts[-1] == "<u><i>context: 0 / 1m</i></u>"
+            assert texts[-1] == "<u><i>context: 0 / 400k</i></u>"
 
 
 class TestTelegramStatePersistence:

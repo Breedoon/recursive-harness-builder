@@ -317,11 +317,15 @@ class SessionManager:
         else:
             effective_env["ANTHROPIC_API_KEY"] = self.config.cli_proxy_api_key
 
-        # Route CC API traffic through the cache-normalizing proxy when enabled.
-        # Forks inherit env from the parent CC process, so this propagates
-        # automatically to all fork chains without explicit fork handling.
+        # Route CC API traffic through the cache-normalizing proxy by default.
+        # An explicit per-session base URL (for example, AgentTask env targeting
+        # a local inference server) takes precedence so one child can select its
+        # provider without changing or restarting the parent daemon.
         from obs_agent.cache_proxy_lifecycle import should_use_proxy
-        if should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled):
+        if (
+            should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled)
+            and "ANTHROPIC_BASE_URL" not in self._sdk_env_overrides
+        ):
             effective_env["ANTHROPIC_BASE_URL"] = (
                 f"http://127.0.0.1:{self.config.cache_proxy_port}"
             )

@@ -267,6 +267,55 @@ class TestCreateOptions:
         assert options.env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert options.env["CLAUDE_CODE_TASK_LIST_ID"] == "team-alpha"
 
+    def test_local_provider_overrides_reach_claude_code_options(self, config):
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.5-27b[128k]"
+        mgr.set_sdk_env_overrides(
+            {
+                "ANTHROPIC_BASE_URL": "http://local-llm:8080",
+                "ANTHROPIC_AUTH_TOKEN": "local-test-token",
+            }
+        )
+
+        options = mgr.create_options()
+
+        assert options.model == "local-qwen3.5-27b[128k]"
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-test-token"
+        assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "128000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
+
+    def test_local_provider_base_url_overrides_enabled_cache_proxy(self, config):
+        config.cache_proxy_enabled = True
+        config.cache_proxy_port = 18923
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.5-27b"
+        mgr.set_sdk_env_overrides(
+            {
+                "ANTHROPIC_BASE_URL": "http://local-llm:8080",
+                "ANTHROPIC_AUTH_TOKEN": "local-test-token",
+            }
+        )
+
+        options = mgr.create_options()
+
+        assert options.model == "local-qwen3.5-27b[32k]"
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "32000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "32000"
+
+    def test_cache_proxy_remains_default_without_session_base_url(self, config):
+        config.cache_proxy_enabled = True
+        config.cache_proxy_port = 18923
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.5-27b"
+
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
+            options = mgr.create_options()
+
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:18923"
+
     def test_exposes_sdk_env_overrides_to_hook_state(self, config):
         state = HookState()
         mgr = SessionManager(config=config, hook_state=state)
@@ -415,6 +464,7 @@ class TestClientLifecycle:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-key")
         monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "stale-token")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "stale-oauth-token")
+        config.model = "claude-opus-4-7"
         mgr = SessionManager(config=config)
         observed = {}
         mock_client = AsyncMock()
@@ -491,7 +541,7 @@ class TestClientLifecycle:
 
         assert client is mock_client
         options = captured["options"]
-        assert options.model == "gpt-5.5[200k]"
+        assert options.model == "gpt-5.6-sol[200k]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env

@@ -511,14 +511,18 @@ def create_obs_tools(
                 "type": "string",
                 "description": (
                     "Model for the child session. Accepts shorthands "
-                    "(claude, gpt, gemini) which resolve to the latest tier, or full names "
-                    "(gpt-5.5, gemini-2.5-pro). "
+                    "(sol, claude, gpt, gemini) which resolve to the latest tier, local aliases "
+                    "(local-qwen3.5-27b, local-gemma4-31b), or full names "
+                    "(gpt-5.6-sol, gemini-2.5-pro). "
                     "Append a context suffix like [1m] or [200k] to control the context window "
-                    "(default: 1m). 'inherit' or omitted = use the same model as the current "
-                    "session. When fork=true, the model must be omitted or set to 'inherit' — "
-                    "cross-model forking is not supported because the forked JSONL contains "
-                    "conversation turns from the parent's model format. Use fork=false to launch "
-                    "a fresh session with a different model."
+                    "(default: model-specific; local aliases default to their deployed 32K limit). "
+                    "Local aliases require fork=false and a compact project context: the child still "
+                    "loads the daemon's configured project/entry context, and prompts that exceed the "
+                    "local 32K window fail loudly rather than falling back. 'inherit' or omitted = use "
+                    "the same model as the current session. When fork=true, the model must be omitted "
+                    "or set to 'inherit' — cross-model forking is not supported because the forked "
+                    "JSONL contains conversation turns from the parent's model format. Use fork=false "
+                    "instead to launch a fresh session with a different model."
                 ),
             },
             "name": {
@@ -542,7 +546,9 @@ def create_obs_tools(
                     "JSON object of environment variable overrides for the child session. "
                     "These are merged into the child's SDK env overrides, e.g. "
                     '\'{"SOME_VAR": "value"}\'. User-provided env vars take precedence '
-                    "over auto-configured ones."
+                    "over auto-configured ones, including ANTHROPIC_BASE_URL when the daemon's "
+                    "cache proxy is enabled, so a single fresh child can target a local provider "
+                    "without restarting or reconfiguring the parent daemon."
                 ),
             },
             "temperature": {

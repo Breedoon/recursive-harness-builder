@@ -576,6 +576,49 @@ class TestAgentTaskTools:
         assert launch_args["fork"] is False
 
     @pytest.mark.asyncio
+    async def test_agent_task_passes_local_provider_env_and_model(self, monkeypatch, skill_config):
+        """A fresh AgentTask can select an arbitrary local model and endpoint."""
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+
+        result = await handler(
+            {
+                "prompt": "Reply LOCAL-READY",
+                "fork": False,
+                "model": "local-qwen3.5-27b",
+                "env": json.dumps(
+                    {
+                        "ANTHROPIC_BASE_URL": "http://local-llm:8080",
+                        "ANTHROPIC_AUTH_TOKEN": "local-test-token",
+                    }
+                ),
+            }
+        )
+
+        assert result["content"][0]["text"] == "ok"
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["fork"] is False
+        assert launch_args["model"] == "local-qwen3.5-27b"
+        assert launch_args["env"] == {
+            "ANTHROPIC_BASE_URL": "http://local-llm:8080",
+            "ANTHROPIC_AUTH_TOKEN": "local-test-token",
+        }
+
+        tool = next(tool for tool in captured["tools"] if tool.name == "AgentTask")
+        model_description = tool.input_schema["properties"]["model"]["description"]
+        env_description = tool.input_schema["properties"]["env"]["description"]
+        assert "local-qwen3.5-27b" in model_description
+        assert "compact project context" in model_description
+        assert "32K" in model_description
+        assert "cache proxy is enabled" in env_description
+        assert "without restarting" in env_description
+
+    @pytest.mark.asyncio
     async def test_agent_task_surfaces_launcher_errors(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
