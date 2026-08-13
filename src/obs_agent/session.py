@@ -309,12 +309,13 @@ class SessionManager:
         effective_env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = str(ctx_tokens)
         effective_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
         effective_env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
-        # For non-Claude models, set the API key to the CLI proxy key so CC
-        # authenticates against CLIProxyAPI (the cache proxy forwards it).
+        # For non-Claude models, set the API key to the CLI proxy key by
+        # default. Explicit per-session API/auth values take precedence so an
+        # AgentTask can authenticate directly to a local provider.
         if is_claude_model(effective_model):
             for key in _ANTHROPIC_AUTH_ENV_KEYS:
                 effective_env.pop(key, None)
-        else:
+        elif not any(key in self._sdk_env_overrides for key in _ANTHROPIC_AUTH_ENV_KEYS):
             effective_env["ANTHROPIC_API_KEY"] = self.config.cli_proxy_api_key
 
         # Route CC API traffic through the cache-normalizing proxy by default.

@@ -282,7 +282,7 @@ class TestCreateOptions:
         assert options.model == "local-qwen3.5-27b[128k]"
         assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
         assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-test-token"
-        assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+        assert "ANTHROPIC_API_KEY" not in options.env
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "128000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "128000"
 
@@ -302,6 +302,8 @@ class TestCreateOptions:
 
         assert options.model == "local-qwen3.5-27b[32k]"
         assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-test-token"
+        assert "ANTHROPIC_API_KEY" not in options.env
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "32000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "32000"
 

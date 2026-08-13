@@ -5199,7 +5199,7 @@ class TestForkTaskRuntime:
         assert child_options.model == "local-qwen3.5-27b[128k]"
         assert child_options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
         assert child_options.env["ANTHROPIC_AUTH_TOKEN"] == "local-test-token"
-        assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
+        assert "ANTHROPIC_API_KEY" not in child_options.env
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "128000"
         await bot.shutdown()
 
