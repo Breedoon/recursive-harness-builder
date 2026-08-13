@@ -28,14 +28,14 @@ from obs_agent.config import (
 
 class TestModelResolution:
     def test_claude_shorthand_resolves_to_opus(self):
-        assert resolve_model("claude") == "claude-opus-4-8"
+        assert resolve_model("claude") == "claude-opus-5"
 
     def test_claude_opus_shorthand(self):
-        assert resolve_model("claude-opus") == "claude-opus-4-8"
+        assert resolve_model("claude-opus") == "claude-opus-5"
 
     def test_claude_sonnet_shorthand(self):
-        assert resolve_model("claude-sonnet") == "claude-sonnet-4-6"
-        assert resolve_model("sonnet") == "claude-sonnet-4-6"
+        assert resolve_model("claude-sonnet") == "claude-sonnet-5"
+        assert resolve_model("sonnet") == "claude-sonnet-5"
 
     def test_claude_haiku_shorthand(self):
         assert resolve_model("claude-haiku") == "claude-haiku-4-5"
@@ -68,15 +68,15 @@ class TestModelResolution:
 
     def test_shorthand_with_context_suffix_preserved(self):
         result = resolve_model("claude[1m]")
-        assert result == "claude-opus-4-8[1m]"
+        assert result == "claude-opus-5[1m]"
 
     def test_explicit_with_context_suffix_preserved(self):
         result = resolve_model("gpt-5.4-mini[200k]")
         assert result == "gpt-5.4-mini[200k]"
 
     def test_resolution_does_not_add_default_context_suffix(self):
-        assert resolve_model("gpt") == "gpt-5.5"
-        assert resolve_model("claude") == "claude-opus-4-8"
+        assert resolve_model("gpt") == "gpt-5.6-sol"
+        assert resolve_model("claude") == "claude-opus-5"
 
 
 class TestModelContextBoundary:
@@ -85,13 +85,13 @@ class TestModelContextBoundary:
         assert split_context_suffix("gpt-5.4-mini[200k]") == ("gpt-5.4-mini", 200_000)
 
     def test_claude_code_boundary_adds_resolved_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt") == "gpt-5.5[400k]"
-        assert normalize_model_for_claude_code("claude") == "claude-opus-4-8[1m]"
+        assert normalize_model_for_claude_code("gpt") == "gpt-5.6-sol[400k]"
+        assert normalize_model_for_claude_code("claude") == "claude-opus-5[1m]"
         assert normalize_model_for_claude_code("haiku") == "claude-haiku-4-5[200k]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
 
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.5[200k]"
+        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.6-sol[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
     def test_local_provider_boundary_preserves_canonical_model_id(self):
@@ -154,7 +154,7 @@ class TestContextSuffixParsing:
 
     def test_claude_alias_uses_default_obs_context_window(self):
         clean, tokens = parse_context_suffix("claude")
-        assert clean == "claude-opus-4-8"
+        assert clean == "claude-opus-5"
         assert tokens == 1_000_000
 
     def test_uppercase_suffix(self):
@@ -231,7 +231,7 @@ class TestIsClaudeModel:
         assert is_claude_model("claude") is True
 
     def test_gpt_is_not_claude(self):
-        assert is_claude_model("gpt-5.5") is False
+        assert is_claude_model("gpt-5.6-sol") is False
 
     def test_gemini_is_not_claude(self):
         assert is_claude_model("gemini-3.1-flash-lite-preview") is False
