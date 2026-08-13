@@ -298,6 +298,17 @@ class SessionManager:
             **_DEFAULT_SDK_ENV,
             **self._sdk_env_overrides,
         }
+        if resolved_model.model.lower().startswith("local-"):
+            local_base_url = os.environ.get("OBS_LOCAL_LLM_BASE_URL", "").strip()
+            local_auth_token = os.environ.get("OBS_LOCAL_LLM_AUTH_TOKEN", "").strip()
+            local_api_key = os.environ.get("OBS_LOCAL_LLM_API_KEY", "").strip()
+            if local_base_url and "ANTHROPIC_BASE_URL" not in effective_env:
+                effective_env["ANTHROPIC_BASE_URL"] = local_base_url
+            if not any(key in effective_env for key in _ANTHROPIC_AUTH_ENV_KEYS):
+                if local_auth_token:
+                    effective_env["ANTHROPIC_AUTH_TOKEN"] = local_auth_token
+                elif local_api_key:
+                    effective_env["ANTHROPIC_API_KEY"] = local_api_key
         self.hook_state.sdk_env_overrides = dict(self._sdk_env_overrides)
         self.hook_state.vault_path = self.config.vault_path
 
@@ -310,22 +321,21 @@ class SessionManager:
         effective_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
         effective_env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
         # For non-Claude models, set the API key to the CLI proxy key by
-        # default. Explicit per-session API/auth values take precedence so an
-        # AgentTask can authenticate directly to a local provider.
+        # default. Explicit per-session credentials and the local-provider
+        # process profile take precedence.
         if is_claude_model(effective_model):
             for key in _ANTHROPIC_AUTH_ENV_KEYS:
                 effective_env.pop(key, None)
-        elif not any(key in self._sdk_env_overrides for key in _ANTHROPIC_AUTH_ENV_KEYS):
+        elif not any(key in effective_env for key in _ANTHROPIC_AUTH_ENV_KEYS):
             effective_env["ANTHROPIC_API_KEY"] = self.config.cli_proxy_api_key
 
         # Route CC API traffic through the cache-normalizing proxy by default.
-        # An explicit per-session base URL (for example, AgentTask env targeting
-        # a local inference server) takes precedence so one child can select its
-        # provider without changing or restarting the parent daemon.
+        # Explicit per-session and local-provider profile URLs take precedence
+        # so one child can select its provider without changing the parent.
         from obs_agent.cache_proxy_lifecycle import should_use_proxy
         if (
             should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled)
-            and "ANTHROPIC_BASE_URL" not in self._sdk_env_overrides
+            and "ANTHROPIC_BASE_URL" not in effective_env
         ):
             effective_env["ANTHROPIC_BASE_URL"] = (
                 f"http://127.0.0.1:{self.config.cache_proxy_port}"

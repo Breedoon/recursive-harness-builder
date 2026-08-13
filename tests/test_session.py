@@ -309,6 +309,45 @@ class TestCreateOptions:
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "32000"
         assert mgr.hook_state.effective_model == "local-qwen3.5-27b[32k]"
 
+    def test_local_provider_uses_process_profile_without_child_secret(
+        self,
+        config,
+        monkeypatch,
+    ):
+        config.cache_proxy_enabled = True
+        config.cache_proxy_port = 18923
+        monkeypatch.setenv("OBS_LOCAL_LLM_BASE_URL", "http://local-llm:8080")
+        monkeypatch.setenv("OBS_LOCAL_LLM_AUTH_TOKEN", "local-profile-token")
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-gemma4-31b"
+
+        options = mgr.create_options()
+
+        assert options.model == "local-gemma4-31b"
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-profile-token"
+        assert "ANTHROPIC_API_KEY" not in options.env
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "32000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "32000"
+
+    def test_child_local_provider_env_overrides_process_profile(self, config, monkeypatch):
+        monkeypatch.setenv("OBS_LOCAL_LLM_BASE_URL", "http://profile-llm:8080")
+        monkeypatch.setenv("OBS_LOCAL_LLM_AUTH_TOKEN", "profile-token")
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-gemma4-31b"
+        mgr.set_sdk_env_overrides(
+            {
+                "ANTHROPIC_BASE_URL": "http://child-llm:8080",
+                "ANTHROPIC_API_KEY": "child-key",
+            }
+        )
+
+        options = mgr.create_options()
+
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://child-llm:8080"
+        assert options.env["ANTHROPIC_API_KEY"] == "child-key"
+        assert "ANTHROPIC_AUTH_TOKEN" not in options.env
+
     def test_cache_proxy_remains_default_without_session_base_url(self, config):
         config.cache_proxy_enabled = True
         config.cache_proxy_port = 18923

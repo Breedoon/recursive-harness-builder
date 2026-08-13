@@ -615,6 +615,8 @@ class TestAgentTaskTools:
         assert "local-qwen3.5-27b" in model_description
         assert "compact project context" in model_description
         assert "32K" in model_description
+        assert "OBS_LOCAL_LLM_BASE_URL" in model_description
+        assert "without putting credentials in the AgentTask request" in model_description
         assert "cache proxy is enabled" in env_description
         assert "without restarting" in env_description
 
