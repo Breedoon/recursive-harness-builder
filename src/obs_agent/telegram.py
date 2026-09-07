@@ -705,6 +705,7 @@ class TelegramBot:
             0.01,
         )
         self._background_task: asyncio.Task | None = None
+        self._schedule_poller_task: asyncio.Task | None = None
         self._transport_queue: asyncio.PriorityQueue[_TransportEnvelope] = asyncio.PriorityQueue()
         self._transport_sequence = 0
         self._transport_worker_task: asyncio.Task | None = None
@@ -4097,14 +4098,14 @@ class TelegramBot:
 
     def _record_status_for_notification(self, record: _ForkTaskRecord) -> str:
         if record.status == "completed":
-            return "completed"
+            return "idle"
         if record.status == "stopped":
             return "stopped"
         return "failed"
 
     def _record_status_label(self, record: _ForkTaskRecord) -> str:
         if record.status == "completed":
-            return "completed"
+            return "went idle"
         if record.status == "stopped":
             return "stopped"
         if record.status == "failed" and record.error == "timed out":
@@ -4313,9 +4314,10 @@ class TelegramBot:
             self._primary_bot = bot
         if not self._enable_background_poller:
             return
-        if self._background_task is not None and not self._background_task.done():
-            return
-        self._background_task = asyncio.create_task(self._background_poller_loop())
+        if self._background_task is None or self._background_task.done():
+            self._background_task = asyncio.create_task(self._background_poller_loop())
+        if self._schedule_poller_task is None or self._schedule_poller_task.done():
+            self._schedule_poller_task = asyncio.create_task(self._schedule_poller_loop())
 
     async def shutdown(self) -> None:
         """Stop background tasks owned by this adapter."""
@@ -4323,6 +4325,12 @@ class TelegramBot:
             self._background_task.cancel()
             try:
                 await self._background_task
+            except asyncio.CancelledError:
+                pass
+        if self._schedule_poller_task is not None and not self._schedule_poller_task.done():
+            self._schedule_poller_task.cancel()
+            try:
+                await self._schedule_poller_task
             except asyncio.CancelledError:
                 pass
         if self._transport_worker_task is not None and not self._transport_worker_task.done():
@@ -5185,7 +5193,27 @@ class TelegramBot:
             )
         except Exception:
             logger.debug("Failed to send attachment receipt marker", exc_info=True)
-        normalized = await self._normalizer.normalize_update(update)
+
+        async def report_transcription_progress(text: str) -> None:
+            try:
+                status_id = await self._send_system_message(
+                    chat_id=route.chat_id,
+                    text=text,
+                    route=route,
+                )
+            except Exception:
+                logger.debug("Failed to send transcription progress", exc_info=True)
+                return
+            if isinstance(status_id, int):
+                receipt_message_ids.append(status_id)
+
+        if message.voice is not None:
+            normalized = await self._normalizer.normalize_update(
+                update,
+                transcription_progress=report_transcription_progress,
+            )
+        else:
+            normalized = await self._normalizer.normalize_update(update)
         if not normalized.agent_text.strip():
             logger.info("Skipping empty normalized Telegram message id=%s", message.message_id)
             return
@@ -7281,13 +7309,23 @@ class TelegramBot:
             user_warnings=normalized.user_warnings,
         )
 
-    async def _background_poller_loop(self) -> None:
-        """Poll for queued background messages and auto-deliver when idle."""
+    async def _schedule_poller_loop(self) -> None:
+        """Poll topic schedules independently of inbox and queue delivery."""
         while True:
             try:
                 await asyncio.sleep(self._background_poll_seconds)
                 await self._process_stop_schedule_events()
                 await self._run_due_interval_schedules()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Schedule poller iteration failed")
+
+    async def _background_poller_loop(self) -> None:
+        """Poll for queued background messages and auto-deliver when idle."""
+        while True:
+            try:
+                await asyncio.sleep(self._background_poll_seconds)
                 await self._poll_team_worker_inbox_wakes()
                 for state in list(self._states_by_route.values()):
                     bot = self._bot_for_state(state)
@@ -9411,7 +9449,7 @@ class TelegramBot:
             if child_anchor_link:
                 parent_marker = (
                     f'{task_prefix} {html.escape(self._record_status_label(record))}: '
-                    f'<a href="{html.escape(child_anchor_link)}">open child completion</a>'
+                    f'<a href="{html.escape(child_anchor_link)}">open child idle notice</a>'
                 )
             try:
                 marker_messages = await self._send_system_html_message(

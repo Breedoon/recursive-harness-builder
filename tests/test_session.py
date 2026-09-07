@@ -267,6 +267,70 @@ class TestCreateOptions:
         assert options.env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert options.env["CLAUDE_CODE_TASK_LIST_ID"] == "team-alpha"
 
+    def test_local_provider_no_auth_does_not_inherit_cli_proxy_key(
+        self,
+        config,
+        monkeypatch,
+    ):
+        config.cache_proxy_enabled = True
+        monkeypatch.setenv("OBS_LOCAL_LLM_BASE_URL", "http://local-llm:8080")
+        monkeypatch.delenv("OBS_LOCAL_LLM_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("OBS_LOCAL_LLM_API_KEY", raising=False)
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-custom[96k]"
+
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
+            options = mgr.create_options()
+
+        assert options.model == "local-custom"
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        assert "ANTHROPIC_AUTH_TOKEN" not in options.env
+        assert "ANTHROPIC_API_KEY" not in options.env
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "96000"
+
+    def test_local_provider_uses_process_profile_without_child_secret(
+        self,
+        config,
+        monkeypatch,
+    ):
+        config.cache_proxy_enabled = True
+        monkeypatch.setenv("OBS_LOCAL_LLM_BASE_URL", "http://local-llm:8080")
+        monkeypatch.setenv("OBS_LOCAL_LLM_AUTH_TOKEN", "local-profile-token")
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-gemma4-31b"
+
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
+            options = mgr.create_options()
+
+        assert options.model == "local-gemma4-31b"
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-profile-token"
+        assert "ANTHROPIC_API_KEY" not in options.env
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "48000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "48000"
+        assert mgr.hook_state.effective_model == "local-gemma4-31b[48k]"
+
+    def test_child_local_provider_env_overrides_process_profile(self, config, monkeypatch):
+        monkeypatch.setenv("OBS_LOCAL_LLM_BASE_URL", "http://profile-llm:8080")
+        monkeypatch.setenv("OBS_LOCAL_LLM_AUTH_TOKEN", "profile-token")
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-custom[96k]"
+        mgr.set_sdk_env_overrides(
+            {
+                "ANTHROPIC_BASE_URL": "http://child-llm:8080",
+                "ANTHROPIC_API_KEY": "child-key",
+            }
+        )
+
+        options = mgr.create_options()
+
+        assert options.model == "local-custom"
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://child-llm:8080"
+        assert options.env["ANTHROPIC_API_KEY"] == "child-key"
+        assert "ANTHROPIC_AUTH_TOKEN" not in options.env
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "96000"
+        assert mgr.hook_state.effective_model == "local-custom[96k]"
+
     def test_exposes_sdk_env_overrides_to_hook_state(self, config):
         state = HookState()
         mgr = SessionManager(config=config, hook_state=state)

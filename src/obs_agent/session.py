@@ -54,6 +54,9 @@ _DEFAULT_SDK_ENV: dict[str, str] = {
     # Git commands (status, commit, log) via Bash still work normally.
     # See Drafts/2026-04/cache-analysis/ and CC utils/gitSettings.ts:13-18.
     "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
+    # Disable tool search discovery. Uses eager loading of available tools instead.
+    # Avoids the nested tool_reference representation bug and reduces startup overhead.
+    "ENABLE_TOOL_SEARCH": "false",
     # NOTE: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC was here until 2026-04-04.
     # Removed because it disables GrowthBook, which gates 1h prompt cache TTL.
     # See Drafts/2026-04/cache-analysis/query-source-investigation.md
@@ -280,8 +283,7 @@ class SessionManager:
         from obs_agent.config import (
             auto_compact_window_for_model,
             is_claude_model,
-            normalize_model_for_claude_code,
-            parse_context_suffix,
+            resolve_model_context,
         )
 
         hook_matchers = create_hook_matchers(self.config, self.hook_state, user_hooks=self.user_hooks)
@@ -290,17 +292,29 @@ class SessionManager:
         # for background fork result delivery
         tool_server = create_obs_tools(self.config, lambda: self._session_id, hook_state=self.hook_state)
 
-        effective_model = normalize_model_for_claude_code(self.effective_model)
-        self.hook_state.effective_model = effective_model
+        resolved_model = resolve_model_context(self.effective_model)
+        effective_model = resolved_model.model_for_claude_code
+        ctx_tokens = resolved_model.context_tokens
+        self.hook_state.effective_model = resolved_model.model_with_context
 
         effective_env = {
             **_DEFAULT_SDK_ENV,
             **self._sdk_env_overrides,
         }
+        if resolved_model.model.lower().startswith("local-"):
+            local_base_url = os.environ.get("OBS_LOCAL_LLM_BASE_URL", "").strip()
+            local_auth_token = os.environ.get("OBS_LOCAL_LLM_AUTH_TOKEN", "").strip()
+            local_api_key = os.environ.get("OBS_LOCAL_LLM_API_KEY", "").strip()
+            if local_base_url and "ANTHROPIC_BASE_URL" not in effective_env:
+                effective_env["ANTHROPIC_BASE_URL"] = local_base_url
+            if not any(key in effective_env for key in _ANTHROPIC_AUTH_ENV_KEYS):
+                if local_auth_token:
+                    effective_env["ANTHROPIC_AUTH_TOKEN"] = local_auth_token
+                elif local_api_key:
+                    effective_env["ANTHROPIC_API_KEY"] = local_api_key
         self.hook_state.sdk_env_overrides = dict(self._sdk_env_overrides)
         self.hook_state.vault_path = self.config.vault_path
 
-        _clean_model, ctx_tokens = parse_context_suffix(effective_model)
         auto_compact_window = auto_compact_window_for_model(
             effective_model,
             ctx_tokens,
@@ -309,19 +323,26 @@ class SessionManager:
         effective_env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = str(ctx_tokens)
         effective_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
         effective_env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
-        # For non-Claude models, set the API key to the CLI proxy key so CC
-        # authenticates against CLIProxyAPI (the cache proxy forwards it).
+        # For non-Claude models, set the API key to the CLI proxy key by
+        # default. Explicit per-session credentials and the local-provider
+        # process profile take precedence.
         if is_claude_model(effective_model):
             for key in _ANTHROPIC_AUTH_ENV_KEYS:
                 effective_env.pop(key, None)
-        else:
+        elif (
+            not resolved_model.model.lower().startswith("local-")
+            and not any(key in effective_env for key in _ANTHROPIC_AUTH_ENV_KEYS)
+        ):
             effective_env["ANTHROPIC_API_KEY"] = self.config.cli_proxy_api_key
 
-        # Route CC API traffic through the cache-normalizing proxy when enabled.
-        # Forks inherit env from the parent CC process, so this propagates
-        # automatically to all fork chains without explicit fork handling.
+        # Route CC API traffic through the cache-normalizing proxy by default.
+        # Explicit per-session and local-provider profile URLs take precedence
+        # so one child can select its provider without changing the parent.
         from obs_agent.cache_proxy_lifecycle import should_use_proxy
-        if should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled):
+        if (
+            should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled)
+            and "ANTHROPIC_BASE_URL" not in effective_env
+        ):
             effective_env["ANTHROPIC_BASE_URL"] = (
                 f"http://127.0.0.1:{self.config.cache_proxy_port}"
             )

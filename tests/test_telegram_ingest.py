@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -150,7 +151,9 @@ class TestTelegramInboundNormalizer:
             effective_attachment=voice,
         )
 
-        async def _fake_transcribe(*, audio_file: Path, title: str, dest_dir: Path) -> None:
+        async def _fake_transcribe(
+            *, audio_file: Path, title: str, dest_dir: Path, correlation_id: str
+        ) -> None:
             (dest_dir / f"{title}.md").write_text("this is the transcript")
 
         monkeypatch.setattr(normalizer, "_run_transcription", _fake_transcribe)
@@ -159,8 +162,149 @@ class TestTelegramInboundNormalizer:
 
         assert "Telegram voice message received." in normalized.agent_text
         assert "Transcript path:" in normalized.agent_text
+        assert "Transcription correlation ID:" in normalized.agent_text
+        assert normalized.attachments[0].transcription_correlation_id
         assert "this is the transcript" in normalized.agent_text
         assert normalized.user_warnings == []
+
+    async def test_voice_transcription_reports_immediate_gpu_waiting(
+        self, tmp_path: Path
+    ) -> None:
+        script = tmp_path / "transcribe.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "correlation_id = os.environ['OBS_TRANSCRIPTION_CORRELATION_ID']\n"
+            "Path(sys.argv[3], f'{sys.argv[2]}.md').write_text(\n"
+            "    'transcription_status: \\\"ok\\\"\\n'\n"
+            "    f'correlation_id: \\\"{correlation_id}\\\"\\n'\n"
+            "    'device: \\\"cuda\\\"\\n'\n"
+            "    'compute_type: \\\"float16\\\"\\n'\n"
+            "    '# Transcript\\n\\nhello world\\n',\n"
+            "    encoding='utf-8',\n"
+            ")\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+        normalizer = TelegramInboundNormalizer(
+            temp_root=tmp_path / "obs-agent-progress",
+            transcription_script=script,
+        )
+        normalizer.initialize()
+        voice = _FakeAttachment(
+            file_path="voice/progress.ogg",
+            payload=b"voice-bytes",
+            file_unique_id="voice-progress",
+            mime_type="audio/ogg",
+        )
+        message = _make_message(
+            message_id=121,
+            voice=voice,
+            effective_attachment=voice,
+        )
+        progress: list[str] = []
+
+        async def _report(text: str) -> None:
+            progress.append(text)
+
+        normalized = await normalizer.normalize_update(
+            _make_update(message),
+            transcription_progress=_report,
+        )
+
+        assert progress == ["waiting for GPU"]
+        assert normalized.user_warnings == []
+        assert "Transcription correlation ID:" in normalized.agent_text
+        assert "hello world" in normalized.agent_text
+
+    async def test_second_voice_is_rejected_before_transcription_subprocess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        script = tmp_path / "transcribe.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "import sys\n"
+            "import time\n"
+            "from pathlib import Path\n"
+            "time.sleep(0.3)\n"
+            "correlation_id = os.environ['OBS_TRANSCRIPTION_CORRELATION_ID']\n"
+            "Path(sys.argv[3], f'{sys.argv[2]}.md').write_text(\n"
+            "    'transcription_status: \\\"ok\\\"\\n'\n"
+            "    f'correlation_id: \\\"{correlation_id}\\\"\\n'\n"
+            "    'device: \\\"cuda\\\"\\n'\n"
+            "    'compute_type: \\\"float16\\\"\\n'\n"
+            "    '# Transcript\\n\\nhello world\\n',\n"
+            "    encoding='utf-8',\n"
+            ")\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+        monkeypatch.setenv(
+            "OBS_TRANSCRIPTION_NORMALIZER_SLOT_LOCK",
+            str(tmp_path / "normalizer-slot.lock"),
+        )
+        normalizer = TelegramInboundNormalizer(
+            temp_root=tmp_path / "obs-agent-single-slot",
+            transcription_script=script,
+        )
+        normalizer.initialize()
+        first_voice = _FakeAttachment(
+            file_path="voice/first.ogg",
+            payload=b"first",
+            file_unique_id="voice-first",
+            mime_type="audio/ogg",
+        )
+        second_voice = _FakeAttachment(
+            file_path="voice/second.ogg",
+            payload=b"second",
+            file_unique_id="voice-second",
+            mime_type="audio/ogg",
+        )
+        first_message = _make_message(
+            message_id=122,
+            voice=first_voice,
+            effective_attachment=first_voice,
+        )
+        second_message = _make_message(
+            message_id=123,
+            voice=second_voice,
+            effective_attachment=second_voice,
+        )
+        first_waiting = asyncio.Event()
+        first_progress: list[str] = []
+        second_progress: list[str] = []
+
+        async def _first_report(text: str) -> None:
+            first_progress.append(text)
+            if text == "waiting for GPU":
+                first_waiting.set()
+
+        async def _second_report(text: str) -> None:
+            second_progress.append(text)
+
+        first_task = asyncio.create_task(
+            normalizer.normalize_update(
+                _make_update(first_message),
+                transcription_progress=_first_report,
+            )
+        )
+        await asyncio.wait_for(first_waiting.wait(), timeout=1.0)
+        second = await normalizer.normalize_update(
+            _make_update(second_message),
+            transcription_progress=_second_report,
+        )
+        first = await first_task
+
+        assert first.user_warnings == []
+        assert first_progress == ["waiting for GPU"]
+        assert second_progress == ["GPU transcription busy; retry later"]
+        assert second.user_warnings == ["GPU transcription busy; retry later"]
+        assert "GPU transcription busy; retry later" in second.agent_text
+        assert second.attachments[0].transcript_path is not None
+        assert not second.attachments[0].transcript_path.exists()
 
     async def test_voice_transcription_failure_sets_warning(
         self, normalizer: TelegramInboundNormalizer, monkeypatch: pytest.MonkeyPatch
@@ -177,7 +321,9 @@ class TestTelegramInboundNormalizer:
             effective_attachment=voice,
         )
 
-        async def _boom(*, audio_file: Path, title: str, dest_dir: Path) -> None:
+        async def _boom(
+            *, audio_file: Path, title: str, dest_dir: Path, correlation_id: str
+        ) -> None:
             raise RuntimeError("decoder exploded")
 
         monkeypatch.setattr(normalizer, "_run_transcription", _boom)
@@ -185,9 +331,9 @@ class TestTelegramInboundNormalizer:
         normalized = await normalizer.normalize_update(_make_update(message))
 
         assert normalized.user_warnings == [
-            "voice transcription failed; the original file path was still sent to the agent"
+            "voice transcription failed retryably; resend the voice note later if needed"
         ]
-        assert "Automatic transcription failed." in normalized.agent_text
+        assert "Automatic transcription failed retryably." in normalized.agent_text
         assert "decoder exploded" in normalized.agent_text
 
     async def test_download_failure_surfaces_system_note_and_warning(

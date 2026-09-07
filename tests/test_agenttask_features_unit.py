@@ -18,6 +18,7 @@ from obs_agent.config import (
     normalize_model_for_claude_code,
     parse_context_suffix,
     resolve_model,
+    resolve_model_context,
     split_context_suffix,
 )
 
@@ -38,8 +39,8 @@ class TestModelResolution:
         assert resolve_model("sonnet") == "claude-sonnet-5"
 
     def test_claude_fable_shorthand(self):
-        assert resolve_model("claude-fable") == "claude-fable-5"
-        assert resolve_model("fable") == "claude-fable-5"
+        assert resolve_model("claude-fable") == "claude-fable-5-1"
+        assert resolve_model("fable") == "claude-fable-5-1"
 
     def test_claude_haiku_shorthand(self):
         assert resolve_model("claude-haiku") == "claude-haiku-4-5"
@@ -102,6 +103,32 @@ class TestModelContextBoundary:
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):
         assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.6-sol[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
+
+    def test_local_provider_boundary_preserves_canonical_model_id(self):
+        assert normalize_model_for_claude_code("local-gemma4-31b") == "local-gemma4-31b"
+        assert normalize_model_for_claude_code("local-qwen3.8-27b[128k]") == "local-qwen3.8-27b"
+        assert normalize_model_for_claude_code("local-qwen") == "local-qwen3.8-27b"
+        assert normalize_model_for_claude_code("local-custom[96k]") == "local-custom"
+        assert parse_context_suffix("local-gemma4-31b") == ("local-gemma4-31b", 48_000)
+        assert parse_context_suffix("local-qwen") == ("local-qwen3.8-27b", 200_000)
+        assert parse_context_suffix("local-qwen[128k]") == ("local-qwen3.8-27b", 128_000)
+        assert parse_context_suffix("local-custom[96k]") == ("local-custom", 96_000)
+
+    @pytest.mark.parametrize("model", ["local-qwen", "local-qwen3.8-27b"])
+    def test_local_qwen_default_context_matches_native_200k_window(self, model):
+        resolved = resolve_model_context(model)
+        assert resolved.context_tokens == 200_000
+        assert resolved.context_tokens <= 262_144
+        assert not resolved.explicit_context
+        assert resolved.model_with_context == "local-qwen3.8-27b[200k]"
+        assert resolved.model_for_claude_code == "local-qwen3.8-27b"
+        assert parse_context_suffix(resolved.model_with_context) == (
+            "local-qwen3.8-27b", 200_000
+        )
+        assert auto_compact_window_for_model(
+            resolved.model, resolved.context_tokens
+        ) == 200_000
+        assert compaction_threshold(resolved.context_tokens) == 167_000
 
     def test_auto_compact_window_tracks_context_by_default(self):
         assert auto_compact_window_for_context(1_000_000) == 1_000_000

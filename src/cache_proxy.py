@@ -58,8 +58,24 @@ CLAUDEMD_MARKER = "As you answer the user's questions, you can use the following
 
 SAVE_BODIES = os.environ.get("CACHE_PROXY_SAVE_BODIES", "").lower() in ("1", "true")
 
-# Fixed billing header to replace the per-process/per-turn one
-FIXED_BILLING_HEADER = "x-anthropic-billing-header: cc_version=0; cc_entrypoint=sdk-py; cch=0;"
+# Fixed billing header to replace the per-process/per-turn one.
+#
+# cc_version here is the ONLY place the Anthropic API learns our Claude Code
+# version: it travels in the request body (system[0]), not in any HTTP header
+# (the User-Agent version is ignored for this check). Newer models gate on it
+# and reject old clients with claude_code_version_too_old. We previously sent
+# cc_version=0, which is treated as ancient and fails that gate. Pin a value
+# at/above the newest model's floor so gated models work without upgrading the
+# bundled CLI. Must stay a constant (not the real per-process value) to keep
+# the cached prefix stable.
+#
+# Format matters: the value must keep the 4-segment "major.minor.patch.build"
+# shape the client normally sends (e.g. 2.1.59.a37). A bare "2.1.251" is
+# REJECTED — verified by live test — so the build suffix must be retained.
+CC_VERSION = os.environ.get("CACHE_PROXY_CC_VERSION", "2.1.251.a37")
+FIXED_BILLING_HEADER = (
+    f"x-anthropic-billing-header: cc_version={CC_VERSION}; cc_entrypoint=sdk-py; cch=0;"
+)
 
 # Running stats
 stats = {

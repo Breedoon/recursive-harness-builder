@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import mimetypes
+import os
 import re
 import shutil
+import signal
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,6 +21,18 @@ if TYPE_CHECKING:
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._ -]+")
+_GPU_TRANSCRIPTION_BUSY = "GPU transcription busy; retry later"
+_GPU_TRANSCRIPTION_UNSUPPORTED = (
+    "GPU voice transcription supports notes up to 180 seconds during initial rollout; "
+    "retry with a shorter note"
+)
+_GPU_TRANSCRIPTION_WAIT_EXPIRED = "GPU transcription wait expired; retry later"
+_SAFE_TRANSCRIPTION_TERMINALS = (
+    _GPU_TRANSCRIPTION_BUSY,
+    _GPU_TRANSCRIPTION_UNSUPPORTED,
+    _GPU_TRANSCRIPTION_WAIT_EXPIRED,
+)
+TranscriptionProgress = Callable[[str], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -30,6 +46,7 @@ class DownloadedAttachment:
     transcript_path: Path | None = None
     transcript_text: str | None = None
     transcription_error: str | None = None
+    transcription_correlation_id: str | None = None
     message_id: int | None = None
     media_group_id: str | None = None
     unsupported_detail: str | None = None
@@ -75,21 +92,42 @@ class TelegramInboundNormalizer:
         self._boot_root.mkdir(parents=True, exist_ok=True)
         self._initialized = True
 
-    async def normalize_update(self, update: Update) -> NormalizedInbound:
+    async def normalize_update(
+        self,
+        update: Update,
+        *,
+        transcription_progress: TranscriptionProgress | None = None,
+    ) -> NormalizedInbound:
         """Normalize a single Telegram update."""
         message = update.effective_message
         if message is None:
             return NormalizedInbound(agent_text="")
-        return await self._normalize_messages([message])
+        return await self._normalize_messages(
+            [message],
+            transcription_progress=transcription_progress,
+        )
 
-    async def normalize_media_group(self, updates: list[Update]) -> NormalizedInbound:
+    async def normalize_media_group(
+        self,
+        updates: list[Update],
+        *,
+        transcription_progress: TranscriptionProgress | None = None,
+    ) -> NormalizedInbound:
         """Normalize a media-group album into one logical agent input."""
         messages = [update.effective_message for update in updates if update.effective_message is not None]
         if not messages:
             return NormalizedInbound(agent_text="")
-        return await self._normalize_messages(messages)
+        return await self._normalize_messages(
+            messages,
+            transcription_progress=transcription_progress,
+        )
 
-    async def _normalize_messages(self, messages: list[Message]) -> NormalizedInbound:
+    async def _normalize_messages(
+        self,
+        messages: list[Message],
+        *,
+        transcription_progress: TranscriptionProgress | None,
+    ) -> NormalizedInbound:
         self._ensure_initialized()
         first = messages[0]
         scope_id = str(first.media_group_id or first.message_id)
@@ -120,6 +158,7 @@ class TelegramInboundNormalizer:
                     spec,
                     message=message,
                     dest_dir=message_dir,
+                    transcription_progress=transcription_progress,
                 )
                 attachments.append(downloaded)
                 if downloaded.download_error:
@@ -127,8 +166,17 @@ class TelegramInboundNormalizer:
                         "attachment download failed inside Telegram; the agent received a system note with the error"
                     )
                 if downloaded.transcription_error:
+                    terminal_warning = next(
+                        (
+                            terminal
+                            for terminal in _SAFE_TRANSCRIPTION_TERMINALS
+                            if terminal in downloaded.transcription_error
+                        ),
+                        None,
+                    )
                     user_warnings.append(
-                        "voice transcription failed; the original file path was still sent to the agent"
+                        terminal_warning
+                        or "voice transcription failed retryably; resend the voice note later if needed"
                     )
 
         agent_parts: list[str] = []
@@ -294,6 +342,7 @@ class TelegramInboundNormalizer:
         *,
         message: Message,
         dest_dir: Path,
+        transcription_progress: TranscriptionProgress | None,
     ) -> DownloadedAttachment:
         try:
             telegram_file = await spec.source.get_file()
@@ -326,12 +375,17 @@ class TelegramInboundNormalizer:
 
         transcript_path = stored_path.with_suffix(".md")
         title = transcript_path.stem
+        correlation_id = uuid.uuid4().hex
         try:
-            await self._run_transcription(
-                audio_file=stored_path,
-                title=title,
-                dest_dir=dest_dir,
-            )
+            transcription_kwargs: dict[str, Any] = {
+                "audio_file": stored_path,
+                "title": title,
+                "dest_dir": dest_dir,
+                "correlation_id": correlation_id,
+            }
+            if transcription_progress is not None:
+                transcription_kwargs["transcription_progress"] = transcription_progress
+            await self._run_transcription(**transcription_kwargs)
             transcript_text = transcript_path.read_text(encoding="utf-8", errors="replace").strip()
             return DownloadedAttachment(
                 kind=downloaded.kind,
@@ -341,6 +395,7 @@ class TelegramInboundNormalizer:
                 size_bytes=downloaded.size_bytes,
                 transcript_path=transcript_path,
                 transcript_text=transcript_text,
+                transcription_correlation_id=correlation_id,
                 message_id=downloaded.message_id,
                 media_group_id=downloaded.media_group_id,
             )
@@ -354,6 +409,7 @@ class TelegramInboundNormalizer:
                 size_bytes=downloaded.size_bytes,
                 transcript_path=transcript_path,
                 transcription_error=detail,
+                transcription_correlation_id=correlation_id,
                 message_id=downloaded.message_id,
                 media_group_id=downloaded.media_group_id,
             )
@@ -369,24 +425,151 @@ class TelegramInboundNormalizer:
         await telegram_file.download_to_drive(custom_path=stored_path)
         return stored_path
 
-    async def _run_transcription(self, *, audio_file: Path, title: str, dest_dir: Path) -> None:
+    async def _run_transcription(
+        self,
+        *,
+        audio_file: Path,
+        title: str,
+        dest_dir: Path,
+        correlation_id: str,
+        transcription_progress: TranscriptionProgress | None = None,
+    ) -> None:
         if not self._transcription_script.is_file():
             raise FileNotFoundError(
                 f"transcription script not found: {self._transcription_script}"
             )
-        proc = await asyncio.create_subprocess_exec(
-            str(self._transcription_script),
-            str(audio_file),
-            title,
-            str(dest_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+
+        transcript_path = dest_dir / f"{title}.md"
+        if transcript_path.exists() or transcript_path.is_symlink():
+            transcript_path.unlink()
+
+        async def report_progress(text: str) -> None:
+            if transcription_progress is None:
+                return
+            try:
+                await asyncio.wait_for(transcription_progress(text), timeout=10.0)
+            except Exception:
+                return
+
+        slot_path = Path(
+            os.environ.get(
+                "OBS_TRANSCRIPTION_NORMALIZER_SLOT_LOCK",
+                "/workspace/runtime/transcription/run/normalizer-gpu-slot.lock",
+            )
         )
-        stdout, _ = await proc.communicate()
-        if proc.returncode != 0:
-            output = (stdout or b"").decode("utf-8", errors="replace")
-            detail = _normalize_whitespace(output) or f"exit code {proc.returncode}"
-            raise RuntimeError(detail)
+        slot_path.parent.mkdir(parents=True, exist_ok=True)
+        slot = slot_path.open("a+")
+        try:
+            try:
+                fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                await report_progress(_GPU_TRANSCRIPTION_BUSY)
+                raise RuntimeError(_GPU_TRANSCRIPTION_BUSY) from exc
+
+            await report_progress("waiting for GPU")
+            child_env = {**os.environ, "OBS_TRANSCRIPTION_CORRELATION_ID": correlation_id}
+            proc = await asyncio.create_subprocess_exec(
+                str(self._transcription_script),
+                str(audio_file),
+                title,
+                str(dest_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+                env=child_env,
+            )
+            communicate_task = asyncio.create_task(proc.communicate())
+
+            async def progress_loop() -> None:
+                while True:
+                    await asyncio.sleep(30.0)
+                    await report_progress("still waiting for GPU or transcribing")
+
+            progress_task = (
+                asyncio.create_task(progress_loop())
+                if transcription_progress is not None
+                else None
+            )
+
+            async def stop_progress() -> None:
+                if progress_task is None:
+                    return
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+
+            async def terminate_group() -> None:
+                if proc.returncode is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                    except TimeoutError:
+                        if proc.returncode is None:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        await asyncio.wait_for(proc.wait(), timeout=3.0)
+                if not communicate_task.done():
+                    communicate_task.cancel()
+                    try:
+                        await communicate_task
+                    except asyncio.CancelledError:
+                        pass
+
+            try:
+                try:
+                    stdout, _ = await asyncio.wait_for(
+                        asyncio.shield(communicate_task),
+                        timeout=5700.0,
+                    )
+                except TimeoutError as exc:
+                    await terminate_group()
+                    transcript_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        "GPU voice transcription exceeded its 5700-second outer bound; retry later"
+                    ) from exc
+                except BaseException:
+                    await terminate_group()
+                    transcript_path.unlink(missing_ok=True)
+                    raise
+            finally:
+                await stop_progress()
+
+            if proc.returncode != 0:
+                transcript_path.unlink(missing_ok=True)
+                output = (stdout or b"").decode("utf-8", errors="replace")
+                detail = _normalize_whitespace(output) or f"exit code {proc.returncode}"
+                for terminal in _SAFE_TRANSCRIPTION_TERMINALS:
+                    if terminal in detail:
+                        await report_progress(terminal)
+                        break
+                raise RuntimeError(detail)
+            if transcript_path.is_symlink() or not transcript_path.is_file():
+                transcript_path.unlink(missing_ok=True)
+                raise RuntimeError("transcription exited successfully without a regular transcript")
+
+            transcript = transcript_path.read_text(encoding="utf-8", errors="strict")
+            required = (
+                'transcription_status: "ok"',
+                f'correlation_id: "{correlation_id}"',
+                'device: "cuda"',
+                'compute_type: "float16"',
+                "# Transcript",
+            )
+            if any(value not in transcript for value in required):
+                transcript_path.unlink(missing_ok=True)
+                raise RuntimeError("GPU transcription returned an incomplete transcript")
+        finally:
+            try:
+                fcntl.flock(slot, fcntl.LOCK_UN)
+            finally:
+                slot.close()
 
     def _attachment_note(self, attachment: DownloadedAttachment) -> str:
         lines: list[str] = []
@@ -428,9 +611,23 @@ class TelegramInboundNormalizer:
                 lines.append(f"Size bytes: {attachment.size_bytes}")
             if attachment.transcript_path is not None:
                 lines.append(f"Transcript path: {attachment.transcript_path}")
-            if attachment.transcription_error:
+            if attachment.transcription_correlation_id:
                 lines.append(
-                    "Automatic transcription failed. Use the stored file path directly."
+                    "Transcription correlation ID: "
+                    f"{attachment.transcription_correlation_id}"
+                )
+            if attachment.transcription_error:
+                terminal_message = next(
+                    (
+                        terminal
+                        for terminal in _SAFE_TRANSCRIPTION_TERMINALS
+                        if terminal in attachment.transcription_error
+                    ),
+                    None,
+                )
+                lines.append(
+                    terminal_message
+                    or "Automatic transcription failed retryably. Resend the voice note later if needed; the stored audio remains available."
                 )
                 lines.append(f"Transcription error: {attachment.transcription_error}")
             else:
