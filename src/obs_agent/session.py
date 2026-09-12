@@ -146,7 +146,7 @@ class SessionManager:
     @property
     def sdk_env_overrides(self) -> dict[str, str]:
         """Expose the current per-session SDK env override map."""
-        return dict(self._sdk_env_overrides)
+        return self._sdk_env_overrides
 
     @property
     def effective_model(self) -> str:

@@ -12,13 +12,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import re
+import secrets
+import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
+import xml.etree.ElementTree as ET
 
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
 from obs_agent.context_probe import probe_context_via_claude_cli
+from obs_agent.context_jsonl import find_session_jsonl_index
 from obs_agent.context_stats import (
     apply_context_probe,
     build_context_snapshot,
@@ -41,6 +48,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("obs_agent.tools")
 _INBOX_FILE_LOCKS: dict[Path, asyncio.Lock] = {}
+_SAFE_TEAM_IDENTITY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-[a-z0-9][a-z0-9_-]{0,127}$")
+_SAFE_AGENT_IDENTITY_RE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-[a-z0-9][a-z0-9_-]{0,127}|[0-9a-f]{10}-[a-z0-9][a-z0-9-]{0,117})$"
+)
 
 
 def _error_result(text: str) -> dict:
@@ -127,24 +138,250 @@ def _transport_unavailable(tool_name: str) -> dict:
     )
 
 
-def _member_activity_sort_key(member: dict[str, Any], agent_name: str) -> tuple[float, str]:
-    candidates = [
-        member.get("last_active_at"),
-        member.get("last_activity_at"),
-        member.get("completed_at"),
-        member.get("created_at"),
-        member.get("updated_at"),
-    ]
-    for candidate in candidates:
-        if isinstance(candidate, (int, float)):
-            return (-float(candidate), str(agent_name))
-        if isinstance(candidate, str) and candidate.strip():
+_SAFE_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SEARCH_MODES = {"children", "siblings", "parent", "ancestors", "descendants", "family", "tree"}
+_SEARCH_MAX_LIMIT = 200
+_CURSOR_MAX_SNAPSHOTS = 64
+_CURSOR_TTL_SECONDS = 300
+
+
+class _CursorEntry:
+    """Process-local frozen snapshot for mutation-stable cursor pagination."""
+
+    __slots__ = (
+        "created_at", "all_members", "total_count", "limit",
+        "mode", "team_name", "current_agent", "target_agent",
+        "target_lineage", "parent_name", "next_offset",
+    )
+
+    def __init__(
+        self,
+        *,
+        created_at: float,
+        all_members: list[dict[str, Any]],
+        total_count: int,
+        limit: int,
+        mode: str,
+        team_name: str,
+        current_agent: str,
+        target_agent: str,
+        target_lineage: list[str],
+        parent_name: str | None,
+        next_offset: int,
+    ):
+        self.created_at = created_at
+        self.all_members = all_members
+        self.total_count = total_count
+        self.limit = limit
+        self.mode = mode
+        self.team_name = team_name
+        self.current_agent = current_agent
+        self.target_agent = target_agent
+        self.target_lineage = target_lineage
+        self.parent_name = parent_name
+        self.next_offset = next_offset
+
+
+_cursor_store: OrderedDict[str, _CursorEntry] = OrderedDict()
+
+
+def _cursor_evict(now: float) -> None:
+    """Remove expired and excess cursor snapshots."""
+    expired = [k for k, v in _cursor_store.items() if now - v.created_at > _CURSOR_TTL_SECONDS]
+    for k in expired:
+        del _cursor_store[k]
+    while len(_cursor_store) > _CURSOR_MAX_SNAPSHOTS:
+        _cursor_store.popitem(last=False)
+
+
+def _build_member_xml_attrs(member: dict[str, Any]) -> dict[str, str]:
+    """Build XML attributes for a single search_team member element."""
+    attrs: dict[str, str] = {}
+    for key in (
+        "team_name", "agent_name", "display_name", "relation", "parent_agent_name",
+        "parent_display_name", "root_team_key", "lineage_length", "session_id", "running", "runtime_status",
+        "idle_ready", "task_status", "last_activity_epoch", "last_activity_at",
+        "last_activity_source", "topic_chat_id", "topic_thread_id",
+    ):
+        value = member.get(key)
+        if value is None:
+            continue
+        if key == "lineage_length" and not isinstance(value, int):
+            continue
+        attrs[key] = str(value).lower() if isinstance(value, bool) else str(value)
+    lineage = member.get("lineage")
+    if isinstance(lineage, list):
+        attrs["lineage"] = "\\x1f".join(str(item) for item in lineage)
+    return attrs
+
+
+def _build_search_result_page(
+    *,
+    page_members: list[dict[str, Any]],
+    mode: str,
+    team_name: str,
+    current_agent: str,
+    target_agent: str,
+    target_lineage: list[str],
+    total_matching: int,
+    offset: int,
+    limit: int,
+    parent_name: str | None,
+    next_cursor: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Build result dict and XML for a search_team page (shared by live and cursor paths)."""
+    has_more = offset + len(page_members) < total_matching
+    result: dict[str, Any] = {
+        "mode": mode,
+        "team_name": team_name,
+        "current_agent": current_agent,
+        "target_agent": target_agent,
+        "target_lineage": list(target_lineage),
+        "total_matching": total_matching,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(page_members),
+        "has_more": has_more,
+        "members": page_members,
+    }
+    if has_more:
+        result["next_offset"] = offset + len(page_members)
+    if next_cursor is not None:
+        result["next_cursor"] = next_cursor
+    page_names = [m["agent_name"] for m in page_members]
+    if mode in {"children", "family"}:
+        result["children"] = [n for n, m in zip(page_names, page_members) if m.get("relation") == "child"]
+    if mode in {"parent", "family"}:
+        result["parent"] = parent_name
+    if mode in {"siblings", "family"}:
+        result["siblings"] = [n for n, m in zip(page_names, page_members) if m.get("relation") == "sibling"]
+    if mode == "ancestors":
+        result["ancestors"] = [n for n, m in zip(page_names, page_members) if m.get("relation") == "ancestor"]
+    if mode == "descendants":
+        result["descendants"] = [n for n, m in zip(page_names, page_members) if m.get("relation") == "descendant"]
+    if mode == "tree":
+        result["tree"] = list(page_names)
+        result["tree_members"] = page_members
+
+    root_attrs: dict[str, str] = {
+        "team_name": team_name,
+        "target_agent": target_agent,
+        "mode": mode,
+        "offset": str(offset),
+        "limit": str(limit),
+        "total_matching": str(total_matching),
+        "returned": str(len(page_members)),
+        "has_more": "true" if has_more else "false",
+    }
+    if "next_offset" in result:
+        root_attrs["next_offset"] = str(result["next_offset"])
+    if next_cursor is not None:
+        root_attrs["next_cursor"] = next_cursor
+    xml_root = ET.Element("search_team", root_attrs)
+    for member in page_members:
+        ET.SubElement(xml_root, "member", _build_member_xml_attrs(member))
+    xml_text = ET.tostring(xml_root, encoding="unicode", short_empty_elements=True)
+    return result, xml_text
+
+
+def _member_activity_sort_key(member: dict[str, Any], agent_name: str) -> tuple[int, float, str, str]:
+    activity = member.get("last_activity_epoch")
+    if isinstance(activity, (int, float)) and math.isfinite(float(activity)):
+        return (0, -float(activity), str(member.get("team_name") or ""), str(agent_name))
+    return (1, 0.0, str(member.get("team_name") or ""), str(agent_name))
+
+
+def _safe_search_identity(value: object, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a known local identity")
+    normalized = value.strip()
+    if not normalized or not _SAFE_IDENTITY_RE.fullmatch(normalized):
+        raise ValueError(f"{field_name} must be a known local identity")
+    return normalized
+
+
+def _parse_search_timestamp(value: object, *, field_name: str) -> float | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            parsed = float(value)
+        elif isinstance(value, str):
+            parsed_datetime = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            if parsed_datetime.tzinfo is None or parsed_datetime.utcoffset() is None:
+                raise ValueError
+            parsed = parsed_datetime.timestamp()
+        else:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{field_name} must be epoch seconds or RFC3339") from None
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite")
+    return parsed
+
+
+def _activity_fallback(entry: dict[str, Any]) -> tuple[float | None, str]:
+    for key in ("last_activity", "last_active_at", "last_activity_at", "updated_at", "completed_at", "created_at"):
+        value = entry.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            parsed = float(value)
+            if key == "updated_at" and parsed > 10_000_000_000:
+                parsed /= 1000.0
+            return parsed, "runtime_last_activity" if key == "last_activity" else "projection_timestamp"
+        if isinstance(value, str) and value.strip():
             try:
-                parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+                parsed_datetime = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+                if parsed_datetime.tzinfo is None or parsed_datetime.utcoffset() is None:
+                    continue
+                return parsed_datetime.timestamp(), "projection_timestamp"
             except ValueError:
                 continue
-            return (-parsed.timestamp(), str(agent_name))
-    return (0.0, str(agent_name))
+    return None, "unknown"
+
+
+def _parse_jsonl_event_timestamp(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed_datetime = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            if parsed_datetime.tzinfo is None or parsed_datetime.utcoffset() is None:
+                return None
+            parsed = parsed_datetime.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _jsonl_event_activity(path: Any) -> float | None:
+    newest: float | None = None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                raw = raw_line.strip()
+                if not raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                timestamp = _parse_jsonl_event_timestamp(record.get("timestamp"))
+                if timestamp is not None and (newest is None or timestamp > newest):
+                    newest = timestamp
+    except (OSError, UnicodeError):
+        return None
+    return newest
 
 
 def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
@@ -166,10 +403,19 @@ def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
         agent_name = str(member.get("name") or "").strip()
         if not agent_name or agent_name == "team-lead":
             continue
+        if not _SAFE_IDENTITY_RE.fullmatch(agent_name):
+            continue
         obs = member.get("obs")
         if not isinstance(obs, dict):
-            continue
-        entry: dict[str, Any] = {"agent_name": agent_name}
+            obs = {}
+        entry: dict[str, Any] = {
+            "agent_name": agent_name,
+            "team_name": team_name,
+        }
+        for source, target in ((member, "session_id"), (obs, "session_id")):
+            value = source.get(target)
+            if isinstance(value, str) and value.strip():
+                entry[target] = value.strip()
         display_name = obs.get("display_name")
         if isinstance(display_name, str) and display_name.strip():
             entry["display_name"] = display_name.strip()
@@ -179,6 +425,24 @@ def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
         parent_display_name = obs.get("parent_display_name")
         if isinstance(parent_display_name, str) and parent_display_name.strip():
             entry["parent_display_name"] = parent_display_name.strip()
+        for key in (
+            "root_team_key",
+            "runtime_status",
+            "task_status",
+            "status",
+            "last_activity_source",
+        ):
+            value = obs.get(key)
+            if isinstance(value, str) and value.strip():
+                entry[key] = value.strip()
+        for key in ("running", "idle_ready"):
+            value = obs.get(key)
+            if isinstance(value, bool):
+                entry[key] = value
+        for key in ("last_activity", "last_active_at", "last_activity_at", "updated_at", "completed_at", "created_at"):
+            value = obs.get(key)
+            if isinstance(value, (int, float, str)) and not isinstance(value, bool):
+                entry[key] = value
         lineage = obs.get("lineage")
         if isinstance(lineage, list):
             normalized_lineage = [
@@ -189,6 +453,10 @@ def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
             if normalized_lineage:
                 entry["lineage"] = normalized_lineage
                 entry["lineage_length"] = len(normalized_lineage)
+        for key in ("topic_chat_id", "topic_thread_id", "updated_at"):
+            value = obs.get(key)
+            if isinstance(value, int):
+                entry[key] = value
         metadata[agent_name] = entry
     return metadata
 
@@ -263,6 +531,34 @@ def create_obs_tools(
             cwd=config.vault_path,
         )
         return result
+
+    def _lookup_team_context() -> tuple[str | None, str | None]:
+        """Return one validated caller team or a deterministic context error."""
+        candidates: set[str] = set()
+        env_team = (
+            hook_state.sdk_env_overrides.get("CLAUDE_CODE_TEAM_NAME", "").strip()
+            if hook_state is not None
+            else ""
+        )
+        if env_team:
+            if not _SAFE_TEAM_IDENTITY_RE.fullmatch(env_team.lower()):
+                return None, "caller team context is invalid"
+            candidates.add(env_team.lower())
+        bootstrap = _current_obs_bootstrap()
+        bootstrap_team = (
+            str(bootstrap.root_team_key or "").strip()
+            if bootstrap is not None
+            else ""
+        )
+        if bootstrap_team:
+            if not _SAFE_TEAM_IDENTITY_RE.fullmatch(bootstrap_team.lower()):
+                return None, "caller team context is invalid"
+            candidates.add(bootstrap_team.lower())
+        if len(candidates) > 1:
+            return None, "caller team context is ambiguous"
+        if not candidates:
+            return None, "caller team context is unavailable"
+        return next(iter(candidates)), None
 
     async def _launch_task(
         args: dict,
@@ -492,7 +788,11 @@ def create_obs_tools(
             },
             "resume": {
                 "type": "string",
-                "description": "Optional agentId to resume an existing child task",
+                "description": "Optional deprecated/internal task handle to resume an existing child task",
+            },
+            "agent_name": {
+                "type": "string",
+                "description": "Optional stable hash-prefixed agent identity; returned with team_name, lineage, and actual session_id.",
             },
             "session_source": {
                 "type": "string",
@@ -583,10 +883,24 @@ def create_obs_tools(
 
     async def _task_output(args: dict, *, tool_name: str) -> dict:
         task_id = str(args.get("task_id", "")).strip()
+        team_name = str(args.get("team_name", "")).strip()
+        agent_name = str(args.get("agent_name", "")).strip()
+        if task_id and (team_name or agent_name):
+            return _error_result(f"Cannot use {tool_name}: task_id cannot be combined with stable identity")
+        if not task_id and not agent_name:
+            return _error_result(f"Cannot use {tool_name}: task_id or agent_name is required")
+        if team_name and not agent_name:
+            return _error_result(f"Cannot use {tool_name}: team_name requires agent_name")
+        if team_name and not _SAFE_TEAM_IDENTITY_RE.fullmatch(team_name.lower()):
+            return _error_result(f"Cannot use {tool_name}: team_name must be a timestamp-prefixed stable identity")
+        if agent_name and not _SAFE_AGENT_IDENTITY_RE.fullmatch(agent_name.lower()):
+            return _error_result(f"Cannot use {tool_name}: agent_name must be a hash-prefixed stable identity")
+        if agent_name and not team_name:
+            _caller_team, caller_error = _lookup_team_context()
+            if caller_error:
+                return _error_result(f"Cannot use {tool_name}: {caller_error}")
         block_raw = args.get("block")
         timeout = args.get("timeout")
-        if not task_id:
-            return _error_result(f"Cannot use {tool_name}: task_id is required")
         try:
             block = _coerce_bool_arg(block_raw, name="block")
         except ValueError:
@@ -603,6 +917,8 @@ def create_obs_tools(
             return await hook_state.fork_task_outputter(
                 {
                     "task_id": task_id,
+                    "team_name": team_name,
+                    "agent_name": agent_name,
                     "block": block,
                     "timeout": timeout,
                     "tool_use_id": hook_state.current_tool_use_id,
@@ -614,12 +930,20 @@ def create_obs_tools(
 
     @tool(
         "AgentTaskOutput",
-        "Inspect a running or completed AgentTask using TaskOutput-style "
-        "parameters. Use task_id, block, and timeout.",
+        "Inspect a running or completed AgentTask using stable agent_name with optional "
+        "authorized team_name inference or deprecated/internal task_id compatibility, with bounded output.",
         {
             "task_id": {
                 "type": "string",
-                "description": "The agentId/task handle returned by AgentTask",
+                "description": "Deprecated/internal compatibility task handle returned by AgentTask",
+            },
+            "team_name": {
+                "type": "string",
+                "description": "Optional stable root team identity for an authorized on-behalf lookup; omit to infer the caller's accessible team",
+            },
+            "agent_name": {
+                "type": "string",
+                "description": "Stable hash-prefixed agent identity; team_name may be omitted to use the caller's accessible team",
             },
             "block": {
                 "type": "boolean",
@@ -636,13 +960,32 @@ def create_obs_tools(
 
     async def _task_stop(args: dict, *, tool_name: str) -> dict:
         task_id = str(args.get("task_id") or args.get("shell_id") or "").strip()
-        if not task_id:
-            return _error_result(f"Cannot use {tool_name}: task_id is required")
+        team_name = str(args.get("team_name", "")).strip()
+        agent_name = str(args.get("agent_name", "")).strip()
+        if task_id and (team_name or agent_name):
+            return _error_result(f"Cannot use {tool_name}: task_id cannot be combined with stable identity")
+        if not task_id and not agent_name:
+            return _error_result(f"Cannot use {tool_name}: task_id or agent_name is required")
+        if team_name and not agent_name:
+            return _error_result(f"Cannot use {tool_name}: team_name requires agent_name")
+        if team_name and not _SAFE_TEAM_IDENTITY_RE.fullmatch(team_name.lower()):
+            return _error_result(f"Cannot use {tool_name}: team_name must be a timestamp-prefixed stable identity")
+        if agent_name and not _SAFE_AGENT_IDENTITY_RE.fullmatch(agent_name.lower()):
+            return _error_result(f"Cannot use {tool_name}: agent_name must be a hash-prefixed stable identity")
+        if agent_name and not team_name:
+            _caller_team, caller_error = _lookup_team_context()
+            if caller_error:
+                return _error_result(f"Cannot use {tool_name}: {caller_error}")
         if hook_state is None or hook_state.fork_task_stopper is None:
             return _transport_unavailable(tool_name)
         try:
             return await hook_state.fork_task_stopper(
-                {"task_id": task_id, "tool_use_id": hook_state.current_tool_use_id}
+                {
+                    "task_id": task_id,
+                    "team_name": team_name,
+                    "agent_name": agent_name,
+                    "tool_use_id": hook_state.current_tool_use_id,
+                }
             )
         except Exception as exc:
             logger.exception("%s failed", tool_name)
@@ -650,11 +993,19 @@ def create_obs_tools(
 
     @tool(
         "AgentTaskStop",
-        "Stop a running AgentTask using TaskStop-style task_id input.",
+        "Stop a running AgentTask using stable agent_name with optional authorized team_name inference or deprecated/internal task_id input; repeated stable stops are idempotent.",
         {
             "task_id": {
                 "type": "string",
-                "description": "The agentId/task handle returned by AgentTask",
+                "description": "Deprecated/internal compatibility task handle returned by AgentTask",
+            },
+            "team_name": {
+                "type": "string",
+                "description": "Optional stable root team identity for an authorized on-behalf lookup; omit to infer the caller's accessible team",
+            },
+            "agent_name": {
+                "type": "string",
+                "description": "Stable hash-prefixed agent identity; team_name may be omitted to use the caller's accessible team",
             },
             "shell_id": {
                 "type": "string",
@@ -1350,24 +1701,142 @@ def create_obs_tools(
 
     @tool(
         "search_team",
-        "Discover teammates in the current lineage tree by scanning team inboxes.",
+        "Discover teammates in a lineage tree with target-relative filters, activity, and pagination.",
         {
             "mode": {
                 "type": "string",
                 "description": "One of: parent, children, siblings, ancestors, descendants, family, tree",
             },
+            "team_name": {
+                "type": "string",
+                "description": "Optional locally known team identity; defaults to the caller's team.",
+            },
+            "agent_name": {
+                "type": "string",
+                "description": "Optional locally known agent identity; defaults to the caller or known team root.",
+            },
+            "running_only": {
+                "type": "boolean",
+                "description": "Return only members currently known to be running.",
+            },
+            "activity_after": {
+                "type": ["number", "string"],
+                "description": "Strict lower activity bound as epoch seconds or RFC3339.",
+            },
+            "activity_before": {
+                "type": ["number", "string"],
+                "description": "Strict upper activity bound as epoch seconds or RFC3339.",
+            },
+            "active_within_seconds": {
+                "type": "number",
+                "description": "Inclusive recent activity window in nonnegative seconds.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Positive page size, default 50, maximum 200.",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Nonnegative result offset, default 0.",
+            },
+            "cursor": {
+                "type": "string",
+                "description": "Opaque cursor token for stable pagination continuation. When provided, no other arguments are allowed.",
+            },
         },
     )
     async def search_team(args: dict) -> dict:
+        now = time.time()
+
+        # --- Cursor continuation path (Property 2) ---
+        cursor_raw = args.get("cursor")
+        if cursor_raw is not None:
+            cursor_token = str(cursor_raw).strip()
+            other_keys = set(args.keys()) - {"cursor"}
+            if other_keys:
+                return _error_result(
+                    "search_team: cursor requests must not include other search arguments"
+                )
+            entry = _cursor_store.pop(cursor_token, None)
+            if entry is None:
+                return _error_result("search_team: unknown, expired, or malformed cursor")
+            if now - entry.created_at > _CURSOR_TTL_SECONDS:
+                return _error_result("search_team: unknown, expired, or malformed cursor")
+            page_offset = entry.next_offset
+            page = entry.all_members[page_offset: page_offset + entry.limit]
+            has_more_cursor = page_offset + len(page) < entry.total_count
+            next_cursor_token: str | None = None
+            if has_more_cursor:
+                next_cursor_token = secrets.token_urlsafe(12)
+                _cursor_store[next_cursor_token] = _CursorEntry(
+                    created_at=entry.created_at,
+                    all_members=entry.all_members,
+                    total_count=entry.total_count,
+                    limit=entry.limit,
+                    mode=entry.mode,
+                    team_name=entry.team_name,
+                    current_agent=entry.current_agent,
+                    target_agent=entry.target_agent,
+                    target_lineage=entry.target_lineage,
+                    parent_name=entry.parent_name,
+                    next_offset=page_offset + len(page),
+                )
+                _cursor_evict(now)
+            cursor_result, cursor_xml = _build_search_result_page(
+                page_members=page,
+                mode=entry.mode,
+                team_name=entry.team_name,
+                current_agent=entry.current_agent,
+                target_agent=entry.target_agent,
+                target_lineage=entry.target_lineage,
+                total_matching=entry.total_count,
+                offset=page_offset,
+                limit=entry.limit,
+                parent_name=entry.parent_name,
+                next_cursor=next_cursor_token,
+            )
+            return {
+                "content": [{"type": "text", "text": cursor_xml}],
+                "tool_use_result": cursor_result,
+            }
+
         mode = str(args.get("mode") or args.get("who") or "family").strip().lower()
         if mode == "all":
             mode = "family"
         if mode == "tree_children":
             mode = "children"
-        if mode not in {"children", "siblings", "parent", "ancestors", "descendants", "family", "tree"}:
+        if mode not in _SEARCH_MODES:
             return _error_result(
                 "search_team: 'mode' must be one of: parent, children, siblings, ancestors, descendants, family, tree, tree_children"
             )
+        try:
+            running_only = _coerce_bool_arg(args.get("running_only", False), name="running_only")
+            activity_after = _parse_search_timestamp(args.get("activity_after"), field_name="activity_after")
+            activity_before = _parse_search_timestamp(args.get("activity_before"), field_name="activity_before")
+            recent_raw = args.get("active_within_seconds")
+            if recent_raw is None or (isinstance(recent_raw, str) and not recent_raw.strip()):
+                active_within_seconds = None
+            elif isinstance(recent_raw, bool):
+                raise ValueError("active_within_seconds must be a nonnegative finite number")
+            else:
+                active_within_seconds = float(recent_raw)
+                if not math.isfinite(active_within_seconds) or active_within_seconds < 0:
+                    raise ValueError("active_within_seconds must be a nonnegative finite number")
+            limit_raw = args.get("limit", 50)
+            if isinstance(limit_raw, bool):
+                raise ValueError("limit must be a positive integer no greater than 200")
+            limit = int(limit_raw)
+            if limit <= 0 or limit > _SEARCH_MAX_LIMIT:
+                raise ValueError("limit must be a positive integer no greater than 200")
+            offset_raw = args.get("offset", 0)
+            if isinstance(offset_raw, bool):
+                raise ValueError("offset must be a nonnegative integer")
+            offset = int(offset_raw)
+            if offset < 0:
+                raise ValueError("offset must be a nonnegative integer")
+        except (TypeError, ValueError, OverflowError) as exc:
+            return _error_result(f"search_team: {exc}")
+
         bootstrap = _current_obs_bootstrap()
         if bootstrap is None:
             return _error_result("Cannot use search_team: no OBS bootstrap found")
@@ -1375,128 +1844,323 @@ def create_obs_tools(
             return _error_result("Cannot use search_team: missing team key or agent name")
         if not bootstrap.lineage:
             return _error_result("Cannot use search_team: empty lineage")
+        try:
+            caller_team = _safe_search_identity(bootstrap.root_team_key, field_name="caller team_name")
+            caller_agent = _safe_search_identity(bootstrap.agent_name, field_name="caller agent_name")
+            requested_team = _safe_search_identity(args.get("team_name"), field_name="team_name")
+            requested_agent = _safe_search_identity(args.get("agent_name"), field_name="agent_name")
+        except ValueError as exc:
+            return _error_result(f"search_team: {exc}")
+        if caller_team is None or caller_agent is None:
+            return _error_result("Cannot use search_team: missing team key or agent name")
 
-        inboxes_dir = (
-            Path.home()
-            / ".claude"
-            / "teams"
-            / bootstrap.root_team_key
-            / "inboxes"
-        )
-        team_projection_metadata = _load_team_projection_metadata(bootstrap.root_team_key)
-        result: dict[str, Any] = {
-            "mode": mode,
-            "team_name": bootstrap.root_team_key,
-            "current_agent": bootstrap.agent_name,
-        }
-        all_agents = []
+        def _provider_entries(team_name: str) -> dict[str, dict[str, Any]]:
+            provider = getattr(hook_state, "team_status_provider", None) if hook_state is not None else None
+            if provider is None:
+                return {}
+            try:
+                raw = provider(team_name=team_name)
+            except TypeError:
+                raw = provider(team_name)
+            except Exception:
+                logger.debug("search_team runtime provider failed", exc_info=True)
+                return {}
+            if not isinstance(raw, dict):
+                return {}
+            entries: dict[str, dict[str, Any]] = {}
+            for key, value in raw.items():
+                if not isinstance(value, dict):
+                    continue
+                canonical_team = value.get("team_name")
+                canonical_agent = value.get("agent_name")
+                if isinstance(key, tuple) and len(key) == 2:
+                    canonical_team = canonical_team or key[0]
+                    canonical_agent = canonical_agent or key[1]
+                if not isinstance(canonical_team, str) or not isinstance(canonical_agent, str):
+                    continue
+                if canonical_team != team_name:
+                    continue
+                try:
+                    safe_agent = _safe_search_identity(canonical_agent, field_name="agent_name")
+                except ValueError:
+                    continue
+                if safe_agent:
+                    entries[safe_agent] = dict(value)
+                    entries[safe_agent]["team_name"] = canonical_team
+                    entries[safe_agent]["agent_name"] = safe_agent
+            return entries
+
+        if requested_agent is not None and requested_team is None:
+            team_name = caller_team
+        else:
+            team_name = requested_team or caller_team
+        agent_name = requested_agent or (caller_agent if team_name == caller_team else None)
+        try:
+            team_projection_metadata = _load_team_projection_metadata(team_name)
+            runtime_metadata = _provider_entries(team_name)
+            for runtime_agent, runtime_details in runtime_metadata.items():
+                projection_details = team_projection_metadata.get(runtime_agent)
+                if projection_details is not None:
+                    runtime_details.setdefault("lineage", projection_details.get("lineage"))
+                    runtime_details.setdefault("display_name", projection_details.get("display_name"))
+                    runtime_details.setdefault("parent_agent_name", projection_details.get("parent_agent_name"))
+                    runtime_details.setdefault("parent_display_name", projection_details.get("parent_display_name"))
+        except (OSError, ValueError) as exc:
+            return _error_result(f"search_team: {exc}")
+        merged_known = {name: dict(details) for name, details in team_projection_metadata.items()}
+        for name, details in runtime_metadata.items():
+            merged_known.setdefault(name, {}).update(details)
+        if team_name == caller_team and caller_agent not in merged_known:
+            merged_known[caller_agent] = {
+                "team_name": team_name,
+                "agent_name": caller_agent,
+                "lineage": list(bootstrap.lineage),
+                "lineage_length": len(bootstrap.lineage),
+                "display_name": bootstrap.lineage[-1],
+            }
+        if requested_agent is not None and requested_agent not in merged_known:
+            return _error_result("search_team: target identity is not locally known")
+        if requested_agent is None and team_name == caller_team and caller_agent in merged_known:
+            agent_name = caller_agent
+        if agent_name is None:
+            root_candidates = [
+                name for name, details in merged_known.items()
+                if details.get("lineage_length") == 1
+                or (isinstance(details.get("lineage"), list) and len(details["lineage"]) == 1)
+                or name == team_name
+            ]
+            root_candidates = sorted(set(root_candidates))
+            if len(root_candidates) != 1:
+                return _error_result("search_team: team_name has no unambiguous locally known root agent")
+            agent_name = root_candidates[0]
+        if agent_name not in merged_known:
+            return _error_result("search_team: target identity is not locally known")
+        target_details = merged_known[agent_name]
+        target_lineage_raw = target_details.get("lineage")
+        target_lineage = tuple(
+            str(item).strip() for item in target_lineage_raw
+            if isinstance(item, str) and str(item).strip()
+        ) if isinstance(target_lineage_raw, list) else ()
+        if not target_lineage and team_name == caller_team and agent_name == caller_agent:
+            target_lineage = tuple(bootstrap.lineage)
+            target_details["lineage"] = list(target_lineage)
+            target_details["lineage_length"] = len(target_lineage)
+        if not target_lineage:
+            return _error_result("search_team: target identity has no locally known lineage")
+        target_details["team_name"] = team_name
+        target_details["agent_name"] = agent_name
+        target_details["root_team_key"] = target_details.get("root_team_key") or team_name
+        inboxes_dir = Path.home() / ".claude" / "teams" / team_name / "inboxes"
+        all_agents = set(merged_known)
         if inboxes_dir.is_dir():
-            for f in inboxes_dir.iterdir():
-                if f.suffix == ".json" and f.stem:
-                    all_agents.append(f.stem)
-        all_agents = sorted(set(all_agents))
+            try:
+                for path in inboxes_dir.iterdir():
+                    if path.suffix != ".json":
+                        continue
+                    try:
+                        inbox_agent = _safe_search_identity(path.stem, field_name="agent_name")
+                    except ValueError:
+                        continue
+                    if inbox_agent is not None:
+                        all_agents.add(inbox_agent)
+            except OSError:
+                pass
+        all_agents.add(agent_name)
+        for name in all_agents:
+            merged_known.setdefault(name, {"team_name": team_name, "agent_name": name})
 
-        my_lineage = bootstrap.lineage
-        my_agent_name = bootstrap.agent_name
+        session_ids = {
+            str(details["session_id"]).strip()
+            for details in merged_known.values()
+            if isinstance(details.get("session_id"), str) and details["session_id"].strip()
+        }
+        session_paths = find_session_jsonl_index(
+            session_ids=session_ids,
+            cwd=config.vault_path,
+        )
+        for name, details in merged_known.items():
+            details["team_name"] = team_name
+            details["agent_name"] = name
+            path = session_paths.get(details.get("session_id")) if details.get("session_id") else None
+            activity_epoch = None
+            activity_source = "unknown"
+            if path is not None:
+                activity_epoch = _jsonl_event_activity(path)
+                if activity_epoch is not None:
+                    activity_source = "jsonl_event_timestamp"
+                else:
+                    try:
+                        activity_epoch = float(path.stat().st_mtime)
+                        activity_source = "jsonl_mtime_fallback"
+                    except OSError:
+                        pass
+            if activity_epoch is None:
+                activity_epoch, activity_source = _activity_fallback(details)
+            details["last_activity_source"] = activity_source
+            if activity_epoch is not None and math.isfinite(activity_epoch):
+                details["last_activity_epoch"] = activity_epoch
+                details["last_activity_at"] = datetime.fromtimestamp(
+                    activity_epoch,
+                    tz=timezone.utc,
+                ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            else:
+                details.pop("last_activity_epoch", None)
+                details.pop("last_activity_at", None)
+            running = details.get("running")
+            if not isinstance(running, bool):
+                running = None
+            details["running"] = running
+            runtime_status = details.get("runtime_status")
+            if runtime_status not in {"running", "idle", "completed", "failed", "stopped", "unknown"}:
+                runtime_status = "running" if running is True else "unknown"
+            details["runtime_status"] = runtime_status
+            if "task_status" not in details and isinstance(details.get("status"), str):
+                details["task_status"] = details["status"]
+            if "display_name" not in details:
+                details["display_name"] = name.replace("-", " ")
+            if isinstance(details.get("lineage"), tuple):
+                details["lineage"] = list(details["lineage"])
+            if isinstance(details.get("lineage"), list):
+                details["lineage_length"] = len(details["lineage"])
+
+        my_lineage = target_lineage
+        my_agent_name = agent_name
         my_hash = lineage_fingerprint(tuple(normalize_lineage_name(n) for n in my_lineage))
 
         def _sort_member_names(names: list[str]) -> list[str]:
-            return sorted(
-                names,
-                key=lambda name: _member_activity_sort_key(
-                    team_projection_metadata.get(name) or {},
-                    name,
-                ),
-            )
+            return sorted(names, key=lambda name: _member_activity_sort_key(merged_known.get(name) or {}, name))
 
         children = _sort_member_names([
             name for name in all_agents
             if name.startswith(f"{my_hash}-") and name != my_agent_name
         ])
-        if mode in {"children", "family"}:
-            result["children"] = children
-
         parent: str | None = None
-        if mode in {"parent", "family"}:
-            if len(my_lineage) > 1:
-                parent_name = bootstrap.parent_agent_name
-                if not parent_name:
-                    parent_lineage = my_lineage[:-1]
-                    parent_name = agent_name_for_lineage(
-                        parent_lineage,
-                        team_key=bootstrap.root_team_key,
-                    )
-                if parent_name in all_agents:
-                    parent = parent_name
-            result["parent"] = parent
-
+        if len(my_lineage) > 1:
+            parent_name = target_details.get("parent_agent_name")
+            if not isinstance(parent_name, str) or not parent_name.strip():
+                parent_name = agent_name_for_lineage(my_lineage[:-1], team_key=team_name)
+            if parent_name in all_agents:
+                parent = parent_name
         siblings: list[str] = []
         if len(my_lineage) > 1:
-            parent_lineage = tuple(normalize_lineage_name(n) for n in my_lineage[:-1])
-            parent_hash = lineage_fingerprint(parent_lineage)
+            parent_hash = lineage_fingerprint(tuple(normalize_lineage_name(n) for n in my_lineage[:-1]))
             siblings = _sort_member_names([
                 name for name in all_agents
                 if name.startswith(f"{parent_hash}-") and name != my_agent_name
             ])
-        if mode in {"siblings", "family"}:
-            result["siblings"] = siblings
+        ancestors = [
+            agent_name_for_lineage(my_lineage[: idx + 1], team_key=team_name)
+            for idx in range(len(my_lineage) - 1)
+        ]
+        descendants = _sort_member_names([
+            name for name, details in merged_known.items()
+            if isinstance(details.get("lineage"), list)
+            and len(details["lineage"]) > len(my_lineage)
+            and tuple(details["lineage"][: len(my_lineage)]) == my_lineage
+        ])
 
-        if mode == "ancestors":
-            ancestors = [
-                agent_name_for_lineage(
-                    my_lineage[: idx + 1],
-                    team_key=bootstrap.root_team_key,
-                )
-                for idx in range(len(my_lineage) - 1)
-            ]
-            result["ancestors"] = ancestors
+        relation_members: list[str]
+        relation_by_name: dict[str, str] = {}
+        if mode == "parent":
+            relation_members = [parent] if parent is not None else []
+            if parent is not None:
+                relation_by_name[parent] = "parent"
+        elif mode == "children":
+            relation_members = children
+            relation_by_name.update({name: "child" for name in children})
+        elif mode == "siblings":
+            relation_members = siblings
+            relation_by_name.update({name: "sibling" for name in siblings})
+        elif mode == "ancestors":
+            relation_members = ancestors
+            relation_by_name.update({name: "ancestor" for name in ancestors})
+        elif mode == "descendants":
+            relation_members = descendants
+            relation_by_name.update({name: "descendant" for name in descendants})
+        elif mode == "family":
+            relation_members = ([parent] if parent is not None else []) + children + siblings
+            relation_by_name.update({name: "child" for name in children})
+            relation_by_name.update({name: "sibling" for name in siblings})
+            if parent is not None:
+                relation_by_name[parent] = "parent"
+        else:
+            relation_members = sorted(all_agents)
+            relation_by_name[my_agent_name] = "self"
+            if parent is not None:
+                relation_by_name[parent] = "parent"
+            relation_by_name.update({name: "child" for name in children})
+            relation_by_name.update({name: "sibling" for name in siblings})
+            for name in relation_members:
+                relation_by_name.setdefault(name, "tree")
 
-        if mode == "descendants":
-            descendants: list[str] = []
-            for agent_name, details in team_projection_metadata.items():
-                lineage = details.get("lineage")
-                if not isinstance(lineage, list):
-                    continue
-                normalized_lineage = tuple(
-                    str(item).strip()
-                    for item in lineage
-                    if isinstance(item, str) and str(item).strip()
-                )
-                if len(normalized_lineage) <= len(my_lineage):
-                    continue
-                if normalized_lineage[: len(my_lineage)] == my_lineage:
-                    descendants.append(agent_name)
-            result["descendants"] = _sort_member_names(list(set(descendants)))
+        activity_filter_active = (
+            activity_after is not None or activity_before is not None or active_within_seconds is not None
+        )
+        filtered_members: list[str] = []
+        for name in relation_members:
+            details = merged_known[name]
+            epoch = details.get("last_activity_epoch")
+            if running_only and details.get("running") is not True:
+                continue
+            if activity_filter_active and not isinstance(epoch, (int, float)):
+                continue
+            if activity_after is not None and not float(epoch) > activity_after:
+                continue
+            if activity_before is not None and not float(epoch) < activity_before:
+                continue
+            if active_within_seconds is not None and float(epoch) < now - active_within_seconds:
+                continue
+            filtered_members.append(name)
+        filtered_members.sort(key=lambda name: _member_activity_sort_key(merged_known[name], name))
+        total_matching = len(filtered_members)
+        page_names = filtered_members[offset: offset + limit]
 
-        if mode == "tree":
-            result["tree"] = all_agents
-            child_set = set(children)
-            sibling_set = set(siblings)
-            tree_members: list[dict[str, Any]] = []
-            for agent_name in all_agents:
-                details = dict(team_projection_metadata.get(agent_name) or {})
-                details["agent_name"] = agent_name
-                if agent_name == my_agent_name:
-                    details["relation"] = "self"
-                elif parent is not None and agent_name == parent:
-                    details["relation"] = "parent"
-                elif agent_name in child_set:
-                    details["relation"] = "child"
-                elif agent_name in sibling_set:
-                    details["relation"] = "sibling"
-                else:
-                    details["relation"] = "tree"
-                tree_members.append(details)
-            tree_members.sort(
-                key=lambda item: _member_activity_sort_key(
-                    item,
-                    str(item.get("agent_name") or ""),
-                )
+        def _detailed_member(name: str) -> dict[str, Any]:
+            details = dict(merged_known[name])
+            details["relation"] = relation_by_name.get(name, "tree")
+            details["agent_name"] = name
+            details["team_name"] = team_name
+            return details
+
+        page_members = [_detailed_member(name) for name in page_names]
+        has_more = offset + len(page_members) < total_matching
+
+        # --- Cursor snapshot creation (Property 2) ---
+        live_next_cursor: str | None = None
+        if has_more:
+            all_detailed = [_detailed_member(name) for name in filtered_members]
+            snap_now = time.time()
+            live_next_cursor = secrets.token_urlsafe(12)
+            _cursor_store[live_next_cursor] = _CursorEntry(
+                created_at=snap_now,
+                all_members=all_detailed,
+                total_count=total_matching,
+                limit=limit,
+                mode=mode,
+                team_name=team_name,
+                current_agent=my_agent_name,
+                target_agent=my_agent_name,
+                target_lineage=list(my_lineage),
+                parent_name=parent,
+                next_offset=offset + len(page_members),
             )
-            result["tree_members"] = tree_members
+            _cursor_evict(snap_now)
 
+        result, xml_text = _build_search_result_page(
+            page_members=page_members,
+            mode=mode,
+            team_name=team_name,
+            current_agent=my_agent_name,
+            target_agent=my_agent_name,
+            target_lineage=list(my_lineage),
+            total_matching=total_matching,
+            offset=offset,
+            limit=limit,
+            parent_name=parent,
+            next_cursor=live_next_cursor,
+        )
         return {
-            "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=True)}],
+            "content": [{"type": "text", "text": xml_text}],
             "tool_use_result": result,
         }
 

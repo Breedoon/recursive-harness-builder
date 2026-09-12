@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
-from obs_agent.context_jsonl import find_session_jsonl, load_jsonl_usage_snapshot
+from obs_agent.context_jsonl import _encode_project_path, find_session_jsonl, find_session_jsonl_index, load_jsonl_usage_snapshot
 
 
 def _write_lines(path: Path, entries: list[dict]) -> None:
@@ -18,17 +19,79 @@ def _write_lines(path: Path, entries: list[dict]) -> None:
 def test_find_session_jsonl_prefers_matching_workspace_dir(tmp_path: Path) -> None:
     projects_root = tmp_path / ".claude" / "projects"
     sid = "abc-session"
-    preferred = projects_root / "-Users-breedoon-Documents-obs-fixture-vault" / f"{sid}.jsonl"
+    cwd = Path("/workspace/recursive-harness/fixture_project")
+    preferred = projects_root / _encode_project_path(cwd) / f"{sid}.jsonl"
     other = projects_root / "-Users-breedoon-Documents-obs" / f"{sid}.jsonl"
     _write_lines(other, [])
     _write_lines(preferred, [])
 
     found = find_session_jsonl(
         session_id=sid,
-        cwd=Path("/workspace/recursive-harness/fixture_project"),
+        cwd=cwd,
         projects_root=projects_root,
     )
     assert found == preferred
+
+
+def test_find_session_jsonl_fallback_chooses_newest_duplicate_with_deterministic_equal_mtime(
+    tmp_path: Path,
+) -> None:
+    projects_root = tmp_path / ".claude" / "projects"
+    sid = "duplicate-session"
+    first = projects_root / "project-a" / f"{sid}.jsonl"
+    second = projects_root / "project-b" / f"{sid}.jsonl"
+    _write_lines(first, [])
+    _write_lines(second, [])
+    os.utime(first, (100.0, 100.0))
+    os.utime(second, (100.0, 100.0))
+
+    found = find_session_jsonl(
+        session_id=sid,
+        cwd=Path("/workspace/recursive-harness/missing-workspace"),
+        projects_root=projects_root,
+    )
+    assert found == max(first, second, key=lambda path: str(path))
+
+    newest = projects_root / "project-c" / f"{sid}.jsonl"
+    _write_lines(newest, [])
+    os.utime(newest, (101.25, 101.25))
+    assert find_session_jsonl(
+        session_id=sid,
+        cwd=Path("/workspace/recursive-harness/missing-workspace"),
+        projects_root=projects_root,
+    ) == newest
+
+
+def test_find_session_jsonl_preferred_path_wins_over_newer_fallback(tmp_path: Path) -> None:
+    projects_root = tmp_path / ".claude" / "projects"
+    sid = "preferred-session"
+    preferred = projects_root / "-workspace-recursive-harness-fixture" / f"{sid}.jsonl"
+    fallback = projects_root / "project-newer" / f"{sid}.jsonl"
+    _write_lines(preferred, [])
+    _write_lines(fallback, [])
+    os.utime(preferred, (100.0, 100.0))
+    os.utime(fallback, (200.0, 200.0))
+
+    assert find_session_jsonl(
+        session_id=sid,
+        cwd=Path("/workspace/recursive-harness/fixture"),
+        projects_root=projects_root,
+    ) == preferred
+
+
+def test_find_session_jsonl_index_resolves_each_session_in_one_call(tmp_path: Path) -> None:
+    projects_root = tmp_path / ".claude" / "projects"
+    first = projects_root / "project-a" / "sid-a.jsonl"
+    second = projects_root / "project-b" / "sid-b.jsonl"
+    _write_lines(first, [])
+    _write_lines(second, [])
+
+    resolved = find_session_jsonl_index(
+        session_ids={"sid-a", "sid-b", "sid-missing"},
+        cwd=Path("/workspace/recursive-harness/missing-workspace"),
+        projects_root=projects_root,
+    )
+    assert resolved == {"sid-a": first, "sid-b": second, "sid-missing": None}
 
 
 def test_load_jsonl_usage_snapshot_returns_none_when_file_missing(tmp_path: Path) -> None:

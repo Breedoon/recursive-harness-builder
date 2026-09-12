@@ -24,6 +24,7 @@ from obs_agent.events import StatusEvent
 from obs_agent.lineage import (
     ObsBootstrap,
     agent_name_for_lineage,
+    build_obs_bootstrap_xml,
     format_root_display_name,
     root_team_key_for_lineage,
 )
@@ -4403,6 +4404,177 @@ class TestCommands:
         topic_client.interrupt.assert_awaited_once()
         assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
 
+    async def test_stop_branch_targets_self_and_recursive_descendants_only(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        team_name = "2026-08-12-08-05-root"
+        root = _state(bot, thread_id=None)
+        branch = _state(bot, thread_id=101)
+        grandchild = _state(bot, thread_id=102)
+        sibling = _state(bot, thread_id=103)
+        root.agent_lineage = ("Root",)
+        branch.agent_lineage = ("Root", "Branch")
+        grandchild.agent_lineage = ("Root", "Branch", "Leaf")
+        sibling.agent_lineage = ("Root", "Sibling")
+        for candidate, agent_name in (
+            (root, team_name),
+            (branch, "branch-agent"),
+            (grandchild, "leaf-agent"),
+            (sibling, "sibling-agent"),
+        ):
+            candidate.session_manager.set_sdk_env_overrides(
+                {"CLAUDE_CODE_TEAM_NAME": team_name, "CLAUDE_CODE_AGENT_NAME": agent_name}
+            )
+            client = MagicMock()
+            client.interrupt = AsyncMock()
+            candidate.session_manager._client = client
+            candidate.session_manager._connected = True
+        bot._route_inbox_targets.update(
+            {
+                (team_name, team_name): root.route,
+                (team_name, "branch-agent"): branch.route,
+                (team_name, "leaf-agent"): grandchild.route,
+                (team_name, "sibling-agent"): sibling.route,
+            }
+        )
+        bot._route_inbox_target_keys_by_route.update(
+            {candidate.route: (team_name, agent_name) for candidate, agent_name in (
+                (root, team_name), (branch, "branch-agent"),
+                (grandchild, "leaf-agent"), (sibling, "sibling-agent"),
+            )}
+        )
+        with patch.object(
+            bot,
+            "_load_tree_members",
+            return_value={
+                team_name: {"agent_name": team_name, "lineage": ["Root"]},
+                "branch-agent": {"agent_name": "branch-agent", "lineage": ["Root", "Branch"]},
+                "leaf-agent": {"agent_name": "leaf-agent", "lineage": ["Root", "Branch", "Leaf"]},
+                "sibling-agent": {"agent_name": "sibling-agent", "lineage": ["Root", "Sibling"]},
+            },
+        ):
+            update = _make_update("/stop_branch", thread_id=101)
+            ctx = _make_context()
+            await bot.handle_stop_branch(update, ctx)
+
+        assert branch.hook_state.interrupt_flag is True
+        assert grandchild.hook_state.interrupt_flag is True
+        assert root.hook_state.interrupt_flag is False
+        assert sibling.hook_state.interrupt_flag is False
+        assert branch.session_manager._client.interrupt.await_count == 1
+        assert grandchild.session_manager._client.interrupt.await_count == 1
+        assert "failed 0" in ctx.bot.send_message.call_args.kwargs["text"]
+
+    async def test_stop_branch_reports_partial_interrupt_failure(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        team_name = "2026-08-12-08-05-root"
+        branch = _state(bot, thread_id=111)
+        failed_leaf = _state(bot, thread_id=112)
+        branch.agent_lineage = ("Root", "Branch")
+        failed_leaf.agent_lineage = ("Root", "Branch", "Leaf")
+        for candidate, agent_name in (
+            (branch, "branch-agent"),
+            (failed_leaf, "failed-leaf-agent"),
+        ):
+            candidate.session_manager.set_sdk_env_overrides(
+                {"CLAUDE_CODE_TEAM_NAME": team_name, "CLAUDE_CODE_AGENT_NAME": agent_name}
+            )
+            client = MagicMock()
+            client.interrupt = AsyncMock()
+            candidate.session_manager._client = client
+            candidate.session_manager._connected = True
+        failed_leaf.hook_state.execution_active = True
+        failed_leaf.session_manager._client.interrupt.side_effect = RuntimeError("offline")
+        bot._route_inbox_targets.update(
+            {
+                (team_name, "branch-agent"): branch.route,
+                (team_name, "failed-leaf-agent"): failed_leaf.route,
+            }
+        )
+        bot._route_inbox_target_keys_by_route.update(
+            {
+                branch.route: (team_name, "branch-agent"),
+                failed_leaf.route: (team_name, "failed-leaf-agent"),
+            }
+        )
+        with patch.object(
+            bot,
+            "_load_tree_members",
+            return_value={
+                "branch-agent": {"agent_name": "branch-agent", "lineage": ["Root", "Branch"]},
+                "failed-leaf-agent": {
+                    "agent_name": "failed-leaf-agent",
+                    "lineage": ["Root", "Branch", "Leaf"],
+                },
+            },
+        ):
+            update = _make_update("/stop_branch", thread_id=111)
+            ctx = _make_context()
+            await bot.handle_stop_branch(update, ctx)
+
+        assert branch.hook_state.interrupt_flag is True
+        assert failed_leaf.hook_state.interrupt_flag is True
+        branch.session_manager._client.interrupt.assert_awaited_once()
+        failed_leaf.session_manager._client.interrupt.assert_awaited_once()
+        text = ctx.bot.send_message.call_args.kwargs["text"]
+        assert "interrupted 1" in text
+        assert "failed 1" in text
+
+    async def test_stop_tree_from_leaf_includes_trunk_and_tolerates_repeat(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        team_name = "2026-08-12-08-05-root"
+        root = _state(bot, thread_id=None)
+        leaf = _state(bot, thread_id=201)
+        root.agent_lineage = ("Root",)
+        leaf.agent_lineage = ("Root", "Leaf")
+        for candidate, agent_name in ((root, team_name), (leaf, "leaf-agent")):
+            candidate.session_manager.set_sdk_env_overrides(
+                {"CLAUDE_CODE_TEAM_NAME": team_name, "CLAUDE_CODE_AGENT_NAME": agent_name}
+            )
+            client = MagicMock()
+            client.interrupt = AsyncMock()
+            candidate.session_manager._client = client
+            candidate.session_manager._connected = True
+        bot._route_inbox_targets.update(
+            {(team_name, team_name): root.route, (team_name, "leaf-agent"): leaf.route}
+        )
+        bot._route_inbox_target_keys_by_route.update(
+            {root.route: (team_name, team_name), leaf.route: (team_name, "leaf-agent")}
+        )
+        with patch.object(
+            bot,
+            "_load_tree_members",
+            return_value={
+                team_name: {"agent_name": team_name, "lineage": ["Root"]},
+                "leaf-agent": {"agent_name": "leaf-agent", "lineage": ["Root", "Leaf"]},
+            },
+        ):
+            update = _make_update("/stop_tree", thread_id=201)
+            ctx = _make_context()
+            await bot.handle_stop_tree(update, ctx)
+            await bot.handle_stop_tree(update, ctx)
+
+        assert root.hook_state.interrupt_flag is True
+        assert leaf.hook_state.interrupt_flag is True
+        assert root.session_manager._client.interrupt.await_count == 2
+        assert leaf.session_manager._client.interrupt.await_count == 2
+        assert "stale 0" in ctx.bot.send_message.call_args.kwargs["text"]
+
+    async def test_delete_commands_are_deprecated_and_non_destructive(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot, thread_id=301)
+        state.session_manager.set_session_id("sid-delete-compat")
+        update = _make_update("/delete", thread_id=301)
+        ctx = _make_context()
+        await bot.handle_delete(update, ctx)
+        assert "deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert "stop_branch" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert bot._get_state(state.route, create=False) is state
+        ctx = _make_context()
+        ctx.args = ["all"]
+        await bot.handle_delete(update, ctx)
+        assert "stop_tree" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert bot._get_state(state.route, create=False) is state
+
     async def test_stop_does_not_mark_parent_agent_task_terminal_request(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         parent_route = TelegramRoute(chat_id=67890, thread_id=None)
@@ -4914,7 +5086,7 @@ class TestTopicCommands:
 
         assert bot._session_heads["sid-healthy"] == "fresh-streamed-uuid"
 
-    async def test_delete_current_topic_drops_route_state(self, config):
+    async def test_delete_current_topic_is_non_destructive_compatibility_path(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         topic_state = _state(bot, thread_id=321)
         topic_state.session_manager.set_session_id("sid-topic")
@@ -4925,13 +5097,15 @@ class TestTopicCommands:
 
         await bot.handle_delete(update, ctx)
 
-        ctx.bot.delete_forum_topic.assert_awaited_once_with(chat_id=67890, message_thread_id=321)
-        assert TelegramRoute(chat_id=67890, thread_id=321) not in bot._states_by_route
+        ctx.bot.delete_forum_topic.assert_not_awaited()
+        assert TelegramRoute(chat_id=67890, thread_id=321) in bot._states_by_route
+        assert "deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert "stop_branch" in ctx.bot.send_message.call_args.kwargs["text"]
 
-    async def test_delete_all_replies_in_general_route(self, config):
+    async def test_delete_all_is_non_destructive_compatibility_path(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         _state(bot)
-        _state(bot, thread_id=321)
+        topic_state = _state(bot, thread_id=321)
 
         update = _make_update("/delete all", thread_id=321)
         ctx = _make_context()
@@ -4940,9 +5114,11 @@ class TestTopicCommands:
 
         await bot.handle_delete(update, ctx)
 
-        assert ctx.bot.send_message.call_args.kwargs["message_thread_id"] is None
-        assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>all non-General topics deleted</i></u>"
-        assert ctx.bot.send_message.call_args.kwargs["disable_notification"] is False
+        ctx.bot.delete_forum_topic.assert_not_awaited()
+        assert TelegramRoute(chat_id=67890, thread_id=321) in bot._states_by_route
+        assert TelegramRoute(chat_id=67890, thread_id=None) in bot._states_by_route
+        assert "deprecated" in ctx.bot.send_message.call_args.kwargs["text"]
+        assert "stop_tree" in ctx.bot.send_message.call_args.kwargs["text"]
 
 
 class TestForkTaskRuntime:
@@ -5057,8 +5233,15 @@ class TestForkTaskRuntime:
         launch_text = launched["content"][0]["text"]
         assert "ForkTask launched." in launch_text
         assert "Working in the background; completion will be posted here." in launch_text
+        assert "task_id_scope: deprecated/internal" in launch_text
+        assert "task_id (deprecated/internal compatibility):" in launch_text
+        assert "team_name:" in launch_text
+        assert "agent_name:" in launch_text
+        assert "lineage:" in launch_text
+        assert "session_id: sid-child" in launch_text
+        assert launch_text.index("team_name:") < launch_text.index("agentId:")
         task_id = launch_text.split("agentId: ", 1)[1].splitlines()[0]
-        assert "output_file:" in launch_text
+        assert "output_file (trusted internal record-derived):" in launch_text
         assert "telegram_topic: https://t.me/c/67890/321/900" in launch_text
         assert task_id in bot._fork_tasks_by_id
         record = bot._fork_tasks_by_id[task_id]
@@ -5073,6 +5256,11 @@ class TestForkTaskRuntime:
         assert "source message" in send_calls[0].kwargs["text"]
         assert "https://t.me/c/67890/55" in send_calls[0].kwargs["text"]
         assert "session forked: sid-child" in send_calls[1].kwargs["text"]
+        assert "team_name:" in launched["content"][0]["text"]
+        assert "agent_name:" in launched["content"][0]["text"]
+        assert "lineage:" in launched["content"][0]["text"]
+        assert "session_id: sid-child" in launched["content"][0]["text"]
+        assert launched["content"][0]["text"].index("team_name:") < launched["content"][0]["text"].index("task_id (deprecated/internal")
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=321))
         assert child_state is not None
         assert child_state.notify_on_completion is True
@@ -5097,8 +5285,7 @@ class TestForkTaskRuntime:
         state.session_manager.set_session_id("sid-root")
         state.session_manager.model_override = "gpt-5.5"
 
-        # Use a unique team name to avoid collision with stale inbox files
-        unique_team = f"team-fresh-{uuid.uuid4().hex[:8]}"
+        unique_team = "2026-03-31-10-00-fresh"
         fake_task_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
         with patch("obs_agent.telegram.uuid.uuid4", side_effect=[fake_task_id]), patch(
             "obs_agent.telegram.fork_session_jsonl"
@@ -5122,7 +5309,13 @@ class TestForkTaskRuntime:
         launch_text = launched["content"][0]["text"]
         assert "AgentTask launched." in launch_text
         assert "Working in the background; completion will be posted here." in launch_text
+        assert "team_name:" in launch_text
+        assert "agent_name:" in launch_text
+        assert "lineage:" in launch_text
+        assert "session_id: pending until the child session starts" in launch_text
+        assert "task_id (deprecated/internal compatibility): 11111111-1111-1111-1111-111111111111" in launch_text
         assert "agentId: 11111111-1111-1111-1111-111111111111" in launch_text
+        assert launch_text.index("team_name:") < launch_text.index("agentId:")
         record = bot._fork_tasks_by_id["11111111-1111-1111-1111-111111111111"]
         assert record.is_fork is False
         assert record.child_session_id == ""
@@ -5350,7 +5543,7 @@ class TestForkTaskRuntime:
                     "prompt": "Worker A boot",
                     "description": "Peer A",
                     "fork": False,
-                    "team_name": "team-alpha",
+                    "team_name": "2026-03-31-10-00-root",
                     "name": "worker-a",
                     "task_tool_name": "AgentTask",
                 },
@@ -5361,13 +5554,13 @@ class TestForkTaskRuntime:
                     "prompt": "Worker B boot",
                     "description": "Peer B",
                     "fork": False,
-                    "team_name": "team-alpha",
+                    "team_name": "2026-03-31-10-00-root",
                     "name": "worker-b",
                     "task_tool_name": "AgentTask",
                 },
             )
 
-        team_config = tmp_path / ".claude" / "teams" / "team-alpha" / "config.json"
+        team_config = tmp_path / ".claude" / "teams" / "2026-03-31-10-00-root" / "config.json"
         assert team_config.exists()
         payload = json.loads(team_config.read_text(encoding="utf-8"))
         members = payload.get("members") or []
@@ -5383,8 +5576,8 @@ class TestForkTaskRuntime:
         assert isinstance(peer_a_obs, dict)
         assert peer_a_obs["display_name"] == "Peer A"
         assert peer_a_obs["lineage"] == ["General", "Peer A"]
-        assert peer_a_obs["root_team_key"] == "team-alpha"
-        assert peer_a_obs["parent_agent_name"] == "team-alpha"
+        assert peer_a_obs["root_team_key"] == "2026-03-31-10-00-root"
+        assert peer_a_obs["parent_agent_name"] == "2026-03-31-10-00-root"
         assert peer_a_obs["topic_chat_id"] == -10067890
         assert peer_a_obs["topic_thread_id"] == 333
         await bot.shutdown()
@@ -5680,7 +5873,7 @@ class TestForkTaskRuntime:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
                 payload={
-                    "team_name": "team-alpha",
+                    "team_name": "2026-03-31-10-00-root",
                     "recipient": "worker-a",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -5737,7 +5930,7 @@ class TestForkTaskRuntime:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
                 payload={
-                    "team_name": "team-alpha",
+                    "team_name": "2026-03-31-10-00-root",
                     "recipient": "worker-a",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -5786,7 +5979,7 @@ class TestForkTaskRuntime:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
                 payload={
-                    "team_name": "team-alpha",
+                    "team_name": "2026-03-31-10-00-root",
                     "recipient": "worker-fork",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -5830,7 +6023,7 @@ class TestForkTaskRuntime:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
                 payload={
-                    "team_name": "team-alpha",
+                    "team_name": "2026-03-31-10-00-root",
                     "recipient": "worker-a",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -5863,7 +6056,7 @@ class TestForkTaskRuntime:
         await bot._handle_inbox_message_notification(
             sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
             payload={
-                "team_name": "team-alpha",
+                "team_name": "2026-03-31-10-00-root",
                 "recipient": "root-agent",
                 "sender": "worker-b",
                 "summary": "handoff",
@@ -6296,6 +6489,7 @@ class TestForkTaskRuntime:
         )
         bot._fork_tasks_by_id["task-123"] = record
         bot._fork_task_by_child_route[child_route] = "task-123"
+        parent_state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
 
         with patch.object(
             bot,
@@ -6308,6 +6502,39 @@ class TestForkTaskRuntime:
         queued = parent_state.hook_state.message_queue.get_nowait()
         assert "<status>stopped</status>" in queued
 
+    def test_fork_task_launch_builder_orders_stable_identity_before_uuid(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        text = bot._build_fork_task_launch_text(
+            task_id="task-builder",
+            output_file=None,
+            topic_link=None,
+            task_label="AgentTask",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-worker",
+            lineage=("Root", "Worker"),
+            session_id="sid-builder",
+        )
+        assert text.index("team_name:") < text.index("agent_name:")
+        assert text.index("agent_name:") < text.index("lineage:")
+        assert text.index("lineage:") < text.index("session_id: sid-builder")
+        assert text.index("session_id: sid-builder") < text.index("task_id (deprecated/internal")
+        assert "agentId: task-builder" in text
+        assert "task_id_scope: deprecated/internal" in text
+
+    def test_fork_task_launch_builder_marks_pending_fresh_session(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        text = bot._build_fork_task_launch_text(
+            task_id="task-fresh-builder",
+            output_file=None,
+            topic_link=None,
+            task_label="AgentTask",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-worker",
+            lineage=("Root", "Worker"),
+        )
+        assert "session_id: pending until the child session starts" in text
+        assert "agentId: task-fresh-builder" in text
+
     async def test_fork_task_output_reports_running(self, config, tmp_path):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
@@ -6319,8 +6546,13 @@ class TestForkTaskRuntime:
             child_route=child_route,
             child_session_id="sid-child",
             prompt="Return READY",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-running-output",
         )
         bot._fork_tasks_by_id["task-123"] = record
+        state = bot._get_state(record.parent_route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = record.team_name
         output_path = tmp_path / "sid-child.jsonl"
         output_path.write_text('{"type":"user"}\n', encoding="utf-8")
         task = asyncio.create_task(asyncio.sleep(30))
@@ -6339,6 +6571,625 @@ class TestForkTaskRuntime:
         assert "<retrieval_status>not_ready</retrieval_status>" in result["content"][0]["text"]
         assert "<status>running</status>" in result["content"][0]["text"]
 
+    async def test_fork_task_output_missing_stable_target_is_not_found(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+        result = await bot._fork_task_output(
+            route=route,
+            args={"agent_name": "abcdef1234-missing", "block": False, "timeout": 1},
+        )
+        assert result["is_error"] is True
+        assert "No task found" in result["content"][0]["text"]
+
+    async def test_fork_task_output_resolves_stable_identity_and_newest_duplicate(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        older = _ForkTaskRecord(
+            task_id="task-old",
+            parent_route=route,
+            child_route=route,
+            child_session_id="sid-old",
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            prompt="old",
+            status="completed",
+            result_text="OLD",
+            created_at=10.0,
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-worker",
+        )
+        newer = _ForkTaskRecord(
+            task_id="task-new",
+            parent_route=route,
+            child_route=route,
+            child_session_id="sid-new",
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            prompt="new",
+            status="completed",
+            result_text="NEW",
+            created_at=20.0,
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-worker",
+        )
+        bot._fork_tasks_by_id.update({older.task_id: older, newer.task_id: newer})
+        bot._team_worker_records[("2026-03-31-10-00-root", "abcdef1234-worker")] = older.task_id
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+
+        result = await bot._fork_task_output(
+            route=route,
+            args={"team_name": "2026-03-31-10-00-root", "agent_name": "abcdef1234-worker", "block": False, "timeout": 1},
+        )
+
+        assert result["tool_use_result"]["task"]["task_id"] == "task-old"
+        assert result["tool_use_result"]["task"]["result"] == "OLD"
+
+        bot._team_worker_records.clear()
+        restored = await bot._fork_task_output(
+            route=route,
+            args={"team_name": "2026-03-31-10-00-root", "agent_name": "abcdef1234-worker", "block": False, "timeout": 1},
+        )
+        assert restored["tool_use_result"]["task"]["task_id"] == "task-new"
+
+    async def test_fork_task_output_allows_same_team_ancestor_and_non_parent_targets(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=777)
+        state = bot._get_state(route, topic_title="Root - Current")
+        assert state is not None
+        state.agent_lineage = ("Root", "Current")
+        state.session_manager.sdk_env_overrides.update(
+            {
+                "CLAUDE_CODE_TEAM_NAME": "2026-03-31-10-00-root",
+                "CLAUDE_CODE_AGENT_NAME": "abcdef1234-current",
+            }
+        )
+        for agent_name, result_text in (
+            ("abcdef1234-ancestor", "ANCESTOR"),
+            ("abcdef1234-nonparent", "NONPARENT"),
+        ):
+            record = _ForkTaskRecord(
+                task_id=f"task-{agent_name}",
+                parent_route=route,
+                child_route=route,
+                parent_session_id_at_launch="sid-parent",
+                parent_source_uuid="parent-source-uuid",
+                child_session_id=f"sid-{agent_name}",
+                prompt=agent_name,
+                status="completed",
+                result_text=result_text,
+                team_name="2026-03-31-10-00-root",
+                agent_name=agent_name,
+            )
+            bot._fork_tasks_by_id[record.task_id] = record
+            inspected = await bot._fork_task_output(
+                route=route,
+                args={"agent_name": agent_name, "block": False, "timeout": 1},
+            )
+            assert inspected["tool_use_result"]["task"]["result"] == result_text
+
+    async def test_fork_task_output_known_task_id_denies_foreign_root(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+        foreign = _ForkTaskRecord(
+            task_id="task-known-foreign",
+            parent_route=route,
+            child_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_session_id="sid-foreign",
+            prompt="foreign",
+            status="completed",
+            result_text="FOREIGN",
+            team_name="2026-03-31-11-00-other",
+            agent_name="0123456789-foreign",
+        )
+        bot._fork_tasks_by_id[foreign.task_id] = foreign
+        output = await bot._fork_task_output(
+            route=route,
+            args={"task_id": foreign.task_id, "block": False, "timeout": 1},
+        )
+        stop = await bot._fork_task_stop(route=route, args={"task_id": foreign.task_id})
+        assert output["is_error"] is True
+        assert stop["is_error"] is True
+
+    async def test_fork_task_output_infers_caller_team_and_denies_other_root(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        state = bot._get_state(route, topic_title="Root - Current")
+        assert state is not None
+        state.agent_lineage = ("Root", "Current")
+        state.session_manager.sdk_env_overrides.update(
+            {
+                "CLAUDE_CODE_TEAM_NAME": "2026-03-31-10-00-root",
+                "CLAUDE_CODE_AGENT_NAME": "abcdef1234-current",
+            }
+        )
+        target = _ForkTaskRecord(
+            task_id="task-sibling",
+            parent_route=route,
+            child_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_session_id="sid-sibling",
+            prompt="sibling",
+            status="completed",
+            result_text="SIBLING",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-sibling",
+        )
+        foreign = _ForkTaskRecord(
+            task_id="task-foreign",
+            parent_route=route,
+            child_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_session_id="sid-foreign",
+            prompt="foreign",
+            status="completed",
+            result_text="FOREIGN",
+            team_name="2026-03-31-11-00-other",
+            agent_name="0123456789-foreign",
+        )
+        bot._fork_tasks_by_id.update({target.task_id: target, foreign.task_id: foreign})
+        inferred = await bot._fork_task_output(
+            route=route,
+            args={"agent_name": target.agent_name, "block": False, "timeout": 1},
+        )
+        assert inferred["tool_use_result"]["task"]["result"] == "SIBLING"
+        denied = await bot._fork_task_output(
+            route=route,
+            args={"team_name": foreign.team_name, "agent_name": foreign.agent_name, "block": False, "timeout": 1},
+        )
+        assert denied["is_error"] is True
+
+    async def test_fork_task_output_caller_team_source_matrix_fails_closed(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        state = bot._get_state(route)
+        assert state is not None
+        record = _ForkTaskRecord(
+            task_id="task-source-matrix",
+            parent_route=route,
+            child_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_session_id="sid-source-matrix",
+            prompt="source",
+            status="completed",
+            result_text="SOURCE",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-source",
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        assert bot._caller_team_name(route) is None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = record.team_name
+        assert bot._caller_team_name(route) == record.team_name
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-11-00-other"
+        assert bot._caller_team_name(route) is None
+        bot._route_inbox_target_keys_by_route[route] = (
+            "2026-03-31-10-00-root",
+            "abcdef1234-current",
+        )
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-11-00-other"
+        assert bot._caller_team_name(route) is None
+        bot._route_inbox_target_keys_by_route.pop(route)
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "../malformed"
+        assert bot._caller_team_name(route) is None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = ""
+        state.pending_obs_bootstrap = "<obs-bootstrap><broken>"
+        assert bot._caller_team_name(route) is None
+        state.pending_obs_bootstrap = build_obs_bootstrap_xml(
+            lineage=("Root",),
+            origin="test",
+            is_fork=False,
+            session_id="sid-source-matrix",
+            root_team_key="2026-03-31-10-00-root",
+            agent_name="2026-03-31-10-00-root",
+        )
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = ""
+        assert bot._caller_team_name(route) == record.team_name
+
+    async def test_fork_task_output_stable_lifecycle_statuses(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+        for status, agent_name in (
+            ("completed", "abcdef1234-completed"),
+            ("failed", "abcdef1234-failed"),
+            ("stopped", "abcdef1234-stopped"),
+        ):
+            record = _ForkTaskRecord(
+                task_id=f"task-{status}",
+                parent_route=route,
+                child_route=route,
+                parent_session_id_at_launch="sid-parent",
+                parent_source_uuid="parent-source-uuid",
+                child_session_id=f"sid-{status}",
+                prompt=status,
+                status=status,
+                result_text=status.upper(),
+                error="boom" if status == "failed" else None,
+                team_name="2026-03-31-10-00-root",
+                agent_name=agent_name,
+            )
+            bot._fork_tasks_by_id[record.task_id] = record
+            result = await bot._fork_task_output(
+                route=route,
+                args={"agent_name": agent_name, "block": False, "timeout": 1},
+            )
+            assert result["tool_use_result"]["task"]["status"] == status
+
+    async def test_fork_task_stop_stable_identity_stops_running_and_repeats_idempotently(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+        record = _ForkTaskRecord(
+            task_id="task-running-stop",
+            parent_route=route,
+            child_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_session_id="sid-running-stop",
+            prompt="stop",
+            status="running",
+            terminal_request=None,
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-running-stop",
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        task = asyncio.create_task(asyncio.sleep(30))
+        bot._fork_task_tasks[record.task_id] = task
+        bot._team_worker_records[(record.team_name, record.agent_name)] = record.task_id
+        first = await bot._fork_task_stop(route=route, args={"agent_name": record.agent_name})
+        assert first["tool_use_result"]["status"] == "stopping"
+        record.status = "stopped"
+        record.terminal_request = "stopped"
+        second = await bot._fork_task_stop(route=route, args={"agent_name": record.agent_name})
+        assert second["tool_use_result"]["idempotent"] is True
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def test_fork_task_stop_terminal_history_is_non_destructive(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+        for status, agent_name in (("completed", "abcdef1234-terminal-completed"), ("failed", "abcdef1234-terminal-failed"), ("stopped", "abcdef1234-terminal-stopped")):
+            record = _ForkTaskRecord(
+                task_id=f"task-terminal-{status}",
+                parent_route=route,
+                child_route=route,
+                parent_session_id_at_launch="sid-parent",
+                parent_source_uuid="parent-source-uuid",
+                child_session_id=f"sid-terminal-{status}",
+                prompt=status,
+                status=status,
+                terminal_request=None,
+                team_name="2026-03-31-10-00-root",
+                agent_name=agent_name,
+            )
+            bot._fork_tasks_by_id[record.task_id] = record
+            result = await bot._fork_task_stop(route=route, args={"agent_name": agent_name})
+            assert result["tool_use_result"]["status"] == status
+            assert result["tool_use_result"]["idempotent"] is True
+            assert record.status == status
+            assert record.terminal_request is None
+
+    async def test_fork_task_stop_repeated_stopping_is_idempotent(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+        record = _ForkTaskRecord(
+            task_id="task-repeated-stopping",
+            parent_route=route,
+            child_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_session_id="sid-repeated-stopping",
+            prompt="stop",
+            status="running",
+            terminal_request="stopped",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-repeated-stopping",
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        result = await bot._fork_task_stop(route=route, args={"agent_name": record.agent_name})
+        assert result["tool_use_result"]["status"] == "stopping"
+        assert result["tool_use_result"]["idempotent"] is True
+
+    async def test_fork_task_stop_stable_identity_is_idempotent(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+        record = _ForkTaskRecord(
+            task_id="task-stable-stop",
+            parent_route=route,
+            child_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_session_id="sid-stop",
+            prompt="stop",
+            status="stopped",
+            terminal_request="stopped",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-stop",
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        bot._team_worker_records[(record.team_name, record.agent_name)] = record.task_id
+        result = await bot._fork_task_stop(
+            route=route,
+            args={"agent_name": record.agent_name},
+        )
+        assert result["tool_use_result"]["status"] == "stopped"
+        assert result["tool_use_result"]["idempotent"] is True
+
+    async def test_fork_task_output_restores_stable_record_after_active_mapping_is_stale(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+        record = _ForkTaskRecord(
+            task_id="task-restored",
+            parent_route=route,
+            child_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_session_id="sid-restored",
+            prompt="restored",
+            status="completed",
+            result_text="RESTORED",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-restored",
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        bot._team_worker_records[(record.team_name, record.agent_name)] = "missing-task"
+        result = await bot._fork_task_output(
+            route=route,
+            args={"agent_name": record.agent_name, "block": False, "timeout": 1},
+        )
+        assert result["tool_use_result"]["task"]["task_id"] == record.task_id
+
+    async def test_fork_task_output_restart_restored_record_keeps_identity(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        record = _ForkTaskRecord(
+            task_id="task-restart-stable",
+            parent_route=route,
+            child_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_session_id="sid-restart",
+            prompt="restart",
+            status="completed",
+            result_text="RESTARTED",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-restart",
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        bot._team_worker_records[(record.team_name, record.agent_name)] = record.task_id
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = record.team_name
+        result = await bot._fork_task_output(
+            route=route,
+            args={"agent_name": record.agent_name, "block": False, "timeout": 1},
+        )
+        assert result["tool_use_result"]["task"]["session_id"] == "sid-restart"
+
+    async def test_fork_task_output_after_restart_uses_persisted_identity_fields(self, config):
+        first = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=902)
+        state = first._get_state(route, topic_title="Root - Restarted")
+        assert state is not None
+        state.session_manager.set_session_id("sid-persisted")
+        state.session_manager.sdk_env_overrides.update(
+            {
+                "CLAUDE_CODE_TEAM_NAME": "2026-03-31-10-00-root",
+                "CLAUDE_CODE_AGENT_NAME": "abcdef1234-persisted",
+            }
+        )
+        first._bind_state_session(state)
+        record = _ForkTaskRecord(
+            task_id="task-persisted-identity",
+            parent_route=route,
+            child_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_session_id="sid-persisted",
+            prompt="persisted",
+            status="completed",
+            result_text="PERSISTED",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-persisted",
+        )
+        first._fork_tasks_by_id[record.task_id] = record
+        first._persist_task_handle_record(record)
+        await first.shutdown()
+        restored = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        await restored.initialize_runtime()
+        restored_state = restored._get_state(route, create=False)
+        assert restored_state is not None
+        restored_result = await restored._fork_task_output(
+            route=route,
+            args={"agent_name": record.agent_name, "block": False, "timeout": 1},
+        )
+        assert restored_result["tool_use_result"]["task"]["team_name"] == record.team_name
+        assert restored_result["tool_use_result"]["task"]["session_id"] == record.child_session_id
+        await restored.shutdown()
+
+    async def test_fork_task_output_rejects_unsafe_or_ambiguous_identity(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+
+        unsafe = await bot._fork_task_output(
+            route=route,
+            args={"team_name": "../team", "agent_name": "worker", "block": False, "timeout": 1},
+        )
+        assert unsafe["is_error"] is True
+        assert "hash-prefixed stable identity" in unsafe["content"][0]["text"]
+
+        partial = await bot._fork_task_output(
+            route=route,
+            args={"team_name": "2026-03-31-10-00-root", "block": False, "timeout": 1},
+        )
+        assert partial["is_error"] is True
+        assert "team_name requires agent_name" in partial["content"][0]["text"]
+
+    async def test_fork_task_output_bounds_known_output_and_exposes_identity(self, config, tmp_path):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=321)
+        record = _ForkTaskRecord(
+            task_id="task-bounded",
+            parent_route=route,
+            child_route=route,
+            child_session_id="sid-bounded",
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            prompt="bounded",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-worker",
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        state = bot._get_state(record.parent_route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = record.team_name
+        task = asyncio.create_task(asyncio.sleep(30))
+        bot._fork_task_tasks[record.task_id] = task
+        output_path = tmp_path / "bounded.txt"
+        output_path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "first"}]}}),
+                    "x" * 97_000,
+                    "not-json-tail",
+                    json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "z" * 5_000}]}}),
+                    json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "z" * 5_000}]}}),
+                    json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "z" * 5_000}]}}),
+                    json.dumps({"type": "progress", "data": {"message": "second"}}),
+                    '{"type":"assistant","message":',
+                ]
+            ),
+            encoding="utf-8",
+        )
+        with patch.object(bot, "_record_output_file", return_value=str(output_path)):
+            try:
+                result = await bot._fork_task_output(
+                    route=route,
+                    args={"task_id": record.task_id, "block": False, "timeout": 1},
+                )
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        text = result["content"][0]["text"]
+        assert len(text) < 13_000
+        assert "<team_name>2026-03-31-10-00-root</team_name>" in text
+        assert "<agent_name>abcdef1234-worker</agent_name>" in text
+        assert "<session_id>sid-bounded</session_id>" in text
+        assert "<task_id_scope>deprecated_internal_compatibility</task_id_scope>" in text
+        assert "<lineage>" in text
+        assert '<output_file scope="trusted_internal_record_derived">' in text
+        assert result["tool_use_result"]["task"]["output_file_scope"] == "trusted_internal_record_derived"
+        assert "[truncated to the most recent output]" in text
+        assert "first" not in text
+        assert "second" in text
+
+    def test_record_output_snapshot_respects_byte_window_and_newest_order(self, config, tmp_path):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        record = _ForkTaskRecord(
+            task_id="task-byte-window",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            child_route=TelegramRoute(chat_id=-10067890, thread_id=321),
+            child_session_id="sid-byte-window",
+            prompt="output",
+        )
+        path = tmp_path / "sid-byte-window.jsonl"
+        prefix = "x" * 97_000
+        path.write_text(
+            prefix
+            + "\n"
+            + json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "newest"}]}})
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch.object(bot, "_record_output_file", return_value=str(path)):
+            snapshot = bot._record_output_snapshot(record)
+        assert "newest" in snapshot
+        assert "x" * 100 not in snapshot
+
+    def test_record_output_snapshot_caps_records_and_preserves_newest_order(self, config, tmp_path):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        record = _ForkTaskRecord(
+            task_id="task-record-cap",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            child_route=TelegramRoute(chat_id=-10067890, thread_id=321),
+            child_session_id="sid-record-cap",
+            prompt="output",
+        )
+        path = tmp_path / "sid-record-cap.jsonl"
+        lines = [
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": f"record-{idx}"}]}})
+            for idx in range(60)
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with patch.object(bot, "_record_output_file", return_value=str(path)):
+            snapshot = bot._record_output_snapshot(record)
+        assert snapshot.splitlines().__len__() == 48
+        assert "record-0" not in snapshot
+        assert "record-11" not in snapshot
+        assert "record-12" in snapshot
+        assert "record-59" in snapshot
+        assert snapshot.index("record-12") < snapshot.index("record-59")
+
+    def test_record_output_snapshot_filters_shapes_fields_and_amplification(self, config, tmp_path):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        record = _ForkTaskRecord(
+            task_id="task-shapes",
+            parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            child_route=TelegramRoute(chat_id=-10067890, thread_id=321),
+            child_session_id="sid-shapes",
+            prompt="output",
+        )
+        path = tmp_path / "sid-shapes.jsonl"
+        path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "user", "message": {"content": "ignore-user"}}),
+                    json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "input": {"text": "ignore-tool"}}]}}),
+                    json.dumps({"type": "progress", "data": {"message": "allowed-progress", "ignored": "not selected"}}),
+                    json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "allowed-assistant"}, {"type": "text", "text": "allowed-assistant"}]}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch.object(bot, "_record_output_file", return_value=str(path)):
+            snapshot = bot._record_output_snapshot(record)
+        assert "ignore-user" not in snapshot
+        assert "ignore-tool" not in snapshot
+        assert "allowed-progress" in snapshot
+        assert snapshot.count("allowed-assistant") == 1
+        assert "ignored" not in snapshot
+
     async def test_fork_task_output_reports_completed_after_completion(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
@@ -6352,8 +7203,13 @@ class TestForkTaskRuntime:
             prompt="Return READY",
             status="completed",
             result_text="READY",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-completed-output",
         )
         bot._fork_tasks_by_id["task-123"] = record
+        state = bot._get_state(record.parent_route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = record.team_name
 
         result = await bot._fork_task_output(
             route=record.parent_route,
@@ -6379,8 +7235,13 @@ class TestForkTaskRuntime:
             child_route=child_route,
             child_session_id="sid-child",
             prompt="Return READY",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-timeout-output",
         )
         bot._fork_tasks_by_id["task-123"] = record
+        state = bot._get_state(record.parent_route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = record.team_name
         task = asyncio.create_task(asyncio.sleep(30))
         bot._fork_task_tasks["task-123"] = task
         try:
@@ -6409,8 +7270,13 @@ class TestForkTaskRuntime:
             prompt="Return READY",
             status="completed",
             result_text="READY",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-repeated-output",
         )
         bot._fork_tasks_by_id["task-123"] = record
+        state = bot._get_state(record.parent_route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = record.team_name
 
         first = await bot._fork_task_output(
             route=record.parent_route,
@@ -6438,8 +7304,13 @@ class TestForkTaskRuntime:
             status="launched",
             terminal_request="stopped",
             result_text="PARTIAL",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-terminal-output",
         )
         bot._fork_tasks_by_id["task-123"] = record
+        state = bot._get_state(record.parent_route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = record.team_name
 
         result = await bot._fork_task_output(
             route=record.parent_route,
@@ -6451,7 +7322,7 @@ class TestForkTaskRuntime:
         assert result["tool_use_result"]["retrieval_status"] == "stopped"
         assert result["tool_use_result"]["task"]["status"] == "stopped"
 
-    async def test_fork_task_output_includes_output_file_when_available(self, config, tmp_path):
+    async def test_fork_task_output_exposes_only_trusted_record_path(self, config, tmp_path):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
         record = _ForkTaskRecord(
@@ -6464,8 +7335,13 @@ class TestForkTaskRuntime:
             prompt="Return READY",
             status="completed",
             result_text="READY",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-trusted-output",
         )
         bot._fork_tasks_by_id["task-123"] = record
+        state = bot._get_state(record.parent_route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = record.team_name
         output_path = tmp_path / "sid-child.jsonl"
         output_path.write_text('{"type":"assistant"}\n', encoding="utf-8")
 
@@ -6475,8 +7351,8 @@ class TestForkTaskRuntime:
                 args={"task_id": "task-123", "block": False, "timeout": 1},
             )
 
-        assert f"<output_file>{output_path}</output_file>" in result["content"][0]["text"]
-        assert result["tool_use_result"]["task"]["output_file"] == str(output_path)
+        assert str(output_path) in result["content"][0]["text"]
+        assert result["tool_use_result"]["task"]["output_file_scope"] == "trusted_internal_record_derived"
 
     async def test_fork_task_output_on_stopped_handle_returns_stopped(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -6490,8 +7366,13 @@ class TestForkTaskRuntime:
             child_session_id="sid-child",
             prompt="Return READY",
             status="stopped",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-stopped-output",
         )
         bot._fork_tasks_by_id["task-123"] = record
+        state = bot._get_state(record.parent_route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = record.team_name
 
         result = await bot._fork_task_output(
             route=record.parent_route,
@@ -6505,6 +7386,9 @@ class TestForkTaskRuntime:
 
     async def test_fork_task_output_unknown_handle_returns_not_found(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=None))
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
 
         result = await bot._fork_task_output(
             route=TelegramRoute(chat_id=-10067890, thread_id=None),
@@ -6521,6 +7405,9 @@ class TestForkTaskRuntime:
         assert child_state is not None
         fake_client = MagicMock()
         fake_client.interrupt = AsyncMock()
+        parent_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=None))
+        assert parent_state is not None
+        parent_state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
         with patch.object(child_state.session_manager, "get_client", AsyncMock(return_value=fake_client)):
             task = asyncio.create_task(asyncio.sleep(30))
             record = _ForkTaskRecord(
@@ -6532,13 +7419,15 @@ class TestForkTaskRuntime:
                 child_session_id="sid-child",
                 prompt="Return READY",
                 description="Audit",
+                team_name="2026-03-31-10-00-root",
+                agent_name="abcdef1234-running",
             )
             bot._fork_tasks_by_id["task-123"] = record
             bot._fork_task_tasks["task-123"] = task
             try:
                 result = await bot._fork_task_stop(
                     route=record.parent_route,
-                    args={"task_id": "task-123"},
+                    args={"agent_name": record.agent_name},
                 )
             finally:
                 task.cancel()
@@ -6550,7 +7439,7 @@ class TestForkTaskRuntime:
         fake_client.interrupt.assert_awaited_once()
         assert "Successfully stopped task: task-123" in result["content"][0]["text"]
 
-    async def test_fork_task_stop_on_completed_handle_returns_not_found(self, config):
+    async def test_fork_task_stop_on_completed_handle_is_idempotent_and_non_destructive(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
         record = _ForkTaskRecord(
@@ -6565,13 +7454,21 @@ class TestForkTaskRuntime:
         )
         bot._fork_tasks_by_id["task-123"] = record
 
+        state = bot._get_state(record.parent_route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+        record.team_name = "2026-03-31-10-00-root"
+        record.agent_name = "abcdef1234-completed"
         result = await bot._fork_task_stop(
             route=record.parent_route,
-            args={"task_id": "task-123"},
+            args={"agent_name": record.agent_name},
         )
 
-        assert result["is_error"] is True
-        assert "No task found with ID: task-123" in result["content"][0]["text"]
+        assert result.get("is_error") is not True
+        assert result["tool_use_result"]["status"] == "completed"
+        assert result["tool_use_result"]["idempotent"] is True
+        assert record.status == "completed"
+        assert record.terminal_request is None
 
     async def test_fork_task_stop_on_idle_ready_team_worker_stops_successfully(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -6584,19 +7481,22 @@ class TestForkTaskRuntime:
             child_route=child_route,
             child_session_id="sid-child",
             prompt="Return READY",
-            status="completed",
+            status="running",
             is_fork=False,
-            team_name="team-alpha",
-            agent_name="worker-a",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-idle-ready",
             idle_ready=True,
         )
         bot._fork_tasks_by_id["task-123"] = record
         bot._fork_task_by_child_route[child_route] = "task-123"
-        bot._team_worker_records[("team-alpha", "worker-a")] = "task-123"
+        bot._team_worker_records[("2026-03-31-10-00-root", "abcdef1234-idle-ready")] = "task-123"
+        state = bot._get_state(record.parent_route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
 
         result = await bot._fork_task_stop(
             route=record.parent_route,
-            args={"task_id": "task-123"},
+            args={"agent_name": record.agent_name},
         )
 
         assert result.get("is_error") is not True
@@ -6604,45 +7504,44 @@ class TestForkTaskRuntime:
         assert record.terminal_request == "stopped"
         assert record.idle_ready is False
         assert child_route not in bot._fork_task_by_child_route
-        assert ("team-alpha", "worker-a") not in bot._team_worker_records
+        assert ("2026-03-31-10-00-root", "abcdef1234-idle-ready") not in bot._team_worker_records
         assert "Successfully stopped task: task-123" in result["content"][0]["text"]
 
-    async def test_fork_task_stop_repeated_call_returns_not_found(self, config):
+    async def test_fork_task_stop_repeated_call_returns_idempotent_history(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
         child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
-        child_state = bot._get_state(child_route, topic_title="Child")
-        assert child_state is not None
-        fake_client = MagicMock()
-        fake_client.interrupt = AsyncMock()
-        with patch.object(child_state.session_manager, "get_client", AsyncMock(return_value=fake_client)):
-            task = asyncio.create_task(asyncio.sleep(30))
-            record = _ForkTaskRecord(
-                task_id="task-123",
-                parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
-                parent_session_id_at_launch="sid-parent",
-                parent_source_uuid="parent-source-uuid",
-                child_route=child_route,
-                child_session_id="sid-child",
-                prompt="Return READY",
-                description="Audit",
-            )
-            bot._fork_tasks_by_id["task-123"] = record
-            bot._fork_task_tasks["task-123"] = task
-            try:
-                await bot._fork_task_stop(route=record.parent_route, args={"task_id": "task-123"})
-            finally:
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-        second = await bot._fork_task_stop(route=record.parent_route, args={"task_id": "task-123"})
-        assert second["is_error"] is True
-        assert "No task found with ID: task-123" in second["content"][0]["text"]
+        state = bot._get_state(route)
+        assert state is not None
+        state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
+        record = _ForkTaskRecord(
+            task_id="task-repeated-history",
+            parent_route=route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-source-uuid",
+            child_route=child_route,
+            child_session_id="sid-child",
+            prompt="Return READY",
+            description="Audit",
+            team_name="2026-03-31-10-00-root",
+            agent_name="abcdef1234-repeated-history",
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        first = await bot._fork_task_stop(route=route, args={"agent_name": record.agent_name})
+        assert first["tool_use_result"]["status"] == "stopping"
+        record.status = "stopped"
+        second = await bot._fork_task_stop(route=route, args={"agent_name": record.agent_name})
+        assert second["tool_use_result"]["status"] == "stopped"
+        assert second["tool_use_result"]["idempotent"] is True
 
-    async def test_fork_task_stop_repeated_same_turn_reports_not_running(self, config):
+    async def test_fork_task_stop_repeated_same_turn_reports_stopping_idempotently(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         child_route = TelegramRoute(chat_id=-10067890, thread_id=321)
         child_state = bot._get_state(child_route, topic_title="Child")
         assert child_state is not None
+        parent_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=None))
+        assert parent_state is not None
+        parent_state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
         fake_client = MagicMock()
         fake_client.interrupt = AsyncMock()
         with patch.object(child_state.session_manager, "get_client", AsyncMock(return_value=fake_client)):
@@ -6656,17 +7555,19 @@ class TestForkTaskRuntime:
                 child_session_id="sid-child",
                 prompt="Return READY",
                 description="Audit",
+                team_name="2026-03-31-10-00-root",
+                agent_name="abcdef1234-running",
             )
             bot._fork_tasks_by_id["task-123"] = record
             bot._fork_task_tasks["task-123"] = task
             try:
                 first = await bot._fork_task_stop(
                     route=record.parent_route,
-                    args={"task_id": "task-123"},
+                    args={"agent_name": record.agent_name},
                 )
                 second = await bot._fork_task_stop(
                     route=record.parent_route,
-                    args={"task_id": "task-123"},
+                    args={"agent_name": record.agent_name},
                 )
             finally:
                 task.cancel()
@@ -6674,9 +7575,9 @@ class TestForkTaskRuntime:
                     await task
 
         assert first.get("is_error") is not True
-        assert second["is_error"] is True
-        assert "<tool_use_error>Task task-123 is not running (status: killed)</tool_use_error>" in second["content"][0]["text"]
-        assert second["tool_use_result"] == "Error: Task task-123 is not running (status: killed)"
+        assert second.get("is_error") is not True
+        assert second["tool_use_result"]["status"] == "stopping"
+        assert second["tool_use_result"]["idempotent"] is True
 
     async def test_fork_task_stop_only_interrupts_target_handle(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -6686,6 +7587,9 @@ class TestForkTaskRuntime:
         child_b_state = bot._get_state(child_b_route, topic_title="Child B")
         assert child_a_state is not None
         assert child_b_state is not None
+        parent_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=None))
+        assert parent_state is not None
+        parent_state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
         fake_client_a = MagicMock()
         fake_client_a.interrupt = AsyncMock()
         fake_client_b = MagicMock()
@@ -6705,6 +7609,8 @@ class TestForkTaskRuntime:
                 child_session_id="sid-child-a",
                 prompt="Return A",
                 description="Audit A",
+                team_name="2026-03-31-10-00-root",
+                agent_name="abcdef1234-a",
             )
             record_b = _ForkTaskRecord(
                 task_id="task-b",
@@ -6715,6 +7621,8 @@ class TestForkTaskRuntime:
                 child_session_id="sid-child-b",
                 prompt="Return B",
                 description="Audit B",
+                team_name="2026-03-31-10-00-root",
+                agent_name="abcdef1234-b",
             )
             bot._fork_tasks_by_id["task-a"] = record_a
             bot._fork_tasks_by_id["task-b"] = record_b
@@ -6723,7 +7631,7 @@ class TestForkTaskRuntime:
             try:
                 await bot._fork_task_stop(
                     route=record_a.parent_route,
-                    args={"task_id": "task-a"},
+                    args={"agent_name": record_a.agent_name},
                 )
             finally:
                 task_a.cancel()
@@ -6976,7 +7884,8 @@ class TestForkTaskRuntime:
         delete_ctx = _make_context()
         delete_ctx.bot.delete_forum_topic = AsyncMock(return_value=True)
         await bot.handle_delete(delete_update, delete_ctx)
-        assert record.terminal_request == "failed"
+        assert record.terminal_request is None
+        delete_ctx.bot.delete_forum_topic.assert_not_awaited()
 
     async def test_active_fork_tasks_still_emit_completion_summary(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -7199,6 +8108,9 @@ class TestCreateTelegramApp:
         assert command_map["model"] == "handle_model"
         assert command_map["new_group"] == "handle_new_group"
         assert command_map["new_bot"] == "handle_new_bot"
+        assert command_map["stop_branch"] == "handle_stop_branch"
+        assert command_map["stop_tree"] == "handle_stop_tree"
+        assert command_map["delete"] == "handle_delete"
 
         callback_names = [getattr(getattr(handler, "callback", None), "__name__", None) for handler in handlers]
         assert "handle_new_group_alias" in callback_names
@@ -7250,6 +8162,9 @@ class TestTelegramCommandRegistration:
         assert "model" in names
         assert "new_group" in names
         assert "new_bot" in names
+        assert "stop_branch" in names
+        assert "stop_tree" in names
+        assert "delete" not in names
 
     async def test_set_bot_commands_describes_tree_children_as_direct_children(self):
         app = MagicMock()
@@ -8082,7 +8997,7 @@ class TestTelegramStatePersistence:
             await restored._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=67890, thread_id=444),
                 payload={
-                    "team_name": "team-alpha",
+                    "team_name": "2026-03-31-10-00-root",
                     "recipient": "worker-a",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -8134,7 +9049,7 @@ class TestTelegramStatePersistence:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=67890, thread_id=444),
                 payload={
-                    "team_name": "team-alpha",
+                    "team_name": "2026-03-31-10-00-root",
                     "recipient": "worker-a",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -8200,7 +9115,7 @@ class TestTelegramStatePersistence:
             await restored._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=67890, thread_id=444),
                 payload={
-                    "team_name": "team-alpha",
+                    "team_name": "2026-03-31-10-00-root",
                     "recipient": "worker-fork",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -8501,7 +9416,7 @@ class TestTelegramStatePersistence:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
                 payload={
-                    "team_name": "team-alpha",
+                    "team_name": "2026-03-31-10-00-root",
                     "recipient": "root-agent",
                     "sender": "worker-b",
                     "summary": "handoff",

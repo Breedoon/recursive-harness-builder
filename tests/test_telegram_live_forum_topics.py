@@ -19,6 +19,10 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+pytestmark = pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
+)
+
 from tests.evals.platform_telegram_forum import (
     TelegramForumObservedMessage,
     TelegramForumPlatform,

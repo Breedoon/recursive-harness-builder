@@ -9,6 +9,11 @@ import tempfile
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
+)
+
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.chatlists import GetExportedInvitesRequest
@@ -77,9 +82,8 @@ def _dialog_filter_title_text(dialog_filter) -> str | None:
 
 @pytest.mark.integration
 @pytest.mark.telegram
-@pytest.mark.skipif(
-    not _has_provisioning_credentials(),
-    reason="Telegram provisioning credentials not configured in .env",
+@pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
 )
 class TestTelegramLiveProvisioning:
     async def test_live_new_bot_ack_and_two_sequential_creations(self, monkeypatch):

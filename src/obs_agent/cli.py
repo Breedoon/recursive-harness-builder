@@ -21,14 +21,21 @@ from typing import TYPE_CHECKING
 import httpx
 
 from obs_agent.config import OBSConfig
-from obs_agent.runtime_env import bootstrap_runtime_env
+from obs_agent.runtime_env import (
+    LegacyFormalTestRedirect,
+    assert_live_entrypoint_allowed,
+    bootstrap_runtime_env,
+)
 
-CLI_HELP = """Usage: obs-agent [--help] [--profile PROFILE] [--test] [--prod]
+CLI_HELP = """Usage: obs-agent [--help] [--profile PROFILE] [--prod]
 
 Commands:
   /help        Show this help
   /stop        Interrupt the current response
   /quit        Exit the CLI
+
+Formal testing: use the host-preflight command in docs/testing.md and the
+isolated obs-live-test service; legacy test-profile live launch is disabled.
 
 Bare quit, exit, and q also exit.
 """.strip()
@@ -321,7 +328,15 @@ async def _consume_sse(
 
 async def async_main() -> None:
     """Async entry point for obs-agent CLI."""
+    try:
+        assert_live_entrypoint_allowed()
+    except LegacyFormalTestRedirect as exc:
+        raise SystemExit(str(exc)) from exc
     bootstrap_runtime_env()
+    try:
+        assert_live_entrypoint_allowed()
+    except LegacyFormalTestRedirect as exc:
+        raise SystemExit(str(exc)) from exc
     config = OBSConfig.from_env()
     base_url = config.base_url
 
@@ -415,7 +430,15 @@ async def async_main() -> None:
 
 def main():
     """Entry point for obs-agent CLI."""
+    try:
+        assert_live_entrypoint_allowed()
+    except LegacyFormalTestRedirect as exc:
+        raise SystemExit(str(exc)) from exc
     bootstrap_runtime_env()
+    try:
+        assert_live_entrypoint_allowed()
+    except LegacyFormalTestRedirect as exc:
+        raise SystemExit(str(exc)) from exc
     # Handle --help synchronously before starting the event loop
     if "--help" in sys.argv or "-h" in sys.argv:
         config = OBSConfig.from_env()

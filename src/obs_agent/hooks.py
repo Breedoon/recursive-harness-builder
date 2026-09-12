@@ -234,6 +234,7 @@ class HookState:
     inbox_message_notifier: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None
     stop_event_notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     context_snapshot_provider: Callable[..., dict[str, Any] | None] | None = None
+    team_status_provider: Callable[..., dict[Any, dict[str, Any]]] | None = None
     sdk_env_overrides: dict[str, str] = field(default_factory=dict)
     vault_path: Path | None = None
     effective_model: str | None = None

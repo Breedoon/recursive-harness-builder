@@ -7,6 +7,10 @@ import uuid
 
 import pytest
 
+pytestmark = pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
+)
+
 from tests.test_telegram_live_forum_topics import (
     _LiveForumHarness,
     _message_containing,

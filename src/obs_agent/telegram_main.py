@@ -10,14 +10,12 @@ import os
 from pathlib import Path
 
 from obs_agent.config import OBSConfig
-from obs_agent.runtime_env import bootstrap_runtime_env
-from obs_agent.telegram import run_telegram_bot
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+from obs_agent.runtime_env import (
+    LegacyFormalTestRedirect,
+    assert_live_entrypoint_allowed,
+    bootstrap_runtime_env,
 )
-
+from obs_agent.telegram import run_telegram_bot
 
 class _DropGetUpdatesFilter(logging.Filter):
     """Suppress high-volume polling lines while keeping other runtime logs."""
@@ -57,6 +55,10 @@ def _attach_runtime_file_handler() -> None:
 
 def _configure_logging() -> None:
     """Apply pragmatic Telegram logging defaults for daemon usage."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
     _attach_runtime_file_handler()
 
     keep_poll_logs = (os.environ.get("OBS_TELEGRAM_LOG_POLLING") or "").strip().lower() in {
@@ -77,7 +79,15 @@ def _configure_logging() -> None:
 
 
 def main() -> None:
+    try:
+        assert_live_entrypoint_allowed()
+    except LegacyFormalTestRedirect as exc:
+        raise SystemExit(str(exc)) from exc
     bootstrap_runtime_env()
+    try:
+        assert_live_entrypoint_allowed()
+    except LegacyFormalTestRedirect as exc:
+        raise SystemExit(str(exc)) from exc
     _configure_logging()
     config = OBSConfig.from_env()
     config.validate()

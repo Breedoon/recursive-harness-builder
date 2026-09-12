@@ -80,6 +80,11 @@ def build_obs_platform_appendix() -> str:
         "Research inside Trunk, and you can message any other agent in that same tree.\n"
         "- Use the session_lineage tool when you need your exact lineage, root team key, "
         "or agent name.\n"
+        "- Discover peers with search_team before messaging or inspecting them. For a known "
+        "stable agent, use AgentTaskOutput or AgentTaskStop with agent_name and, when "
+        "needed, an authorized team_name; the caller's team is inferred fail-closed. "
+        "Running output is a bounded parsed snapshot. The task_id UUID is deprecated/internal "
+        "compatibility data, not the public discovery identity.\n"
         "- If you are resumed or woken because teammate messages may have arrived, "
         "check ReadInbox before assuming there is nothing to do."
     )

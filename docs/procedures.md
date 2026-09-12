@@ -59,6 +59,8 @@ Use Loop for simple tasks that can be handled by one execute/verify/fix cycle. U
 
 Those fields are an `AgentTask` payload, not a shell command. In Telegram mode, the human-facing way to use them is to ask the root agent to launch a Loop or Router with the matching prompt file.
 
+For team work, use `search_team` to discover the target's stable `team_name` and `agent_name` before messaging or inspecting it. Use `AgentTaskOutput` or `AgentTaskStop` with `agent_name` alone when the caller team can be inferred, or with an authorized matching `team_name`; cross-root and missing/conflicting caller context fail closed. Output is a bounded parsed snapshot of known child-session JSONL. The opaque `task_id` UUID remains deprecated/internal compatibility data and is caller-root authorized rather than a public discovery key.
+
 The Router hook is intentionally narrow: it blocks direct file-writing tools so a Router must dispatch implementation work instead of doing it itself.
 
 ## Customizing procedures

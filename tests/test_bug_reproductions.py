@@ -33,6 +33,10 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
+)
+
 from tests.evals.platform_telegram_forum import TelegramForumPlatform
 from tests.test_telegram_live_forum_topics import (
     _extract_topic_link,

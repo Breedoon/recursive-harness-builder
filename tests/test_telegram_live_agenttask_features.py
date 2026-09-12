@@ -18,6 +18,10 @@ from typing import Any
 
 import pytest
 
+pytestmark = pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
+)
+
 from tests.test_telegram_live_forum_topics import (
     _extract_topic_link,
     _send_and_wait_for_token,
@@ -1274,9 +1278,8 @@ def _cliproxy_is_running() -> bool:
         return False
 
 
-_requires_cliproxy = pytest.mark.skipif(
-    not _cliproxy_is_running(),
-    reason="CLIProxyAPI not running at :8317",
+_requires_cliproxy = pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
 )
 
 

@@ -76,6 +76,57 @@ def _projects_root(projects_root: Path | None) -> Path:
     return Path.home() / ".claude" / "projects"
 
 
+def find_session_jsonl_index(
+    *,
+    session_ids: set[str],
+    cwd: Path,
+    projects_root: Path | None = None,
+) -> dict[str, Path | None]:
+    """Resolve several sessions with one project-directory fallback scan."""
+    requested = {session_id for session_id in session_ids if session_id}
+    resolved: dict[str, Path | None] = {session_id: None for session_id in requested}
+    if not requested:
+        return resolved
+    root = _projects_root(projects_root)
+    if not root.is_dir():
+        return resolved
+
+    preferred_dir = root / _encode_project_path(cwd)
+    remaining = set(requested)
+    for session_id in remaining.copy():
+        preferred = preferred_dir / f"{session_id}.jsonl"
+        if preferred.is_file():
+            resolved[session_id] = preferred
+            remaining.remove(session_id)
+    if not remaining:
+        return resolved
+
+    matches: dict[str, list[Path]] = {session_id: [] for session_id in remaining}
+    try:
+        for project_dir in root.iterdir():
+            if not project_dir.is_dir():
+                continue
+            for session_id in remaining:
+                candidate = project_dir / f"{session_id}.jsonl"
+                if candidate.is_file():
+                    matches[session_id].append(candidate)
+    except OSError:
+        return resolved
+
+    for session_id, candidates in matches.items():
+        if not candidates:
+            continue
+        if len(candidates) == 1:
+            resolved[session_id] = candidates[0]
+            continue
+        try:
+            candidates.sort(key=lambda path: (path.stat().st_mtime, str(path)), reverse=True)
+        except OSError:
+            continue
+        resolved[session_id] = candidates[0]
+    return resolved
+
+
 def find_session_jsonl(
     *,
     session_id: str,
@@ -83,35 +134,11 @@ def find_session_jsonl(
     projects_root: Path | None = None,
 ) -> Path | None:
     """Find session JSONL, preferring the current workspace project directory."""
-    if not session_id:
-        return None
-    root = _projects_root(projects_root)
-    if not root.is_dir():
-        return None
-
-    preferred = root / _encode_project_path(cwd) / f"{session_id}.jsonl"
-    if preferred.is_file():
-        return preferred
-
-    matches: list[Path] = []
-    try:
-        for project_dir in root.iterdir():
-            if not project_dir.is_dir():
-                continue
-            candidate = project_dir / f"{session_id}.jsonl"
-            if candidate.is_file():
-                matches.append(candidate)
-    except OSError:
-        return None
-
-    if not matches:
-        return None
-    if len(matches) == 1:
-        return matches[0]
-
-    # If copied sessions exist across multiple projects, choose newest file.
-    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return matches[0]
+    return find_session_jsonl_index(
+        session_ids={session_id},
+        cwd=cwd,
+        projects_root=projects_root,
+    ).get(session_id)
 
 
 def load_jsonl_usage_snapshot(

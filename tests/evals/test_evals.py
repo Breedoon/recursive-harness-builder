@@ -288,9 +288,8 @@ def _print_bot_logs(log_file: Path | None) -> None:
 @pytest.mark.eval
 @pytest.mark.telegram
 @pytest.mark.timeout(1800)
-@pytest.mark.skipif(
-    not _tg_creds_available,
-    reason="Telegram credentials not configured (need OBS_TEST_TELEGRAM_API_ID, OBS_TEST_TELEGRAM_API_HASH, OBS_TEST_TELEGRAM_SESSION, OBS_TEST_TELEGRAM_BOT_USERNAME, OBS_TEST_TELEGRAM_BOT_TOKEN)",
+@pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
 )
 async def test_eval_telegram_all(eval_vault: Path) -> None:
     """Run ALL Telegram eval scenarios sequentially in a single test.

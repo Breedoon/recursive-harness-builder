@@ -12,6 +12,10 @@ import uuid
 
 import pytest
 
+pytestmark = pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
+)
+
 from obs_agent.lineage import agent_name_for_lineage
 from tests.evals.platform_telegram_forum import TelegramForumPlatform
 from tests.test_telegram_live_forum_topics import (

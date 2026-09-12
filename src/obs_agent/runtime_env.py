@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Iterable
 
 _DEFAULT_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+FORMAL_TEST_REDIRECT = (
+    "legacy test-profile live launch is disabled; use the host-preflight command "
+    "in docs/testing.md and the dedicated obs-live-test service"
+)
+
+
+class LegacyFormalTestRedirect(RuntimeError):
+    """Raised before a live entry point can create any runtime side effect."""
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
@@ -75,6 +83,20 @@ def _apply_profile_defaults(profile: str) -> None:
         os.environ.setdefault("OBS_AGENT_MODEL", "haiku")
 
 
+def assert_live_entrypoint_allowed(
+    *,
+    argv: Iterable[str] | None = None,
+    environ: dict[str, str] | None = None,
+) -> None:
+    """Reject legacy formal/test launch modes before .env or profile mapping."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    explicit_profile, _explicit_prod, _filtered = _resolve_profile(args)
+    source = os.environ if environ is None else environ
+    env_profile = (source.get("OBS_PROFILE") or "").strip().lower()
+    if explicit_profile == "test" or (explicit_profile is None and env_profile == "test"):
+        raise LegacyFormalTestRedirect(FORMAL_TEST_REDIRECT)
+
+
 def bootstrap_runtime_env(
     *,
     argv: Iterable[str] | None = None,
@@ -87,7 +109,7 @@ def bootstrap_runtime_env(
     - existing explicit environment variables win
     - profile-specific values override generic vars loaded from .env
     - existing explicit environment variables win over .env and profile mapping
-    - test profile defaults the model to Haiku; prod remains the config default
+    - production is the default; test profile remains library-only compatibility
     """
 
     provided_args = list(sys.argv[1:] if argv is None else argv)
@@ -97,7 +119,7 @@ def bootstrap_runtime_env(
 
     env_profile = (os.environ.get("OBS_PROFILE") or "").strip().lower()
     requested_profile = explicit_profile or env_profile
-    profile = "prod" if explicit_prod else ("test" if requested_profile == "prod" else requested_profile or "test")
+    profile = "prod" if explicit_prod else requested_profile or "prod"
     os.environ["OBS_PROFILE"] = profile
 
     _apply_profile_prefix(profile, explicit_env_keys)
