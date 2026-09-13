@@ -10,6 +10,7 @@ See decisions D018 (forking as core primitive).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -17,6 +18,7 @@ import re
 import secrets
 import time
 from collections import OrderedDict
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -285,10 +287,12 @@ def _build_search_result_page(
 
 
 def _member_activity_sort_key(member: dict[str, Any], agent_name: str) -> tuple[int, float, str, str]:
-    activity = member.get("last_activity_epoch")
-    if isinstance(activity, (int, float)) and math.isfinite(float(activity)):
-        return (0, -float(activity), str(member.get("team_name") or ""), str(agent_name))
-    return (1, 0.0, str(member.get("team_name") or ""), str(agent_name))
+    """Sort valid activity newest first, with unknown activity last."""
+    activity = _parse_jsonl_event_timestamp(member.get("last_activity_epoch"))
+    team_name = str(member.get("team_name") or "")
+    if activity is not None:
+        return (0, -activity, team_name, str(agent_name))
+    return (1, 0.0, team_name, str(agent_name))
 
 
 def _safe_search_identity(value: object, *, field_name: str) -> str | None:
@@ -322,44 +326,61 @@ def _parse_search_timestamp(value: object, *, field_name: str) -> float | None:
     return parsed
 
 
-def _activity_fallback(entry: dict[str, Any]) -> tuple[float | None, str]:
-    for key in ("last_activity", "last_active_at", "last_activity_at", "updated_at", "completed_at", "created_at"):
-        value = entry.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            parsed = float(value)
-            if key == "updated_at" and parsed > 10_000_000_000:
-                parsed /= 1000.0
-            return parsed, "runtime_last_activity" if key == "last_activity" else "projection_timestamp"
-        if isinstance(value, str) and value.strip():
-            try:
-                parsed_datetime = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-                if parsed_datetime.tzinfo is None or parsed_datetime.utcoffset() is None:
-                    continue
-                return parsed_datetime.timestamp(), "projection_timestamp"
-            except ValueError:
-                continue
-    return None, "unknown"
-
-
 def _parse_jsonl_event_timestamp(value: object) -> float | None:
+    """Accept only timestamps that can also be rendered as a UTC datetime.
+
+    A finite float is not sufficient: very large epochs and timezone offsets
+    near years 1 and 9999 can lie outside datetime's supported range. Reject
+    them here so an invalid newest event cannot hide a valid older event or
+    crash result serialization later.
+    """
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        try:
+    try:
+        if isinstance(value, (int, float)):
             parsed = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
-    elif isinstance(value, str) and value.strip():
-        try:
+        elif isinstance(value, str) and value.strip():
             parsed_datetime = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
             if parsed_datetime.tzinfo is None or parsed_datetime.utcoffset() is None:
                 return None
             parsed = parsed_datetime.timestamp()
-        except (TypeError, ValueError, OverflowError):
+        else:
             return None
-    else:
+        if not math.isfinite(parsed):
+            return None
+        datetime.fromtimestamp(parsed, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
         return None
-    return parsed if math.isfinite(parsed) else None
+    return parsed
+
+
+def _activity_fallback(entry: dict[str, Any]) -> tuple[float | None, str]:
+    """Use the first usable runtime/projection timestamp, not the first field."""
+    timestamp_fields = (
+        "last_activity", "last_active_at", "last_activity_at",
+        "updated_at", "completed_at", "created_at",
+    )
+    for key in timestamp_fields:
+        value = entry.get(key)
+        is_numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if key == "updated_at" and is_numeric:
+            # Older projection records use milliseconds for this field only.
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if numeric_value > 10_000_000_000:
+                value = numeric_value / 1000.0
+        parsed = _parse_jsonl_event_timestamp(value)
+        if parsed is None:
+            continue
+        source = (
+            "runtime_last_activity"
+            if key == "last_activity" and is_numeric
+            else "projection_timestamp"
+        )
+        return parsed, source
+    return None, "unknown"
 
 
 def _jsonl_event_activity(path: Any) -> float | None:
@@ -372,7 +393,7 @@ def _jsonl_event_activity(path: Any) -> float | None:
                     continue
                 try:
                     record = json.loads(raw)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, RecursionError):
                     continue
                 if not isinstance(record, dict):
                     continue
@@ -392,6 +413,8 @@ def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
     except Exception:
         logger.warning("Failed reading team config JSON: %s", config_path, exc_info=True)
+        return {}
+    if not isinstance(payload, dict):
         return {}
     members = payload.get("members")
     if not isinstance(members, list):
@@ -1823,13 +1846,17 @@ def create_obs_tools(
                 if not math.isfinite(active_within_seconds) or active_within_seconds < 0:
                     raise ValueError("active_within_seconds must be a nonnegative finite number")
             limit_raw = args.get("limit", 50)
-            if isinstance(limit_raw, bool):
+            if isinstance(limit_raw, bool) or (
+                isinstance(limit_raw, float) and not limit_raw.is_integer()
+            ):
                 raise ValueError("limit must be a positive integer no greater than 200")
             limit = int(limit_raw)
             if limit <= 0 or limit > _SEARCH_MAX_LIMIT:
                 raise ValueError("limit must be a positive integer no greater than 200")
             offset_raw = args.get("offset", 0)
-            if isinstance(offset_raw, bool):
+            if isinstance(offset_raw, bool) or (
+                isinstance(offset_raw, float) and not offset_raw.is_integer()
+            ):
                 raise ValueError("offset must be a nonnegative integer")
             offset = int(offset_raw)
             if offset < 0:
@@ -1859,9 +1886,24 @@ def create_obs_tools(
             if provider is None:
                 return {}
             try:
-                raw = provider(team_name=team_name)
-            except TypeError:
-                raw = provider(team_name)
+                # Select the legacy positional convention before invoking the
+                # provider. Retrying after TypeError would call a broken provider
+                # twice and mistake its implementation error for an API mismatch.
+                use_positional_argument = False
+                try:
+                    provider_signature = inspect.signature(provider)
+                except (TypeError, ValueError):
+                    provider_signature = None
+                if provider_signature is not None:
+                    try:
+                        provider_signature.bind(team_name=team_name)
+                    except TypeError:
+                        provider_signature.bind(team_name)
+                        use_positional_argument = True
+                if use_positional_argument:
+                    raw = provider(team_name)
+                else:
+                    raw = provider(team_name=team_name)
             except Exception:
                 logger.debug("search_team runtime provider failed", exc_info=True)
                 return {}
@@ -1981,7 +2023,16 @@ def create_obs_tools(
         for name, details in merged_known.items():
             details["team_name"] = team_name
             details["agent_name"] = name
-            path = session_paths.get(details.get("session_id")) if details.get("session_id") else None
+            session_id = details.get("session_id")
+            if isinstance(session_id, str) and session_id.strip():
+                session_id = session_id.strip()
+                details["session_id"] = session_id
+                path = session_paths.get(session_id)
+            else:
+                # Provider records are best-effort metadata. A malformed ID
+                # must neither become a dictionary key nor leak into results.
+                details.pop("session_id", None)
+                path = None
             activity_epoch = None
             activity_source = "unknown"
             if path is not None:
@@ -1990,8 +2041,9 @@ def create_obs_tools(
                     activity_source = "jsonl_event_timestamp"
                 else:
                     try:
-                        activity_epoch = float(path.stat().st_mtime)
-                        activity_source = "jsonl_mtime_fallback"
+                        activity_epoch = _parse_jsonl_event_timestamp(path.stat().st_mtime)
+                        if activity_epoch is not None:
+                            activity_source = "jsonl_mtime_fallback"
                     except OSError:
                         pass
             if activity_epoch is None:
@@ -2011,7 +2063,9 @@ def create_obs_tools(
                 running = None
             details["running"] = running
             runtime_status = details.get("runtime_status")
-            if runtime_status not in {"running", "idle", "completed", "failed", "stopped", "unknown"}:
+            if not isinstance(runtime_status, str) or runtime_status not in {
+                "running", "idle", "completed", "failed", "stopped", "unknown",
+            }:
                 runtime_status = "running" if running is True else "unknown"
             details["runtime_status"] = runtime_status
             if "task_status" not in details and isinstance(details.get("status"), str):
@@ -2048,10 +2102,15 @@ def create_obs_tools(
                 name for name in all_agents
                 if name.startswith(f"{parent_hash}-") and name != my_agent_name
             ])
-        ancestors = [
-            agent_name_for_lineage(my_lineage[: idx + 1], team_key=team_name)
-            for idx in range(len(my_lineage) - 1)
-        ]
+        ancestors: list[str] = []
+        for ancestor_length in range(1, len(my_lineage)):
+            ancestor_name = agent_name_for_lineage(
+                my_lineage[:ancestor_length], team_key=team_name
+            )
+            # Lineage can outlive a deleted or unavailable projection record.
+            # Return only locally known members, as the other relation modes do.
+            if ancestor_name in all_agents:
+                ancestors.append(ancestor_name)
         descendants = _sort_member_names([
             name for name, details in merged_known.items()
             if isinstance(details.get("lineage"), list)
@@ -2116,7 +2175,9 @@ def create_obs_tools(
         page_names = filtered_members[offset: offset + limit]
 
         def _detailed_member(name: str) -> dict[str, Any]:
-            details = dict(merged_known[name])
+            # A cursor promises a frozen snapshot, including nested lineage and
+            # provider metadata that may change after the first page is returned.
+            details = deepcopy(merged_known[name])
             details["relation"] = relation_by_name.get(name, "tree")
             details["agent_name"] = name
             details["team_name"] = team_name
@@ -2138,7 +2199,7 @@ def create_obs_tools(
                 limit=limit,
                 mode=mode,
                 team_name=team_name,
-                current_agent=my_agent_name,
+                current_agent=caller_agent,
                 target_agent=my_agent_name,
                 target_lineage=list(my_lineage),
                 parent_name=parent,
@@ -2150,7 +2211,7 @@ def create_obs_tools(
             page_members=page_members,
             mode=mode,
             team_name=team_name,
-            current_agent=my_agent_name,
+            current_agent=caller_agent,
             target_agent=my_agent_name,
             target_lineage=list(my_lineage),
             total_matching=total_matching,

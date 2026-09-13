@@ -197,7 +197,7 @@ def load_jsonl_usage_snapshot(
                     continue
                 try:
                     obj = json.loads(raw)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
                     continue
 
                 # Valid JSON is not necessarily a transcript event. Corrupt or
@@ -210,7 +210,12 @@ def load_jsonl_usage_snapshot(
                 message = obj.get("message")
                 if not isinstance(message, dict):
                     continue
-                text_char_count += _content_char_count(message.get("content"))
+                try:
+                    text_char_count += _content_char_count(message.get("content"))
+                except RecursionError:
+                    # A decoder may accept deeper nesting than the estimator.
+                    # Keep independent usage counters even without this estimate.
+                    pass
                 if event_type != "assistant":
                     continue
                 assistant_entries += 1

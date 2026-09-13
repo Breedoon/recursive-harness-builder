@@ -243,3 +243,49 @@ def test_text_only_transcript_still_has_context_estimate(tmp_path: Path) -> None
     assert snapshot is not None
     assert snapshot.latest_context_triplet_tokens == 100
     assert snapshot.context_estimate_source == "jsonl_text_estimate"
+
+
+@pytest.mark.parametrize("decoder_error", [ValueError, RecursionError])
+def test_decoder_limits_do_not_hide_later_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decoder_error: type[Exception]
+) -> None:
+    projects_root = tmp_path / "projects"
+    session_path = _write_session(projects_root, "project", "session")
+    session_path.write_text(
+        "decoder-limit\n" + session_path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    real_loads = json.loads
+
+    def bounded_decoder(raw):
+        if raw == "decoder-limit":
+            raise decoder_error("JSON decoder limit exceeded")
+        return real_loads(raw)
+
+    monkeypatch.setattr(json, "loads", bounded_decoder)
+    snapshot = load_jsonl_usage_snapshot(
+        session_id="session", cwd=tmp_path, projects_root=projects_root
+    )
+    assert snapshot is not None
+    assert snapshot.latest_input_tokens == 37
+
+
+def test_deep_content_does_not_hide_usage_in_the_same_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    projects_root = tmp_path / "projects"
+    session_path = _write_session(projects_root, "project", "session")
+    # Decoder nesting limits differ across Python versions. Substitute only the
+    # decoder to exercise the estimator's independent limit deterministically.
+    nested_content: object = "nested"
+    for _ in range(1500):
+        nested_content = [nested_content]
+    event = {
+        "type": "assistant",
+        "message": {"content": nested_content, "usage": {"input_tokens": 37}},
+    }
+    monkeypatch.setattr(json, "loads", lambda raw: event)
+    snapshot = load_jsonl_usage_snapshot(
+        session_id="session", cwd=tmp_path, projects_root=projects_root
+    )
+    assert snapshot is not None
+    assert snapshot.latest_input_tokens == 37
