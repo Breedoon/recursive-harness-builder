@@ -150,7 +150,7 @@ class SessionManager:
 
     @property
     def effective_model(self) -> str:
-        """Return the model this session will pass to ClaudeAgentOptions."""
+        """Return the requested OBS model/budget, before CLI capacity translation."""
         return self.model_override or self.config.model
 
     def _jsonl_has_entry_file_context(self, session_id: str | None) -> bool:
@@ -278,11 +278,23 @@ class SessionManager:
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with hooks, MCP tools, and resume."""
         from obs_agent.config import (
-            auto_compact_window_for_model,
             is_claude_model,
             normalize_model_for_claude_code,
             parse_context_suffix,
         )
+        from obs_agent.claude_context import build_claude_context_plan
+
+        effective_model = normalize_model_for_claude_code(self.effective_model)
+        clean_model, context_tokens = parse_context_suffix(effective_model)
+        effective_env = {**_DEFAULT_SDK_ENV, **self._sdk_env_overrides}
+        context_plan = build_claude_context_plan(
+            model=clean_model,
+            context_tokens=context_tokens,
+            auto_compact_window_tokens=self.config.auto_compact_window_tokens,
+            environ={**os.environ, **effective_env},
+        )
+        context_env = context_plan.environment
+        effective_env.update(context_env)
 
         hook_matchers = create_hook_matchers(self.config, self.hook_state, user_hooks=self.user_hooks)
 
@@ -290,25 +302,18 @@ class SessionManager:
         # for background fork result delivery
         tool_server = create_obs_tools(self.config, lambda: self._session_id, hook_state=self.hook_state)
 
-        effective_model = normalize_model_for_claude_code(self.effective_model)
+        # Persist/report the requested OBS budget, NOT the CLI capacity selector.
+        # Otherwise [400k] would become [1m] when this session spawns children.
         self.hook_state.effective_model = effective_model
-
-        effective_env = {
-            **_DEFAULT_SDK_ENV,
-            **self._sdk_env_overrides,
-        }
         self.hook_state.sdk_env_overrides = dict(self._sdk_env_overrides)
         self.hook_state.vault_path = self.config.vault_path
-
-        _clean_model, ctx_tokens = parse_context_suffix(effective_model)
-        auto_compact_window = auto_compact_window_for_model(
-            effective_model,
-            ctx_tokens,
-            auto_compact_window_tokens=self.config.auto_compact_window_tokens,
+        logger.info(
+            "Claude context policy model=%s cli_model=%s context=%s "
+            "compact_window=%s target=%s output_reserve=%s",
+            effective_model, context_plan.cli_model, context_tokens,
+            context_plan.cli_compact_window_tokens, context_plan.threshold_tokens,
+            context_plan.output_reserve_tokens,
         )
-        effective_env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = str(ctx_tokens)
-        effective_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
-        effective_env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
         # For non-Claude models, set the API key to the CLI proxy key so CC
         # authenticates against CLIProxyAPI (the cache proxy forwards it).
         if is_claude_model(effective_model):
@@ -327,12 +332,16 @@ class SessionManager:
             )
 
         options = ClaudeAgentOptions(
-            model=effective_model,
+            model=context_plan.cli_model,
             hooks=hook_matchers,
             mcp_servers={"obs-agent": tool_server},
             cwd=str(self.config.vault_path),
             permission_mode="bypassPermissions",
             setting_sources=["project"],
+            # Project settings can also contain env overrides. Supply the three
+            # budget controls at the CLI-settings boundary as well, without
+            # replacing unrelated project settings or persisting a 1M OBS model.
+            settings=json.dumps({"env": context_env}),
             env=effective_env,
             max_buffer_size=self.config.max_buffer_size,
             stderr=_on_cli_stderr,
