@@ -83,17 +83,36 @@ def _apply_profile_defaults(profile: str) -> None:
         os.environ.setdefault("OBS_AGENT_MODEL", "haiku")
 
 
+def _has_test_profile_argument(args: list[str]) -> bool:
+    """Detect any test selector, even when a later option selects production.
+
+    Profile resolution is a compatibility parser, not a safety gate: its final
+    value discards earlier options. A live launch must not make a test request
+    safe merely by appending ``--prod`` or another ``--profile`` argument.
+    """
+    for index, argument in enumerate(args):
+        if argument in {"--test", "--test-instance"}:
+            return True
+        if argument == "--profile" and index + 1 < len(args):
+            if args[index + 1].strip().lower() == "test":
+                return True
+        if argument.startswith("--profile="):
+            if argument.partition("=")[2].strip().lower() == "test":
+                return True
+    return False
+
+
 def assert_live_entrypoint_allowed(
     *,
     argv: Iterable[str] | None = None,
     environ: dict[str, str] | None = None,
 ) -> None:
-    """Reject legacy formal/test launch modes before .env or profile mapping."""
+    """Reject any legacy test selector before .env loading or profile mapping."""
     args = list(sys.argv[1:] if argv is None else argv)
-    explicit_profile, _explicit_prod, _filtered = _resolve_profile(args)
+    _resolve_profile(args)  # Preserve validation of incomplete profile options.
     source = os.environ if environ is None else environ
     env_profile = (source.get("OBS_PROFILE") or "").strip().lower()
-    if explicit_profile == "test" or (explicit_profile is None and env_profile == "test"):
+    if _has_test_profile_argument(args) or env_profile == "test":
         raise LegacyFormalTestRedirect(FORMAL_TEST_REDIRECT)
 
 

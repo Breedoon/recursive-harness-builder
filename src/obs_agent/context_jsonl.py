@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
+import stat
 from typing import Any
 
 
@@ -29,7 +30,8 @@ class JsonlUsageSnapshot:
 
 
 def _as_int(value: Any) -> int:
-    if isinstance(value, int):
+    """Accept only nonnegative integer token counts, not JSON booleans."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return 0
 
@@ -76,54 +78,80 @@ def _projects_root(projects_root: Path | None) -> Path:
     return Path.home() / ".claude" / "projects"
 
 
+def _session_file_mtime(path: Path) -> float | None:
+    """Observe a regular file once; concurrent cleanup must not abort a batch."""
+    try:
+        metadata = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    return metadata.st_mtime
+
+
 def find_session_jsonl_index(
     *,
     session_ids: set[str],
     cwd: Path,
     projects_root: Path | None = None,
 ) -> dict[str, Path | None]:
-    """Resolve several sessions with one project-directory fallback scan."""
-    requested = {session_id for session_id in session_ids if session_id}
+    """Resolve session basenames with one best-effort project-directory scan.
+
+    The current workspace wins over any fallback, even a newer one. Otherwise,
+    choose the newest readable candidate, using its path to break timestamp ties.
+    Invalid identifiers stay unresolved; they must never become filesystem paths.
+    """
+    requested = {
+        session_id for session_id in session_ids
+        if isinstance(session_id, str) and session_id
+    }
     resolved: dict[str, Path | None] = {session_id: None for session_id in requested}
-    if not requested:
+    remaining = {
+        session_id for session_id in requested
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", session_id)
+    }
+    if not remaining:
         return resolved
+
     root = _projects_root(projects_root)
-    if not root.is_dir():
+    try:
+        if not root.is_dir():
+            return resolved
+    except OSError:
         return resolved
 
     preferred_dir = root / _encode_project_path(cwd)
-    remaining = set(requested)
     for session_id in remaining.copy():
         preferred = preferred_dir / f"{session_id}.jsonl"
-        if preferred.is_file():
+        if _session_file_mtime(preferred) is not None:
             resolved[session_id] = preferred
             remaining.remove(session_id)
     if not remaining:
         return resolved
 
-    matches: dict[str, list[Path]] = {session_id: [] for session_id in remaining}
+    # Store the observed ranking rather than stat-ing candidates again in a sort.
+    # A disappearing or inaccessible file must not erase another valid result.
+    best_ranks: dict[str, tuple[float, str]] = {}
     try:
         for project_dir in root.iterdir():
-            if not project_dir.is_dir():
+            try:
+                if not project_dir.is_dir():
+                    continue
+            except OSError:
                 continue
             for session_id in remaining:
                 candidate = project_dir / f"{session_id}.jsonl"
-                if candidate.is_file():
-                    matches[session_id].append(candidate)
+                modified_at = _session_file_mtime(candidate)
+                if modified_at is None:
+                    continue
+                rank = (modified_at, str(candidate))
+                previous_rank = best_ranks.get(session_id)
+                if previous_rank is None or rank > previous_rank:
+                    best_ranks[session_id] = rank
+                    resolved[session_id] = candidate
     except OSError:
-        return resolved
-
-    for session_id, candidates in matches.items():
-        if not candidates:
-            continue
-        if len(candidates) == 1:
-            resolved[session_id] = candidates[0]
-            continue
-        try:
-            candidates.sort(key=lambda path: (path.stat().st_mtime, str(path)), reverse=True)
-        except OSError:
-            continue
-        resolved[session_id] = candidates[0]
+        # Keep results already observed if the directory iterator itself fails.
+        pass
     return resolved
 
 
@@ -162,7 +190,7 @@ def load_jsonl_usage_snapshot(
     text_char_count = 0
 
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 raw = line.strip()
                 if not raw:
@@ -172,12 +200,18 @@ def load_jsonl_usage_snapshot(
                 except json.JSONDecodeError:
                     continue
 
+                # Valid JSON is not necessarily a transcript event. Corrupt or
+                # foreign records must not hide usable events later in the file.
+                if not isinstance(obj, dict):
+                    continue
+                event_type = obj.get("type")
+                if not isinstance(event_type, str) or event_type not in {"assistant", "user"}:
+                    continue
                 message = obj.get("message")
                 if not isinstance(message, dict):
                     continue
-                if obj.get("type") in {"assistant", "user"}:
-                    text_char_count += _content_char_count(message.get("content"))
-                if obj.get("type") != "assistant":
+                text_char_count += _content_char_count(message.get("content"))
+                if event_type != "assistant":
                     continue
                 assistant_entries += 1
 
