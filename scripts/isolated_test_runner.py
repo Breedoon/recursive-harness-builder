@@ -23,6 +23,9 @@ if Path(__file__).resolve(strict=True) == CANONICAL_INNER_RUNNER:
 
 from scripts.live_test_protocol import (
     CONTAINER_ATTESTATION_FILE,
+    CONTAINER_RUN_ROOT,
+    CONTAINER_SECRET_FILE,
+    CONTAINER_SOURCE_ROOT,
     ContainerRuntimeObservationAdapter,
     EXPECTED_LIVE_MODEL,
     EXPECTED_SERVICE_NAME,
@@ -38,6 +41,8 @@ from scripts.live_test_protocol import (
     write_evidence_manifest,
 )
 
+from scripts.mount_inventory import MountInventoryError, validated_application_mounts
+
 CANONICAL_COMMAND = (
     "python -m scripts.isolated_test_runner --phase host-preflight "
     "--host-observation /workspace/runtime/obs-live-test-host-observation.json "
@@ -49,6 +54,48 @@ INNER_COMMAND = (
     "--attestation /run/obs-live-test-attestation/host-attestation.json "
     "--lane unit --scenario focused --dry-run"
 )
+
+
+class CompleteMountObservationAdapter(ContainerRuntimeObservationAdapter):
+    """Validate every mount before adapting to the protocol's four-mount schema.
+
+    The inherited observer still measures source, image, executable, secret,
+    ownership, and environment facts. Only its lossy mount-selection step is
+    replaced. Validation and selection use the same procfs read.
+    """
+
+    def observe(self, attestation: HostAttestation) -> Mapping[str, Any]:
+        # Reject nested source mounts before the inherited observer hashes or
+        # reads the source tree. Its later _mount_records call validates again,
+        # rather than trusting a cached table across the filesystem reads.
+        self._mount_records()
+        return super().observe(attestation)
+
+    def _mount_records(self) -> list[dict[str, Any]]:
+        targets = {
+            str(CONTAINER_SOURCE_ROOT): "source",
+            str(CONTAINER_RUN_ROOT): "run",
+            str(CONTAINER_SECRET_FILE): "secret",
+            str(CONTAINER_ATTESTATION_FILE): "attestation",
+        }
+        try:
+            records = validated_application_mounts(
+                self.proc_mountinfo.read_text(encoding="utf-8"),
+                application_targets=targets,
+            )
+        except (MountInventoryError, UnicodeError) as exc:
+            raise PreflightError(
+                "inner.mount_inventory", "complete mount inventory is invalid or outside policy"
+            ) from exc
+        return [
+            {
+                "name": targets[record.target],
+                "target": record.target,
+                "mode": record.mode,
+                "symlink": Path(record.target).is_symlink(),
+            }
+            for record in records
+        ]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -150,7 +197,7 @@ def _inner_dry_run(args: argparse.Namespace) -> dict[str, Any]:
         )
     attestation: HostAttestation = load_host_attestation(args.attestation)
     decision = inner_preflight(
-        attestation, ContainerRuntimeObservationAdapter(os.environ)
+        attestation, CompleteMountObservationAdapter(os.environ)
     )
     command = (
         "python",
