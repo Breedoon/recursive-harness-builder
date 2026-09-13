@@ -117,25 +117,38 @@ def binary_workspace(tmp_path, monkeypatch):
     return project, home
 
 
-@pytest.mark.parametrize("model, window, output_cap, expected", [
-    ("gpt-5.6-sol", 100_000, 32_000, 67_000),
-    ("gpt-5.6-sol", 200_000, 32_000, 167_000),
-    ("gpt-5.6-sol", 400_000, 32_000, 367_000),
-    ("gpt-5.6-sol", 1_000_000, 32_000, 967_000),
-    ("claude-opus-4-6", 100_000, 32_000, 67_000),
-    ("claude-opus-4-6", 400_000, 32_000, 367_000),
-    ("gpt-5.6-sol", 128_000, 32_000, 95_000),
-    ("gpt-5.6-sol", 64_000, 32_000, 31_000),
-    ("gpt-5.6-sol", 400_000, 8_000, 367_000),
+@pytest.mark.parametrize("model, window, output_cap, expected, native_defaults, stale_project", [
+    ("gpt-5.6-sol", 100_000, 32_000, 67_000, False, False),
+    ("gpt-5.6-sol", 200_000, 32_000, 167_000, False, False),
+    ("gpt-5.6-sol", 400_000, 32_000, 367_000, False, False),
+    ("gpt-5.6-sol", 1_000_000, 32_000, 967_000, False, False),
+    ("claude-opus-4-6", 100_000, 32_000, 67_000, False, False),
+    ("claude-opus-4-6", 400_000, 32_000, 367_000, False, False),
+    ("gpt-5.6-sol", 128_000, 32_000, 95_000, False, False),
+    ("gpt-5.6-sol", 64_000, 32_000, 31_000, False, False),
+    ("gpt-5.6-sol", 400_000, 8_000, 367_000, False, False),
+    ("gpt-5.6-sol", 35_000, 32_000, 2_000, False, False),
+    ("gpt-5.6-sol", 333_000, 32_000, 300_000, False, False),
+    # Independently verify native anchors without OBS's percentage/window.
+    ("claude-opus-4-6", 200_000, 32_000, 167_000, True, False),
+    ("claude-opus-4-6", 1_000_000, 32_000, 967_000, True, False),
+    # A stale project-level override must not undo a fresh 400K session.
+    ("gpt-5.6-sol", 400_000, 32_000, 367_000, False, True),
 ])
 def test_binary_reports_the_requested_compaction_threshold(
     binary_workspace, monkeypatch, tmp_path, request, model, window, output_cap, expected,
+    native_defaults, stale_project,
 ):
     from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
     from obs_agent.config import OBSConfig
     from obs_agent.session import SessionManager
 
     project, home = binary_workspace
+    if stale_project:
+        (project / ".claude" / "settings.json").write_text(json.dumps({"env": {
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200000",
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "10",
+        }}))
     monkeypatch.setenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", str(output_cap))
     manager = SessionManager(config=OBSConfig(
         vault_path=project, model=f"{model}[{window // 1000}k]", cache_proxy_enabled=False,
@@ -151,9 +164,11 @@ def test_binary_reports_the_requested_compaction_threshold(
     options.extra_args = {"debug-file": str(debug_log)}
     # Use the pinned SDK's command builder and bundled-binary discovery. The
     # direct process launch below deliberately uses a clean, allowlisted env.
+    if native_defaults:
+        options.settings = json.dumps({"env": {}})
+    context_env = json.loads(options.settings)["env"]
     transport = SubprocessCLITransport(prompt="unused", options=options)
     command = transport._build_command()
-    context_env = json.loads(options.settings)["env"]
 
     with _fake_anthropic_api() as (base_url, requests):
         child_env = {
@@ -173,10 +188,22 @@ def test_binary_reports_the_requested_compaction_threshold(
         }
         user_message = {"type": "user", "session_id": "default", "parent_tool_use_id": None,
                         "message": {"role": "user", "content": "Reply with OK."}}
-        result = subprocess.run(
-            command, input=json.dumps(user_message) + "\n", cwd=project,
-            env=child_env, text=True, capture_output=True, timeout=45,
-        )
+        try:
+            result = subprocess.run(
+                command, input=json.dumps(user_message) + "\n", cwd=project,
+                env=child_env, text=True, capture_output=True, timeout=45,
+            )
+        except subprocess.TimeoutExpired as error:
+            # Keep the binary's debug file and partial streams even on timeout.
+            # subprocess.run has already killed and waited for its direct child.
+            stdout = error.stdout or b""
+            stderr = error.stderr or b""
+            result = subprocess.CompletedProcess(
+                command, returncode=-1,
+                stdout=stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout,
+                stderr=(stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr)
+                + "\nNative compatibility probe timed out after 45 seconds.",
+            )
     log_text = debug_log.read_text(errors="replace") if debug_log.exists() else ""
     artifact_dir = os.environ.get("OBS_CONTEXT_TEST_ARTIFACT_DIR")
     if artifact_dir:

@@ -2,7 +2,7 @@
 
 The OBS suffix is metadata, not a Claude model capability declaration. Claude
 Code recognizes a 200K/1M selector, so a 400K budget needs a 1M selector *and* an
-explicit compaction window. Keeping those quantities separate is essential for
+explicit compaction percentage. Keeping those quantities separate is essential for
 child inheritance and context reporting. See docs/context-compaction.md for the
 reference thresholds, version assumptions, and the executable compatibility test.
 """
@@ -16,11 +16,10 @@ from decimal import Decimal, ROUND_HALF_UP
 
 STANDARD_CONTEXT_TOKENS = 200_000
 EXTENDED_CONTEXT_TOKENS = 1_000_000
-MIN_CLI_COMPACT_WINDOW_TOKENS = 100_000
 DEFAULT_OUTPUT_RESERVE_TOKENS = 20_000
 COMPACTION_BUFFER_TOKENS = 13_000
-# A positive threshold and the documented >=1% override require at least 34K.
-MIN_OBS_CONTEXT_TOKENS = 34_000
+# A 35K budget leaves a 2K target: at least 1% of a 200K CLI window.
+MIN_OBS_CONTEXT_TOKENS = 35_000
 
 
 class ContextBudgetError(ValueError):
@@ -49,7 +48,7 @@ def _enabled(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _validate_environment(environ: Mapping[str, str], context_tokens: int) -> None:
+def _validate_environment(environ: Mapping[str, str], cli_capacity_tokens: int) -> None:
     """Do not silently override an operator's explicit compaction kill switch."""
     for name in (
         "DISABLE_COMPACT",
@@ -60,7 +59,7 @@ def _validate_environment(environ: Mapping[str, str], context_tokens: int) -> No
             raise ContextBudgetError(
                 f"{name} disables automatic compaction; unset it before using an OBS context budget"
             )
-    if context_tokens > STANDARD_CONTEXT_TOKENS and _enabled(
+    if cli_capacity_tokens > STANDARD_CONTEXT_TOKENS and _enabled(
         environ.get("CLAUDE_CODE_DISABLE_1M_CONTEXT")
     ):
         raise ContextBudgetError(
@@ -68,9 +67,9 @@ def _validate_environment(environ: Mapping[str, str], context_tokens: int) -> No
             "unset it or select a context budget no greater than 200K"
         )
     declared_window = (environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") or "").strip()
-    if declared_window and declared_window != str(context_tokens):
+    if declared_window and declared_window != str(cli_capacity_tokens):
         raise ContextBudgetError(
-            "CLAUDE_CODE_MAX_CONTEXT_TOKENS conflicts with the OBS context budget; "
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS conflicts with the CLI capacity selector; "
             "unset it and configure the model suffix instead"
         )
 
@@ -108,7 +107,11 @@ class ClaudeContextPlan:
         A stale percentage inherited from the parent process cannot be removed
         by popping a key from ClaudeAgentOptions.env: the SDK merges os.environ
         back in. Always supply a fresh value. The percentage uses the CLI's
-        *effective* window, after its output reserve, not the raw context size.
+        *effective native capacity*, after its output reserve. Claude 2.1.59
+        ignores AUTO_COMPACT_WINDOW, so using the requested smaller window as
+        the denominator would silently delay compaction (400K -> about 946K).
+        Set that variable to the native capacity too, so old releases that
+        ignore it and newer releases that honor it use the same denominator.
 
         A half-token bias stays inside the target token's floor interval. It
         avoids accidentally compacting one token early due to decimal-to-binary
@@ -136,9 +139,11 @@ def build_claude_context_plan(
     """Build the CLI selector and controls without changing OBS model metadata.
 
     ``model`` must already be resolved and stripped of the OBS suffix. Requested
-    windows from 34K through 1M are supported. Below Claude's 100K window floor,
-    a percentage override supplies the earlier target; smaller budgets cannot
-    retain the 33K reserve. Unsupported values fail explicitly, never fall back.
+    windows from 35K through 1M are supported. The percentage supplies the
+    requested earlier target within a recognized 200K/1M capacity. Smaller
+    budgets cannot retain the 33K reserve and a >=1% override. An optional cap
+    on a 1M selector must also retain that minimum percentage (about 43K).
+    Unsupported values fail explicitly, never fall back.
 
     The optional OBS cap can only make compaction earlier. Raw Claude window and
     percentage overrides are superseded by this per-session policy. Disable
@@ -154,8 +159,14 @@ def build_claude_context_plan(
     )
     if not model.strip() or "[" in model or "]" in model:
         raise ContextBudgetError("CLI context planning requires a clean, nonempty model identity")
+    cli_capacity = (
+        EXTENDED_CONTEXT_TOKENS
+        if context_tokens > STANDARD_CONTEXT_TOKENS
+        else STANDARD_CONTEXT_TOKENS
+    )
     environment = environ if environ is not None else {}
-    _validate_environment(environment, context_tokens)
+    _validate_environment(environment, cli_capacity)
+    output_reserve = _output_reserve(environment)
 
     compact_window = context_tokens
     if auto_compact_window_tokens:
@@ -165,14 +176,27 @@ def build_claude_context_plan(
         )
         compact_window = min(context_tokens, auto_compact_window_tokens)
 
-    # The selector establishes capacity. The separate window and percentage
-    # establish a smaller budget; they do not enlarge the provider's real limit.
+    # Keep the percentage in the documented 1..100 range even when an operator
+    # asks for an unusually small cap on a session using the 1M selector.
+    threshold = default_compaction_threshold(compact_window)
+    effective_capacity = cli_capacity - output_reserve
+    if threshold * 100 < effective_capacity:
+        minimum_cap = 33_000 + (effective_capacity + 99) // 100
+        raise ContextBudgetError(
+            "auto-compact cap must retain at least a 1% CLI threshold; "
+            f"use {minimum_cap:,} tokens or more for this capacity selector"
+        )
+
+    # The selector establishes capacity, not the provider's actual limit.
+    # The percentage alone carries the requested budget. Do not set the CLI
+    # window to that smaller budget: version 2.1.59 ignores it, whereas newer
+    # versions honor it, producing different percentage denominators.
     selector = "[1m]" if context_tokens > STANDARD_CONTEXT_TOKENS else "[200k]"
     return ClaudeContextPlan(
         cli_model=model.strip() + selector,
         context_tokens=context_tokens,
         compact_window_tokens=compact_window,
-        cli_compact_window_tokens=max(compact_window, MIN_CLI_COMPACT_WINDOW_TOKENS),
-        threshold_tokens=default_compaction_threshold(compact_window),
-        output_reserve_tokens=_output_reserve(environment),
+        cli_compact_window_tokens=cli_capacity,
+        threshold_tokens=threshold,
+        output_reserve_tokens=output_reserve,
     )

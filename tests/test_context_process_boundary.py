@@ -90,7 +90,9 @@ async def test_actual_sdk_child_receives_requested_budget(
     model_arg = observed["argv"][observed["argv"].index("--model") + 1]
     assert model_arg == f"gpt-5.6-sol[{selector}]"
     assert observed["budget_env"] == {key: options.env[key] for key in BUDGET_KEYS}
-    assert observed["budget_env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == str(window)
+    assert observed["budget_env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == (
+        "1000000" if window > 200_000 else "200000"
+    )
     assert float(observed["budget_env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) > 20
     settings_arg = observed["argv"][observed["argv"].index("--settings") + 1]
     assert json.loads(settings_arg)["env"] == observed["budget_env"]
@@ -119,7 +121,7 @@ async def test_inherited_child_keeps_400k_while_fresh_child_can_select_100k(
     assert inherited_observation["budget_env"]["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "400000"
     assert child_observation["budget_env"]["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "100000"
     assert config.model == "gpt[400k]"
-    assert parent_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
+    assert parent_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
 
 
 @pytest.mark.asyncio
@@ -156,5 +158,6 @@ def test_operator_cap_and_requested_metadata_are_distinct(tmp_path, isolated_opt
     options = manager.create_options()
     assert options.model == "gpt-5.6-sol[1m]"
     assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "400000"
-    assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "150000"
+    assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+    assert int(980_000 * float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) / 100) == 117_000
     assert manager.hook_state.effective_model == "gpt-5.6-sol[400k]"
