@@ -95,7 +95,8 @@ async def test_actual_sdk_child_receives_requested_budget(
     )
     assert float(observed["budget_env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) > 20
     settings_arg = observed["argv"][observed["argv"].index("--settings") + 1]
-    assert json.loads(settings_arg)["env"] == observed["budget_env"]
+    settings_env = json.loads(settings_arg)["env"]
+    assert {key: settings_env[key] for key in BUDGET_KEYS} == observed["budget_env"]
     assert manager.hook_state.effective_model.endswith(f"[{window // 1000}k]" if window < 1_000_000 else "[1m]")
     assert os.environ["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "10"
 

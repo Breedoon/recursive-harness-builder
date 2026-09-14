@@ -267,6 +267,7 @@ async def test_telegram_effort_persists_and_restores_with_conversation(config):
         await bot.shutdown()
     restored = TelegramBot(config, fragment_gap=0.001, enable_background_poller=False)
     try:
+        await restored.initialize_runtime()
         state = restored._get_state(route)
         assert state.session_manager.effective_effort == "xhigh"
         assert state.session_id == "kept-id"

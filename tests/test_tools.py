@@ -473,6 +473,7 @@ class TestAgentTaskTools:
                 "max_turns": 12,
                 "fork": True,
                 "model": None,
+                "effort": None,
                 "team_name": None,
                 "agent_name": None,
                 "task_tool_name": "AgentTask",

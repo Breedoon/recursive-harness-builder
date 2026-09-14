@@ -45,7 +45,7 @@ def _sse_response(model: str) -> bytes:
 
 
 @contextmanager
-def _fake_anthropic_api():
+def _fake_anthropic_api(*, capture_bodies: bool = False):
     requests = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -58,7 +58,7 @@ def _fake_anthropic_api():
                 self.send_error(413)
                 return
             body = json.loads(self.rfile.read(length) or "{}")
-            requests.append(self.path)
+            requests.append((self.path, body) if capture_bodies else self.path)
             if "count_tokens" in self.path:
                 payload = b'{"input_tokens": 500}'
                 content_type = "application/json"
