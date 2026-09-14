@@ -1,0 +1,45 @@
+name: Effort development workspace
+on:
+  push:
+    branches: [feat/effort-controls]
+    paths:
+      - .github/workflows/effort-development.yml
+      - .effort-development.patch
+permissions:
+  contents: write
+jobs:
+  validate:
+    if: github.repository == 'Breedoon/recursive-harness-builder' && github.ref == 'refs/heads/feat/effort-controls'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/effort-controls
+      - uses: astral-sh/setup-uv@v6
+      - name: Apply effort implementation when present
+        run: |
+          if [ -f .effort-development.patch ]; then
+            git apply --check .effort-development.patch
+            git apply .effort-development.patch
+            rm .effort-development.patch
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add src tests docs env.example
+            git add -u .effort-development.patch
+            git commit -m 'feat: add session and AgentTask effort controls with per-model defaults'
+            git push origin HEAD:feat/effort-controls
+          fi
+      - name: Export source workspace for local regression testing
+        run: git archive --format=tar HEAD > effort-workspace.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: effort-workspace
+          path: effort-workspace.tar
+          retention-days: 1
+      - name: Run effort regression tests when present
+        run: |
+          if [ -f tests/test_effort.py ]; then
+            uv sync --extra dev
+            uv run pytest tests/test_effort.py -q
+          fi
