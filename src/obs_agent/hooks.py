@@ -29,7 +29,7 @@ from claude_agent_sdk.types import (
 )
 
 from obs_agent.lineage import obs_bootstrap_to_dict, resolve_obs_bootstrap
-from obs_agent.queueing import coerce_queued_message
+from obs_agent.queueing import QueuedMessage, coerce_queued_message
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -215,7 +215,7 @@ class HookState:
     status_queue is drained by the daemon's event_generator to yield SSE status events.
     """
 
-    message_queue: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
+    message_queue: asyncio.Queue[QueuedMessage | str] = field(default_factory=asyncio.Queue)
     status_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     interrupt_flag: bool = False
     interrupt_requested: bool = False
@@ -424,12 +424,8 @@ def _make_immutable_check(config: OBSConfig) -> CheckFn:
     return _check
 
 
-def _make_queue_check(state: HookState) -> CheckFn:
-    """Create a check that drains the message queue into additionalContext.
-
-    Also pushes a queue_delivered StatusEvent to state.status_queue so the
-    daemon's event_generator can yield it to the SSE stream.
-    """
+def _make_tool_state_check(state: HookState) -> CheckFn:
+    """Track tool/session state without consuming queued user messages."""
 
     async def _check(
         hook_input: HookInput,
@@ -444,7 +440,36 @@ def _make_queue_check(state: HookState) -> CheckFn:
                 state.session_id = session_id.strip()
         elif event_name == "PostToolUse" and state.current_tool_use_id == tool_use_id:
             state.current_tool_use_id = None
+        return None
 
+    return _check
+
+
+def _make_queue_check(state: HookState) -> CheckFn:
+    """Drain queued messages into additionalContext and emit delivery status.
+
+    This event-agnostic helper is registered only as the final PostToolUse
+    check. Do not put it before an awaited/vetoing check: cancellation or a
+    short-circuit after draining would lose messages already marked delivered.
+    PreToolUse only tracks tool state; the runner handles messages left over
+    when a turn ends without another successful tool call.
+    """
+
+    async def _check(
+        hook_input: HookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput | None:
+        if (
+            state.pause_queue_delivery
+            or state.interrupt_requested
+            or state.interrupt_flag
+        ):
+            return None
+
+        # Keep draining and constructing the response synchronous (no await),
+        # so concurrent callbacks cannot consume the same message or cancel
+        # this callback between dequeue and returning its context.
         messages: list[str] = []
         deferred_messages: list[QueuedMessage] = []
         while not state.message_queue.empty():
@@ -836,8 +861,11 @@ def create_hook_matchers(
 ) -> dict[str, list[HookMatcher]]:
     """Build hook matcher dict ready for ClaudeAgentOptions(hooks=...).
 
-    PreToolUse pipeline: interrupt check -> native/immutable guard -> queue check -> [user hook]
-    PostToolUse pipeline: queue check -> [user hook]
+    PreToolUse pipeline: interrupt -> native/immutable guard -> tool state -> [user hook]
+    PostToolUse pipeline: tool state -> [user hook] -> queue delivery
+
+    Queue delivery must be last, after any check that can await or stop the
+    callback. This keeps cancelled/short-circuited messages queued for retry.
 
     If *user_hooks* is provided (mapping of event name to
     ``"file_path::function_name"``), the user-supplied check is appended
@@ -846,6 +874,7 @@ def create_hook_matchers(
     """
     interrupt_check = _make_interrupt_check(state)
     immutable_check = _make_immutable_check(config)
+    tool_state_check = _make_tool_state_check(state)
     queue_check = _make_queue_check(state)
     notification_check = _make_notification_check(state)
     stop_check = _make_stop_check(state)
@@ -875,10 +904,12 @@ def create_hook_matchers(
         checks = list(builtin)
         if event in _resolved_user_checks:
             checks.append(_resolved_user_checks[event])
+        if event == "PostToolUse":
+            checks.append(queue_check)
         return HookPipeline(checks)
 
-    pre_tool_pipeline = _pipeline([interrupt_check, immutable_check, queue_check], "PreToolUse")
-    post_tool_pipeline = _pipeline([queue_check], "PostToolUse")
+    pre_tool_pipeline = _pipeline([interrupt_check, immutable_check, tool_state_check], "PreToolUse")
+    post_tool_pipeline = _pipeline([tool_state_check], "PostToolUse")
     notification_pipeline = _pipeline([notification_check], "Notification")
     stop_pipeline = _pipeline([stop_check], "Stop")
 
