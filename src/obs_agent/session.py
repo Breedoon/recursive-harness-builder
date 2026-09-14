@@ -114,6 +114,7 @@ class SessionManager:
         # give child sessions a different model without mutating the shared
         # OBSConfig instance.
         self.model_override: str | None = None
+        self.effort_override: str | None = None
         # Per-session user hooks.  Mapping of hook event name to
         # ``"file_path::function_name"`` spec.  Threaded to
         # ``create_hook_matchers`` at session creation time.
@@ -155,6 +156,39 @@ class SessionManager:
     def effective_model(self) -> str:
         """Return the requested OBS model/budget, before CLI capacity translation."""
         return self.model_override or self.config.model
+
+    @property
+    def effective_effort(self) -> str:
+        from obs_agent.effort import resolve_effort
+
+        return resolve_effort(
+            self.effective_model,
+            override=self.effort_override,
+            configured=self.config.effort_level,
+            model_defaults=self.config.model_effort_levels,
+            environ=os.environ,
+            session_env=self._sdk_env_overrides,
+        )
+
+    async def set_effort(self, effort: str) -> str:
+        """Reconfigure an idle session without clearing its conversation ID.
+
+        The transport must serialize this with turn admission and reject active
+        or queued work. Reconnection is lazy, on the next message.
+        """
+        from obs_agent.effort import build_effort_env, normalize_effort, resolve_effort
+
+        selection = normalize_effort(effort)
+        effective = resolve_effort(
+            self.effective_model, override=selection,
+            model_defaults=self.config.model_effort_levels,
+        )
+        build_effort_env(
+            self.effective_model, effective, {**os.environ, **self._sdk_env_overrides}
+        )  # Validate the merged body before disconnecting or changing state.
+        await self.disconnect()
+        self.effort_override = selection
+        return effective
 
     def _jsonl_has_entry_file_context(self, session_id: str | None) -> bool:
         if not session_id:
@@ -342,6 +376,13 @@ class SessionManager:
                 context_plan.output_reserve_tokens,
             )
 
+        from obs_agent.effort import build_effort_env
+
+        effort_env = build_effort_env(
+            clean_model, self.effective_effort, {**os.environ, **effective_env}
+        )
+        effective_env.update(effort_env)
+
         hook_matchers = create_hook_matchers(
             self.config,
             self.hook_state,
@@ -395,7 +436,7 @@ class SessionManager:
             # Project settings can also contain env overrides. Supply the budget
             # controls at the CLI-settings boundary without replacing unrelated
             # project settings or changing the persisted OBS model identity.
-            settings=json.dumps({"env": context_env}),
+            settings=json.dumps({"env": {**context_env, **effort_env}}),
             env=effective_env,
             max_buffer_size=self.config.max_buffer_size,
             stderr=_on_cli_stderr,

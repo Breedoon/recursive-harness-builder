@@ -206,3 +206,12 @@ Before public release, the config surface should be simplified or aliased:
 - Prefer `OBS_CLI_PROXY_*` everywhere and retire bare `CLI_PROXY_*` names in docs after code unification.
 - Make bot-only Telegram setup the default, with userbot provisioning clearly optional.
 - Keep `examples/recursive-workflow/` as the default starter project so new users do not need to build a project directory from scratch.
+
+## Reasoning effort
+
+Use `/effort` in Telegram or the CLI to inspect a session's selected effort,
+`/effort low|medium|high|xhigh|max` to change it between turns, and `/effort auto`
+to return to its model default. AgentTask accepts the same levels plus `inherit`.
+`OBS_EFFORT_LEVEL` sets a shared default; `OBS_MODEL_EFFORT_LEVELS` is a JSON
+model-to-effort map, with aliases resolved like context defaults. See
+[Reasoning effort](effort.md) for precedence, persistence, and CLIProxyAPI details.

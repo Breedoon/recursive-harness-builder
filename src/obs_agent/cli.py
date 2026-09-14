@@ -32,6 +32,7 @@ CLI_HELP = """Usage: obs-agent [--help] [--profile PROFILE] [--prod]
 Commands:
   /help        Show this help
   /stop        Interrupt the current response
+  /effort [LEVEL] Show/set low, medium, high, xhigh, max, or auto between turns
   /quit        Exit the CLI
 
 Formal testing: use the host-preflight command in docs/testing.md and the
@@ -62,6 +63,30 @@ def parse_slash_command(text: str) -> tuple[str | None, str | None]:
     if text.startswith("/"):
         return (text, None)
     return (None, text)
+
+
+async def execute_effort_command(command: str, *, base_url: str) -> str:
+    """Use the daemon's admission guard; never send /effort as an LLM prompt."""
+    from obs_agent.effort import EFFORT_USAGE, normalize_effort
+
+    args = command.split()[1:]
+    if len(args) > 1:
+        return f"usage: {EFFORT_USAGE}"
+    try:
+        selection = normalize_effort(args[0]) if args else None
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            if selection is None:
+                response = await client.get(f"{base_url}/effort")
+            else:
+                response = await client.post(f"{base_url}/effort", json={"effort": selection})
+        data = response.json()
+        if response.is_error:
+            return str(data.get("detail", f"daemon returned status {response.status_code}"))
+        return data.get("message") or f"effort: {data['effort']}; model: {data['model']}"
+    except ValueError as exc:
+        return f"{exc}. usage: {EFFORT_USAGE}"
+    except httpx.HTTPError as exc:
+        return f"Error: connection failed - {exc}"
 
 
 def check_daemon(base_url: str) -> bool:
@@ -222,6 +247,8 @@ async def _handle_input_during_stream(
             return "/quit"
         elif command == "/help":
             channel.print_output(CLI_HELP + "\n")
+        elif command is not None and command.split()[0] == "/effort":
+            channel.print_output(await execute_effort_command(command, base_url=base_url) + "\n")
         elif command is not None:
             channel.print_output(format_unknown_command(command) + "\n")
         elif text:
@@ -402,6 +429,9 @@ async def async_main() -> None:
                 continue
             elif command == "/stop":
                 print("(nothing to interrupt)")
+                continue
+            elif command is not None and command.split()[0] == "/effort":
+                print(await execute_effort_command(command, base_url=base_url))
                 continue
             elif command is not None:
                 print(format_unknown_command(command))
