@@ -1,0 +1,178 @@
+--- a/tests/test_effort.py
++++ b/tests/test_effort.py
+@@ -267,6 +267,7 @@
+         await bot.shutdown()
+     restored = TelegramBot(config, fragment_gap=0.001, enable_background_poller=False)
+     try:
++        await restored.initialize_runtime()
+         state = restored._get_state(route)
+         assert state.session_manager.effective_effort == "xhigh"
+         assert state.session_id == "kept-id"
+--- a/tests/test_tools.py
++++ b/tests/test_tools.py
+@@ -473,6 +473,7 @@
+                 "max_turns": 12,
+                 "fork": True,
+                 "model": None,
++                "effort": None,
+                 "team_name": None,
+                 "agent_name": None,
+                 "task_tool_name": "AgentTask",
+--- a/tests/test_claude_context_binary.py
++++ b/tests/test_claude_context_binary.py
+@@ -45,7 +45,7 @@
+ 
+ 
+ @contextmanager
+-def _fake_anthropic_api():
++def _fake_anthropic_api(*, capture_bodies: bool = False):
+     requests = []
+ 
+     class Handler(BaseHTTPRequestHandler):
+@@ -58,7 +58,7 @@
+                 self.send_error(413)
+                 return
+             body = json.loads(self.rfile.read(length) or "{}")
+-            requests.append(self.path)
++            requests.append((self.path, body) if capture_bodies else self.path)
+             if "count_tokens" in self.path:
+                 payload = b'{"input_tokens": 500}'
+                 content_type = "application/json"
+--- /dev/null
++++ b/tests/test_effort_binary.py
+@@ -0,0 +1,76 @@
++"""Installed Claude binary -> loopback-only fake API, never a real provider.
++
++Reuse the context compatibility suite's isolated workspace and fake Anthropic
++server. These probes verify that the environment reaches an actual HTTP body,
++not merely that ClaudeAgentOptions contains the desired strings.
++"""
++import json
++import os
++import subprocess
++
++import pytest
++
++from test_claude_context_binary import _fake_anthropic_api, binary_workspace
++
++pytestmark = pytest.mark.skipif(
++    os.environ.get("OBS_RUN_LOCAL_CLAUDE_CONTEXT_TESTS") != "1",
++    reason="Explicit opt-in and a loopback-only network namespace are required",
++)
++
++
++@pytest.mark.parametrize("model,effort", [
++    *(('gpt-5.6-sol', level) for level in ('low', 'medium', 'high', 'xhigh', 'max')),
++    *(('claude-opus-4-6', level) for level in ('low', 'medium', 'high', 'max')),
++])
++def test_installed_cli_sends_effort_in_http_request(binary_workspace, tmp_path, model, effort):
++    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
++    from obs_agent.config import OBSConfig
++    from obs_agent.session import SessionManager
++
++    project, home = binary_workspace
++    manager = SessionManager(config=OBSConfig(
++        vault_path=project, model=model, cache_proxy_enabled=False,
++    ))
++    manager.effort_override = effort
++    options = manager.create_options()
++    options.mcp_servers = {}
++    options.hooks = {}
++    options.tools = []
++    options.permission_mode = "default"
++    options.max_turns = 1
++    options.system_prompt = "Answer briefly."
++    options.extra_args = {}
++    transport = SubprocessCLITransport(prompt="unused", options=options)
++
++    with _fake_anthropic_api(capture_bodies=True) as (base_url, requests):
++        child_env = {
++            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
++            "HOME": str(home), "TMPDIR": str(tmp_path), "LANG": "C.UTF-8",
++            "CLAUDE_CONFIG_DIR": str(home / ".claude"),
++            "XDG_CONFIG_HOME": str(home / ".config"),
++            "ANTHROPIC_BASE_URL": base_url,
++            "ANTHROPIC_API_KEY": "sk-offline-effort-probe",
++            "CLAUDE_CODE_ENTRYPOINT": "sdk-py",
++            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
++            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
++            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
++            "DISABLE_TELEMETRY": "1", "DISABLE_ERROR_REPORTING": "1",
++            **json.loads(options.settings)["env"],
++        }
++        user_message = {
++            "type": "user", "session_id": "default", "parent_tool_use_id": None,
++            "message": {"role": "user", "content": "Reply with OK."},
++        }
++        result = subprocess.run(
++            transport._build_command(), input=json.dumps(user_message) + "\n",
++            cwd=project, env=child_env, text=True, capture_output=True, timeout=45,
++        )
++    diagnostic = f"exit={result.returncode}\n{result.stdout[-3000:]}\n{result.stderr[-2000:]}"
++    assert result.returncode == 0, diagnostic
++    bodies = [body for path, body in requests if path.split("?")[0] == "/v1/messages"]
++    assert bodies, diagnostic
++    for body in bodies:
++        assert body.get("output_config", {}).get("effort") == effort, body
++        if model.startswith("gpt-"):
++            assert body["thinking"]["type"] == "adaptive", body
++            assert "budget_tokens" not in body["thinking"], body
+--- /dev/null
++++ b/.github/workflows/effort.yml
+@@ -0,0 +1,56 @@
++name: Effort compatibility
++
++on:
++  pull_request:
++    paths:
++      - src/obs_agent/**
++      - tests/test_effort*.py
++      - tests/test_claude_context_binary.py
++      - tests/test_tools.py
++      - tests/test_telegram.py
++      - .github/workflows/effort.yml
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++jobs:
++  effort:
++    runs-on: ubuntu-latest
++    timeout-minutes: 15
++    steps:
++      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
++        with:
++          persist-credentials: false
++      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
++        with:
++          python-version: '3.13.5'
++      - name: Install locked dependencies
++        run: |
++          python -m pip install uv
++          uv sync --frozen --extra dev
++      - name: Run unit and transport regression suites
++        run: |
++          .venv/bin/python -m pytest -q --tb=short \
++            tests/test_effort.py tests/test_config.py tests/test_session.py \
++            tests/test_tools.py tests/test_telegram.py tests/test_telegram_state_store.py \
++            tests/test_cli.py tests/test_daemon.py --junitxml=effort-results.xml
++      - name: Verify installed CLI effort payloads without external networking
++        shell: bash
++        run: |
++          sudo unshare --net -- bash -c '
++            set -euo pipefail
++            ip link set lo up
++            cd "$2"
++            exec runuser -u "$1" -- env OBS_RUN_LOCAL_CLAUDE_CONTEXT_TESTS=1 \
++              "$2/.venv/bin/python" -m pytest -q --tb=short \
++              tests/test_effort_binary.py --junitxml="$2/effort-binary-results.xml"
++          ' _ "$(id -un)" "$GITHUB_WORKSPACE"
++      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
++        if: always()
++        with:
++          name: effort-test-results
++          path: |
++            effort-results.xml
++            effort-binary-results.xml
++          retention-days: 7
