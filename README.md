@@ -31,6 +31,23 @@ The example shows the intended pattern: describe coordination behavior in markdo
 
 ## Quick start
 
+For repository development, use the canonical isolated testing protocol in
+[`docs/testing.md`](docs/testing.md). Formal tests must run through the
+host-managed `obs-live-test` service, never inside the production-serving
+`obs-test` container or by relying on `OBS_PROFILE=test` alone. The authored
+command is intentionally parked and unrun in this slice:
+
+```text
+python -m scripts.isolated_test_runner --phase host-preflight --host-observation /workspace/runtime/obs-live-test-host-observation.json --compose-file deploy/obs-live-test/compose.yaml --lane unit --scenario focused --dry-run
+```
+
+This command performs only host preflight against an independently produced
+host observation; it does not create a service. Legacy live launch through
+`--test`, `--test-instance`, `--profile test`, or the parallel live-smoke script
+fails closed before runtime side effects. The protocol candidate is
+**UNVERIFIED / UNRESOLVED** for runtime, container, credential, test, live,
+integration, release, and production-readiness claims.
+
 The recommended setup path is to let an agent install it for you.
 
 Open Claude Code, Codex, or another coding agent and give it this prompt:

@@ -149,11 +149,11 @@ class SessionManager:
     @property
     def sdk_env_overrides(self) -> dict[str, str]:
         """Expose the current per-session SDK env override map."""
-        return dict(self._sdk_env_overrides)
+        return self._sdk_env_overrides
 
     @property
     def effective_model(self) -> str:
-        """Return the model this session will pass to ClaudeAgentOptions."""
+        """Return the requested OBS model/budget, before CLI capacity translation."""
         return self.model_override or self.config.model
 
     def _jsonl_has_entry_file_context(self, session_id: str | None) -> bool:
@@ -280,28 +280,24 @@ class SessionManager:
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with hooks, MCP tools, and resume."""
+        from obs_agent.claude_context import build_claude_context_plan
         from obs_agent.config import (
             auto_compact_window_for_model,
             is_claude_model,
             resolve_model_context,
         )
 
-        hook_matchers = create_hook_matchers(self.config, self.hook_state, user_hooks=self.user_hooks)
-
-        # Create MCP tool server with session_id getter closure and hook_state
-        # for background fork result delivery
-        tool_server = create_obs_tools(self.config, lambda: self._session_id, hook_state=self.hook_state)
-
         resolved_model = resolve_model_context(self.effective_model)
-        effective_model = resolved_model.model_for_claude_code
-        ctx_tokens = resolved_model.context_tokens
-        self.hook_state.effective_model = resolved_model.model_with_context
-
+        clean_model = resolved_model.model
+        context_tokens = resolved_model.context_tokens
+        requested_model = resolved_model.model_with_context
+        is_local_provider = clean_model.lower().startswith("local-")
         effective_env = {
             **_DEFAULT_SDK_ENV,
             **self._sdk_env_overrides,
         }
-        if resolved_model.model.lower().startswith("local-"):
+
+        if is_local_provider:
             local_base_url = os.environ.get("OBS_LOCAL_LLM_BASE_URL", "").strip()
             local_auth_token = os.environ.get("OBS_LOCAL_LLM_AUTH_TOKEN", "").strip()
             local_api_key = os.environ.get("OBS_LOCAL_LLM_API_KEY", "").strip()
@@ -312,25 +308,67 @@ class SessionManager:
                     effective_env["ANTHROPIC_AUTH_TOKEN"] = local_auth_token
                 elif local_api_key:
                     effective_env["ANTHROPIC_API_KEY"] = local_api_key
+
+            auto_compact_window = auto_compact_window_for_model(
+                clean_model,
+                context_tokens,
+                auto_compact_window_tokens=self.config.auto_compact_window_tokens,
+            )
+            context_env = {
+                "OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS": str(context_tokens),
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(auto_compact_window),
+            }
+            effective_env.update(context_env)
+            effective_env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
+            cli_model = resolved_model.model_for_claude_code
+        else:
+            context_plan = build_claude_context_plan(
+                model=clean_model,
+                context_tokens=context_tokens,
+                auto_compact_window_tokens=self.config.auto_compact_window_tokens,
+                environ={**os.environ, **effective_env},
+            )
+            context_env = context_plan.environment
+            effective_env.update(context_env)
+            cli_model = context_plan.cli_model
+            logger.info(
+                "Claude context policy model=%s cli_model=%s context=%s "
+                "compact_window=%s target=%s output_reserve=%s",
+                requested_model,
+                context_plan.cli_model,
+                context_tokens,
+                context_plan.cli_compact_window_tokens,
+                context_plan.threshold_tokens,
+                context_plan.output_reserve_tokens,
+            )
+
+        hook_matchers = create_hook_matchers(
+            self.config,
+            self.hook_state,
+            user_hooks=self.user_hooks,
+        )
+
+        # Create MCP tool server with session_id getter closure and hook_state
+        # for background fork result delivery
+        tool_server = create_obs_tools(
+            self.config,
+            lambda: self._session_id,
+            hook_state=self.hook_state,
+        )
+
+        # Persist/report the requested OBS budget, NOT the CLI capacity selector.
+        # Otherwise [400k] would become [1m] when this session spawns children.
+        self.hook_state.effective_model = requested_model
         self.hook_state.sdk_env_overrides = dict(self._sdk_env_overrides)
         self.hook_state.vault_path = self.config.vault_path
 
-        auto_compact_window = auto_compact_window_for_model(
-            effective_model,
-            ctx_tokens,
-            auto_compact_window_tokens=self.config.auto_compact_window_tokens,
-        )
-        effective_env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = str(ctx_tokens)
-        effective_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(auto_compact_window)
-        effective_env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
-        # For non-Claude models, set the API key to the CLI proxy key by
-        # default. Explicit per-session credentials and the local-provider
-        # process profile take precedence.
-        if is_claude_model(effective_model):
+        # For non-Claude hosted models, set the API key to the CLI proxy key by
+        # default. Explicit per-session and local-provider credentials take precedence.
+        if is_claude_model(clean_model):
             for key in _ANTHROPIC_AUTH_ENV_KEYS:
                 effective_env.pop(key, None)
         elif (
-            not resolved_model.model.lower().startswith("local-")
+            not is_local_provider
             and not any(key in effective_env for key in _ANTHROPIC_AUTH_ENV_KEYS)
         ):
             effective_env["ANTHROPIC_API_KEY"] = self.config.cli_proxy_api_key
@@ -348,12 +386,16 @@ class SessionManager:
             )
 
         options = ClaudeAgentOptions(
-            model=effective_model,
+            model=cli_model,
             hooks=hook_matchers,
             mcp_servers={"obs-agent": tool_server},
             cwd=str(self.config.vault_path),
             permission_mode="bypassPermissions",
             setting_sources=["project"],
+            # Project settings can also contain env overrides. Supply the budget
+            # controls at the CLI-settings boundary without replacing unrelated
+            # project settings or changing the persisted OBS model identity.
+            settings=json.dumps({"env": context_env}),
             env=effective_env,
             max_buffer_size=self.config.max_buffer_size,
             stderr=_on_cli_stderr,

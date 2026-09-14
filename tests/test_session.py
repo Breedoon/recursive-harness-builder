@@ -245,7 +245,8 @@ class TestCreateOptions:
         assert mgr.effective_model == config.model
         mgr.model_override = "gpt-5.5"
         assert mgr.effective_model == "gpt-5.5"
-        assert mgr.create_options().model == "gpt-5.5[400k]"
+        assert mgr.create_options().model == "gpt-5.5[1m]"
+        assert mgr.hook_state.effective_model == "gpt-5.5[400k]"
 
     def test_passes_hook_state_to_obs_tools(self, config):
         state = HookState()
@@ -356,7 +357,7 @@ class TestCreateOptions:
         assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
-        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
+        assert 1 <= float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) <= 100
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
     def test_model_override_sets_default_1m_context_window_envs(self, config):
@@ -366,7 +367,7 @@ class TestCreateOptions:
         assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
-        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
+        assert 1 <= float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) <= 100
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
     def test_explicit_context_override_sets_matching_envs(self, config):
@@ -376,7 +377,7 @@ class TestCreateOptions:
         assert options.model == "gpt-5.4-mini[200k]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
-        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
+        assert 1 <= float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) <= 100
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
     def test_inherited_model_uses_parent_config_context_envs_without_override(self, config):
@@ -469,7 +470,7 @@ class TestClientLifecycle:
         assert options.model == "gpt-5.4-mini[1m]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1000000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
-        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
+        assert 1 <= float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) <= 100
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
     @pytest.mark.asyncio
@@ -559,7 +560,7 @@ class TestClientLifecycle:
         assert options.model == "gpt-5.6-sol[200k]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
-        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in options.env
+        assert 1 <= float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) <= 100
         assert options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
 
     @pytest.mark.asyncio

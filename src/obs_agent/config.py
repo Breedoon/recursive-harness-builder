@@ -93,22 +93,31 @@ class ModelContext:
 
 
 def _context_suffix_for_tokens(context_tokens: int) -> str:
+    if isinstance(context_tokens, bool) or not isinstance(context_tokens, int):
+        raise ValueError("Context window must be an integer token count")
+    if context_tokens <= 0 or context_tokens % 1_000:
+        raise ValueError("Context suffixes require a positive whole number of thousands of tokens")
     if context_tokens % 1_000_000 == 0:
         return f"[{context_tokens // 1_000_000}m]"
     if context_tokens % 1_000 == 0:
         return f"[{context_tokens // 1_000}k]"
-    return f"[{context_tokens}k]"
+    raise ValueError("Context window cannot be represented as a k/m suffix")
 
 
 def split_context_suffix(model_str: str) -> tuple[str, int | None]:
     """Split a model string into (clean_model, explicit_context_tokens)."""
+    model_str = model_str.strip()
     m = _CONTEXT_SUFFIX_RE.search(model_str)
     if not m:
-        return model_str.strip(), None
+        if not model_str or "[" in model_str or "]" in model_str:
+            raise ValueError("Model must be nonempty with at most one valid [Nk] or [Nm] suffix")
+        return model_str, None
     value = int(m.group(1))
     unit = m.group(2).lower()
     tokens = value * 1_000_000 if unit == "m" else value * 1_000
     clean = model_str[: m.start()].strip()
+    if not clean or "[" in clean or "]" in clean or tokens <= 0:
+        raise ValueError("Context suffix requires a nonempty model and a positive token count")
     return clean, tokens
 
 
@@ -162,11 +171,12 @@ def normalize_model_for_claude_code(
     *,
     default_context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
 ) -> str:
-    """Resolve the model identifier passed to Claude Code.
+    """Resolve OBS's model metadata representation.
 
-    OBS passes context suffixes for hosted models. Local Anthropic-compatible
-    providers receive their canonical model ID while OBS supplies the context
-    limit separately through SDK environment metadata.
+    Hosted models retain arbitrary context suffixes so child inheritance keeps
+    the requested budget. Local Anthropic-compatible providers retain their
+    canonical unsuffixed model ID because their upstream router matches it
+    literally. SessionManager translates hosted budgets at the CLI boundary.
     """
     resolved = resolve_model_context(
         model_str,
@@ -192,31 +202,14 @@ def parse_context_suffix(model_str: str) -> tuple[str, int]:
 
 
 def compaction_threshold(context_tokens: int) -> int:
-    """Return the compaction-trigger token count for a given context window.
+    """Return OBS's linear compaction target, not a percentage interpolation.
 
-    Reverse-engineered from Anthropic's Claude Code behaviour:
-      - 200 000 tokens → fires at ~167 000  (≈83.5 %)
-      - 1 000 000 tokens → fires at ~920 000 (≈92.0 %)
-
-    The percentage scales linearly from 83.5 % at 200 K to 92.0 % at 1 M,
-    clamped at those bounds.  A safety floor of 10 000 tokens below the window
-    is enforced so compaction always has room to work.
+    Reference defaults: 200K -> 167K and 1M -> 967K, hence T(C) = C - 33K.
+    See docs/context-compaction.md for the CLI-version and output-reserve caveats.
     """
-    if context_tokens <= 0:
-        return 0
-    # Linear interpolation between two known data-points
-    low_ctx, low_pct = 200_000, 0.835
-    high_ctx, high_pct = 1_000_000, 0.920
-    if context_tokens <= low_ctx:
-        pct = low_pct
-    elif context_tokens >= high_ctx:
-        pct = high_pct
-    else:
-        ratio = (context_tokens - low_ctx) / (high_ctx - low_ctx)
-        pct = low_pct + ratio * (high_pct - low_pct)
-    threshold = int(context_tokens * pct)
-    # Ensure at least 10 K headroom
-    return min(threshold, context_tokens - 10_000)
+    from obs_agent.claude_context import default_compaction_threshold
+
+    return default_compaction_threshold(context_tokens)
 
 
 def auto_compact_window_for_context(
@@ -227,7 +220,7 @@ def auto_compact_window_for_context(
     """Return the Claude Code auto-compact window to pass for a model context.
 
     The window should match the resolved model context so Claude Code's own
-    compaction trigger tracks the same percentage curve as native Claude
+    compaction trigger retains the same reserved token headroom as native
     sessions. Operators can set ``OBS_AUTO_COMPACT_WINDOW_TOKENS`` as an
     emergency cap for a provider with a smaller observed prompt limit.
     """
@@ -245,9 +238,9 @@ def default_auto_compact_window_for_model(
     """Return OBS's built-in auto-compact window for a resolved model.
 
     By default, OBS passes the resolved context window through to Claude Code.
-    That lets Claude Code apply its built-in compaction curve consistently:
-    about 167K for a 200K window, about 342K for a 400K window, and about
-    920K for a 1M window.
+    SessionManager also selects a sufficient CLI context tier and supplies the
+    percentage guard. The reference targets are 167K for a 200K window, 367K
+    for 400K, and 967K for 1M; the suffix alone does not enforce this policy.
     """
     if context_tokens <= 0:
         return 0
@@ -263,8 +256,8 @@ def auto_compact_window_for_model(
     """Return the Claude Code auto-compact window for a model/context pair.
 
     ``auto_compact_window_tokens`` is an explicit operator override. A value of
-    0 means "use OBS's model-aware default", not "disable the conservative
-    proxied-provider window".
+    0 means "use the resolved OBS context window". A positive override can
+    lower that window but cannot enlarge it.
     """
     if context_tokens <= 0:
         return 0

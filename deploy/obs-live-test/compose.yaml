@@ -1,0 +1,99 @@
+# Inert service-creation template. The host must complete host-preflight and
+# write its integrity-bound attestation before this file may be used.
+name: obs-live-test
+
+services:
+  obs-live-test:
+    image: ${OBS_LIVE_TEST_IMAGE_REFERENCE:?set repository@sha256 immutable image reference}
+    container_name: obs-live-test
+    hostname: obs-live-test
+    restart: "no"
+    read_only: true
+    init: true
+    user: ${OBS_LIVE_TEST_UID:?set observed non-production uid}:${OBS_LIVE_TEST_GID:?set observed non-production gid}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      OBS_PROFILE: test
+      OBS_TEST_NETWORK_IDENTITY: obs-live-test-${OBS_LIVE_TEST_RUN_ID:?set host-attested run id}
+      OBS_TEST_NETWORK_MODE: private
+      HOME: /run/obs-live-test/home
+      CLAUDE_CONFIG_DIR: /run/obs-live-test/claude-config
+      OBS_CLAUDE_PROJECTS_DIR: /run/obs-live-test/claude-projects
+      OBS_CLAUDE_TEAMS_DIR: /run/obs-live-test/claude-teams
+      OBS_CLAUDE_SESSIONS_DIR: /run/obs-live-test/claude-sessions
+      OBS_CLAUDE_AUTH_FILE: /run/obs-live-test/claude-auth.json
+      CLAUDE_PROJECTS_DIR: /run/obs-live-test/claude-projects
+      CLAUDE_TEAMS_DIR: /run/obs-live-test/claude-teams
+      CLAUDE_SESSIONS_DIR: /run/obs-live-test/claude-sessions
+      CLAUDE_AUTH_FILE: /run/obs-live-test/claude-auth.json
+      OBS_TEST_PROJECT_ROOT: /run/obs-live-test/project
+      OBS_VAULT_PATH: /run/obs-live-test/fixture
+      OBS_TELEGRAM_STATE_DB_PATH: /run/obs-live-test/state.sqlite3
+      OBS_TELEGRAM_STATE_WAL_PATH: /run/obs-live-test/state.sqlite3-wal
+      XDG_CACHE_HOME: /run/obs-live-test/cache-root
+      OBS_CACHE_DATA_DIR: /run/obs-live-test/cache-data
+      CACHE_PROXY_LOG_DIR: /run/obs-live-test/cache-log
+      TMPDIR: /run/obs-live-test/temp
+      OBS_TELEGRAM_TEMP_ROOT: /run/obs-live-test/download
+      OBS_RUNTIME_LOG_FILE: /run/obs-live-test/runtime.log
+      OBS_TELEGRAM_LOG_FILE: /run/obs-live-test/telegram.log
+      OBS_TEST_EVIDENCE_ROOT: /run/obs-live-test/evidence
+      OBS_DAEMON_METADATA_DIR: /run/obs-live-test/daemon-metadata
+      OBS_DAEMON_PID_FILE: /run/obs-live-test/daemon.pid
+      OBS_DAEMON_LOCK_FILE: /run/obs-live-test/daemon.lock
+      OBS_TEST_OWNERSHIP_MARKER: /run/obs-live-test/ownership.json
+      OBS_TEST_SOURCE_SNAPSHOT: /source/snapshot
+      OBS_TEST_SECRET_FILE: /run/obs-live-test-secret/test-credentials
+      OBS_TEST_ATTESTATION: /run/obs-live-test-attestation/host-attestation.json
+      OBS_CACHE_PROXY_PORT: ${OBS_LIVE_TEST_CACHE_PORT:?set host-attested cache port}
+      OBS_DAEMON_PORT: ${OBS_LIVE_TEST_DAEMON_PORT:?set host-attested daemon port}
+    command:
+      - python
+      - -I
+      - /source/snapshot/scripts/isolated_test_runner.py
+      - --phase
+      - inner
+      - --attestation
+      - /run/obs-live-test-attestation/host-attestation.json
+      - --lane
+      - unit
+      - --scenario
+      - focused
+      - --dry-run
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=0700
+    networks:
+      - obs-live-test-network
+    volumes:
+      - type: bind
+        source: ${OBS_LIVE_TEST_SOURCE_SNAPSHOT:?set host-attested immutable snapshot}
+        target: /source/snapshot
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${OBS_LIVE_TEST_RUN_ROOT:?set exact host-attested run root}
+        target: /run/obs-live-test
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${OBS_LIVE_TEST_SECRET_FILE:?set exact host-attested test secret file}
+        target: /run/obs-live-test-secret/test-credentials
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${OBS_LIVE_TEST_ATTESTATION_FILE:?set exact host-preflight attestation file}
+        target: /run/obs-live-test-attestation/host-attestation.json
+        read_only: true
+        bind:
+          create_host_path: false
+
+networks:
+  obs-live-test-network:
+    name: obs-live-test-${OBS_LIVE_TEST_RUN_ID:?set host-attested run id}
+    driver: bridge
+    internal: true

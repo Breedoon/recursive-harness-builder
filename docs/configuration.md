@@ -2,12 +2,26 @@
 
 This guide describes the public configuration surface for Recursive Harness Builder as it exists today, plus the naming/defaults that should be used by public install docs. Copy `env.example` to `.env` and fill in the values for your machine.
 
+Formal testing has a separate configuration contract: use the host-managed
+`obs-live-test` service and [`docs/testing.md`](testing.md). Repository `.env`
+and ambient production values are not permitted to populate that lane. The
+candidate protocol is authored but **UNVERIFIED / UNRESOLVED** and was not
+executed.
+
 ## Loading rules
 
 - The runtime reads `.env` from the repository root before constructing `OBSConfig`.
 - Explicit shell environment variables win over `.env` values.
-- `OBS_PROFILE` selects profile-specific overrides. For example, `--profile test` or `--test` causes `OBS_TEST_TELEGRAM_BOT_TOKEN` to populate `OBS_TELEGRAM_BOT_TOKEN` when the generic key is not already set.
-- Profile-specific keys should be used for test/prod separation; generic keys should describe the active profile after bootstrap.
+- Production is the runtime default. `OBS_PROD_*` values map to generic keys
+  when production bootstrap is selected.
+- Pure unit/library callers may still parse a test profile and directly exercise
+  `OBS_TEST_*` mapping without launching a live runtime.
+- All public live entry points reject `--test`, `--test-instance`,
+  `--profile test`, and `OBS_PROFILE=test` before `.env` loading or factories.
+- A profile is never an isolation boundary. Formal testing requires the
+  independently observed host attestation, immutable source/image/executed-code
+  binding, pairwise-disjoint topology, test-secret measurement, mount/network/
+  port/poller denial, and inner preflight in `docs/testing.md`.
 
 ## Current naming caveat
 

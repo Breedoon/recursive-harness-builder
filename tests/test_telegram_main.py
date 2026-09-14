@@ -1,8 +1,12 @@
 """Tests for Telegram daemon entrypoint logging behavior."""
 
 import logging
+import sys
+from unittest.mock import patch
 
-from obs_agent.telegram_main import _DropGetUpdatesFilter, _configure_logging
+import pytest
+
+from obs_agent.telegram_main import _DropGetUpdatesFilter, _configure_logging, main
 
 
 def _log_record(message: str) -> logging.LogRecord:
@@ -31,6 +35,29 @@ def test_polling_filter_keeps_non_polling_lines() -> None:
         'HTTP Request: POST https://api.telegram.org/bot123/sendMessage "HTTP/1.1 200 OK"'
     )
     assert drop_filter.filter(record) is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["telegram-main", "--test"],
+        ["telegram-main", "--test-instance"],
+        ["telegram-main", "--profile", "test"],
+    ],
+)
+def test_telegram_entrypoint_redirects_before_logging_config_proxy_or_poller(
+    argv: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "argv", argv)
+    with patch(
+        "obs_agent.telegram_main._configure_logging",
+        side_effect=AssertionError("logging side effect must not run"),
+    ), patch(
+        "obs_agent.telegram_main.run_telegram_bot",
+        side_effect=AssertionError("poller factory must not run"),
+    ):
+        with pytest.raises(SystemExit, match="obs-live-test"):
+            main()
 
 
 def test_configure_logging_attaches_runtime_file_handler(tmp_path, monkeypatch) -> None:

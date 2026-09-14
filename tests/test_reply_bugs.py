@@ -442,6 +442,9 @@ from tests.test_telegram_live_smoke import (
 )
 
 
+@pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
+)
 @pytest.mark.integration
 @pytest.mark.telegram
 @pytest.mark.telegram_smoke

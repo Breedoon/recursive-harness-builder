@@ -108,6 +108,20 @@ class TestAppFactory:
             create_default_app()
             mock_validate.assert_called_once()
 
+    def test_create_default_app_rejects_test_profile_before_config_or_proxy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OBS_PROFILE", "test")
+        with patch(
+            "obs_agent.daemon.bootstrap_runtime_env",
+            side_effect=AssertionError("bootstrap must not run"),
+        ), patch(
+            "obs_agent.config.OBSConfig.from_env",
+            side_effect=AssertionError("config factory must not run"),
+        ):
+            with pytest.raises(SystemExit, match="obs-live-test"):
+                create_default_app()
+
 
 # --- Health Endpoint ---
 

@@ -1,0 +1,69 @@
+name: Context budget compatibility
+
+on:
+  push:
+    branches: [fix/arbitrary-context-compaction-20260913]
+  pull_request:
+    paths:
+      - src/obs_agent/claude_context.py
+      - src/obs_agent/config.py
+      - src/obs_agent/session.py
+      - tests/test_claude_context_*.py
+      - tests/test_context_budget_regressions.py
+      - tests/test_context_process_boundary.py
+      - tests/test_session.py
+      - .github/workflows/context-compaction.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  context-budget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13.5'
+      - name: Install the locked SDK and dependencies
+        run: |
+          python -m pip install uv
+          uv sync --frozen --extra dev
+      - name: Record the installed SDK and CLI versions
+        run: |
+          .venv/bin/python -c 'from importlib.metadata import version; from claude_agent_sdk._cli_version import __cli_version__; print("SDK", version("claude-agent-sdk")); print("bundled CLI", __cli_version__)'
+      - name: Run unit, process-boundary, and native CLI tests without external networking
+        shell: bash
+        run: |
+          # Only the dependency-install step has external networking. The native
+          # binary receives a temporary HOME, dummy key, and loopback fake API.
+          # Run as the normal runner user inside a root-created network namespace.
+          sudo unshare --net -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            cd "$2"
+            exec runuser -u "$1" -- env \
+              OBS_RUN_LOCAL_CLAUDE_CONTEXT_TESTS=1 \
+              OBS_CONTEXT_TEST_ARTIFACT_DIR="$2/context-binary-evidence" \
+              "$2/.venv/bin/python" -m pytest -q \
+                tests/test_context_budget_regressions.py \
+                tests/test_claude_context_policy.py \
+                tests/test_context_process_boundary.py \
+                tests/test_claude_context_binary.py \
+                tests/test_session.py tests/test_config.py \
+                --junitxml="$2/context-test-results.xml"
+          ' _ "$(id -un)" "$GITHUB_WORKSPACE"
+      - name: Preserve diagnostics, including failing compatibility probes
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: context-budget-evidence
+          path: |
+            context-test-results.xml
+            context-binary-evidence/
+          if-no-files-found: warn
+          retention-days: 7

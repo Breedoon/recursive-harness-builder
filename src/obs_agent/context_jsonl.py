@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
+import stat
 from typing import Any
 
 
@@ -29,7 +30,8 @@ class JsonlUsageSnapshot:
 
 
 def _as_int(value: Any) -> int:
-    if isinstance(value, int):
+    """Accept only nonnegative integer token counts, not JSON booleans."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return 0
 
@@ -76,6 +78,83 @@ def _projects_root(projects_root: Path | None) -> Path:
     return Path.home() / ".claude" / "projects"
 
 
+def _session_file_mtime(path: Path) -> float | None:
+    """Observe a regular file once; concurrent cleanup must not abort a batch."""
+    try:
+        metadata = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    return metadata.st_mtime
+
+
+def find_session_jsonl_index(
+    *,
+    session_ids: set[str],
+    cwd: Path,
+    projects_root: Path | None = None,
+) -> dict[str, Path | None]:
+    """Resolve session basenames with one best-effort project-directory scan.
+
+    The current workspace wins over any fallback, even a newer one. Otherwise,
+    choose the newest readable candidate, using its path to break timestamp ties.
+    Invalid identifiers stay unresolved; they must never become filesystem paths.
+    """
+    requested = {
+        session_id for session_id in session_ids
+        if isinstance(session_id, str) and session_id
+    }
+    resolved: dict[str, Path | None] = {session_id: None for session_id in requested}
+    remaining = {
+        session_id for session_id in requested
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", session_id)
+    }
+    if not remaining:
+        return resolved
+
+    root = _projects_root(projects_root)
+    try:
+        if not root.is_dir():
+            return resolved
+    except OSError:
+        return resolved
+
+    preferred_dir = root / _encode_project_path(cwd)
+    for session_id in remaining.copy():
+        preferred = preferred_dir / f"{session_id}.jsonl"
+        if _session_file_mtime(preferred) is not None:
+            resolved[session_id] = preferred
+            remaining.remove(session_id)
+    if not remaining:
+        return resolved
+
+    # Store the observed ranking rather than stat-ing candidates again in a sort.
+    # A disappearing or inaccessible file must not erase another valid result.
+    best_ranks: dict[str, tuple[float, str]] = {}
+    try:
+        for project_dir in root.iterdir():
+            try:
+                if not project_dir.is_dir():
+                    continue
+            except OSError:
+                continue
+            for session_id in remaining:
+                candidate = project_dir / f"{session_id}.jsonl"
+                modified_at = _session_file_mtime(candidate)
+                if modified_at is None:
+                    continue
+                rank = (modified_at, str(candidate))
+                previous_rank = best_ranks.get(session_id)
+                if previous_rank is None or rank > previous_rank:
+                    best_ranks[session_id] = rank
+                    resolved[session_id] = candidate
+    except OSError:
+        # Keep results already observed if the directory iterator itself fails.
+        pass
+    return resolved
+
+
 def find_session_jsonl(
     *,
     session_id: str,
@@ -83,35 +162,11 @@ def find_session_jsonl(
     projects_root: Path | None = None,
 ) -> Path | None:
     """Find session JSONL, preferring the current workspace project directory."""
-    if not session_id:
-        return None
-    root = _projects_root(projects_root)
-    if not root.is_dir():
-        return None
-
-    preferred = root / _encode_project_path(cwd) / f"{session_id}.jsonl"
-    if preferred.is_file():
-        return preferred
-
-    matches: list[Path] = []
-    try:
-        for project_dir in root.iterdir():
-            if not project_dir.is_dir():
-                continue
-            candidate = project_dir / f"{session_id}.jsonl"
-            if candidate.is_file():
-                matches.append(candidate)
-    except OSError:
-        return None
-
-    if not matches:
-        return None
-    if len(matches) == 1:
-        return matches[0]
-
-    # If copied sessions exist across multiple projects, choose newest file.
-    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return matches[0]
+    return find_session_jsonl_index(
+        session_ids={session_id},
+        cwd=cwd,
+        projects_root=projects_root,
+    ).get(session_id)
 
 
 def load_jsonl_usage_snapshot(
@@ -135,22 +190,33 @@ def load_jsonl_usage_snapshot(
     text_char_count = 0
 
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 raw = line.strip()
                 if not raw:
                     continue
                 try:
                     obj = json.loads(raw)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
                     continue
 
+                # Valid JSON is not necessarily a transcript event. Corrupt or
+                # foreign records must not hide usable events later in the file.
+                if not isinstance(obj, dict):
+                    continue
+                event_type = obj.get("type")
+                if not isinstance(event_type, str) or event_type not in {"assistant", "user"}:
+                    continue
                 message = obj.get("message")
                 if not isinstance(message, dict):
                     continue
-                if obj.get("type") in {"assistant", "user"}:
+                try:
                     text_char_count += _content_char_count(message.get("content"))
-                if obj.get("type") != "assistant":
+                except RecursionError:
+                    # A decoder may accept deeper nesting than the estimator.
+                    # Keep independent usage counters even without this estimate.
+                    pass
+                if event_type != "assistant":
                     continue
                 assistant_entries += 1
 

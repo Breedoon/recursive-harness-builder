@@ -20,7 +20,11 @@ from pydantic import BaseModel, Field
 from obs_agent.commands import CommandRegistry
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
-from obs_agent.runtime_env import bootstrap_runtime_env
+from obs_agent.runtime_env import (
+    LegacyFormalTestRedirect,
+    assert_live_entrypoint_allowed,
+    bootstrap_runtime_env,
+)
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent
 from obs_agent.session import SessionManager
 
@@ -48,7 +52,15 @@ def create_default_app() -> FastAPI:
     """
     from obs_agent.config import OBSConfig
 
+    try:
+        assert_live_entrypoint_allowed()
+    except LegacyFormalTestRedirect as exc:
+        raise SystemExit(str(exc)) from exc
     bootstrap_runtime_env(mutate_argv=False)
+    try:
+        assert_live_entrypoint_allowed()
+    except LegacyFormalTestRedirect as exc:
+        raise SystemExit(str(exc)) from exc
     config = OBSConfig.from_env()
     config.validate()
 

@@ -128,7 +128,7 @@ class TestModelContextBoundary:
         assert auto_compact_window_for_model(
             resolved.model, resolved.context_tokens
         ) == 128_000
-        assert compaction_threshold(resolved.context_tokens) == 106_880
+        assert compaction_threshold(resolved.context_tokens) == 95_000
 
     def test_auto_compact_window_tracks_context_by_default(self):
         assert auto_compact_window_for_context(1_000_000) == 1_000_000
@@ -145,7 +145,7 @@ class TestModelContextBoundary:
     def test_model_aware_auto_compact_defaults_track_resolved_context(self):
         assert auto_compact_window_for_model("claude", 1_000_000) == 1_000_000
         assert auto_compact_window_for_model("gpt", 400_000) == 400_000
-        assert compaction_threshold(auto_compact_window_for_model("gpt", 400_000)) == 342_500
+        assert compaction_threshold(auto_compact_window_for_model("gpt", 400_000)) == 367_000
         assert auto_compact_window_for_model("gpt[128k]", 128_000) == 128_000
         assert auto_compact_window_for_model(
             "claude",
@@ -189,22 +189,17 @@ class TestContextSuffixParsing:
         assert clean == "model"
         assert tokens == 1_000_000
 
-    def test_invalid_suffix_ignored(self):
-        """Invalid suffixes like [1g] should be treated as part of the model name."""
-        clean, tokens = parse_context_suffix("model[1g]")
-        # The regex won't match, so the whole string is the model
-        assert tokens == 1_000_000  # default
+    def test_invalid_suffix_rejected(self):
+        with pytest.raises(ValueError):
+            parse_context_suffix("model[1g]")
 
-    def test_empty_string(self):
-        clean, tokens = parse_context_suffix("")
-        assert clean == ""
-        assert tokens == 1_000_000
+    def test_empty_string_rejected(self):
+        with pytest.raises(ValueError):
+            parse_context_suffix("")
 
     def test_suffix_only_matches_end(self):
-        """Suffix-like patterns in the middle should not match."""
-        clean, tokens = parse_context_suffix("model[1m]-variant")
-        # [1m] is not at the end, so no match
-        assert tokens == 1_000_000
+        with pytest.raises(ValueError):
+            parse_context_suffix("model[1m]-variant")
 
 
 # ---------------------------------------------------------------------------
@@ -213,28 +208,19 @@ class TestContextSuffixParsing:
 
 class TestCompactionThreshold:
     def test_1m_context(self):
-        threshold = compaction_threshold(1_000_000)
-        # Should be around 920K (92%)
-        assert 900_000 <= threshold <= 950_000
+        assert compaction_threshold(1_000_000) == 967_000
 
     def test_200k_context(self):
-        threshold = compaction_threshold(200_000)
-        # Should be around 167K (83.5%)
-        assert 160_000 <= threshold <= 175_000
+        assert compaction_threshold(200_000) == 167_000
 
-    def test_400k_context_interpolates_between_200k_and_1m(self):
-        assert compaction_threshold(400_000) == 342_500
+    def test_400k_context_uses_linear_headroom(self):
+        assert compaction_threshold(400_000) == 367_000
 
     def test_128k_context(self):
-        threshold = compaction_threshold(128_000)
-        # Between the two known points
-        assert 100_000 <= threshold <= 120_000
+        assert compaction_threshold(128_000) == 95_000
 
-    def test_32k_context_clamps_at_low(self):
-        threshold = compaction_threshold(32_000)
-        # Clamped at 83.5% for small contexts, minus 10K headroom
-        assert threshold <= 32_000 - 10_000
-        assert threshold > 0
+    def test_32k_context_floors_at_zero(self):
+        assert compaction_threshold(32_000) == 0
 
     def test_zero_context(self):
         assert compaction_threshold(0) == 0

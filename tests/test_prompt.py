@@ -139,5 +139,20 @@ class TestPromptFallbacks:
         assert message.startswith(f"<{ENTRY_FILE_CONTEXT_TAG} source=\"CLAUDE.md\">")
         assert message.count(ENTRY_FILE_SENTINEL) == 1
         assert "# Entry" in message
-        assert build_obs_platform_appendix() in message
+        appendix = build_obs_platform_appendix()
+        assert appendix in message
+        assert "Discover peers with search_team" in appendix
+        assert "AgentTaskOutput or AgentTaskStop" in appendix
+        assert "task_id UUID is deprecated/internal" in appendix
+        assert "bounded parsed snapshot" in appendix
         assert message.endswith("</obs-platform-context>")
+
+    def test_procedures_document_stable_task_discovery(self):
+        from pathlib import Path
+
+        procedures = Path(__file__).resolve().parents[1].joinpath("docs", "procedures.md").read_text()
+        assert "search_team" in procedures
+        assert "AgentTaskOutput" in procedures
+        assert "AgentTaskStop" in procedures
+        assert "deprecated/internal" in procedures
+        assert "cross-root" in procedures

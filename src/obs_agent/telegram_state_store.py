@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -142,6 +143,13 @@ class TelegramStateStore:
     def initialize(self) -> None:
         if self._conn is not None:
             return
+        configured_wal = os.environ.get("OBS_TELEGRAM_STATE_WAL_PATH")
+        if configured_wal:
+            expected_wal = Path(f"{self._db_path}-wal")
+            if Path(configured_wal) != expected_wal:
+                raise ValueError(
+                    "OBS_TELEGRAM_STATE_WAL_PATH must equal the SQLite-derived <db>-wal path"
+                )
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self._db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row

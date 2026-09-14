@@ -53,6 +53,30 @@ class TestCLIEntryPoint:
         """start_daemon function exists and is callable."""
         assert callable(start_daemon)
 
+    @pytest.mark.parametrize(
+        "argv", [["obs-agent", "--test"], ["obs-agent", "--test-instance"], ["obs-agent", "--profile", "test"]]
+    )
+    def test_main_rejects_legacy_test_launch_before_daemon_activity(
+        self,
+        argv: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setattr(
+            "obs_agent.cli.bootstrap_runtime_env",
+            lambda: pytest.fail("bootstrap must not run before redirect"),
+        )
+        monkeypatch.setattr(
+            "obs_agent.cli.check_daemon",
+            lambda *_args: pytest.fail("daemon check must not run"),
+        )
+        monkeypatch.setattr(
+            "obs_agent.cli.start_daemon",
+            lambda *_args: pytest.fail("daemon factory must not run"),
+        )
+        with pytest.raises(SystemExit, match="obs-live-test"):
+            main()
+
 
 # --- Message Sending ---
 
@@ -291,6 +315,9 @@ class TestCommandHelpCopy:
         assert "/help" in CLI_HELP
         assert "/stop" in CLI_HELP
         assert "/quit" in CLI_HELP
+        assert "docs/testing.md" in CLI_HELP
+        assert "obs-live-test" in CLI_HELP
+        assert "legacy test-profile live launch is disabled" in CLI_HELP
         assert "Bare quit, exit, and q also exit." in CLI_HELP
 
     def test_unknown_command_mentions_help(self):

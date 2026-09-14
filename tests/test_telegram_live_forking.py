@@ -18,6 +18,10 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
+pytestmark = pytest.mark.skip(
+    reason="deprecated direct live launcher; migrate through scripts.isolated_test_runner"
+)
+
 from obs_agent.context_jsonl import find_session_jsonl
 from tests.evals.platform_telegram import TelegramObservedMessage, TelegramPlatform, TelegramResponseTrace
 from tests.live_test_vault import ensure_live_test_vault

@@ -7,6 +7,11 @@ The project is a Python harness around Claude Code / Claude Agent SDK. Workflows
 ## Current support level
 
 - macOS, Linux/WSL, and native Windows are intended support targets.
+- Formal repository testing is canonical only through the separate host-managed
+  `obs-live-test` Ubuntu service documented in [`docs/testing.md`](docs/testing.md).
+  The current `obs-test` container is production-serving despite its name.
+- The testing protocol candidate is authored but **UNVERIFIED / UNRESOLVED**;
+  this slice did not install, authenticate, start, or exercise it.
 - Native Windows has not yet been validated end-to-end; if first-run setup fails there, use WSL while the compatibility issue is narrowed.
 - Claude models can run without CLIProxyAPI.
 - Non-Claude models route through CLIProxyAPI via the cache proxy and need a working local CLIProxyAPI-compatible service.
@@ -78,6 +83,10 @@ Public-release note: the variable and code terminology should eventually be rena
 
 ## Configure environment
 
+For ordinary development, copy the example file and edit it. Do not use a
+repository `.env` as a source for formal live-test credentials; the dedicated
+host-owned protocol scrubs and rejects repository/ambient production values.
+
 Copy the example file and edit it:
 
 ```bash
@@ -86,11 +95,19 @@ cp env.example .env
 
 The runtime loads `.env` from the repo root. Existing shell environment variables win over values in `.env`.
 
-Runtime profiles are supported:
+Runtime profile parsing remains available for pure unit/library compatibility:
 
-- Default profile: `prod`
-- Test profile: pass `--test` or `--profile test`
-- Profile-specific keys such as `OBS_TEST_TELEGRAM_BOT_TOKEN` are mapped to generic keys when that profile is active.
+- Default profile: `prod`.
+- Production live launch uses the ordinary no-test-flag path or `--prod`.
+- `OBS_TEST_*` mapping may still be invoked directly by library tests, but it is
+  not a live launcher.
+
+Every public live entry point rejects `--test`, `--test-instance`,
+`--profile test`, and `OBS_PROFILE=test` before `.env` loading, daemon/cache
+startup, Telegram polling, or client construction. Do not run formal daemon/live
+tests in the current production-serving `obs-test` container. Use the exact
+host-preflight dry run in [`docs/testing.md`](docs/testing.md); only a later
+approved host executor may create `obs-live-test` after host attestation.
 
 ## Required settings for Telegram mode
 

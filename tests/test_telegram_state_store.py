@@ -2,7 +2,21 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from obs_agent.telegram_state_store import TelegramStateStore
+
+
+def test_state_store_rejects_wal_path_not_derived_from_database(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "telegram-state.sqlite3"
+    monkeypatch.setenv(
+        "OBS_TELEGRAM_STATE_WAL_PATH", str(tmp_path / "different.wal")
+    )
+    store = TelegramStateStore(db_path)
+    with pytest.raises(ValueError, match="SQLite-derived <db>-wal"):
+        store.initialize()
 
 
 def test_state_store_roundtrip_snapshot(tmp_path):
