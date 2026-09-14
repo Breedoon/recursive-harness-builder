@@ -1722,46 +1722,51 @@ def create_obs_tools(
         "search_team",
         "Discover teammates in a lineage tree with target-relative filters, activity, and pagination.",
         {
-            "mode": {
-                "type": "string",
-                "description": "One of: parent, children, siblings, ancestors, descendants, family, tree",
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "description": "One of: parent, children, siblings, ancestors, descendants, family, tree",
+                },
+                "team_name": {
+                    "type": "string",
+                    "description": "Optional locally known team identity; defaults to the caller's team.",
+                },
+                "agent_name": {
+                    "type": "string",
+                    "description": "Optional locally known agent identity; defaults to the caller or known team root.",
+                },
+                "running_only": {
+                    "type": "boolean",
+                    "description": "Return only members currently known to be running.",
+                },
+                "activity_after": {
+                    "type": ["number", "string"],
+                    "description": "Strict lower activity bound as epoch seconds or RFC3339.",
+                },
+                "activity_before": {
+                    "type": ["number", "string"],
+                    "description": "Strict upper activity bound as epoch seconds or RFC3339.",
+                },
+                "active_within_seconds": {
+                    "type": "number",
+                    "description": "Inclusive recent activity window in nonnegative seconds.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Positive page size, default 50, maximum 200.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Nonnegative result offset, default 0.",
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Opaque cursor token for stable pagination continuation. When provided, no other arguments are allowed.",
+                },
             },
-            "team_name": {
-                "type": "string",
-                "description": "Optional locally known team identity; defaults to the caller's team.",
-            },
-            "agent_name": {
-                "type": "string",
-                "description": "Optional locally known agent identity; defaults to the caller or known team root.",
-            },
-            "running_only": {
-                "type": "boolean",
-                "description": "Return only members currently known to be running.",
-            },
-            "activity_after": {
-                "type": ["number", "string"],
-                "description": "Strict lower activity bound as epoch seconds or RFC3339.",
-            },
-            "activity_before": {
-                "type": ["number", "string"],
-                "description": "Strict upper activity bound as epoch seconds or RFC3339.",
-            },
-            "active_within_seconds": {
-                "type": "number",
-                "description": "Inclusive recent activity window in nonnegative seconds.",
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Positive page size, default 50, maximum 200.",
-            },
-            "offset": {
-                "type": "integer",
-                "description": "Nonnegative result offset, default 0.",
-            },
-            "cursor": {
-                "type": "string",
-                "description": "Opaque cursor token for stable pagination continuation. When provided, no other arguments are allowed.",
-            },
+            "required": [],
+            "additionalProperties": False,
         },
     )
     async def search_team(args: dict) -> dict:

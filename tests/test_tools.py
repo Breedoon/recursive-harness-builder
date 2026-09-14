@@ -279,6 +279,20 @@ class TestAgentTaskTools:
         assert "agent" in schema["properties"]
         assert "limit" in schema["properties"]
 
+    def test_search_team_schema_has_no_required_fields(self, monkeypatch, skill_config):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        create_obs_tools(skill_config, lambda: "sid-123")
+
+        tool = next(tool for tool in captured["tools"] if tool.name == "search_team")
+        schema = tool.input_schema
+        assert schema["type"] == "object"
+        assert schema["required"] == []
+        assert schema["properties"]["running_only"]["type"] == "boolean"
+        assert schema["properties"]["limit"]["type"] == "integer"
+        assert schema["properties"]["cursor"]["type"] == "string"
+
     def test_agent_task_schema_allows_prompt_and_prompt_file_together(self, monkeypatch, skill_config):
         from obs_agent.tools import create_obs_tools
 
