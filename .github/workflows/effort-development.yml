@@ -1,65 +1,46 @@
-name: Effort development workspace
+name: Finalize effort regression tests
 on:
   push:
     branches: [feat/effort-controls]
-    paths:
-      - .github/workflows/effort-development.yml
-      - .effort-development.patch.3
+    paths: [.github/workflows/effort-development.yml]
 permissions:
   contents: write
-concurrency:
-  group: effort-development
-  cancel-in-progress: false
 jobs:
-  validate:
-    if: github.repository == 'Breedoon/recursive-harness-builder' && github.ref == 'refs/heads/feat/effort-controls'
+  finalize:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      UV_PYTHON: '3.13'
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           ref: feat/effort-controls
       - uses: astral-sh/setup-uv@v6
-      - name: Apply effort implementation when present
+      - name: Apply regression updates and remove development files
         run: |
-          if [ -f .effort-development.patch.3 ]; then
-            cat .effort-development.patch.1 .effort-development.patch.2 .effort-development.patch.3 | base64 -d | xz -dc > /tmp/effort.patch
-            echo '38bfb733c6dcaefbbdeed6fcd97943e05b3dcfb80751f69ea9aab75406049893  /tmp/effort.patch' | sha256sum --check
-            git apply --check /tmp/effort.patch
-            git apply /tmp/effort.patch
-            rm .effort-development.patch.*
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add src tests docs env.example
-            git add -u
-            git commit -m 'feat: add session and AgentTask effort controls with per-model defaults'
-            git push origin HEAD:feat/effort-controls
-          fi
-      - name: Install dependencies
-        run: uv sync --extra dev
-      - name: Export isolated test dependencies and source
+          git apply --check .effort-fixes.patch
+          git apply .effort-fixes.patch
+          rm .effort-fixes.patch .github/workflows/effort-development.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tests .github/workflows
+          git add -u
+          git commit -m 'test: cover effort persistence and actual Claude HTTP payloads'
+          git push origin HEAD:feat/effort-controls
+      - name: Install locked dependencies
+        run: uv sync --frozen --extra dev
+      - name: Verify installed CLI effort payloads without external networking
+        shell: bash
         run: |
-          git archive --format=tar HEAD > effort-workspace.tar
-          tar --exclude='*/_bundled/*' --exclude='*.pyc' -czf effort-dependencies.tar.gz -C .venv/lib/python3.13/site-packages .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: effort-workspace
-          path: |
-            effort-workspace.tar
-            effort-dependencies.tar.gz
-          retention-days: 1
-      - name: Run regression suites
-        run: |
-          if [ -f tests/test_effort.py ]; then
-            uv run pytest tests/test_effort.py tests/test_config.py tests/test_session.py tests/test_tools.py tests/test_telegram.py tests/test_telegram_state_store.py tests/test_cli.py tests/test_daemon.py -q --tb=short --junitxml=effort-results.xml 2>&1 | tee effort-results.txt
-          fi
+          sudo unshare --net -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            cd "$2"
+            exec runuser -u "$1" -- env OBS_RUN_LOCAL_CLAUDE_CONTEXT_TESTS=1 \
+              "$2/.venv/bin/python" -m pytest -q --tb=short \
+              tests/test_effort_binary.py --junitxml="$2/effort-binary-results.xml"
+          ' _ "$(id -un)" "$GITHUB_WORKSPACE"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: effort-test-results
-          path: |
-            effort-results.xml
-            effort-results.txt
+          name: effort-binary-results
+          path: effort-binary-results.xml
           retention-days: 7
