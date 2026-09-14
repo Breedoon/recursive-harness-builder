@@ -1925,12 +1925,12 @@ class TestAgentTaskTools:
         assert "not locally known" in remote_agent_only["content"][0]["text"]
 
         remote_target = await handler({"mode": "parent", "team_name": remote_team, "agent_name": remote_child})
-        assert remote_target["tool_use_result"]["current_agent"] == remote_child
+        assert remote_target["tool_use_result"]["current_agent"] == caller_child
         assert remote_target["tool_use_result"]["target_agent"] == remote_child
         assert remote_target["tool_use_result"]["parent"] == remote_root
 
         remote_root_target = await handler({"mode": "children", "team_name": remote_team})
-        assert remote_root_target["tool_use_result"]["current_agent"] == remote_root
+        assert remote_root_target["tool_use_result"]["current_agent"] == caller_child
         assert remote_root_target["tool_use_result"]["target_agent"] == remote_root
         assert remote_root_target["tool_use_result"]["children"] == [remote_child]
 

@@ -102,7 +102,10 @@ def _strip_context_suffix(model: str) -> str:
 
 def _normalize_model_name(model: str) -> str:
     """Resolve OBS shorthand and strip Claude Code's context suffix artifact."""
-    return _strip_context_suffix(_resolve_obs_model(model))
+    normalized = model.strip()
+    if not normalized:
+        return ""
+    return _strip_context_suffix(_resolve_obs_model(normalized))
 
 
 def _resolve_upstream(model: str) -> str:

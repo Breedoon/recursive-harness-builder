@@ -1601,42 +1601,32 @@ class TelegramBot:
                 except (json.JSONDecodeError, TypeError):
                     pass
             restored_bootstrap = None
-            if state.agent_lineage is None and entry.pending_obs_bootstrap:
+            if entry.pending_obs_bootstrap:
                 try:
                     restored_bootstrap = parse_obs_bootstrap_xml(entry.pending_obs_bootstrap)
                 except Exception:
                     restored_bootstrap = None
-                if restored_bootstrap is not None and restored_bootstrap.lineage:
+                if (
+                    state.agent_lineage is None
+                    and restored_bootstrap is not None
+                    and restored_bootstrap.lineage
+                ):
                     state.agent_lineage = restored_bootstrap.lineage
-            elif entry.pending_obs_bootstrap:
-                try:
-                    restored_bootstrap = parse_obs_bootstrap_xml(entry.pending_obs_bootstrap)
-                except Exception:
-                    restored_bootstrap = None
-            if restored_bootstrap is not None:
-                team_name = restored_bootstrap.root_team_key
-                agent_name = restored_bootstrap.agent_name
-                if team_name and agent_name:
-                    state.session_manager.set_sdk_env_overrides(
-                        self._build_team_worker_env(
-                            team_name=team_name,
-                            agent_name=agent_name,
-                        )
+
+            # Rebuild stable team identity from persisted bootstrap, environment,
+            # or lineage without scanning thousands of historical JSONLs.
+            projection = self._state_inbox_projection(
+                state,
+                allow_jsonl_lookup=False,
+                allow_default_projection=True,
+            )
+            if projection is not None:
+                state.session_manager.set_sdk_env_overrides(
+                    self._build_team_worker_env(
+                        team_name=projection[0],
+                        agent_name=projection[1],
                     )
-            elif state.agent_lineage:
-                # Keep restore cheap: do not scan session JSONL for thousands of
-                # historical routes at daemon startup. If a route lacks persisted
-                # bootstrap/env metadata, the active run path resolves it lazily.
-                env = state.session_manager.sdk_env_overrides
-                persisted_team = env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
-                persisted_agent = env.get("CLAUDE_CODE_AGENT_NAME", "").strip()
-                if persisted_team and persisted_agent:
-                    state.session_manager.set_sdk_env_overrides(
-                        self._build_team_worker_env(
-                            team_name=persisted_team,
-                            agent_name=persisted_agent,
-                        )
-                    )
+                )
             if entry.session_id:
                 state.session_manager.set_session_id(entry.session_id)
                 self._route_by_session_id[entry.session_id] = route
@@ -2471,7 +2461,8 @@ class TelegramBot:
         if allow_default_projection and (not team_name or not agent_name):
             default_team_name, default_agent_name = self._default_team_projection(lineage)
             team_name = team_name or default_team_name
-            agent_name = agent_name or default_agent_name
+            if not agent_name:
+                agent_name = team_name if len(lineage) <= 1 else default_agent_name
         key = self._team_worker_key(team_name, agent_name)
         if key is None:
             return None
@@ -2495,7 +2486,7 @@ class TelegramBot:
         key = self._state_inbox_projection(
             state,
             allow_jsonl_lookup=allow_jsonl_lookup,
-            allow_default_projection=False,
+            allow_default_projection=True,
         )
         if key is None:
             self._remove_route_inbox_target(state.route)
@@ -4073,7 +4064,23 @@ class TelegramBot:
                 candidates.add(normalized.lower())
         if len(candidates) != 1:
             return None
-        return next(iter(candidates))
+        candidate = next(iter(candidates))
+
+        # A process environment value is a caller identity source, but it must
+        # not contradict an already-bound route or task record for this route.
+        bound_teams: set[str] = set()
+        inbox_key = self._route_inbox_target_keys_by_route.get(route)
+        if inbox_key is not None:
+            bound_teams.add(inbox_key[0])
+        for record in self._fork_tasks_by_id.values():
+            if record.child_route != route and record.parent_route != route:
+                continue
+            record_team = (record.team_name or "").strip().lower()
+            if record_team:
+                bound_teams.add(record_team)
+        if bound_teams and candidate not in bound_teams:
+            return None
+        return candidate
 
     def _is_task_team_accessible(self, route: TelegramRoute, target_team_name: str) -> bool:
         caller_team = self._caller_team_name(route)
@@ -4114,7 +4121,18 @@ class TelegramBot:
         team_name: str | None,
         agent_name: str | None,
     ) -> _ForkTaskRecord | None:
-        return self._resolve_task_record(team_name=team_name, agent_name=agent_name)
+        """Resolve only the currently registered worker for inbox delivery."""
+        key = self._team_worker_key(team_name, agent_name)
+        if key is None:
+            return None
+        task_id = self._team_worker_records.get(key)
+        if not task_id:
+            return None
+        record = self._fork_tasks_by_id.get(task_id)
+        if record is None:
+            self._remove_team_worker_mappings_for_task(task_id)
+            return None
+        return record
 
     def _resolve_route_inbox_target(
         self,

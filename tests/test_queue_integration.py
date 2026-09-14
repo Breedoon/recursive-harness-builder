@@ -169,16 +169,22 @@ class TestPipelineWithRealQueue:
 
     @pytest.mark.asyncio
     async def test_full_pipeline_enqueue_then_drain(self, config):
-        """Full create_hook_matchers pipeline: enqueue then drain at hook boundary."""
+        """The registered pipeline delivers queued messages after a successful tool."""
         state = HookState()
         state.message_queue.put_nowait("user follow-up")
 
         matchers = create_hook_matchers(config, state)
         pre_pipeline = matchers["PreToolUse"][0].hooks[0]
+        post_pipeline = matchers["PostToolUse"][0].hooks[0]
 
-        result = await pre_pipeline(_make_pre_tool_use_input(), "tu-1", _EMPTY_CONTEXT)
+        pre_result = await pre_pipeline(_make_pre_tool_use_input(), "tu-1", _EMPTY_CONTEXT)
+        assert pre_result == {}
+        assert state.message_queue.qsize() == 1
 
-        # Should have drained the queue into additionalContext
+        post_input = _make_pre_tool_use_input()
+        post_input["hook_event_name"] = "PostToolUse"
+        result = await post_pipeline(post_input, "tu-1", _EMPTY_CONTEXT)
+
         ctx = result.get("hookSpecificOutput", {}).get("additionalContext", "")
         assert "user follow-up" in ctx
         assert state.message_queue.empty()
@@ -205,19 +211,22 @@ class TestSharedStateBetweenEndpointAndPipeline:
 
     @pytest.mark.asyncio
     async def test_enqueue_endpoint_feeds_pipeline(self, config):
-        """Message enqueued via HTTP endpoint is drained by hook pipeline."""
+        """Message enqueued via HTTP is delivered after a successful tool."""
         app = create_app(config)
         client = TestClient(app)
 
-        # Enqueue via HTTP
         client.post("/chat/enqueue", json={"message": "via http"})
 
-        # Get the pipeline from the same app
         state: HookState = app.state.hook_state
         matchers = create_hook_matchers(config, state)
         pre_pipeline = matchers["PreToolUse"][0].hooks[0]
+        post_pipeline = matchers["PostToolUse"][0].hooks[0]
 
-        result = await pre_pipeline(_make_pre_tool_use_input(), "tu-1", _EMPTY_CONTEXT)
+        await pre_pipeline(_make_pre_tool_use_input(), "tu-1", _EMPTY_CONTEXT)
+        assert state.message_queue.qsize() == 1
+        post_input = _make_pre_tool_use_input()
+        post_input["hook_event_name"] = "PostToolUse"
+        result = await post_pipeline(post_input, "tu-1", _EMPTY_CONTEXT)
 
         ctx = result.get("hookSpecificOutput", {}).get("additionalContext", "")
         assert "via http" in ctx

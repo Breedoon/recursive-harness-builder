@@ -1362,7 +1362,7 @@ class TestBackgroundPoller:
                         "from": "worker-b",
                         "text": "poll wake message",
                         "summary": "handoff",
-                        "timestamp": "2026-03-13T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(),
                         "read": False,
                     }
                 ],
@@ -5354,7 +5354,7 @@ class TestForkTaskRuntime:
         assert child_state is not None
         assert child_state.notify_on_completion is True
         assert child_state.session_manager.model_override == "gpt-5.5"
-        assert child_state.session_manager.create_options().model == "gpt-5.5[400k]"
+        assert child_state.session_manager.create_options().model == "gpt-5.5[1m]"
         assert (
             child_state.session_manager.create_options().env["ANTHROPIC_API_KEY"]
             == config.cli_proxy_api_key
@@ -5426,9 +5426,10 @@ class TestForkTaskRuntime:
         assert child_state.session_id is None
         assert child_state.session_manager.model_override == "gpt-5.5"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[400k]"
+        assert child_options.model == "gpt-5.5[1m]"
         child_env = child_options.env
-        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
+        assert child_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in child_env
         assert child_env["CLAUDE_CODE_ENABLE_TASKS"] == "1"
         assert child_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
         assert child_env["CLAUDE_CODE_TASK_LIST_ID"] == unique_team
@@ -5471,12 +5472,12 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=334))
         assert child_state is not None
-        assert child_state.session_manager.model_override == "gpt-5.5"
+        assert child_state.session_manager.model_override == "gpt-5.6-sol"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[400k]"
+        assert child_options.model == "gpt-5.6-sol[1m]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "400000"
-        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "400000"
-        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in child_options.env
+        assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in child_options.env
         assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
         await bot.shutdown()
 
@@ -5512,12 +5513,12 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=335))
         assert child_state is not None
-        assert child_state.session_manager.model_override == "gpt-5.5[200k]"
+        assert child_state.session_manager.model_override == "gpt-5.6-sol[200k]"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.5[200k]"
+        assert child_options.model == "gpt-5.6-sol[200k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
-        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in child_options.env
+        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in child_options.env
         await bot.shutdown()
 
     async def test_launch_agent_task_inherit_model_keeps_parent_identity_and_adds_1m(
@@ -5848,12 +5849,12 @@ class TestForkTaskRuntime:
         assert "task-123" not in parent_state.active_fork_task_ids
         queued = parent_state.hook_state.message_queue.get_nowait()
         assert "<task-notification>" in queued
-        assert "<status>completed</status>" in queued
+        assert "<status>idle</status>" in queued
         assert "SECRET-42" in queued
         assert "https://t.me/c/67890/321/910" in queued
         send_calls = fake_bot.send_message.await_args_list
-        assert "subtask: fork completed" in send_calls[0].kwargs["text"]
-        assert "open child completion" in send_calls[1].kwargs["text"]
+        assert "subtask: fork went idle" in send_calls[0].kwargs["text"]
+        assert "open child idle notice" in send_calls[1].kwargs["text"]
         assert "https://t.me/c/67890/321/910" in send_calls[1].kwargs["text"]
         run_text = run_mock.await_args.kwargs["user_text"]
         assert run_text == (
@@ -5863,7 +5864,7 @@ class TestForkTaskRuntime:
             'Return SECRET-42'
         )
         fake_bot.edit_message_text.assert_awaited_once()
-        assert "subtask: fork completed" in fake_bot.edit_message_text.await_args.kwargs["text"]
+        assert "subtask: fork went idle" in fake_bot.edit_message_text.await_args.kwargs["text"]
         assert "return_to_parent: https://t.me/c/67890/911" in fake_bot.edit_message_text.await_args.kwargs["text"]
         assert record.idle_ready is True
         assert bot._fork_task_by_child_route[child_route] == "task-123"
@@ -5962,7 +5963,7 @@ class TestForkTaskRuntime:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
                 payload={
-                    "team_name": "2026-03-31-10-00-root",
+                    "team_name": "team-alpha",
                     "recipient": "worker-a",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -6019,7 +6020,7 @@ class TestForkTaskRuntime:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
                 payload={
-                    "team_name": "2026-03-31-10-00-root",
+                    "team_name": "team-alpha",
                     "recipient": "worker-a",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -6068,7 +6069,7 @@ class TestForkTaskRuntime:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
                 payload={
-                    "team_name": "2026-03-31-10-00-root",
+                    "team_name": "team-alpha",
                     "recipient": "worker-fork",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -6112,7 +6113,7 @@ class TestForkTaskRuntime:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
                 payload={
-                    "team_name": "2026-03-31-10-00-root",
+                    "team_name": "team-alpha",
                     "recipient": "worker-a",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -6145,7 +6146,7 @@ class TestForkTaskRuntime:
         await bot._handle_inbox_message_notification(
             sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
             payload={
-                "team_name": "2026-03-31-10-00-root",
+                "team_name": "team-alpha",
                 "recipient": "root-agent",
                 "sender": "worker-b",
                 "summary": "handoff",
@@ -6199,7 +6200,7 @@ class TestForkTaskRuntime:
                         "from": "worker-b",
                         "text": "process item 8",
                         "summary": "handoff",
-                        "timestamp": "2026-03-13T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(),
                         "read": False,
                     }
                 ],
@@ -6294,7 +6295,7 @@ class TestForkTaskRuntime:
                         "from": "worker-peer",
                         "text": "team-beta message",
                         "summary": "beta-summary",
-                        "timestamp": "2026-03-13T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(),
                         "read": False,
                     }
                 ],
@@ -6405,7 +6406,7 @@ class TestForkTaskRuntime:
                         "from": "worker-peer",
                         "text": "poll wake payload",
                         "summary": "poll-handoff",
-                        "timestamp": "2026-03-14T00:00:00Z",
+                        "timestamp": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(),
                         "read": False,
                     }
                 ],
@@ -7207,6 +7208,8 @@ class TestForkTaskRuntime:
         record = _ForkTaskRecord(
             task_id="task-byte-window",
             parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="",
+            parent_source_uuid="",
             child_route=TelegramRoute(chat_id=-10067890, thread_id=321),
             child_session_id="sid-byte-window",
             prompt="output",
@@ -7230,6 +7233,8 @@ class TestForkTaskRuntime:
         record = _ForkTaskRecord(
             task_id="task-record-cap",
             parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="",
+            parent_source_uuid="",
             child_route=TelegramRoute(chat_id=-10067890, thread_id=321),
             child_session_id="sid-record-cap",
             prompt="output",
@@ -7254,6 +7259,8 @@ class TestForkTaskRuntime:
         record = _ForkTaskRecord(
             task_id="task-shapes",
             parent_route=TelegramRoute(chat_id=-10067890, thread_id=None),
+            parent_session_id_at_launch="",
+            parent_source_uuid="",
             child_route=TelegramRoute(chat_id=-10067890, thread_id=321),
             child_session_id="sid-shapes",
             prompt="output",
@@ -9086,7 +9093,7 @@ class TestTelegramStatePersistence:
             await restored._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=67890, thread_id=444),
                 payload={
-                    "team_name": "2026-03-31-10-00-root",
+                    "team_name": "team-alpha",
                     "recipient": "worker-a",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -9138,7 +9145,7 @@ class TestTelegramStatePersistence:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=67890, thread_id=444),
                 payload={
-                    "team_name": "2026-03-31-10-00-root",
+                    "team_name": "team-alpha",
                     "recipient": "worker-a",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -9204,7 +9211,7 @@ class TestTelegramStatePersistence:
             await restored._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=67890, thread_id=444),
                 payload={
-                    "team_name": "2026-03-31-10-00-root",
+                    "team_name": "team-alpha",
                     "recipient": "worker-fork",
                     "sender": "worker-b",
                     "summary": "handoff",
@@ -9505,7 +9512,7 @@ class TestTelegramStatePersistence:
             await bot._handle_inbox_message_notification(
                 sender_route=TelegramRoute(chat_id=-10067890, thread_id=555),
                 payload={
-                    "team_name": "2026-03-31-10-00-root",
+                    "team_name": "team-alpha",
                     "recipient": "root-agent",
                     "sender": "worker-b",
                     "summary": "handoff",
