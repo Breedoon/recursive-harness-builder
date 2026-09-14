@@ -648,6 +648,23 @@ def create_obs_tools(
                     f"session with a different model."
                 )
             model = model_raw
+        # Effort is independent of model/context and may change on a fork.
+        from obs_agent.effort import EFFORT_ENV, normalize_effort
+
+        effort = args.get("effort")
+        if effort is not None:
+            try:
+                effort = (
+                    "inherit" if isinstance(effort, str) and effort.strip().lower() == "inherit"
+                    else normalize_effort(effort)
+                )
+            except ValueError as exc:
+                return _error_result(f"Cannot launch {tool_name}: {exc}")
+            if resume:
+                return _error_result(
+                    f"Cannot launch {tool_name}: resume preserves the child's effort; "
+                    "use /effort in its topic before resuming"
+                )
         # --- inherit_schedules ---
         inherit_schedules = True
         if "inherit_schedules" in args:
@@ -666,6 +683,14 @@ def create_obs_tools(
                 return _error_result(f"Cannot launch {tool_name}: env must be a valid JSON object: {exc}")
             if not isinstance(env_override, dict):
                 return _error_result(f"Cannot launch {tool_name}: env must be a JSON object (dict), got {type(env_override).__name__}")
+
+        if env_override and EFFORT_ENV in env_override:
+            try:
+                normalize_effort(env_override[EFFORT_ENV])
+            except ValueError as exc:
+                return _error_result(f"Cannot launch {tool_name}: {exc}")
+            if resume:
+                return _error_result(f"Cannot launch {tool_name}: resume preserves the child's effort")
 
         # --- temperature ---
         temperature: float | None = None
@@ -760,6 +785,7 @@ def create_obs_tools(
                 "max_turns": max_turns,
                 "fork": fork,
                 "model": model,
+                "effort": effort,
                 "team_name": team_name,
                 "agent_name": agent_name,
                 "task_tool_name": tool_name,
@@ -842,6 +868,19 @@ def create_obs_tools(
                     "cross-model forking is not supported because the forked JSONL contains "
                     "conversation turns from the parent's model format. Use fork=false to launch "
                     "a fresh session with a different model."
+                ),
+            },
+            "effort": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "xhigh", "max", "auto", "inherit"],
+                "description": (
+                    "Reasoning effort, independent of model and context. Omitted: inherit parent "
+                    "when model is inherited, otherwise use the selected model's default. "
+                    "'inherit' explicitly uses parent effort; 'auto' uses the model default. "
+                    "xhigh and max are distinct; provider/model support varies. "
+                    "Passed via Claude Code env and translated for CLIProxyAPI. "
+                    "Temperature/disabled-thinking overrides remain authoritative. "
+                    "For a resumed child use /effort in its topic instead."
                 ),
             },
             "name": {

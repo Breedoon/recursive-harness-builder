@@ -218,3 +218,11 @@ When designing a workflow or procedure, ask:
 6. What should happen if the agent gets stuck?
 
 Use this document as a design checklist, not as a guarantee. Capabilities depend on model, context quality, tools, and verification strategy.
+
+## Per-task reasoning effort
+
+AgentTask accepts `effort` independently of `model` and its context suffix:
+`low`, `medium`, `high`, `xhigh`, `max`, `auto`, or `inherit`. Same-model children
+inherit effort when omitted; explicitly selecting a different model uses that
+model's default unless an effort is supplied. See [Reasoning effort](effort.md)
+for examples, runtime `/effort` controls, and Claude/OpenAI compatibility.
