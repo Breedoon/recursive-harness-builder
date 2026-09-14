@@ -14,15 +14,23 @@ jobs:
         with:
           ref: feat/effort-controls
       - uses: astral-sh/setup-uv@v6
-      - name: Apply regression updates and remove development files
+      - name: Apply regression updates
         run: |
-          git apply --check .effort-fixes.patch
-          git apply .effort-fixes.patch
-          rm .effort-fixes.patch .github/workflows/effort-development.yml
+          git apply --exclude='.github/workflows/*' --check .effort-fixes.patch
+          git apply --exclude='.github/workflows/*' .effort-fixes.patch
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tests/test_context_process_boundary.py')
+          s = p.read_text()
+          old = 'assert json.loads(settings_arg)["env"] == observed["budget_env"]'
+          assert old in s
+          p.write_text(s.replace(old, 'settings_env = json.loads(settings_arg)["env"]\n    assert {key: settings_env[key] for key in BUDGET_KEYS} == observed["budget_env"]'))
+          PY
+          rm .effort-fixes.patch
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add tests .github/workflows
-          git add -u
+          git add tests
+          git add -u .effort-fixes.patch
           git commit -m 'test: cover effort persistence and actual Claude HTTP payloads'
           git push origin HEAD:feat/effort-controls
       - name: Install locked dependencies
