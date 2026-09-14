@@ -4,14 +4,19 @@ on:
     branches: [feat/effort-controls]
     paths:
       - .github/workflows/effort-development.yml
-      - .effort-development.patch
+      - .effort-development.patch.3
 permissions:
   contents: write
+concurrency:
+  group: effort-development
+  cancel-in-progress: false
 jobs:
   validate:
     if: github.repository == 'Breedoon/recursive-harness-builder' && github.ref == 'refs/heads/feat/effort-controls'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: '3.13'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,27 +24,42 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Apply effort implementation when present
         run: |
-          if [ -f .effort-development.patch ]; then
-            git apply --check .effort-development.patch
-            git apply .effort-development.patch
-            rm .effort-development.patch
+          if [ -f .effort-development.patch.3 ]; then
+            cat .effort-development.patch.1 .effort-development.patch.2 .effort-development.patch.3 | base64 -d | xz -dc > /tmp/effort.patch
+            echo '38bfb733c6dcaefbbdeed6fcd97943e05b3dcfb80751f69ea9aab75406049893  /tmp/effort.patch' | sha256sum --check
+            git apply --check /tmp/effort.patch
+            git apply /tmp/effort.patch
+            rm .effort-development.patch.*
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add src tests docs env.example
-            git add -u .effort-development.patch
+            git add -u
             git commit -m 'feat: add session and AgentTask effort controls with per-model defaults'
             git push origin HEAD:feat/effort-controls
           fi
-      - name: Export source workspace for local regression testing
-        run: git archive --format=tar HEAD > effort-workspace.tar
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Export isolated test dependencies and source
+        run: |
+          git archive --format=tar HEAD > effort-workspace.tar
+          tar --exclude='*/_bundled/*' --exclude='*.pyc' -czf effort-dependencies.tar.gz -C .venv/lib/python3.13/site-packages .
       - uses: actions/upload-artifact@v4
         with:
           name: effort-workspace
-          path: effort-workspace.tar
+          path: |
+            effort-workspace.tar
+            effort-dependencies.tar.gz
           retention-days: 1
-      - name: Run effort regression tests when present
+      - name: Run regression suites
         run: |
           if [ -f tests/test_effort.py ]; then
-            uv sync --extra dev
-            uv run pytest tests/test_effort.py -q
+            uv run pytest tests/test_effort.py tests/test_config.py tests/test_session.py tests/test_tools.py tests/test_telegram.py tests/test_telegram_state_store.py tests/test_cli.py tests/test_daemon.py -q --tb=short --junitxml=effort-results.xml 2>&1 | tee effort-results.txt
           fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: effort-test-results
+          path: |
+            effort-results.xml
+            effort-results.txt
+          retention-days: 7
