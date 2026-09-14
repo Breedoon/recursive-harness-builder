@@ -110,25 +110,25 @@ class TestModelContextBoundary:
         assert normalize_model_for_claude_code("local-qwen") == "local-qwen3.8-27b"
         assert normalize_model_for_claude_code("local-custom[96k]") == "local-custom"
         assert parse_context_suffix("local-gemma4-31b") == ("local-gemma4-31b", 48_000)
-        assert parse_context_suffix("local-qwen") == ("local-qwen3.8-27b", 200_000)
+        assert parse_context_suffix("local-qwen") == ("local-qwen3.8-27b", 128_000)
         assert parse_context_suffix("local-qwen[128k]") == ("local-qwen3.8-27b", 128_000)
         assert parse_context_suffix("local-custom[96k]") == ("local-custom", 96_000)
 
     @pytest.mark.parametrize("model", ["local-qwen", "local-qwen3.8-27b"])
-    def test_local_qwen_default_context_matches_native_200k_window(self, model):
+    def test_local_qwen_default_context_matches_documented_128k_contract(self, model):
         resolved = resolve_model_context(model)
-        assert resolved.context_tokens == 200_000
-        assert resolved.context_tokens <= 262_144
+        assert resolved.context_tokens == 128_000
+        assert resolved.context_tokens <= 131_072
         assert not resolved.explicit_context
-        assert resolved.model_with_context == "local-qwen3.8-27b[200k]"
+        assert resolved.model_with_context == "local-qwen3.8-27b[128k]"
         assert resolved.model_for_claude_code == "local-qwen3.8-27b"
         assert parse_context_suffix(resolved.model_with_context) == (
-            "local-qwen3.8-27b", 200_000
+            "local-qwen3.8-27b", 128_000
         )
         assert auto_compact_window_for_model(
             resolved.model, resolved.context_tokens
-        ) == 200_000
-        assert compaction_threshold(resolved.context_tokens) == 167_000
+        ) == 128_000
+        assert compaction_threshold(resolved.context_tokens) == 106_880
 
     def test_auto_compact_window_tracks_context_by_default(self):
         assert auto_compact_window_for_context(1_000_000) == 1_000_000

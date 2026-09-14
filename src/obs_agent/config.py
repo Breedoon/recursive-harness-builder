@@ -59,8 +59,8 @@ _DEFAULT_CONTEXT_TOKENS = 1_000_000
 _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 0
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5": 200_000,
-    "local-qwen": 200_000,
-    "local-qwen3.8-27b": 200_000,
+    "local-qwen": 128_000,
+    "local-qwen3.8-27b": 128_000,
     "local-gemma4-31b": 48_000,
     "gpt-5.6-sol": 400_000,
     "gpt-5.6-luna": 400_000,
