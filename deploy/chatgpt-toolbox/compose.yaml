@@ -1,0 +1,76 @@
+name: chatgpt-toolbox
+
+services:
+  toolbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DESKTOP_COMMANDER_VERSION: "0.2.50"
+    image: local/chatgpt-toolbox:0.1.0
+    pull_policy: never
+    container_name: chatgpt-toolbox
+    hostname: chatgpt-toolbox
+    command: ["idle"]
+    restart: "no"
+    init: true
+    read_only: true
+    user: "10001:10001"
+    privileged: false
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DESKTOP_COMMANDER_DISABLE_TELEMETRY: "1"
+      MCP_SERVER_URL: https://mcp.desktopcommander.app
+      HOME: /session/home
+      XDG_CONFIG_HOME: /session/xdg/config
+      XDG_CACHE_HOME: /session/xdg/cache
+      XDG_DATA_HOME: /session/xdg/data
+      NPM_CONFIG_CACHE: /tmp/npm-cache
+      TOOLBOX_WORKSPACE: /workspace
+      TOOLBOX_SESSION: /session
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    volumes:
+      - type: volume
+        source: workspace
+        target: /workspace
+      - type: volume
+        source: session
+        target: /session
+    networks:
+      - egress
+    cpus: "1.0"
+    mem_limit: 1g
+    memswap_limit: 1g
+    pids_limit: 128
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+      nproc:
+        soft: 128
+        hard: 128
+    stop_grace_period: 10s
+    logging:
+      driver: none
+    labels:
+      io.obs.chatgpt-toolbox.boundary: "isolated-v1"
+      io.obs.chatgpt-toolbox.connector.endpoint: "https://mcp.desktopcommander.app/mcp"
+      io.obs.chatgpt-toolbox.desktop-commander.version: "0.2.50"
+      io.obs.chatgpt-toolbox.remote.session-persistence: "disabled"
+
+networks:
+  egress:
+    name: chatgpt-toolbox-net
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+
+volumes:
+  workspace:
+    name: chatgpt-toolbox-workspace
+  session:
+    name: chatgpt-toolbox-session

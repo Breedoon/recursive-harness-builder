@@ -1,0 +1,10 @@
+{
+  "name": "obs-chatgpt-toolbox-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned Desktop Commander dependency for the isolated ChatGPT toolbox",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@wonderwhy-er/desktop-commander": "0.2.50"
+  }
+}
