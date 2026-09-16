@@ -43,9 +43,11 @@ def test_reject_invalid_effort(value):
 
 
 @pytest.mark.parametrize("model,expected", [
-    ("gpt", "medium"), ("sol[200k]", "medium"), ("claude", "high"),
+    ("gpt", "medium"), ("astra", "medium"), ("sol[200k]", "medium"),
+    ("terra", "medium"), ("luna", "medium"), ("claude", "high"),
     ("sonnet[1m]", "high"), ("claude-opus-4-7", "xhigh"),
-    ("haiku", "auto"), ("local-qwen", "auto"), ("custom-model", "auto"),
+    ("qwen", "medium"), ("local-qwen", "medium"),
+    ("haiku", "auto"), ("custom-model", "auto"),
 ])
 def test_defaults_resolve_model_aliases_independently_of_context(model, expected):
     assert resolve_effort(model) == expected

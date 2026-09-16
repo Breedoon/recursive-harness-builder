@@ -39,8 +39,11 @@ MODEL_RESOLUTION: dict[str, str] = {
     # OpenAI tiers – "gpt" resolves to main production model
     "gpt": "gpt-5.6-sol",
     "gpt-pro": "gpt-5.6-sol",
+    "astra": "gpt-6-astra",
     "sol": "gpt-5.6-sol",
     "gpt-sol": "gpt-5.6-sol",
+    "terra": "gpt-5.6-terra",
+    "luna": "gpt-5.6-luna",
     "gpt-mini": "gpt-5.4-mini",
     "openai": "gpt-5.6-sol",
     "chatgpt": "gpt-5.6-sol",
@@ -49,6 +52,7 @@ MODEL_RESOLUTION: dict[str, str] = {
     "gemini-pro": "gemini-3.1-pro-preview",
     "gemini-flash": "gemini-2.5-flash",
     # Local durable aliases
+    "qwen": "local-qwen3.8-27b",
     "local-qwen": "local-qwen3.8-27b",
 }
 
@@ -59,15 +63,16 @@ _DEFAULT_CONTEXT_TOKENS = 1_000_000
 _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 0
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5": 200_000,
-    "local-qwen": 128_000,
-    "local-qwen3.8-27b": 128_000,
+    "local-qwen": 262_000,
+    "local-qwen3.8-27b": 262_000,
     "local-gemma4-31b": 48_000,
-    "gpt-5.6-sol": 400_000,
-    "gpt-5.6-luna": 400_000,
-    "gpt-5.6-terra": 400_000,
-    "gpt-5.5": 400_000,
-    "gpt-5.4": 1_000_000,
-    "gpt-5.4-mini": 1_000_000,
+    "gpt-6-astra": 900_000,
+    "gpt-5.6-sol": 900_000,
+    "gpt-5.6-luna": 900_000,
+    "gpt-5.6-terra": 900_000,
+    "gpt-5.5": 900_000,
+    "gpt-5.4": 900_000,
+    "gpt-5.4-mini": 900_000,
 }
 
 
@@ -83,6 +88,8 @@ MODEL_EFFORT_LEVELS: dict[str, str] = {
     "claude-opus-4-7": "xhigh",
     "claude-opus-4-6": "high",
     "claude-sonnet-4-6": "high",
+    "local-qwen3.8-27b": "medium",
+    "gpt-6-astra": "medium",
     "gpt-5.6-sol": "medium",
     "gpt-5.6-luna": "medium",
     "gpt-5.6-terra": "medium",
@@ -329,7 +336,7 @@ class OBSConfig:
     max_queue_continuations: int = 3
     bg_fork_timeout: float = 600.0  # seconds to wait for background forks
     max_buffer_size: int = 10 * 1024 * 1024  # 10 MB SDK JSON buffer limit
-    context_window_estimate_tokens: int = 400_000
+    context_window_estimate_tokens: int = 900_000
     auto_compact_window_tokens: int = _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS
     context_probe_claude_cli: bool = False
     claude_idle_process_cap: int | None = None

@@ -927,7 +927,7 @@ class TestTelegramMessageFlow:
         assert calls[2]["disable_notification"] is True
         assert "<i>Read: CLAUDE.md</i>" in calls[2]["text"]
         assert "Hello from tool run" in calls[2]["text"]
-        assert calls[3]["text"] == "<u><i>context: 0 / 400k</i></u>"
+        assert calls[3]["text"] == "<u><i>context: 0 / 900k</i></u>"
         assert calls[3]["disable_notification"] is False
 
     async def test_thinking_content_is_rendered_verbatim(self, config):
@@ -1048,7 +1048,7 @@ class TestTelegramMessageFlow:
         assert calls[1] == "<u><i>working</i></u>"
         assert "turn one" in calls[2]
         assert "turn two" in calls[3]
-        assert calls[4] == "<u><i>context: 0 / 400k</i></u>"
+        assert calls[4] == "<u><i>context: 0 / 900k</i></u>"
 
     async def test_completion_summary_omits_username_when_configured(self, config):
         config.telegram_notify_username = "breedoon"
@@ -1070,7 +1070,7 @@ class TestTelegramMessageFlow:
             await bot.handle_message(update, ctx)
 
         calls = [c.kwargs["text"] for c in ctx.bot.send_message.call_args_list]
-        assert calls[-1] == "<u><i>context: 0 / 400k</i></u>"
+        assert calls[-1] == "<u><i>context: 0 / 900k</i></u>"
 
     async def test_attachment_receipt_is_sent_before_normalization(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -5444,7 +5444,7 @@ class TestForkTaskRuntime:
             f"Agent name env var should contain 'fresh-child', got: {child_env['CLAUDE_CODE_AGENT_NAME']}"
         await bot.shutdown()
 
-    async def test_launch_agent_task_explicit_shorthand_model_gets_400k_at_sdk_boundary(
+    async def test_launch_agent_task_explicit_shorthand_model_gets_900k_budget(
         self,
         config,
         tmp_path,
@@ -5479,7 +5479,7 @@ class TestForkTaskRuntime:
         assert child_state.session_manager.model_override == "gpt-5.6-sol"
         child_options = child_state.session_manager.create_options()
         assert child_options.model == "gpt-5.6-sol[1m]"
-        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "400000"
+        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "900000"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in child_options.env
         assert child_options.env["ANTHROPIC_API_KEY"] == config.cli_proxy_api_key
@@ -8797,7 +8797,7 @@ class TestTelegramErrorHandling:
 
             texts = [c.kwargs.get("text", "") for c in ctx.bot.send_message.call_args_list]
             assert any("FINAL_MARKER" in t for t in texts)
-            assert texts[-1] == "<u><i>context: 0 / 400k</i></u>"
+            assert texts[-1] == "<u><i>context: 0 / 900k</i></u>"
 
 
 class TestTelegramStatePersistence:

@@ -59,9 +59,10 @@ an effort change returns an error rather than silently ignoring the change; use
 
 `MODEL_EFFORT_LEVELS` lives beside `MODEL_CONTEXT_WINDOWS` in
 `src/obs_agent/config.py`. Built-in OBS defaults are `medium` for the configured
-GPT-5.4/5.5/5.6 models; `high` for the configured modern Claude models, except
-Opus 4.7 (`xhigh`). Other models, including Haiku/local models, use provider
-`auto`. Aliases and context suffixes resolve before the default lookup.
+GPT models and local Qwen; `high` for the configured modern Claude models,
+except Opus 4.7 (`xhigh`). Other models, including Haiku and unlisted local
+models, use provider `auto`. Aliases and context suffixes resolve before the
+default lookup.
 
 Override them without editing Python:
 
