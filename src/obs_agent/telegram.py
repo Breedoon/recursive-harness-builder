@@ -36,12 +36,9 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, Conflict, RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from obs_agent.context_probe import probe_context_via_claude_cli
 from obs_agent.context_stats import (
-    apply_context_probe,
     build_context_snapshot,
     format_context_snapshot_compact,
-    format_context_snapshot_lines,
 )
 from obs_agent.config import (
     normalize_model_for_claude_code,
@@ -69,6 +66,9 @@ from obs_agent.lineage import (
 from obs_agent.queueing import QueuedMessage, coerce_queued_message
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent, TurnEndEvent
 from obs_agent.session import SessionManager
+from obs_agent.session_info import (
+    SessionViewContext, build_session_info, format_session_info_lines, session_context_window,
+)
 from obs_agent.telegram_format import md_to_telegram_html, split_message
 from obs_agent.telegram_ingest import TelegramInboundNormalizer
 from obs_agent.telegram_state_store import TelegramStateStore
@@ -137,7 +137,7 @@ _TELEGRAM_HELP_TEXT = """Usage:
 /clear — clear this topic but keep its agent identity
 /model MODEL — select the model before the first message of a new or cleared session
 /effort [LEVEL] — show/set effort between turns; auto restores the model default
-/context — show session and context info
+/session — show agent, model, files, runtime and hooks
 
 Bare commands are not supported; use the slash form, e.g. /stop.
 """.strip()
@@ -5117,10 +5117,7 @@ class TelegramBot:
 
     @staticmethod
     def _context_window_tokens_for_state(state: TelegramSessionState, fallback_tokens: int) -> int:
-        if state.hook_state.effective_model:
-            _clean, tokens = parse_context_suffix(state.hook_state.effective_model)
-            return tokens
-        return fallback_tokens
+        return session_context_window(state.session_manager, fallback_tokens)
 
     def _build_completion_summary(
         self,
@@ -5706,24 +5703,33 @@ class TelegramBot:
         state = self._get_state(route)
         return ([state] if state is not None else []), False
 
-    async def _build_context_lines(self, state: TelegramSessionState) -> list[str]:
-        snapshot = build_context_snapshot(
-            session_id=state.session_id,
-            data=state.hook_state.last_result_data,
-            context_window_estimate_tokens=self._context_window_tokens_for_state(
-                state,
-                self._config.context_window_estimate_tokens,
-            ),
-            cwd=self._config.vault_path,
+    def _build_session_lines(self, state: TelegramSessionState) -> list[str]:
+        task = self._find_task_by_child_route(state.route)
+        route_key = self._route_inbox_target_keys_by_route.get(state.route)
+        view = SessionViewContext(
+            transport="Telegram", topic_title=state.topic_title,
+            lineage=tuple(state.agent_lineage or ()),
+            pending_bootstrap=state.pending_obs_bootstrap,
+            team_name=(task.team_name if task else None) or (route_key[0] if route_key else None),
+            agent_name=(task.agent_name if task else None) or (route_key[1] if route_key else None),
+            task_id=task.task_id if task else None,
+            task_status=task.status if task else None,
+            origin=task.launch_tool_name if task else None,
+            is_fork=task.is_fork if task else None,
+            parent_session_id=task.parent_session_id_at_launch if task else None,
+            parent_source_uuid=task.parent_source_uuid if task else None,
+            head_uuid=self._session_heads.get(state.session_id or ""),
+            chat_id=state.route.chat_id, thread_id=state.route.thread_id,
+            busy=state.busy, pending_messages=len(state.pending_messages),
+            active_children=len(state.active_fork_task_ids),
+            schedule_count=len(self._schedule_ids_by_route.get(state.route, ())),
+            notify_on_completion=state.notify_on_completion,
+            inbox_wake_pending=state.inbox_wake_pending,
+            state_db_path=str(self._config.telegram_state_db_path),
+            timeout_ms=task.timeout_ms if task else None,
+            max_turns=task.max_turns if task else None,
         )
-        probe = None
-        if self._config.context_probe_claude_cli:
-            probe = await probe_context_via_claude_cli(
-                session_id=snapshot.get("session_id"),
-                cwd=self._config.vault_path,
-            )
-        snapshot = apply_context_probe(snapshot, probe)
-        return [*format_context_snapshot_lines(snapshot), f"effort: {state.session_manager.effective_effort}"]
+        return format_session_info_lines(build_session_info(state.session_manager, view=view))
 
     def _current_tree_context(
         self,
@@ -6745,24 +6751,29 @@ class TelegramBot:
                     disable_notification=True,
                 )
 
-    async def handle_context(
+    async def handle_session(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /context - show session and context window info for this route."""
+        """Handle /session without starting a client or creating a persisted route."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
             return
+        if context.args:
+            await update.effective_message.reply_text("Usage: /session", parse_mode=None)
+            return
 
         route = self._route_for_message(update.effective_message)
-        state = self._get_state(route)
+        state = self._get_state(route, create=False)
         if state is None:
-            return
-        lines = await self._build_context_lines(state)
-        await update.effective_message.reply_text(
-            "\n".join(lines),
-            disable_web_page_preview=True,
-        )
+            state = self._build_session_state(route)
+            if self._default_new_chat_hooks is not None:
+                state.session_manager.user_hooks = dict(self._default_new_chat_hooks)
+        text = "\n".join(self._build_session_lines(state))
+        for chunk in split_message(text):
+            await update.effective_message.reply_text(
+                chunk, parse_mode=None, disable_web_page_preview=True,
+            )
 
     async def handle_report(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -10510,7 +10521,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("stop_tree", bot.handle_stop_tree))
     app.add_handler(CommandHandler("model", bot.handle_model))
     app.add_handler(CommandHandler("effort", bot.handle_effort))
-    app.add_handler(CommandHandler("context", bot.handle_context))
+    app.add_handler(CommandHandler("session", bot.handle_session))
     app.add_handler(CommandHandler("report", bot.handle_report))
     app.add_handler(CommandHandler("schedule", bot.handle_schedule))
     app.add_handler(CommandHandler("tree", bot.handle_tree))
@@ -10567,7 +10578,7 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("stop_tree", "Interrupt the complete root team tree"),
         BotCommand("model", "Select model before the first message of a new or cleared session"),
         BotCommand("effort", "Show or set effort: low, medium, high, xhigh, max, auto"),
-        BotCommand("context", "Show session and context window info"),
+        BotCommand("session", "Show agent, model, files, runtime and hooks"),
         BotCommand("report", "Save a debug case file for this message/topic"),
         BotCommand("schedule", "Create schedules once Sprint 1 reliability is approved"),
         BotCommand("tree", "Render the full agent tree for this team"),
