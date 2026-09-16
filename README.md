@@ -80,6 +80,17 @@ Recursive Harness Builder currently includes:
 
 Telegram is the UI. The core model is markdown-defined workflow procedures running on top of resumable, forkable agent sessions.
 
+## Architecture and session inspection
+
+Use `/session` in Telegram or the CLI to inspect the current agent's identity,
+lineage, model/effort, one context summary, transcript path, runtime parameters
+and configured hooks. The command is read-only, including during active work.
+
+See [Agent and session architecture](docs/agent-session-model.md) for the data
+model, ownership/persistence map, child inheritance rules and architecture review.
+Related policies: [configuration](docs/configuration.md),
+[effort](docs/effort.md), and [context/compaction](docs/context-compaction.md).
+
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE).

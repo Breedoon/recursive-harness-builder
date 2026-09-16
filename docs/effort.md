@@ -21,7 +21,7 @@ Changes are session/topic-local. They apply on the next turn, reconnecting the
 SDK lazily while retaining the conversation ID and normal resume/cache-window
 policy. Active or queued work must finish first (or use `/stop`). Telegram saves
 the selection in its state database, restores it after restart and JSONL recovery,
-and shows it alongside `/context` and model selection. `/clear` and `/new` reset
+and shows it in [`/session`](agent-session-model.md) and model selection. `/clear` and `/new` reset
 the conversation while preserving the topic's selected model and effort; use
 `/effort auto` to return to the model default. CLI settings last for the daemon
 session. The daemon also exposes `GET /effort` and `POST /effort` with

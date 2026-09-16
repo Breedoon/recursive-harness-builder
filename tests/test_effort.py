@@ -274,7 +274,7 @@ async def test_telegram_effort_persists_and_restores_with_conversation(config):
         update, ctx = update_and_context([])
         await restored.handle_effort(update, ctx)
         assert "effort: xhigh" in ctx.bot.send_message.call_args.kwargs["text"]
-        assert "effort: xhigh" in await restored._build_context_lines(state)
+        assert "effort: xhigh" in restored._build_session_lines(state)
     finally:
         await restored.shutdown()
 

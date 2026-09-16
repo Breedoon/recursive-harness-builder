@@ -323,14 +323,14 @@ async def _tool_session_id(platform: TelegramPlatform, tool_name: str) -> str:
     return _extract_session_id(reply)
 
 
-async def _command_context(platform: TelegramPlatform) -> str:
-    return await platform.send_control("/context", timeout=20.0)
+async def _command_session(platform: TelegramPlatform) -> str:
+    return await platform.send_control("/session", timeout=20.0)
 
 
 @pytest.mark.integration
 @pytest.mark.telegram
 class TestTelegramLiveForking:
-    async def test_live_context_command_and_tool_session_ids_match(
+    async def test_live_session_command_and_tool_session_ids_match(
         self, live_tg_fork: _LiveForkHarness
     ) -> None:
         await _reset(live_tg_fork.platform)
@@ -338,7 +338,7 @@ class TestTelegramLiveForking:
 
         tool_sid = await _tool_session_id(live_tg_fork.platform, "session_info")
         context_sid = await _tool_session_id(live_tg_fork.platform, "context_info")
-        context_output = await _command_context(live_tg_fork.platform)
+        context_output = await _command_session(live_tg_fork.platform)
         command_sid = _extract_session_id(context_output)
         jsonl_path = _extract_jsonl_path(context_output)
 
@@ -357,7 +357,7 @@ class TestTelegramLiveForking:
             "Reply with exactly LATEST_ANCHOR."
         )
         assert "LATEST_ANCHOR" in seed.output, live_tg_fork.failure_context()
-        session_before = _extract_session_id(await _command_context(live_tg_fork.platform))
+        session_before = _extract_session_id(await _command_session(live_tg_fork.platform))
         files_before = _all_jsonl_files(live_tg_fork.vault_path)
 
         latest_message_id = seed.messages[-1].message_id
@@ -391,7 +391,7 @@ class TestTelegramLiveForking:
         assert "ACK_ALPHA" in alpha.output, live_tg_fork.failure_context()
         assert "ACK_BETA" in beta.output, live_tg_fork.failure_context()
 
-        root_session_id = _extract_session_id(await _command_context(live_tg_fork.platform))
+        root_session_id = _extract_session_id(await _command_session(live_tg_fork.platform))
         root_path = find_session_jsonl(session_id=root_session_id, cwd=live_tg_fork.vault_path)
         assert root_path is not None, live_tg_fork.failure_context()
         root_entries = _read_jsonl(root_path)
@@ -406,7 +406,7 @@ class TestTelegramLiveForking:
             "instruction in our conversation.",
             reply_to_message_id=alpha_message_id,
         )
-        fork_session_id = _extract_session_id(await _command_context(live_tg_fork.platform))
+        fork_session_id = _extract_session_id(await _command_session(live_tg_fork.platform))
         files_after = _all_jsonl_files(live_tg_fork.vault_path)
         fork_path = find_session_jsonl(session_id=fork_session_id, cwd=live_tg_fork.vault_path)
 
@@ -433,7 +433,7 @@ class TestTelegramLiveForking:
             "Reply with exactly the acknowledgement from the most recent remember-token "
             "instruction in our conversation."
         )
-        session_after_followup = _extract_session_id(await _command_context(live_tg_fork.platform))
+        session_after_followup = _extract_session_id(await _command_session(live_tg_fork.platform))
         assert "ACK_ALPHA" in plain_followup, live_tg_fork.failure_context()
         assert session_after_followup == fork_session_id, live_tg_fork.failure_context()
 
@@ -453,7 +453,7 @@ class TestTelegramLiveForking:
         )
         assert "ACK_BETA_DEEP" in beta.output, live_tg_fork.failure_context()
         assert "ACK_GAMMA_DEEP" in gamma.output, live_tg_fork.failure_context()
-        trunk_session_id = _extract_session_id(await _command_context(live_tg_fork.platform))
+        trunk_session_id = _extract_session_id(await _command_session(live_tg_fork.platform))
 
         beta_message_id = _content_message(beta, "ACK_BETA_DEEP").message_id
         fork_one = await live_tg_fork.platform.reply_with_trace(
@@ -462,7 +462,7 @@ class TestTelegramLiveForking:
             "instruction in our conversation.",
             reply_to_message_id=beta_message_id,
         )
-        fork_one_session_id = _extract_session_id(await _command_context(live_tg_fork.platform))
+        fork_one_session_id = _extract_session_id(await _command_session(live_tg_fork.platform))
         assert "ACK_BETA_DEEP" in fork_one.output, live_tg_fork.failure_context()
         assert fork_one_session_id != trunk_session_id, live_tg_fork.failure_context()
 
@@ -479,7 +479,7 @@ class TestTelegramLiveForking:
             "instruction in our conversation.",
             reply_to_message_id=fork_one_message_id,
         )
-        fork_two_session_id = _extract_session_id(await _command_context(live_tg_fork.platform))
+        fork_two_session_id = _extract_session_id(await _command_session(live_tg_fork.platform))
         fork_two_followup = await live_tg_fork.platform.send(
             "This is still the deterministic Telegram harness test. "
             "Reply with exactly the acknowledgement from the most recent remember-token "
@@ -541,7 +541,7 @@ class TestTelegramLiveForking:
         assert "ACK_ALPHA_BUSY" in alpha.output, live_tg_fork.failure_context()
         assert "ACK_TAIL_BUSY" in tail.output, live_tg_fork.failure_context()
 
-        root_session_id = _extract_session_id(await _command_context(live_tg_fork.platform))
+        root_session_id = _extract_session_id(await _command_session(live_tg_fork.platform))
         files_before = _all_jsonl_files(live_tg_fork.vault_path)
         alpha_message_id = _content_message(alpha, "ACK_ALPHA_BUSY").message_id
 
@@ -565,7 +565,7 @@ class TestTelegramLiveForking:
             timeout=240.0,
         )
         queued_fork = await live_tg_fork.platform.wait_for_prompt_with_trace(timeout=240)
-        fork_session_id = _extract_session_id(await _command_context(live_tg_fork.platform))
+        fork_session_id = _extract_session_id(await _command_session(live_tg_fork.platform))
         files_after = _all_jsonl_files(live_tg_fork.vault_path)
 
         assert "LONG_BUSY_DONE" in queued_reply.output, live_tg_fork.failure_context()
@@ -578,7 +578,7 @@ class TestTelegramLiveForking:
             "Reply with exactly the acknowledgement from the most recent remember-token "
             "instruction in our conversation."
         )
-        session_after_followup = _extract_session_id(await _command_context(live_tg_fork.platform))
+        session_after_followup = _extract_session_id(await _command_session(live_tg_fork.platform))
         assert "ACK_ALPHA_BUSY" in followup, live_tg_fork.failure_context()
         assert session_after_followup == fork_session_id, live_tg_fork.failure_context()
 

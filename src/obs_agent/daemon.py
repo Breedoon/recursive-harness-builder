@@ -28,6 +28,7 @@ from obs_agent.runtime_env import (
 )
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent
 from obs_agent.session import SessionManager
+from obs_agent.session_info import SessionViewContext, build_session_info
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -141,7 +142,18 @@ def create_app(config: OBSConfig) -> FastAPI:
         registry: CommandRegistry = application.state.commands
         return {"commands": [*registry.list_commands(), {
             "name": "effort", "description": "Show or set session reasoning effort",
-        }]}
+        }, {"name": "session", "description": "Show agent/session metadata"}]}
+
+    @application.get("/session")
+    async def get_session():
+        """Read metadata during idle or active work without starting an SDK client."""
+        return build_session_info(
+            application.state.session_manager,
+            view=SessionViewContext(
+                busy=application.state.turn_lock.locked(),
+                pending_messages=len(application.state.pending_messages),
+            ),
+        )
 
     @application.get("/effort")
     async def get_effort():

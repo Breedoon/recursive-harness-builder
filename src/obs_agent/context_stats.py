@@ -169,7 +169,7 @@ def build_context_snapshot(
 
 
 def format_context_snapshot_lines(snapshot: dict[str, Any]) -> list[str]:
-    """Render snapshot as stable line-oriented text for /context + MCP tools."""
+    """Render snapshot as stable line-oriented text for diagnostic MCP tools."""
     total_cost = snapshot.get("total_cost_usd")
     total_cost_text = f"{total_cost}" if total_cost is not None else "?"
     return [

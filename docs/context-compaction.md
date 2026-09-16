@@ -1,5 +1,8 @@
 # Context budgets and automatic compaction
 
+For the per-agent ownership and persistence map, see
+[Agent and session architecture](agent-session-model.md).
+
 OBS suffixes specify a requested budget, not a Claude Code model capability.
 `gpt[400k]` must remain 400K in OBS state and child inheritance. The Claude
 subprocess instead needs a recognized capacity selector and a percentage that

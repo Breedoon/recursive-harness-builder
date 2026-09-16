@@ -32,6 +32,7 @@ CLI_HELP = """Usage: obs-agent [--help] [--profile PROFILE] [--prod]
 Commands:
   /help        Show this help
   /stop        Interrupt the current response
+  /session     Show agent, model/context, files, runtime and hooks
   /effort [LEVEL] Show/set low, medium, high, xhigh, max, or auto between turns
   /quit        Exit the CLI
 
@@ -87,6 +88,23 @@ async def execute_effort_command(command: str, *, base_url: str) -> str:
         return f"{exc}. usage: {EFFORT_USAGE}"
     except httpx.HTTPError as exc:
         return f"Error: connection failed - {exc}"
+
+
+async def execute_session_command(command: str, *, base_url: str) -> str:
+    """Fetch metadata without forwarding this control command to the model."""
+    from obs_agent.session_info import format_session_info_lines
+
+    if len(command.split()) != 1:
+        return "Usage: /session"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{base_url}/session")
+        response.raise_for_status()
+        return "\n".join(format_session_info_lines(response.json()))
+    except httpx.HTTPError:
+        return "Error: unable to read session information from the daemon"
+    except (ValueError, KeyError, TypeError):
+        return "Error: invalid session information from the daemon"
 
 
 def check_daemon(base_url: str) -> bool:
@@ -247,6 +265,8 @@ async def _handle_input_during_stream(
             return "/quit"
         elif command == "/help":
             channel.print_output(CLI_HELP + "\n")
+        elif command is not None and command.split()[0] == "/session":
+            channel.print_output(await execute_session_command(command, base_url=base_url) + "\n")
         elif command is not None and command.split()[0] == "/effort":
             channel.print_output(await execute_effort_command(command, base_url=base_url) + "\n")
         elif command is not None:
@@ -429,6 +449,9 @@ async def async_main() -> None:
                 continue
             elif command == "/stop":
                 print("(nothing to interrupt)")
+                continue
+            elif command is not None and command.split()[0] == "/session":
+                print(await execute_session_command(command, base_url=base_url))
                 continue
             elif command is not None and command.split()[0] == "/effort":
                 print(await execute_effort_command(command, base_url=base_url))

@@ -1,5 +1,8 @@
 # Configuration Guide
 
+For the per-agent ownership and persistence map, see
+[Agent and session architecture](agent-session-model.md).
+
 This guide describes the public configuration surface for Recursive Harness Builder as it exists today, plus the naming/defaults that should be used by public install docs. Copy `env.example` to `.env` and fill in the values for your machine.
 
 Formal testing has a separate configuration contract: use the host-managed
