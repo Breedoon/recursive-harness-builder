@@ -441,6 +441,7 @@ class TestTelegramMessageFlow:
         state = _state(bot)
         state.session_manager.set_session_id("sid-poisoned")
         state.session_manager.model_override = "gpt-5.5"
+        state.session_manager.effort_override = "max"
         bot._bind_state_session(state)
         bot._set_session_head(session_id="sid-poisoned", jsonl_uuid="err")
 
@@ -459,6 +460,7 @@ class TestTelegramMessageFlow:
             async def mock_run(msg):
                 assert state.session_id != "sid-poisoned"
                 assert state.session_manager.model_override == "gpt-5.5"
+                assert state.session_manager.effort_override == "max"
                 yield TextEvent(text="RECOVERED")
                 yield TurnEndEvent(
                     jsonl_uuid="a-new",
@@ -3459,7 +3461,7 @@ class TestCommands:
         )
         assert persisted.model_override == resolved
         assert ctx.bot.send_message.call_args.kwargs["text"] == (
-            f"<u><i>model selected for next session: {effective}</i></u>"
+            f"<u><i>model selected for next session: {effective}; effort: medium</i></u>"
         )
 
     async def test_model_inherit_restores_default_before_first_message(self, config):
@@ -5289,6 +5291,7 @@ class TestForkTaskRuntime:
         )
         state.session_manager.set_session_id("sid-root")
         state.session_manager.model_override = "gpt-5.5"
+        state.session_manager.effort_override = "low"
         bot._session_heads["sid-root"] = "head-uuid"
         bot._record_message_binding(
             route=route,
@@ -5354,6 +5357,7 @@ class TestForkTaskRuntime:
         assert child_state is not None
         assert child_state.notify_on_completion is True
         assert child_state.session_manager.model_override == "gpt-5.5"
+        assert child_state.session_manager.effective_effort == "low"
         assert child_state.session_manager.create_options().model == "gpt-5.5[1m]"
         assert (
             child_state.session_manager.create_options().env["ANTHROPIC_API_KEY"]
@@ -8202,6 +8206,7 @@ class TestCreateTelegramApp:
         }
         assert command_map["help"] == "handle_help"
         assert command_map["model"] == "handle_model"
+        assert command_map["effort"] == "handle_effort"
         assert command_map["new_group"] == "handle_new_group"
         assert command_map["new_bot"] == "handle_new_bot"
         assert command_map["stop_branch"] == "handle_stop_branch"

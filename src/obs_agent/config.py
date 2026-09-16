@@ -71,6 +71,27 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 }
 
 
+# OBS defaults, not a provider capability allowlist. Unknown/local/older models
+# retain provider defaults (auto); explicit efforts are validated by the provider.
+# Keep these beside MODEL_CONTEXT_WINDOWS when adding/changing model aliases.
+MODEL_EFFORT_LEVELS: dict[str, str] = {
+    "claude-opus-5": "high",
+    "claude-sonnet-5": "high",
+    "claude-fable-5": "high",
+    "claude-fable-5-1": "high",
+    "claude-opus-4-8": "high",
+    "claude-opus-4-7": "xhigh",
+    "claude-opus-4-6": "high",
+    "claude-sonnet-4-6": "high",
+    "gpt-5.6-sol": "medium",
+    "gpt-5.6-luna": "medium",
+    "gpt-5.6-terra": "medium",
+    "gpt-5.5": "medium",
+    "gpt-5.4": "medium",
+    "gpt-5.4-mini": "medium",
+}
+
+
 @dataclass(frozen=True)
 class ModelContext:
     """Resolved model identity plus OBS context-window metadata."""
@@ -298,6 +319,8 @@ class OBSConfig:
     # full model names pass through unchanged.
     # Change this to e.g. "claude" to make root sessions default to Claude.
     default_model: str = "sol"
+    effort_level: str | None = None
+    model_effort_levels: dict[str, str] = field(default_factory=dict)
     claude_dir: str = ".claude"
     agent_entry_file: str = "CLAUDE.md"
     daemon_host: str = "127.0.0.1"
@@ -360,6 +383,20 @@ class OBSConfig:
         else:
             dm = kwargs.get("default_model", "sol")
             kwargs["model"] = resolve_model(dm)
+        from obs_agent.effort import normalize_effort
+
+        if effort := os.environ.get("OBS_EFFORT_LEVEL"):
+            kwargs["effort_level"] = normalize_effort(effort)
+        if raw_defaults := os.environ.get("OBS_MODEL_EFFORT_LEVELS"):
+            import json
+
+            defaults = json.loads(raw_defaults)
+            if not isinstance(defaults, dict):
+                raise ValueError("OBS_MODEL_EFFORT_LEVELS must be a JSON object")
+            kwargs["model_effort_levels"] = {
+                resolve_model_context(model).model.lower(): normalize_effort(effort)
+                for model, effort in defaults.items()
+            }
         if host := os.environ.get("OBS_DAEMON_HOST"):
             kwargs["daemon_host"] = host
         if port := os.environ.get("OBS_DAEMON_PORT"):

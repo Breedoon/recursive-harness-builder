@@ -136,6 +136,7 @@ _TELEGRAM_HELP_TEXT = """Usage:
 /new [name] — reset this topic into a new trunk agent
 /clear — clear this topic but keep its agent identity
 /model MODEL — select the model before the first message of a new or cleared session
+/effort [LEVEL] — show/set effort between turns; auto restores the model default
 /context — show session and context info
 
 Bare commands are not supported; use the slash form, e.g. /stop.
@@ -1569,6 +1570,7 @@ class TelegramBot:
             pending_obs_bootstrap=state.pending_obs_bootstrap,
             model_override=state.session_manager.model_override,
             user_hooks_json=user_hooks_json,
+            effort_override=state.session_manager.effort_override,
         )
 
     def _restore_state_from_store(self) -> None:
@@ -1595,6 +1597,13 @@ class TelegramBot:
             # Restore model_override and user_hooks for non-Claude sessions
             if entry.model_override:
                 state.session_manager.model_override = entry.model_override
+            if entry.effort_override:
+                from obs_agent.effort import normalize_effort
+
+                try:
+                    state.session_manager.effort_override = normalize_effort(entry.effort_override)
+                except ValueError:
+                    logger.warning("Ignoring invalid persisted effort for route=%s", route)
             if entry.user_hooks_json:
                 try:
                     state.session_manager.user_hooks = json.loads(entry.user_hooks_json)
@@ -3790,6 +3799,7 @@ class TelegramBot:
             return None
 
         old_model_override = state.session_manager.model_override
+        old_effort_override = state.session_manager.effort_override
         old_user_hooks = (
             dict(state.session_manager.user_hooks)
             if state.session_manager.user_hooks is not None
@@ -3822,6 +3832,7 @@ class TelegramBot:
         self._set_session_head(session_id=recovery_session_id, jsonl_uuid=target.target_uuid)
         await self._activate_route_session(state, recovery_session_id)
         state.session_manager.model_override = old_model_override
+        state.session_manager.effort_override = old_effort_override
         state.session_manager.user_hooks = old_user_hooks
         state.session_manager.set_sdk_env_overrides(old_env)
 
@@ -5712,7 +5723,7 @@ class TelegramBot:
                 cwd=self._config.vault_path,
             )
         snapshot = apply_context_probe(snapshot, probe)
-        return format_context_snapshot_lines(snapshot)
+        return [*format_context_snapshot_lines(snapshot), f"effort: {state.session_manager.effective_effort}"]
 
     def _current_tree_context(
         self,
@@ -6195,6 +6206,44 @@ class TelegramBot:
             disable_notification=True,
         )
 
+    async def handle_effort(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Inspect/select per-topic effort, safely between turns."""
+        from obs_agent.effort import EFFORT_USAGE
+
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        await self._ensure_background_poller(context.bot)
+        route = self._route_for_message(update.effective_message)
+        state = self._get_state(route)
+        if state is None:
+            return
+        state.last_bot = context.bot
+        args = list(context.args or [])
+        async with self._get_route_lock(route):
+            if not args:
+                response = (f"effort: {state.session_manager.effective_effort}; "
+                            f"model: {state.session_manager.effective_model}\n"
+                            f"usage: {EFFORT_USAGE}")
+            elif len(args) != 1:
+                response = f"usage: {EFFORT_USAGE}"
+            elif state.busy or state.pending_messages or not state.hook_state.message_queue.empty():
+                response = "effort unchanged: wait for the active/queued work to finish, or /stop first"
+            else:
+                try:
+                    effort = await state.session_manager.set_effort(args[0])
+                except ValueError as exc:
+                    response = f"{exc}. usage: {EFFORT_USAGE}"
+                else:
+                    self._persist_state_for_route(route)
+                    response = f"effort selected: {effort}; applies on the next turn (conversation kept)"
+        await self._send_system_message(
+            route=route, bot=context.bot, text=response, disable_notification=True,
+        )
+
     async def handle_model(
         self,
         update: Update,
@@ -6249,7 +6298,8 @@ class TelegramBot:
                 )
                 state.hook_state.effective_model = effective_model
                 self._persist_state_for_route(route)
-                response = f"model selected for next session: {effective_model}"
+                response = (f"model selected for next session: {effective_model}; "
+                            f"effort: {state.session_manager.effective_effort}")
 
         await self._send_system_message(
             route=route,
@@ -8252,12 +8302,27 @@ class TelegramBot:
         lineage_name: str | None = None,
         lineage_origin: str | None = None,
         model: str | None = None,
+        effort: str | None = None,
         inherit_schedules: bool = True,
         env_override: dict[str, str] | None = None,
         temperature: float | None = None,
         user_hooks: dict[str, str] | None = None,
         inherit_hooks: bool = False,
     ) -> dict[str, Any]:
+        from obs_agent.effort import child_effort_override, build_effort_env, resolve_effort
+
+        child_model = resolve_model(model) if model else parent_state.session_manager.effective_model
+        selected_effort = child_effort_override(
+            effort, parent_effort=parent_state.session_manager.effective_effort,
+            model=model, session_env=env_override,
+        )
+        # Check malformed extra-body JSON before creating the topic or forking JSONL.
+        build_effort_env(child_model, resolve_effort(
+            child_model, override=selected_effort,
+            configured=self._config.effort_level,
+            model_defaults=self._config.model_effort_levels,
+            environ=os.environ, session_env=env_override,
+        ), {**os.environ, **(env_override or {})})
         if is_fork:
             if not source_session_id or not source_uuid:
                 raise RuntimeError("Cannot create fork child topic: source session head is unavailable")
@@ -8430,13 +8495,13 @@ class TelegramBot:
         # Merge user-provided env overrides (from AgentTask env parameter)
         if env_override:
             team_env.update(env_override)
-        # Temperature convenience: construct CLAUDE_CODE_EXTRA_BODY.
-        # Temperature takes precedence over env.CLAUDE_CODE_EXTRA_BODY if both provided.
+        # Temperature takes precedence over thinking, but preserve unrelated fields.
         if temperature is not None:
-            import json as _json
-            team_env["CLAUDE_CODE_EXTRA_BODY"] = _json.dumps(
-                {"temperature": temperature, "thinking": {"type": "disabled"}}
-            )
+            from obs_agent.effort import parse_extra_body
+
+            body = parse_extra_body(team_env.get("CLAUDE_CODE_EXTRA_BODY"))
+            body.update({"temperature": temperature, "thinking": {"type": "disabled"}})
+            team_env["CLAUDE_CODE_EXTRA_BODY"] = json.dumps(body)
         child_state.session_manager.set_sdk_env_overrides(team_env)
         # Apply per-session model override. resolve_model handles shorthand
         # lookup and context suffix preservation. _build_options in session.py
@@ -8444,10 +8509,8 @@ class TelegramBot:
         # compaction threshold, API key) for non-Claude models. When no explicit
         # model is provided, inherit the parent's effective model instead of
         # falling back to the shared config default.
-        from obs_agent.config import resolve_model
-        child_state.session_manager.model_override = (
-            resolve_model(model) if model else parent_state.session_manager.effective_model
-        )
+        child_state.session_manager.model_override = child_model
+        child_state.session_manager.effort_override = selected_effort
         # --- User hooks ---
         # Resolve effective hooks: explicit hooks take precedence, then
         # inheritance from the parent if inherit_hooks is True.
@@ -9550,6 +9613,8 @@ class TelegramBot:
         if resume_task_id and session_source_raw:
             raise ValueError("resume and session_source are mutually exclusive")
         if resume_task_id:
+            if args.get("effort") is not None or "CLAUDE_CODE_EFFORT_LEVEL" in (args.get("env") or {}):
+                raise ValueError("resume preserves the child's effort; use /effort in its topic")
             return await self._resume_fork_task(
                 route=route,
                 state=state,
@@ -9704,6 +9769,7 @@ class TelegramBot:
             lineage_name=lineage_name,
             lineage_origin="agent_task_fork" if is_fork else "agent_task_fresh",
             model=model,
+            effort=args.get("effort"),
             inherit_schedules=inherit_schedules,
             env_override=env_override,
             temperature=temperature,
@@ -10443,6 +10509,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("stop_branch", bot.handle_stop_branch))
     app.add_handler(CommandHandler("stop_tree", bot.handle_stop_tree))
     app.add_handler(CommandHandler("model", bot.handle_model))
+    app.add_handler(CommandHandler("effort", bot.handle_effort))
     app.add_handler(CommandHandler("context", bot.handle_context))
     app.add_handler(CommandHandler("report", bot.handle_report))
     app.add_handler(CommandHandler("schedule", bot.handle_schedule))
@@ -10499,6 +10566,7 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("stop_branch", "Interrupt this agent and all recursive descendants"),
         BotCommand("stop_tree", "Interrupt the complete root team tree"),
         BotCommand("model", "Select model before the first message of a new or cleared session"),
+        BotCommand("effort", "Show or set effort: low, medium, high, xhigh, max, auto"),
         BotCommand("context", "Show session and context window info"),
         BotCommand("report", "Save a debug case file for this message/topic"),
         BotCommand("schedule", "Create schedules once Sprint 1 reliability is approved"),

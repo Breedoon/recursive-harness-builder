@@ -9,6 +9,7 @@ See implementation-plan.md Steps 9-10 and decisions D014, D018, D022.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import TYPE_CHECKING
@@ -37,6 +38,11 @@ logger = logging.getLogger("obs_agent.daemon")
 class ChatRequest(BaseModel):
     """Request body for POST /chat."""
     message: str = Field(..., min_length=1)
+
+
+class EffortRequest(BaseModel):
+    """A session-local effort selection; auto restores the model default."""
+    effort: str
 
 
 class ChatResponse(BaseModel):
@@ -93,6 +99,9 @@ def create_app(config: OBSConfig) -> FastAPI:
     application.state.session_manager = SessionManager(config=config, hook_state=hook_state)
     application.state.commands = CommandRegistry(hook_state)
     application.state.pending_messages: list[str] = []
+    # Serialize turn admission with effort changes so a disconnect cannot race
+    # a new runner. Interrupt/enqueue remain available while a turn holds this.
+    application.state.turn_lock = asyncio.Lock()
 
     @application.get("/health")
     async def health():
@@ -130,7 +139,28 @@ def create_app(config: OBSConfig) -> FastAPI:
     async def list_commands():
         """List available commands for discoverability."""
         registry: CommandRegistry = application.state.commands
-        return {"commands": registry.list_commands()}
+        return {"commands": [*registry.list_commands(), {
+            "name": "effort", "description": "Show or set session reasoning effort",
+        }]}
+
+    @application.get("/effort")
+    async def get_effort():
+        manager = application.state.session_manager
+        return {"effort": manager.effective_effort, "model": manager.effective_model}
+
+    @application.post("/effort")
+    async def set_effort(request: EffortRequest):
+        lock = application.state.turn_lock
+        if lock.locked() or application.state.pending_messages or not hook_state.message_queue.empty():
+            return JSONResponse(status_code=409, content={
+                "detail": "effort unchanged: active/queued work must finish; use /stop first",
+            })
+        async with lock:
+            try:
+                effort = await application.state.session_manager.set_effort(request.effort)
+            except ValueError as exc:
+                return JSONResponse(status_code=422, content={"detail": str(exc)})
+        return {"effort": effort, "message": f"effort selected: {effort}; applies on the next turn (conversation kept)"}
 
     @application.post("/chat")
     async def chat(request: ChatRequest):
@@ -149,9 +179,10 @@ def create_app(config: OBSConfig) -> FastAPI:
 
         result_parts: list[str] = []
         try:
-            async for event in runner.run(request.message):
-                if isinstance(event, TextEvent):
-                    result_parts.append(event.text)
+            async with application.state.turn_lock:
+                async for event in runner.run(request.message):
+                    if isinstance(event, TextEvent):
+                        result_parts.append(event.text)
         except Exception as exc:
             logger.exception("Error in /chat")
             return JSONResponse(
@@ -183,16 +214,17 @@ def create_app(config: OBSConfig) -> FastAPI:
 
         async def event_generator():
             try:
-                async for event in runner.run(request.message):
-                    if isinstance(event, TextEvent):
-                        for text_line in event.text.split("\n"):
-                            yield f"data: {text_line}\n"
-                        yield "\n"
-                    elif isinstance(event, StatusEvent):
-                        yield event.to_sse()
-                    elif isinstance(event, DoneEvent):
-                        application.state.pending_messages = runner.remaining_pending
-                        yield "data: [DONE]\n\n"
+                async with application.state.turn_lock:
+                    async for event in runner.run(request.message):
+                        if isinstance(event, TextEvent):
+                            for text_line in event.text.split("\n"):
+                                yield f"data: {text_line}\n"
+                            yield "\n"
+                        elif isinstance(event, StatusEvent):
+                            yield event.to_sse()
+                        elif isinstance(event, DoneEvent):
+                            application.state.pending_messages = runner.remaining_pending
+                            yield "data: [DONE]\n\n"
             except Exception as exc:
                 logger.exception("Error in SSE stream")
                 error_msg = f"{type(exc).__name__}: {str(exc)[:200]}"
