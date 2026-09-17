@@ -52,6 +52,20 @@ from obs_agent.telegram import (
 _TEST_GAP = 0.05
 
 
+async def _drain_detached_wakes(bot, timeout: float = 2.0) -> None:
+    """Wait for detached route-target inbox wakes to finish.
+
+    The route-target wake is no longer awaited by the delivery notifier (it used
+    to block the sender for the recipient's entire turn — see
+    tests/test_inbox_wake_detach.py).  Tests that assert on what the wake did
+    must join the detached task first.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while bot._detached_wake_tasks and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+
+
 def _make_update(
     text: str,
     user_id: int = 12345,
@@ -6360,6 +6374,8 @@ class TestForkTaskRuntime:
                 },
             )
 
+            await _drain_detached_wakes(bot)
+
         run_mock.assert_awaited_once()
         kwargs = run_mock.await_args.kwargs
         assert kwargs["state"] is state
@@ -6425,6 +6441,7 @@ class TestForkTaskRuntime:
             AsyncMock(return_value=_RunOutcome(assistant_text="POLL-WAKE-OK")),
         ) as run_mock:
             await bot._poll_team_worker_inbox_wakes()
+            await _drain_detached_wakes(bot)
 
         run_mock.assert_awaited_once()
         kwargs = run_mock.await_args.kwargs
@@ -9273,6 +9290,7 @@ class TestTelegramStatePersistence:
                     "content": "process restored route wake",
                 },
             )
+            await _drain_detached_wakes(restored)
 
         run_mock.assert_awaited_once()
         assert restored._resolve_route_inbox_target(

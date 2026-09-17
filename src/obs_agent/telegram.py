@@ -683,6 +683,10 @@ class TelegramBot:
         self._fork_tasks_by_id: dict[str, _ForkTaskRecord] = {}
         self._fork_task_by_child_route: dict[TelegramRoute, str] = {}
         self._fork_task_tasks: dict[str, asyncio.Task] = {}
+        # Detached route-target inbox wakes.  Held by strong reference: asyncio
+        # keeps only a weak reference to a running task, so a bare
+        # create_task(...) can be garbage-collected mid-flight.
+        self._detached_wake_tasks: set[asyncio.Task] = set()
         self._team_worker_records: dict[tuple[str, str], str] = {}
         self._route_inbox_targets: dict[tuple[str, str], TelegramRoute] = {}
         self._route_inbox_target_keys_by_route: dict[TelegramRoute, tuple[str, str]] = {}
@@ -4810,6 +4814,14 @@ class TelegramBot:
                 await task
             except asyncio.CancelledError:
                 pass
+        for task in list(self._detached_wake_tasks):
+            if not task.done():
+                task.cancel()
+        for task in list(self._detached_wake_tasks):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         for task in list(self._fork_task_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -7719,7 +7731,11 @@ class TelegramBot:
                         team_name_for_wake, agent_name_for_wake = tn, an
                         break
                 if team_name_for_wake and agent_name_for_wake:
-                    await self._start_idle_route_inbox_wake(
+                    # Detached: awaiting here re-enters _run_and_send from inside
+                    # _run_and_send's own tail, nesting another full turn into
+                    # whatever is waiting on this one (on the inbox path, the
+                    # original sender's tool call).
+                    self._spawn_detached_route_inbox_wake(
                         state=state,
                         team_name=team_name_for_wake,
                         agent_name=agent_name_for_wake,
@@ -9243,6 +9259,69 @@ class TelegramBot:
             extra_pending=queued_before if queued_before else None,
         )
 
+    def _on_detached_wake_done(self, task: asyncio.Task) -> None:
+        self._detached_wake_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("Detached route inbox wake failed", exc_info=exc)
+
+    def _spawn_detached_route_inbox_wake(
+        self,
+        *,
+        state: TelegramSessionState,
+        team_name: str,
+        agent_name: str,
+        sender: str | None,
+        summary: str | None,
+        content: str | None,
+    ) -> asyncio.Task:
+        """Run a route-target inbox wake detached from the caller's turn.
+
+        The wake drives the *recipient's* entire turn through ``_run_and_send``.
+        Awaiting it inline blocks the caller — and on the ``SendInboxMessage``
+        path the caller is the sender's MCP tool call, so the sender could not
+        end its turn until the recipient finished.  The worker-record path
+        already detaches (``_schedule_fork_task``); this mirrors it.
+
+        The route lock and the busy re-check move *inside* the detached task so
+        that turn serialization for the route is unchanged.  If the re-check
+        loses the race, the message takes the existing deferral path instead of
+        being dropped.
+        """
+
+        async def _runner() -> None:
+            lock = self._get_route_lock(state.route)
+            async with lock:
+                if (
+                    state.busy
+                    or state.hook_state.pause_queue_delivery
+                    or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
+                ):
+                    self._queue_running_team_worker_notice(
+                        state=state,
+                        team_name=team_name,
+                        agent_name=agent_name,
+                        sender=sender,
+                        summary=summary,
+                        content=content,
+                    )
+                    return
+                await self._start_idle_route_inbox_wake(
+                    state=state,
+                    team_name=team_name,
+                    agent_name=agent_name,
+                    sender=sender,
+                    summary=summary,
+                    content=content,
+                )
+
+        task = asyncio.create_task(_runner())
+        self._detached_wake_tasks.add(task)
+        task.add_done_callback(self._on_detached_wake_done)
+        return task
+
     async def _maybe_wake_route_inbox_target(
         self,
         *,
@@ -9260,19 +9339,14 @@ class TelegramBot:
         lock = self._get_route_lock(state.route)
         if lock.locked():
             return False
-        async with lock:
-            if state.busy or state.hook_state.pause_queue_delivery:
-                return False
-            if self._chat_pending_ops.get(state.route.chat_id, 0) > 0:
-                return False
-            await self._start_idle_route_inbox_wake(
-                state=state,
-                team_name=team_name,
-                agent_name=agent_name,
-                sender=sender,
-                summary=summary,
-                content=content,
-            )
+        self._spawn_detached_route_inbox_wake(
+            state=state,
+            team_name=team_name,
+            agent_name=agent_name,
+            sender=sender,
+            summary=summary,
+            content=content,
+        )
         return True
 
     async def _handle_inbox_message_notification(
