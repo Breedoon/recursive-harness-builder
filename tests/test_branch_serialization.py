@@ -458,6 +458,82 @@ class TestExplicitPathsAreNotGated:
             "ungated path this split exists to remove"
         )
 
+    async def test_explicit_launch_still_runs_under_branch_saturation(self, config):
+        """DEADLOCK-FREEDOM, demonstrated rather than asserted.
+
+        Tier A is structurally deadlock-free *because* it never gates explicit
+        launches. That is a LOAD-BEARING INVARIANT, not an incidental gap: a
+        parent blocked in ``AgentTaskOutput(block=true)`` while holding the
+        branch's only slot would wait for a child that could never be admitted,
+        and would return a silent ``retrieval_status: "timeout"`` — a wrong
+        answer, not a crash.
+
+        Asserting "I did not add a gate here" is not enough, because a gate
+        could arrive indirectly (via a helper, or via the wake-replay split).
+        This drives the real launch path under the exact condition that would
+        deadlock if the invariant were broken: the branch is saturated by a
+        busy sibling AND by the launching parent itself, so
+        ``_branch_wake_gate_blocks`` is True for the child — and the child must
+        still run.
+        """
+        bot = _make_bot(config)
+        sibling = _make_route_target(
+            bot, thread_id=901, team_name="t", agent_name="sibling", lineage=("Trunk", "S")
+        )
+        sibling.busy = True
+
+        parent_route = TelegramRoute(chat_id=_CHAT_ID, thread_id=902)
+        parent_state = bot._get_state(parent_route, topic_title="Parent")
+        assert parent_state is not None
+        parent_state.agent_lineage = ("Trunk", "P")
+        parent_state.last_bot = MagicMock()
+        # The parent is mid-turn: this is the AgentTaskOutput(block=true) shape,
+        # where the parent holds a slot while awaiting its child.
+        parent_state.busy = True
+
+        child_route = TelegramRoute(chat_id=_CHAT_ID, thread_id=903)
+        child_state = bot._get_state(child_route, topic_title="General - Child")
+        assert child_state is not None
+        child_state.agent_lineage = ("Trunk", "C")
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=9))
+        child_state.last_bot = fake_bot
+        child_state.session_manager.set_session_id("sid-child")
+
+        record = _ForkTaskRecord(
+            task_id="task-explicit",
+            parent_route=parent_route,
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-uuid",
+            child_route=child_route,
+            child_session_id="sid-child",
+            prompt="do the work",
+            description="Child",
+            team_name="t",
+            agent_name="child",
+            is_fork=False,
+            status="launched",
+        )
+        bot._fork_tasks_by_id["task-explicit"] = record
+
+        # Precondition: the gate WOULD block a wake-class start for this child.
+        # Without this the test could pass merely because the branch was quiet.
+        assert bot._branch_turn_load(child_state) == 2
+        assert bot._branch_wake_gate_blocks(child_state) is True
+
+        run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="CHILD-RAN"))
+        with patch.object(bot, "_run_and_send", run_mock):
+            await bot._execute_fork_task("task-explicit")
+
+        assert run_mock.await_count == 1, (
+            "DEADLOCK: an explicit launch was blocked while the branch was saturated. "
+            "Tier A must never gate explicit launches — a parent blocked in "
+            "AgentTaskOutput(block=true) would wait forever for a child that can "
+            "never be admitted, and return a silent retrieval_status: timeout."
+        )
+        assert run_mock.await_args.kwargs["state"] is child_state
+        await bot.shutdown()
+
     async def test_gate_predicate_is_true_for_the_launcher_itself(self, config):
         """Control for the test above: the predicate WOULD block, if consulted.
 
