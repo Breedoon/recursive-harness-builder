@@ -426,6 +426,38 @@ class TestExplicitPathsAreNotGated:
                     f"slot-yield around the blocking await."
                 )
 
+    async def test_the_absence_assertion_does_not_shelter_the_wake_replay(self, config):
+        """Companion to the test above — it must NOT be readable as blanket cover.
+
+        ``_execute_fork_task`` used to do double duty: explicit-launch execution
+        (correctly ungated) AND draining ``record.wake_requested``, which is a
+        wake-class start and must be gated.  Asserting "this function has no
+        gate" therefore silently locked that gap in.
+
+        The replay now lives in its own method, which MUST consult the gate.
+        This pins the split so the absence-assertion above can only ever cover
+        the explicit path.
+        """
+        import inspect
+
+        from obs_agent import telegram as telegram_mod
+
+        replay = inspect.getsource(
+            telegram_mod.TelegramBot._replay_pending_team_worker_wake
+        )
+        assert "_branch_wake_gate_blocks" in replay, (
+            "the team-worker wake replay must be gated — it is a wake-class start"
+        )
+        execute = inspect.getsource(telegram_mod.TelegramBot._execute_fork_task)
+        assert "_replay_pending_team_worker_wake" in execute, (
+            "_execute_fork_task must delegate the replay rather than inlining it; "
+            "inlining re-conflates the gated and ungated paths in one function"
+        )
+        assert "_start_idle_team_worker_wake" not in execute, (
+            "_execute_fork_task must not call the wake directly — that is the "
+            "ungated path this split exists to remove"
+        )
+
     async def test_gate_predicate_is_true_for_the_launcher_itself(self, config):
         """Control for the test above: the predicate WOULD block, if consulted.
 
@@ -443,6 +475,201 @@ class TestExplicitPathsAreNotGated:
         assert bot._branch_turn_load(launcher) == 1
         assert bot._branch_wake_gate_blocks(launcher) is True
         await bot.shutdown()
+
+
+class TestTeamWorkerWakeReplayGating:
+    """The fifth wake-class entry point: draining ``record.wake_requested`` when
+    a team worker's fork task ends (``_replay_pending_team_worker_wake``).
+
+    ``record.wake_requested`` is the second of the two deferral mechanisms.  Its
+    drain fires precisely under the branch saturation that caused the deferral,
+    so leaving it ungated lets a deferred wake start the very turn the gate was
+    meant to defer.
+    """
+
+    def _setup(self, config, *, base_thread: int, sibling_busy: bool):
+        bot = _make_bot(config)
+        sibling = _make_route_target(
+            bot,
+            thread_id=base_thread,
+            team_name="t",
+            agent_name="sibling",
+            lineage=("Trunk", "S"),
+        )
+        sibling.busy = sibling_busy
+
+        child_route = TelegramRoute(chat_id=_CHAT_ID, thread_id=base_thread + 1)
+        child_state = bot._get_state(child_route, topic_title="General - Worker")
+        assert child_state is not None
+        child_state.agent_lineage = ("Trunk", "W")
+        fake_bot = MagicMock()
+        fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=7))
+        child_state.last_bot = fake_bot
+        child_state.session_manager.set_session_id("sid-worker")
+
+        record = _ForkTaskRecord(
+            task_id="task-w",
+            parent_route=TelegramRoute(chat_id=_CHAT_ID, thread_id=None),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="parent-uuid",
+            child_route=child_route,
+            child_session_id="sid-worker",
+            prompt="old",
+            description="Worker",
+            team_name="t",
+            agent_name="worker",
+            is_fork=False,
+            status="completed",
+            idle_ready=True,
+        )
+        # A wake arrived while this worker was mid-turn and was deferred onto
+        # the record — exactly what telegram.py:9578 does.
+        record.wake_requested = True
+        record.wake_source_sender = "sender-x"
+        record.wake_source_summary = "handoff"
+        record.wake_source_content = "please process item 7"
+        bot._fork_tasks_by_id["task-w"] = record
+        bot._fork_task_by_child_route[child_route] = "task-w"
+        bot._team_worker_records[("t", "worker")] = "task-w"
+        return bot, child_state, record
+
+    async def test_positive_control_replay_fires_when_the_branch_is_quiet(self, config):
+        """POSITIVE CONTROL — with no busy sibling the replay must still wake.
+
+        Without this, the gated assertion below could pass simply because the
+        replay never fires at all.
+        """
+        bot, child_state, record = self._setup(config, base_thread=701, sibling_busy=False)
+        with patch.object(bot, "_start_idle_team_worker_wake", new_callable=AsyncMock) as wake:
+            await bot._replay_pending_team_worker_wake(record)
+        wake.assert_awaited_once()
+        assert child_state.hook_state.message_queue.qsize() == 0
+        await bot.shutdown()
+
+    async def test_replay_is_gated_when_a_same_branch_sibling_is_busy(self, config):
+        """The defect: this drain used to consult no gate at all."""
+        bot, child_state, record = self._setup(config, base_thread=711, sibling_busy=True)
+        with patch.object(bot, "_start_idle_team_worker_wake", new_callable=AsyncMock) as wake:
+            await bot._replay_pending_team_worker_wake(record)
+        wake.assert_not_awaited()
+        assert record.wake_requested is False, (
+            "the deferral must be converted, not left dangling on the record"
+        )
+        assert child_state.hook_state.message_queue.qsize() == 1, (
+            "a gated replay must convert into the poller-drained deferral, not vanish"
+        )
+        await bot.shutdown()
+
+    async def test_gated_replay_is_delivered_once_the_branch_quiets_down(self, config):
+        """The converted deferral must be recoverable, not a permanent stall."""
+        bot, child_state, record = self._setup(config, base_thread=721, sibling_busy=True)
+        sibling = bot._get_state(TelegramRoute(chat_id=_CHAT_ID, thread_id=721), create=False)
+        with patch.object(bot, "_start_idle_team_worker_wake", new_callable=AsyncMock):
+            await bot._replay_pending_team_worker_wake(record)
+        assert child_state.hook_state.message_queue.qsize() == 1
+
+        run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="OK"))
+        with patch.object(bot, "_run_and_send", run_mock):
+            await bot._poll_background_queues_once()
+            run_mock.assert_not_awaited()  # still gated: sibling busy
+            sibling.busy = False
+            await bot._poll_background_queues_once()
+        assert run_mock.await_count == 1, (
+            "the converted replay deferral was never delivered after the branch quieted"
+        )
+        kwargs = run_mock.await_args.kwargs
+        carried = "".join(m.text for m in (kwargs.get("extra_pending") or []))
+        assert "process item 7" in carried, "the replayed wake lost its payload"
+        await bot.shutdown()
+
+    async def test_execute_fork_task_tail_routes_through_the_gated_replay(self, config):
+        """End-to-end through the real tail, not just the extracted method."""
+        bot, child_state, record = self._setup(config, base_thread=731, sibling_busy=True)
+        parent_state = bot._get_state(record.parent_route, topic_title="Parent")
+        assert parent_state is not None
+        parent_state.last_bot = MagicMock()
+
+        with patch.object(
+            bot, "_run_and_send", AsyncMock(return_value=_RunOutcome(assistant_text="OK"))
+        ), patch.object(
+            bot, "_start_idle_team_worker_wake", new_callable=AsyncMock
+        ) as wake:
+            await bot._execute_fork_task("task-w")
+
+        wake.assert_not_awaited(), "the fork-task tail still reaches the ungated wake"
+        assert child_state.hook_state.message_queue.qsize() >= 1
+        await bot.shutdown()
+
+
+class TestGateObservability:
+    """Tier A is default-on for every backend and changes the outcome of the
+    large majority of inbox wakes.  A silent gate cannot be monitored after
+    deploy, which makes the deferred live check unperformable."""
+
+    async def test_deferral_logs_branch_load_and_cap(self, config, caplog):
+        import logging
+
+        bot = _make_bot(config)
+        sibling = _make_route_target(
+            bot, thread_id=801, team_name="t", agent_name="sibling", lineage=("Trunk", "S")
+        )
+        sibling.busy = True
+        target = _make_route_target(
+            bot, thread_id=802, team_name="t", agent_name="target", lineage=("Trunk", "T")
+        )
+
+        with caplog.at_level(logging.INFO, logger="obs_agent.telegram"):
+            assert bot._branch_wake_gate_blocks(target, site="unit-test") is True
+
+        records = [r.getMessage() for r in caplog.records if "[branch-gate]" in r.getMessage()]
+        assert records, "a gate deferral emitted no log line at all"
+        line = records[-1]
+        assert "site=unit-test" in line
+        assert "branch=Trunk" in line, f"branch anchor missing from: {line}"
+        assert "load=1" in line, f"branch load missing from: {line}"
+        assert "cap=1" in line, f"cap missing from: {line}"
+        await bot.shutdown()
+
+    async def test_no_log_when_the_gate_admits(self, config, caplog):
+        """Control: the gate must not log on every call, only on deferral."""
+        import logging
+
+        bot = _make_bot(config)
+        target = _make_route_target(
+            bot, thread_id=811, team_name="t", agent_name="target", lineage=("Trunk", "T")
+        )
+        with caplog.at_level(logging.INFO, logger="obs_agent.telegram"):
+            assert bot._branch_wake_gate_blocks(target, site="unit-test") is False
+        assert not [r for r in caplog.records if "[branch-gate]" in r.getMessage()], (
+            "the gate logged even though it admitted the turn"
+        )
+        await bot.shutdown()
+
+    async def test_every_real_gate_site_passes_a_site_label(self, config):
+        """Each production call site must be identifiable in the log."""
+        import inspect
+        import re
+
+        from obs_agent import telegram as telegram_mod
+
+        source = inspect.getsource(telegram_mod.TelegramBot)
+        calls = re.findall(r"_branch_wake_gate_blocks\(\s*([^)]*?)\)", source, re.S)
+        # Drop the definition itself.
+        calls = [c for c in calls if "self," not in c or "site=" in c]
+        assert calls, "no gate call sites found — did the predicate get renamed?"
+        unlabelled = [c for c in calls if "site=" not in c]
+        assert not unlabelled, (
+            f"gate call sites without a site= label (invisible in the log): {unlabelled}"
+        )
+        labels = set(re.findall(r'site="([^"]+)"', source))
+        assert labels >= {
+            "poller",
+            "poller-recheck",
+            "route-wake",
+            "route-wake-recheck",
+            "team-worker-wake",
+            "team-worker-wake-replay",
+        }, f"missing expected site labels, got {labels}"
 
 
 class TestDeferredWakeDurability:

@@ -7936,7 +7936,7 @@ class TelegramBot:
                 continue
             # Tier A: a same-branch sibling is mid-turn.  Leave the queue in
             # place; the next poll after the branch quiets down delivers it.
-            if self._branch_wake_gate_blocks(state):
+            if self._branch_wake_gate_blocks(state, site="poller"):
                 continue
 
             queued = _drain_queue(state.hook_state.message_queue)
@@ -7959,7 +7959,7 @@ class TelegramBot:
                     state.busy
                     or state.hook_state.pause_queue_delivery
                     or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
-                    or self._branch_wake_gate_blocks(state)
+                    or self._branch_wake_gate_blocks(state, site="poller-recheck")
                 ):
                     for message in queued:
                         state.hook_state.message_queue.put_nowait(message)
@@ -9344,12 +9344,40 @@ class TelegramBot:
         except (TypeError, ValueError):
             return 1
 
-    def _branch_wake_gate_blocks(self, state: TelegramSessionState) -> bool:
-        """True when a wake-class turn start for ``state`` must be deferred."""
+    def _branch_wake_gate_blocks(
+        self,
+        state: TelegramSessionState,
+        *,
+        site: str | None = None,
+    ) -> bool:
+        """True when a wake-class turn start for ``state`` must be deferred.
+
+        Pass ``site`` to log the deferral.  Tier A is on by default on every
+        backend and changes the outcome of the large majority of inbox wakes,
+        so a silent gate would leave no way to answer — after deploy — whether
+        it is firing, how often, for which branch, or whether anything is
+        starving.  Logged at INFO to match the codebase's existing treatment of
+        the same class of event (``"[process_message] queued while busy"``,
+        ``"Auto-delivering queued updates"``).
+        """
         cap = self._effective_branch_turn_cap(state)
         if cap <= 0:
             return False
-        return self._branch_turn_load(state) >= cap
+        load = self._branch_turn_load(state)
+        if load < cap:
+            return False
+        if site is not None:
+            anchor = self._branch_anchor_for(state)
+            logger.info(
+                "[branch-gate] deferring wake-class turn start site=%s route=%s "
+                "branch=%s load=%d cap=%d",
+                site,
+                state.route,
+                "/".join(anchor) if anchor else None,
+                load,
+                cap,
+            )
+        return True
 
     def _on_detached_wake_done(self, task: asyncio.Task) -> None:
         self._detached_wake_tasks.discard(task)
@@ -9393,7 +9421,7 @@ class TelegramBot:
                     # Tier A: re-check inside the lock.  The pre-check above is
                     # racy by construction; a sibling can start a turn while we
                     # wait for the lock.
-                    or self._branch_wake_gate_blocks(state)
+                    or self._branch_wake_gate_blocks(state, site="route-wake-recheck")
                 ):
                     self._queue_running_team_worker_notice(
                         state=state,
@@ -9433,7 +9461,7 @@ class TelegramBot:
         if self._chat_pending_ops.get(state.route.chat_id, 0) > 0:
             return False
         # Tier A: a same-branch sibling is mid-turn — defer this wake.
-        if self._branch_wake_gate_blocks(state):
+        if self._branch_wake_gate_blocks(state, site="route-wake"):
             return False
         lock = self._get_route_lock(state.route)
         if lock.locked():
@@ -9586,7 +9614,9 @@ class TelegramBot:
         # Tier A: a same-branch sibling is mid-turn — defer this wake exactly
         # the way a busy recipient is already deferred, just above.
         child_state = self._get_state(record.child_route, create=False)
-        if child_state is not None and self._branch_wake_gate_blocks(child_state):
+        if child_state is not None and self._branch_wake_gate_blocks(
+            child_state, site="team-worker-wake"
+        ):
             self._queue_running_team_worker_notice(
                 state=child_state,
                 team_name=team_name,
@@ -10321,26 +10351,66 @@ class TelegramBot:
             self._fork_task_by_child_route[record.child_route] = record.task_id
             self._register_team_worker_record(record)
             await self._prune_idle_claude_processes(completing_task_id=record.task_id)
-            if record.wake_requested:
-                try:
-                    await self._start_idle_team_worker_wake(
-                        record=record,
-                        sender=record.wake_source_sender,
-                        summary=record.wake_source_summary,
-                        content=record.wake_source_content,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Failed immediate wake for team worker task_id=%s status=%s",
-                        record.task_id,
-                        record.status,
-                        exc_info=True,
-                    )
-                    await self._send_bounce_backs_for_dead_agent(record.child_route)
+            await self._replay_pending_team_worker_wake(record)
             return
 
         self._fork_task_by_child_route.pop(record.child_route, None)
         self._remove_team_worker_mappings_for_task(task_id)
+
+    async def _replay_pending_team_worker_wake(self, record: _ForkTaskRecord) -> None:
+        """Drain ``record.wake_requested`` when a team worker's task ends.
+
+        This is a WAKE-CLASS turn start, not an explicit launch: it replays an
+        inbox wake that was deferred while the worker was mid-turn.  Tier A
+        therefore gates it, exactly like the other drain
+        (``_queue_running_team_worker_notice``, consumed by the background
+        poller).  ``record.wake_requested`` is the second of the two deferral
+        mechanisms named in the Tier A header comment, and leaving its drain
+        ungated would let a deferred wake start a turn under the very branch
+        saturation that caused the deferral.
+
+        Kept OUT of ``_execute_fork_task`` deliberately: that function also
+        performs explicit-launch execution, which must never be gated (see
+        ``test_explicit_paths_are_not_gated``).  Splitting the two lets the
+        structural test keep protecting the explicit path while this one is
+        gated.
+        """
+        if not record.wake_requested:
+            return
+        child_state = self._get_state(record.child_route, create=False)
+        if child_state is not None and self._branch_wake_gate_blocks(
+            child_state, site="team-worker-wake-replay"
+        ):
+            # Convert the deferral into the other, poller-drained mechanism so
+            # it stays recoverable: the poller (itself gated) delivers it once
+            # the branch quiets down.  The message itself is untouched in the
+            # durable inbox either way.
+            record.wake_requested = False
+            self._queue_running_team_worker_notice(
+                state=child_state,
+                team_name=record.team_name or "",
+                agent_name=record.agent_name or "",
+                sender=record.wake_source_sender,
+                summary=record.wake_source_summary,
+                content=record.wake_source_content,
+            )
+            self._persist_task_handle_record(record)
+            return
+        try:
+            await self._start_idle_team_worker_wake(
+                record=record,
+                sender=record.wake_source_sender,
+                summary=record.wake_source_summary,
+                content=record.wake_source_content,
+            )
+        except Exception:
+            logger.warning(
+                "Failed immediate wake for team worker task_id=%s status=%s",
+                record.task_id,
+                record.status,
+                exc_info=True,
+            )
+            await self._send_bounce_backs_for_dead_agent(record.child_route)
 
     async def _fork_task_output(
         self,
