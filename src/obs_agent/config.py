@@ -343,6 +343,23 @@ class OBSConfig:
     claude_kill_on_idle: bool = False
     fork_cache_warmup_delay_seconds: float = 1.0
 
+    # Per-branch turn serialization.
+    #
+    # How many turns may be in flight at once within one branch (one lineage
+    # subtree).  ``None`` means "not set", which is NOT the same as unlimited:
+    #
+    #   Tier A (implemented; gates wake-class turn starts only — inbox wakes,
+    #     team-worker wakes, background-poller auto-delivery) treats an unset
+    #     value as 1, i.e. default-on for every backend.
+    #   Tier B (the opt-in counting cap at the _run_and_send choke point) is
+    #     NOT implemented yet.  When it lands, an unset value means 1 for
+    #     ``local-*`` models and unlimited for hosted models.
+    #
+    # ``0`` explicitly disables both tiers.  A value set on an agent is intended
+    # to bound its whole subtree, with a descendant unable to loosen it
+    # (effective = min(own, inherited)); that inheritance is Tier B's plumbing.
+    max_concurrent_turns: int | None = None
+
     # Cache proxy
     cache_proxy_port: int = 18923
     cache_proxy_enabled: bool = True
@@ -428,6 +445,8 @@ class OBSConfig:
             kwargs["claude_kill_on_idle"] = kill_on_idle.strip().lower() in {"1", "true", "yes", "on"}
         if fork_cache_delay := os.environ.get("OBS_FORK_CACHE_WARMUP_DELAY_SECONDS"):
             kwargs["fork_cache_warmup_delay_seconds"] = float(fork_cache_delay)
+        if max_turns_env := os.environ.get("OBS_MAX_CONCURRENT_TURNS"):
+            kwargs["max_concurrent_turns"] = int(max_turns_env)
         if proxy_port := os.environ.get("OBS_CACHE_PROXY_PORT"):
             kwargs["cache_proxy_port"] = int(proxy_port)
         if proxy_enabled := os.environ.get("OBS_CACHE_PROXY_ENABLED"):

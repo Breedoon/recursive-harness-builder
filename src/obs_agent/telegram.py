@@ -7913,61 +7913,76 @@ class TelegramBot:
             except Exception:
                 logger.exception("Schedule poller iteration failed")
 
+    async def _poll_background_queues_once(self) -> None:
+        """One background-poller pass: auto-deliver queued updates to idle routes.
+
+        Extracted from ``_background_poller_loop`` so the gating behaviour can
+        be driven directly by a test.  This is a wake-class turn start (nobody
+        asked for it right now), so Tier A gates it.  A2 named this path as the
+        most likely implementation hole: gating the wake sites without gating
+        the poller merely delays the parallel turn by one poll interval.
+        """
+        await self._poll_team_worker_inbox_wakes()
+        for state in list(self._states_by_route.values()):
+            bot = self._bot_for_state(state)
+            if bot is None:
+                continue
+            if state.busy or state.hook_state.pause_queue_delivery:
+                continue
+            if self._chat_pending_ops.get(state.route.chat_id, 0) > 0:
+                # Keep model-visible queue delivery behind Telegram transport drain.
+                # Otherwise the model can process queued updates before users have
+                # seen prior assistant messages still pending delivery.
+                continue
+            # Tier A: a same-branch sibling is mid-turn.  Leave the queue in
+            # place; the next poll after the branch quiets down delivers it.
+            if self._branch_wake_gate_blocks(state):
+                continue
+
+            queued = _drain_queue(state.hook_state.message_queue)
+            has_pending = bool(state.pending_messages)
+            if not queued and not has_pending:
+                continue
+
+            lock = self._get_route_lock(state.route)
+            if lock.locked():
+                for message in queued:
+                    state.hook_state.message_queue.put_nowait(message)
+                continue
+
+            logger.info(
+                "Auto-delivering queued updates route=%s queued=%d pending=%d",
+                state.route, len(queued), len(state.pending_messages),
+            )
+            async with lock:
+                if (
+                    state.busy
+                    or state.hook_state.pause_queue_delivery
+                    or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
+                    or self._branch_wake_gate_blocks(state)
+                ):
+                    for message in queued:
+                        state.hook_state.message_queue.put_nowait(message)
+                    continue
+
+                await self._run_and_send(
+                    state=state,
+                    user_text=_AUTO_DELIVERY_PROMPT,
+                    bot=bot,
+                    trigger_message=(
+                        (queued or state.pending_messages)[-1]
+                        if (queued or state.pending_messages)
+                        else None
+                    ),
+                    extra_pending=queued if queued else None,
+                )
+
     async def _background_poller_loop(self) -> None:
         """Poll for queued background messages and auto-deliver when idle."""
         while True:
             try:
                 await asyncio.sleep(self._background_poll_seconds)
-                await self._poll_team_worker_inbox_wakes()
-                for state in list(self._states_by_route.values()):
-                    bot = self._bot_for_state(state)
-                    if bot is None:
-                        continue
-                    if state.busy or state.hook_state.pause_queue_delivery:
-                        continue
-                    if self._chat_pending_ops.get(state.route.chat_id, 0) > 0:
-                        # Keep model-visible queue delivery behind Telegram transport drain.
-                        # Otherwise the model can process queued updates before users have
-                        # seen prior assistant messages still pending delivery.
-                        continue
-
-                    queued = _drain_queue(state.hook_state.message_queue)
-                    has_pending = bool(state.pending_messages)
-                    if not queued and not has_pending:
-                        continue
-
-                    lock = self._get_route_lock(state.route)
-                    if lock.locked():
-                        for message in queued:
-                            state.hook_state.message_queue.put_nowait(message)
-                        continue
-
-                    logger.info(
-                        "Auto-delivering queued updates route=%s queued=%d pending=%d",
-                        state.route, len(queued), len(state.pending_messages),
-                    )
-                    async with lock:
-                        if (
-                            state.busy
-                            or state.hook_state.pause_queue_delivery
-                            or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
-                        ):
-                            for message in queued:
-                                state.hook_state.message_queue.put_nowait(message)
-                            continue
-
-                        await self._run_and_send(
-                            state=state,
-                            user_text=_AUTO_DELIVERY_PROMPT,
-                            bot=bot,
-                            trigger_message=(
-                                (queued or state.pending_messages)[-1]
-                                if (queued or state.pending_messages)
-                                else None
-                            ),
-                            extra_pending=queued if queued else None,
-                        )
-
+                await self._poll_background_queues_once()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -9259,6 +9274,83 @@ class TelegramBot:
             extra_pending=queued_before if queued_before else None,
         )
 
+    # ------------------------------------------------------------------
+    # Tier A — per-branch gating of wake-class turn starts
+    # ------------------------------------------------------------------
+    #
+    # A "wake-class" turn start is one nobody explicitly asked for right now:
+    # an inbox wake, a team-worker wake, or the background poller's queued
+    # auto-delivery.  Those are gated per branch.  Explicit AgentTask launches,
+    # resumes, user messages, and scheduled runs are NEVER gated: gating an
+    # explicit launch lets a parent blocked in AgentTaskOutput(block=true) hold
+    # the branch's only slot while waiting for a child that can never be
+    # admitted, which makes the parent silently return retrieval_status
+    # "timeout".  Because explicit launches are never gated, Tier A is
+    # deadlock-free by construction.  (User-facing docs land with vault-aay.4.)
+    #
+    # Gating suppresses only the *turn start*.  The message itself takes the
+    # deferral path that already exists (_queue_running_team_worker_notice /
+    # record.wake_requested), and the durable inbox JSON is untouched, so the
+    # recipient still sees it at its next ReadInbox.
+
+    def _branch_anchor_for(self, state: TelegramSessionState) -> tuple[str, ...] | None:
+        """The lineage prefix that defines this state's branch.
+
+        Tier A anchors on the tree root (``lineage[:1]``), which matches the
+        observed load shape: one tree usually dominates.  Returns ``None`` when
+        the state has no lineage yet — the gate then fails OPEN rather than
+        gating traffic it cannot classify.
+        """
+        lineage = state.agent_lineage
+        if not lineage:
+            return None
+        return tuple(lineage[:1])
+
+    def _branch_turn_load(self, state: TelegramSessionState) -> int:
+        """Count live states in ``state``'s branch that are mid-turn.
+
+        In-memory prefix scan over ``_states_by_route``; no I/O.  ``state``
+        itself is excluded so a wake never gates itself out.
+        """
+        anchor = self._branch_anchor_for(state)
+        if anchor is None:
+            return 0
+        depth = len(anchor)
+        load = 0
+        for other in self._states_by_route.values():
+            if other is state:
+                continue
+            other_lineage = other.agent_lineage
+            if not other_lineage:
+                continue
+            if tuple(other_lineage[:depth]) != anchor:
+                continue
+            if other.busy:
+                load += 1
+        return load
+
+    def _effective_branch_turn_cap(self, state: TelegramSessionState) -> int:
+        """Tier A's effective cap: the configured value, or 1 when unset.
+
+        ``0`` (or negative) disables the gate.  Tier B will resolve this from
+        the per-agent parameter with subtree inheritance; Tier A reads the
+        process-level config only.
+        """
+        configured = getattr(self._config, "max_concurrent_turns", None)
+        if configured is None:
+            return 1
+        try:
+            return int(configured)
+        except (TypeError, ValueError):
+            return 1
+
+    def _branch_wake_gate_blocks(self, state: TelegramSessionState) -> bool:
+        """True when a wake-class turn start for ``state`` must be deferred."""
+        cap = self._effective_branch_turn_cap(state)
+        if cap <= 0:
+            return False
+        return self._branch_turn_load(state) >= cap
+
     def _on_detached_wake_done(self, task: asyncio.Task) -> None:
         self._detached_wake_tasks.discard(task)
         if task.cancelled():
@@ -9298,6 +9390,10 @@ class TelegramBot:
                     state.busy
                     or state.hook_state.pause_queue_delivery
                     or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
+                    # Tier A: re-check inside the lock.  The pre-check above is
+                    # racy by construction; a sibling can start a turn while we
+                    # wait for the lock.
+                    or self._branch_wake_gate_blocks(state)
                 ):
                     self._queue_running_team_worker_notice(
                         state=state,
@@ -9335,6 +9431,9 @@ class TelegramBot:
         if state.busy or state.hook_state.pause_queue_delivery:
             return False
         if self._chat_pending_ops.get(state.route.chat_id, 0) > 0:
+            return False
+        # Tier A: a same-branch sibling is mid-turn — defer this wake.
+        if self._branch_wake_gate_blocks(state):
             return False
         lock = self._get_route_lock(state.route)
         if lock.locked():
@@ -9481,6 +9580,21 @@ class TelegramBot:
                 record.wake_source_summary = summary
                 record.wake_source_content = content
                 self._persist_task_handle_record(record)
+            _mark_direct_send_notified()
+            return {"delivered": True}
+
+        # Tier A: a same-branch sibling is mid-turn — defer this wake exactly
+        # the way a busy recipient is already deferred, just above.
+        child_state = self._get_state(record.child_route, create=False)
+        if child_state is not None and self._branch_wake_gate_blocks(child_state):
+            self._queue_running_team_worker_notice(
+                state=child_state,
+                team_name=team_name,
+                agent_name=recipient,
+                sender=sender,
+                summary=summary,
+                content=content,
+            )
             _mark_direct_send_notified()
             return {"delivered": True}
 
