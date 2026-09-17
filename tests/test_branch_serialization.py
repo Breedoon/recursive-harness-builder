@@ -721,6 +721,112 @@ class TestGateObservability:
         )
         await bot.shutdown()
 
+    async def test_starved_route_is_distinguishable_from_idle_routes(self, config, caplog):
+        """ACCEPTANCE CRITERION for gate observability.
+
+        "The line has fields" is not the bar.  The bar is that the log answers
+        the one question it exists to answer: is anything STARVING?
+
+        The poller used to consult the gate ABOVE its emptiness guard, so every
+        idle route on a saturated branch logged "deferring wake-class turn
+        start" on every poll pass — for routes that had nothing to defer.  A
+        genuinely starved route and three idle ones then produced byte-identical
+        lines apart from the route id, which made starvation undetectable:
+        filtering the noise deleted the signal, keeping it buried the signal.
+
+        This reproduces that experiment and requires the shapes to differ.
+        """
+        import logging
+        import re
+
+        config.max_concurrent_turns = 1
+        bot = _make_bot(config)
+        busy = _make_route_target(
+            bot, thread_id=820, team_name="t", agent_name="busy", lineage=("Trunk", "B")
+        )
+        busy.busy = True  # saturates the branch for everyone below
+
+        starved = _make_route_target(
+            bot, thread_id=821, team_name="t", agent_name="starved", lineage=("Trunk", "X")
+        )
+        starved.hook_state.message_queue.put_nowait(QueuedMessage(text="stuck payload"))
+
+        idle_routes = []
+        for offset in range(3):
+            idle_routes.append(
+                _make_route_target(
+                    bot,
+                    thread_id=830 + offset,
+                    team_name="t",
+                    agent_name=f"idle{offset}",
+                    lineage=("Trunk", f"I{offset}"),
+                )
+            )
+
+        run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="OK"))
+        with caplog.at_level(logging.INFO, logger="obs_agent.telegram"):
+            with patch.object(bot, "_run_and_send", run_mock):
+                for _ in range(5):
+                    await bot._poll_background_queues_once()
+
+        run_mock.assert_not_awaited()  # branch stayed saturated throughout
+        assert starved.hook_state.message_queue.qsize() == 1, (
+            "precondition: the starved route's work must still be stuck"
+        )
+
+        lines = [r.getMessage() for r in caplog.records if "[branch-gate]" in r.getMessage()]
+        starved_lines = [ln for ln in lines if f"thread_id={starved.route.thread_id}" in ln]
+        idle_lines = [
+            ln
+            for ln in lines
+            for idle in idle_routes
+            if f"thread_id={idle.route.thread_id}" in ln
+        ]
+
+        # 1. The starved route is reported, repeatedly — that is the signal.
+        assert len(starved_lines) == 5, (
+            f"the starved route must be reported on every pass; got "
+            f"{len(starved_lines)}: {starved_lines}"
+        )
+        # 2. Idle routes are not reported at all — they had nothing to defer.
+        assert idle_lines == [], (
+            "idle routes with nothing queued must not be reported as deferred; got "
+            f"{len(idle_lines)} false lines, e.g. {idle_lines[:2]}"
+        )
+
+        # 3. Shapes differ — this is precisely what V-A2's experiment measured.
+        def _shape(line: str) -> str:
+            return re.sub(r"thread_id=\d+", "thread_id=*", line)
+
+        assert not ({_shape(ln) for ln in starved_lines} & {_shape(ln) for ln in idle_lines}), (
+            "starved and idle routes still produce identical log shapes — "
+            "starvation remains undetectable"
+        )
+        # 4. The line carries the depth that makes the starvation claim checkable.
+        assert "pending=1" in starved_lines[0], (
+            f"the deferral line must carry outstanding work depth: {starved_lines[0]}"
+        )
+        await bot.shutdown()
+
+    async def test_deferral_line_marks_unknown_depth_explicitly(self, config, caplog):
+        """Sites that cannot cheaply compute depth emit an explicit placeholder,
+        so a reader never mistakes "unknown" for "zero"."""
+        import logging
+
+        bot = _make_bot(config)
+        sibling = _make_route_target(
+            bot, thread_id=840, team_name="t", agent_name="sibling", lineage=("Trunk", "S")
+        )
+        sibling.busy = True
+        target = _make_route_target(
+            bot, thread_id=841, team_name="t", agent_name="target", lineage=("Trunk", "T")
+        )
+        with caplog.at_level(logging.INFO, logger="obs_agent.telegram"):
+            assert bot._branch_wake_gate_blocks(target, site="unit-test") is True
+        line = [r.getMessage() for r in caplog.records if "[branch-gate]" in r.getMessage()][-1]
+        assert "pending=-" in line, f"expected an explicit unknown marker: {line}"
+        await bot.shutdown()
+
     async def test_every_real_gate_site_passes_a_site_label(self, config):
         """Each production call site must be identifiable in the log."""
         import inspect

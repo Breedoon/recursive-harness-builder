@@ -7934,9 +7934,22 @@ class TelegramBot:
                 # Otherwise the model can process queued updates before users have
                 # seen prior assistant messages still pending delivery.
                 continue
+            # Nothing to deliver.  This MUST be tested BEFORE the gate is
+            # consulted: otherwise every idle route on a saturated branch logs
+            # "deferring wake-class turn start" on every poll pass, which is
+            # false (there was nothing to defer) and loud enough to bury the
+            # routes that genuinely are deferred.  Non-destructive on purpose —
+            # the drain below is the destructive one.
+            pending_depth = state.hook_state.message_queue.qsize() + len(
+                state.pending_messages
+            )
+            if pending_depth == 0:
+                continue
             # Tier A: a same-branch sibling is mid-turn.  Leave the queue in
             # place; the next poll after the branch quiets down delivers it.
-            if self._branch_wake_gate_blocks(state, site="poller"):
+            if self._branch_wake_gate_blocks(
+                state, site="poller", pending=pending_depth
+            ):
                 continue
 
             queued = _drain_queue(state.hook_state.message_queue)
@@ -9349,6 +9362,7 @@ class TelegramBot:
         state: TelegramSessionState,
         *,
         site: str | None = None,
+        pending: int | None = None,
     ) -> bool:
         """True when a wake-class turn start for ``state`` must be deferred.
 
@@ -9359,6 +9373,15 @@ class TelegramBot:
         starving.  Logged at INFO to match the codebase's existing treatment of
         the same class of event (``"[process_message] queued while busy"``,
         ``"Auto-delivering queued updates"``).
+
+        ``pending`` is how much work is actually waiting on this route.  It is
+        what makes starvation *distinguishable* rather than merely *logged*: a
+        starved route reports a non-zero and non-shrinking ``pending`` across
+        successive deferrals, which an idle route can never do.  Callers that
+        cannot cheaply compute it pass ``None`` and the field is omitted.
+
+        Callers must not consult this predicate for a route with nothing to
+        defer — the log line would be factually wrong.
         """
         cap = self._effective_branch_turn_cap(state)
         if cap <= 0:
@@ -9370,12 +9393,13 @@ class TelegramBot:
             anchor = self._branch_anchor_for(state)
             logger.info(
                 "[branch-gate] deferring wake-class turn start site=%s route=%s "
-                "branch=%s load=%d cap=%d",
+                "branch=%s load=%d cap=%d pending=%s",
                 site,
                 state.route,
                 "/".join(anchor) if anchor else None,
                 load,
                 cap,
+                "-" if pending is None else pending,
             )
         return True
 
