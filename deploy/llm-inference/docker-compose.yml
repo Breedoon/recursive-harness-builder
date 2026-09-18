@@ -1,0 +1,97 @@
+services:
+  llm-inference:
+    image: local/llama-swap:v250-llamacpp-ece963f
+    pull_policy: never
+    container_name: llm-inference
+    hostname: llm-inference
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - |
+        export LLAMA_API_KEY="$$(cat /run/secrets/llama_api_key)"
+        exec /app/llama-swap -config /etc/llama-swap/config/config.yaml -listen 127.0.0.1:8081 -watch-config
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "GPU-06d627bf-d600-1180-3383-bcb0fb5d6335"
+    volumes:
+      - /data/models:/models:ro
+      - /data/gpu-coordination/rtx3090.lock:/workspace/gpu-coordination/rtx3090.lock
+      - ./secrets/api-key:/run/secrets/llama_api_key:ro
+      - ./runtime-config:/etc/llama-swap/config:ro
+      - ./qwen3.8-blackfrost-claude-code-v1.jinja:/etc/llama-swap/templates/qwen3.8-blackfrost-claude-code-v1.jinja:ro
+      - /data/scratch/llm-inference/state:/state
+    ports:
+      - "172.17.0.1:8080:8080"
+    gpus:
+      - driver: nvidia
+        device_ids:
+          - GPU-06d627bf-d600-1180-3383-bcb0fb5d6335
+        capabilities: [gpu]
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-modeset:/dev/nvidia-modeset
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+    ipc: host
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      ssh.name: "llm-inference"
+      ssh.purpose: "private llama-swap backend for the authenticated local inference gate"
+      llama-swap.version: "v250"
+      llama-swap.revision: "60226b63776efac11e15828abe0bb302ec259699"
+      llama-swap.image-id: "sha256:193aba47c409ddb95fb91a28a2298ee29b67f68ce6e4e0712705b3f4c89bc57f"
+      llama.cpp.revision: "ece963f41b0b02d7a0d61436ae365762c073a4c8"
+
+  llm-gate:
+    image: python:3.12-slim
+    pull_policy: never
+    container_name: llm-gate
+    network_mode: "service:llm-inference"
+    pid: "service:llm-inference"
+    depends_on:
+      llm-inference:
+        condition: service_started
+    entrypoint: ["/usr/local/bin/python3", "-u", "/gate/gate.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      NVIDIA_VISIBLE_DEVICES: "GPU-06d627bf-d600-1180-3383-bcb0fb5d6335"
+      GATE_LISTEN_HOST: "0.0.0.0"
+      GATE_LISTEN_PORT: "8080"
+      GATE_BACKEND_HOST: "127.0.0.1"
+      GATE_BACKEND_PORT: "8081"
+      GATE_QUEUE_LIMIT: "4"
+      GATE_CONCURRENCY_LIMIT: "1"
+      GATE_SLOT_SAMPLE_INTERVAL: "3"
+      GATE_API_KEY_PATH: "/run/secrets/llama_api_key"
+      GATE_CONTROL_SOCKET: "/workspace/gpu-coordination/llm-gate.sock"
+      GATE_STATE_PATH: "/state/handoff-gate.json"
+      GATE_GPU_LOCK_PATH: "/workspace/gpu-coordination/rtx3090.lock"
+    volumes:
+      - ./gate.py:/gate/gate.py:ro
+      - ./secrets/api-key:/run/secrets/llama_api_key:ro
+      - /data/gpu-coordination:/workspace/gpu-coordination
+      - /data/scratch/llm-inference/state:/state
+    gpus:
+      - driver: nvidia
+        device_ids:
+          - GPU-06d627bf-d600-1180-3383-bcb0fb5d6335
+        capabilities: [gpu]
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-modeset:/dev/nvidia-modeset
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+    restart: unless-stopped
+    stop_grace_period: 30s
+    labels:
+      ssh.name: "llm-gate"
+      ssh.purpose: "authenticated serialized streaming admission and GPU handoff gate"
+      llm-gate.version: "1"

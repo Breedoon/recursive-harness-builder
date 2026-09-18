@@ -1,0 +1,41 @@
+healthCheckTimeout: 3600
+logLevel: info
+logTimeFormat: rfc3339nano
+logToStdout: both
+store:
+  path: /state/llama-swap.sqlite
+captureBuffer: 0
+includeAliasesInList: true
+globalTTL: 60
+unloadTimeout: 120
+startPort: 10001
+apiKeys:
+  - "${env.LLAMA_API_KEY}"
+models:
+  local-qwen3.8-27b:
+    aliases:
+      - local-qwen
+    useModelName: local-qwen3.8-27b
+    ttl: 0
+    cmd: >
+      flock --exclusive --no-fork /workspace/gpu-coordination/rtx3090.lock
+      llama-server --host 127.0.0.1 --port ${PORT}
+      --model /models/local-llm/qwen3.8-27b-abliterated-q4km/Qwen3.8-27B-ABLITERATED-Q4_K_M.gguf
+      --alias local-qwen3.8-27b --ctx-size 131072 --parallel 1 --n-gpu-layers all
+      --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --fit off
+      --jinja --chat-template-file /etc/llama-swap/templates/qwen3.8-blackfrost-claude-code-v1.jinja
+      --reasoning on --reasoning-format deepseek
+      --metrics --slots --threads 24 --threads-batch 24
+      --log-prefix --log-timestamps
+  local-gemma4-31b:
+    aliases:
+      - local-gemma
+    useModelName: local-gemma4-31b
+    cmd: >
+      flock --exclusive --no-fork /workspace/gpu-coordination/rtx3090.lock
+      llama-server --host 127.0.0.1 --port ${PORT}
+      --model /models/local-llm/gemma4-31b-abliterated-q4k/Huihui-gemma-4-31B-it-qat-q4_0-unquantized-abliterated-Q4_K.gguf
+      --alias local-gemma4-31b --ctx-size 49152 --parallel 1 --n-gpu-layers all
+      --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0
+      --jinja --reasoning off --metrics --slots --threads 24 --threads-batch 24
+      --log-prefix --log-timestamps
