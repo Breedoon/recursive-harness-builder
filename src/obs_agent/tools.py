@@ -897,7 +897,8 @@ def create_obs_tools(
         sender = str(args.get("sender", "")).strip() or (
             bootstrap.agent_name if bootstrap is not None and bootstrap.agent_name else "obs-worker"
         )
-        # needs_reply is the canonical name; must_reply accepted for backward compat.
+        # Backend-only optional reply flags stay accepted for internal callers,
+        # but they are intentionally omitted from the MCP schema so agents cannot set them.
         # Use _coerce_bool_arg to handle string "false" correctly (bool("false") is True).
         if "needs_reply" in args:
             needs_reply_raw = args.get("needs_reply")
@@ -1232,14 +1233,9 @@ def create_obs_tools(
                     "type": "string",
                     "description": "Optional sender label; defaults to the current agent name.",
                 },
-                "needs_reply": {
-                    "type": "boolean",
-                    "description": "Set true only when the message asks a question or makes a request that needs a reply.",
-                },
-                "must_reply": {
-                    "type": "boolean",
-                    "description": "Deprecated alias for needs_reply.",
-                },
+                # Backend-only optional flags intentionally omitted from the MCP schema:
+                # "needs_reply": {"type": "boolean", ...}
+                # "must_reply": {"type": "boolean", ...}
             },
             "required": ["recipient", "content"],
             "additionalProperties": False,

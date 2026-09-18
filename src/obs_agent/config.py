@@ -48,6 +48,8 @@ MODEL_RESOLUTION: dict[str, str] = {
     "gemini": "gemini-3.1-flash-lite-preview",
     "gemini-pro": "gemini-3.1-pro-preview",
     "gemini-flash": "gemini-2.5-flash",
+    # Local durable aliases
+    "local-qwen": "local-qwen3.8-27b",
 }
 
 # Regex for context-window suffix: [1m], [200k], [128k], etc.
@@ -57,6 +59,9 @@ _DEFAULT_CONTEXT_TOKENS = 1_000_000
 _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 0
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5": 200_000,
+    "local-qwen": 128_000,
+    "local-qwen3.8-27b": 128_000,
+    "local-gemma4-31b": 48_000,
     "gpt-5.6-sol": 400_000,
     "gpt-5.6-luna": 400_000,
     "gpt-5.6-terra": 400_000,
@@ -75,8 +80,16 @@ class ModelContext:
     explicit_context: bool
 
     @property
-    def model_for_claude_code(self) -> str:
+    def model_with_context(self) -> str:
         return self.model + _context_suffix_for_tokens(self.context_tokens)
+
+    @property
+    def model_for_claude_code(self) -> str:
+        # Local Anthropic-compatible providers route on the canonical model ID;
+        # their context limit is passed separately through the SDK environment.
+        if self.model.lower().startswith("local-"):
+            return self.model
+        return self.model_with_context
 
 
 def _context_suffix_for_tokens(context_tokens: int) -> str:
@@ -149,11 +162,11 @@ def normalize_model_for_claude_code(
     *,
     default_context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
 ) -> str:
-    """Resolve model identity and append OBS's context window suffix.
+    """Resolve the model identifier passed to Claude Code.
 
-    OBS treats context length as runtime metadata, not part of model identity.
-    At the Claude Code boundary we always pass the resolved context suffix,
-    including the default ``[1m]`` for native Claude models.
+    OBS passes context suffixes for hosted models. Local Anthropic-compatible
+    providers receive their canonical model ID while OBS supplies the context
+    limit separately through SDK environment metadata.
     """
     resolved = resolve_model_context(
         model_str,

@@ -215,6 +215,34 @@ class TestTelegramMessageFlow:
         assert working_call["reply_to_message_id"] is None
         assert working_call["max_attempts"] == 1
 
+    def test_agent_task_completion_is_labeled_as_went_idle(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        record = _ForkTaskRecord(
+            task_id="task-1",
+            parent_route=TelegramRoute(chat_id=1),
+            parent_session_id_at_launch="sid-parent",
+            parent_source_uuid="uuid-parent",
+            child_route=TelegramRoute(chat_id=1, thread_id=2),
+            child_session_id="sid-child",
+            prompt="run",
+            description="worker",
+            status="completed",
+            is_fork=False,
+        )
+
+        assert bot._record_status_for_notification(record) == "idle"
+        assert bot._record_status_label(record) == "went idle"
+        assert bot._record_summary(record) == 'Agent task "worker" went idle'
+        assert "<status>idle</status>" in bot._build_fork_task_notification_xml(record)
+        assert (
+            "<summary>Agent task &quot;worker&quot; went idle</summary>"
+            in bot._build_fork_task_notification_xml(record)
+        )
+        assert bot._build_fork_task_terminal_html(
+            record=record,
+            parent_callback_link=None,
+        ) == "agent task went idle"
+
     async def test_assistant_messages_are_mapped_to_jsonl_uuid(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         events = [
@@ -1224,6 +1252,40 @@ class TestBackgroundPoller:
                 assert mock_run.await_count == blocked_count + 1
 
             await bot.shutdown()
+
+    async def test_schedule_polling_continues_while_inbox_poll_is_blocked(self, config):
+        bot = TelegramBot(
+            config,
+            fragment_gap=_TEST_GAP,
+            background_poll_seconds=0.01,
+            enable_background_poller=True,
+        )
+        inbox_poll_started = asyncio.Event()
+        release_inbox_poll = asyncio.Event()
+
+        async def blocked_inbox_poll():
+            inbox_poll_started.set()
+            await release_inbox_poll.wait()
+
+        inbox_poll = AsyncMock(side_effect=blocked_inbox_poll)
+        schedule_scan = AsyncMock()
+        with patch.object(bot, "_poll_team_worker_inbox_wakes", new=inbox_poll), patch.object(
+            bot,
+            "_run_due_interval_schedules",
+            new=schedule_scan,
+        ):
+            try:
+                await bot._ensure_background_poller(None)
+                await asyncio.wait_for(inbox_poll_started.wait(), timeout=0.2)
+                deadline = asyncio.get_running_loop().time() + 0.2
+                while schedule_scan.await_count < 2 and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.005)
+
+                assert inbox_poll.await_count == 1
+                assert schedule_scan.await_count >= 2
+            finally:
+                release_inbox_poll.set()
+                await bot.shutdown()
 
     async def test_inbox_poll_wakes_idle_team_worker_without_notifier(self, config, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
