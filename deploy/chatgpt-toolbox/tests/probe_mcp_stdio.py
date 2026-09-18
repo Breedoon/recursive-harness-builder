@@ -89,6 +89,7 @@ def main() -> int:
             "server_version": initialized.get("result", {}).get("serverInfo", {}).get("version"),
             "protocol_version": initialized.get("result", {}).get("protocolVersion"),
             "tool_count": len(tool_names),
+            "tool_names": tool_names,
             "required_tools_present": sorted(required & set(tool_names)),
             "all_required_tools_present": required.issubset(tool_names),
             "initialized_notification_sent": False,

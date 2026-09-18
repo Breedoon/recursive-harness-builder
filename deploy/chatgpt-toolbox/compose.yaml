@@ -15,7 +15,7 @@ services:
     restart: "no"
     init: true
     read_only: true
-    user: "10001:10001"
+    user: "10001:1000"
     privileged: false
     cap_drop:
       - ALL
@@ -29,17 +29,21 @@ services:
       XDG_CACHE_HOME: /session/xdg/cache
       XDG_DATA_HOME: /session/xdg/data
       NPM_CONFIG_CACHE: /tmp/npm-cache
-      TOOLBOX_WORKSPACE: /workspace
+      TOOLBOX_WORKSPACE: /workspace/runtime/git/obs-vault-active
+      TOOLBOX_ACTIVE_VAULT: /workspace/runtime/git/obs-vault-active
       TOOLBOX_SESSION: /session
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+      - /workspace/runtime/git/obs-vault-active/.git:rw,noexec,nosuid,nodev,size=1m,mode=0555
     volumes:
-      - type: volume
-        source: workspace
-        target: /workspace
       - type: volume
         source: session
         target: /session
+      - type: bind
+        source: /data/scratch/obs-test/runtime/git/obs-vault-active
+        target: /workspace/runtime/git/obs-vault-active
+        bind:
+          create_host_path: false
     networks:
       - egress
     cpus: "1.0"
@@ -70,7 +74,5 @@ networks:
       com.docker.network.bridge.enable_icc: "false"
 
 volumes:
-  workspace:
-    name: chatgpt-toolbox-workspace
   session:
     name: chatgpt-toolbox-session

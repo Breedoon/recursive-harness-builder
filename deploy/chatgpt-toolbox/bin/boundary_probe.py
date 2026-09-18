@@ -9,12 +9,19 @@ import subprocess
 import tempfile
 
 
-HOST_PATHS = [
-    "/workspace/runtime",
+ACTIVE_VAULT = "/workspace/runtime/git/obs-vault-active"
+ACTIVE_VAULT_GIT = f"{ACTIVE_VAULT}/.git"
+FORBIDDEN_HOST_PATHS = [
     "/workspace/obs",
     "/home/agent",
     "/home/breedoon",
     "/Users/breedoon",
+]
+ACTIVE_VAULT_FORBIDDEN_SIBLINGS = [
+    "/workspace/runtime/state",
+    "/workspace/runtime/logs",
+    "/workspace/runtime/cliproxy",
+    "/workspace/runtime/git/obs-artifacts",
 ]
 
 CREDENTIAL_PATHS = [
@@ -31,6 +38,10 @@ CREDENTIAL_PATHS = [
     "/workspace/.git",
     "/workspace/.git-credentials",
     "/session/home/.desktop-commander-device/device.json",
+    f"{ACTIVE_VAULT}/.git-credentials",
+    f"{ACTIVE_VAULT}/.ssh",
+    f"{ACTIVE_VAULT}/.config/gh",
+    f"{ACTIVE_VAULT}/.config/git/credentials",
 ]
 
 SENSITIVE_ENV_EXACT = {
@@ -55,7 +66,7 @@ def status_fields() -> dict[str, str]:
 
 
 def relevant_mounts() -> list[dict[str, str]]:
-    wanted = {"/", "/tmp", "/run", "/workspace", "/session"}
+    wanted = {"/", "/tmp", "/run", "/workspace", "/session", ACTIVE_VAULT, ACTIVE_VAULT_GIT}
     mounts = []
     for line in pathlib.Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines():
         before, separator, after = line.partition(" - ")
@@ -104,6 +115,26 @@ def git_helper_configured(scope: str) -> bool:
         timeout=10,
     )
     return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def git_repo_helper_configured(path: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", path, "config", "--get-all", "credential.helper"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def git_repository_visible(path: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", path, "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "true"
 
 
 def default_gateway() -> str | None:
@@ -161,7 +192,29 @@ def main() -> int:
         },
         "environment_names": env_names,
         "sensitive_environment_names": sensitive_env_names,
-        "host_path_state": {path: path_state(path) for path in HOST_PATHS},
+        "forbidden_host_path_state": {
+            path: path_state(path) for path in FORBIDDEN_HOST_PATHS
+        },
+        "active_vault": {
+            "path": ACTIVE_VAULT,
+            "state": path_state(ACTIVE_VAULT),
+            "real_path": os.path.realpath(ACTIVE_VAULT),
+            "forbidden_sibling_state": {
+                path: path_state(path) for path in ACTIVE_VAULT_FORBIDDEN_SIBLINGS
+            },
+            "git_mount_state": path_state(ACTIVE_VAULT_GIT),
+            "git_write": write_probe(f"{ACTIVE_VAULT_GIT}/toolbox-git-write-probe"),
+            "git_metadata_state": {
+                path: path_state(path)
+                for path in (
+                    f"{ACTIVE_VAULT_GIT}/HEAD",
+                    f"{ACTIVE_VAULT_GIT}/config",
+                    f"{ACTIVE_VAULT_GIT}/objects",
+                    f"{ACTIVE_VAULT_GIT}/refs",
+                )
+            },
+            "repository_visible": git_repository_visible(ACTIVE_VAULT),
+        },
         "credential_path_state": {path: path_state(path) for path in CREDENTIAL_PATHS},
         "tool_presence": {
             "docker": shutil.which("docker") is not None,
@@ -171,6 +224,7 @@ def main() -> int:
         "git_credentials": {
             "global_helper_configured": git_helper_configured("global"),
             "system_helper_configured": git_helper_configured("system"),
+            "active_vault_helper_configured": git_repo_helper_configured(ACTIVE_VAULT),
         },
         "docker_control_tcp": {
             "gateway_present": gateway is not None,
@@ -187,13 +241,21 @@ def main() -> int:
         not receipt["write_tests"]["root_filesystem_write"],
         receipt["write_tests"]["tmp_write"],
         not receipt["write_tests"]["run_write"],
-        receipt["write_tests"]["workspace_write"],
+        not receipt["write_tests"]["workspace_write"],
         receipt["write_tests"]["session_write"],
-        "present" not in receipt["host_path_state"].values(),
+        receipt["active_vault"]["state"] == "present",
+        receipt["active_vault"]["real_path"] == ACTIVE_VAULT,
+        receipt["active_vault"]["git_mount_state"] == "present",
+        not receipt["active_vault"]["git_write"],
+        "present" not in receipt["active_vault"]["git_metadata_state"].values(),
+        not receipt["active_vault"]["repository_visible"],
+        "present" not in receipt["forbidden_host_path_state"].values(),
+        "present" not in receipt["active_vault"]["forbidden_sibling_state"].values(),
         "present" not in receipt["credential_path_state"].values(),
         not any(receipt["tool_presence"].values()),
         not receipt["git_credentials"]["global_helper_configured"],
         not receipt["git_credentials"]["system_helper_configured"],
+        not receipt["git_credentials"]["active_vault_helper_configured"],
         not sensitive_env_names,
         not receipt["docker_control_tcp"]["port_2375_reachable"],
         not receipt["docker_control_tcp"]["port_2376_reachable"],

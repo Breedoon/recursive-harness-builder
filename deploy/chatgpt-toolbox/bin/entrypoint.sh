@@ -1,7 +1,17 @@
 #!/bin/sh
 set -eu
 
-umask 077
+umask 007
+
+: "${TOOLBOX_ACTIVE_VAULT:?TOOLBOX_ACTIVE_VAULT is required}"
+[ "$TOOLBOX_ACTIVE_VAULT" = "/workspace/runtime/git/obs-vault-active" ] || {
+  printf '%s\n' "unexpected active vault path" >&2
+  exit 64
+}
+[ -d "$TOOLBOX_ACTIVE_VAULT" ] || {
+  printf '%s\n' "active vault mount is unavailable" >&2
+  exit 64
+}
 
 mkdir -p \
   "$HOME" \

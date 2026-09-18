@@ -13,15 +13,19 @@ from typing import Any
 CONTAINER = "chatgpt-toolbox"
 IMAGE = "local/chatgpt-toolbox:0.1.0"
 EXPECTED_NETWORK = "chatgpt-toolbox-net"
-EXPECTED_VOLUMES = {
-    "/workspace": "chatgpt-toolbox-workspace",
-    "/session": "chatgpt-toolbox-session",
+ACTIVE_VAULT_HOST_PATH = "/data/scratch/obs-test/runtime/git/obs-vault-active"
+ACTIVE_VAULT_CONTAINER_PATH = "/workspace/runtime/git/obs-vault-active"
+ACTIVE_VAULT_GIT_PATH = f"{ACTIVE_VAULT_CONTAINER_PATH}/.git"
+EXPECTED_MOUNTS = {
+    "/session": ("volume", "chatgpt-toolbox-session", True),
+    ACTIVE_VAULT_CONTAINER_PATH: ("bind", ACTIVE_VAULT_HOST_PATH, True),
 }
 EXPECTED_ENV_NAMES = {
     "DESKTOP_COMMANDER_DISABLE_TELEMETRY",
     "HOME",
     "MCP_SERVER_URL",
     "NPM_CONFIG_CACHE",
+    "TOOLBOX_ACTIVE_VAULT",
     "TOOLBOX_SESSION",
     "TOOLBOX_WORKSPACE",
     "XDG_CACHE_HOME",
@@ -30,6 +34,7 @@ EXPECTED_ENV_NAMES = {
 }
 SOURCE_FILES = [
     ".dockerignore",
+    "DEPENDENCY-ADVISORY.md",
     "Dockerfile",
     "compose.yaml",
     "package.json",
@@ -39,6 +44,7 @@ SOURCE_FILES = [
     "bin/self_test.py",
     "bin/boundary_probe.py",
     "tests/probe_mcp_stdio.py",
+    "tests/prove_active_vault.py",
     "tests/prove_runtime.py",
     "tests/verify_golden.py",
 ]
@@ -88,6 +94,23 @@ def parse_json_command(args: list[str], *, timeout: int = 120) -> Any:
     return json.loads(result.stdout)
 
 
+def active_vault_proof(source_dir: pathlib.Path, output: pathlib.Path) -> dict[str, Any]:
+    result = run(
+        [
+            sys.executable,
+            str(source_dir / "tests/prove_active_vault.py"),
+            "--host-active-vault",
+            ACTIVE_VAULT_HOST_PATH,
+            "--output",
+            str(output),
+            "--container",
+            CONTAINER,
+        ],
+        timeout=120,
+    )
+    return json.loads(output.read_text(encoding="utf-8"))
+
+
 def existing_container() -> bool:
     result = run(
         ["docker", "container", "inspect", CONTAINER],
@@ -108,10 +131,18 @@ def validate_source(source_dir: pathlib.Path, config: dict[str, Any]) -> list[st
         errors.append("base image is not pinned to the resolved amd64 digest")
     if "@wonderwhy-er/desktop-commander" not in (source_dir / "package-lock.json").read_text(encoding="utf-8"):
         errors.append("Desktop Commander is absent from package lock")
+    advisory = (source_dir / "DEPENDENCY-ADVISORY.md").read_text(encoding="utf-8")
+    if (
+        "## Materiality" not in advisory
+        or "## Candidate-specific disposition" not in advisory
+        or "0.2.23" not in advisory
+        or "write_file" not in advisory
+    ):
+        errors.append("dependency advisory disposition is incomplete")
 
     service = config.get("services", {}).get("toolbox", {})
-    if service.get("user") != "10001:10001":
-        errors.append("Compose service user is not 10001:10001")
+    if service.get("user") != "10001:1000":
+        errors.append("Compose service user is not 10001:1000")
     if service.get("read_only") is not True:
         errors.append("read_only is not true")
     if service.get("privileged") is True:
@@ -138,6 +169,10 @@ def validate_source(source_dir: pathlib.Path, config: dict[str, Any]) -> list[st
         errors.append(f"unexpected Compose environment names: {sorted(set(environment) ^ EXPECTED_ENV_NAMES)}")
     if environment.get("MCP_SERVER_URL") != "https://mcp.desktopcommander.app":
         errors.append("Desktop Commander device server base is not the evidenced endpoint")
+    if environment.get("TOOLBOX_ACTIVE_VAULT") != ACTIVE_VAULT_CONTAINER_PATH:
+        errors.append("active vault container path is not exact")
+    if environment.get("TOOLBOX_WORKSPACE") != ACTIVE_VAULT_CONTAINER_PATH:
+        errors.append("toolbox workspace is not the active vault")
     labels = service.get("labels", {})
     if labels.get("io.obs.chatgpt-toolbox.connector.endpoint") != "https://mcp.desktopcommander.app/mcp":
         errors.append("ChatGPT connector endpoint label is not the evidenced endpoint")
@@ -146,15 +181,23 @@ def validate_source(source_dir: pathlib.Path, config: dict[str, Any]) -> list[st
 
     mounts = service.get("volumes", [])
     parsed_mounts = {
-        mount.get("target"): (mount.get("type"), mount.get("source"))
+        mount.get("target"): (
+            mount.get("type"),
+            mount.get("source"),
+            not mount.get("read_only", False),
+        )
         for mount in mounts
     }
     expected_mounts = {
-        "/workspace": ("volume", "workspace"),
-        "/session": ("volume", "session"),
+        "/session": ("volume", "session", True),
+        ACTIVE_VAULT_CONTAINER_PATH: ("bind", ACTIVE_VAULT_HOST_PATH, True),
     }
     if parsed_mounts != expected_mounts:
         errors.append(f"unexpected Compose mounts: {parsed_mounts}")
+    tmpfs = service.get("tmpfs", [])
+    git_tmpfs = [item for item in tmpfs if item.startswith(f"{ACTIVE_VAULT_GIT_PATH}:")]
+    if len(git_tmpfs) != 1 or "mode=0555" not in git_tmpfs[0]:
+        errors.append("active-vault .git is not hidden by a non-writable tmpfs")
 
     if set(service.get("networks", {})) != {"egress"}:
         errors.append("service network is not exactly the dedicated egress bridge")
@@ -184,6 +227,7 @@ def summarize_runtime(container: dict[str, Any], image: dict[str, Any]) -> dict[
         {
             "type": mount["Type"],
             "name": mount.get("Name"),
+            "source": mount.get("Source"),
             "destination": mount["Destination"],
             "rw": mount["RW"],
         }
@@ -206,6 +250,7 @@ def summarize_runtime(container: dict[str, Any], image: dict[str, Any]) -> dict[
         "port_bindings": host.get("PortBindings") or {},
         "mounts": sorted(mounts, key=lambda item: item["destination"]),
         "hostconfig_bind_entries": host.get("Binds") or [],
+        "tmpfs": host.get("Tmpfs") or {},
         "bind_mounts": [item for item in mounts if item["type"] == "bind"],
         "devices": host.get("Devices") or [],
         "device_requests": host.get("DeviceRequests") or [],
@@ -229,11 +274,20 @@ def summarize_runtime(container: dict[str, Any], image: dict[str, Any]) -> dict[
     }
 
 
-def validate_runtime(summary: dict[str, Any], boundary: dict[str, Any], self_test: dict[str, Any]) -> list[str]:
+def validate_runtime(
+    summary: dict[str, Any],
+    boundary: dict[str, Any],
+    self_test: dict[str, Any],
+    active_vault_proof: dict[str, Any],
+) -> list[str]:
     errors: list[str] = []
     checks = {
         "container running": summary["running"] is True,
-        "non-root user": summary["user"] == "10001:10001" and self_test["uid"] == 10001,
+        "non-root shared-vault identity": (
+            summary["user"] == "10001:1000"
+            and self_test["uid"] == 10001
+            and self_test["gid"] == 1000
+        ),
         "read-only root": summary["readonly_rootfs"] is True,
         "not privileged": summary["privileged"] is False,
         "cap_drop ALL": set(summary["cap_drop"]) == {"ALL"},
@@ -241,7 +295,19 @@ def validate_runtime(summary: dict[str, Any], boundary: dict[str, Any], self_tes
         "dedicated network": summary["attached_networks"] == [EXPECTED_NETWORK],
         "not host network": summary["network_mode"] != "host",
         "no published ports": not summary["published_ports"] and not summary["port_bindings"],
-        "no bind mounts": not summary["bind_mounts"],
+        "only active-vault bind mount": summary["bind_mounts"] == [
+            {
+                "type": "bind",
+                "name": None,
+                "source": ACTIVE_VAULT_HOST_PATH,
+                "destination": ACTIVE_VAULT_CONTAINER_PATH,
+                "rw": True,
+            }
+        ],
+        "active-vault git tmpfs": (
+            ACTIVE_VAULT_GIT_PATH in summary["tmpfs"]
+            and "mode=0555" in summary["tmpfs"][ACTIVE_VAULT_GIT_PATH]
+        ),
         "no devices": not summary["devices"] and not summary["device_requests"],
         "no extra hosts": not summary["extra_hosts"],
         "memory bounded": summary["memory_bytes"] == 1073741824,
@@ -250,16 +316,23 @@ def validate_runtime(summary: dict[str, Any], boundary: dict[str, Any], self_tes
         "pids bounded": summary["pids_limit"] == 128,
         "nofile bounded": summary["ulimits"].get("nofile") == {"soft": 1024, "hard": 2048},
         "nproc bounded": summary["ulimits"].get("nproc") == {"soft": 128, "hard": 128},
-        "named volume mounts only": {
-            item["destination"]: (item["type"], item["name"], item["rw"])
+        "exact workspace/session/active-vault mounts": {
+            item["destination"]: (
+                item["type"],
+                item["source"] if item["type"] == "bind" else item["name"],
+                item["rw"],
+            )
             for item in summary["mounts"]
         }
-        == {
-            destination: ("volume", name, True)
-            for destination, name in EXPECTED_VOLUMES.items()
-        },
+        == EXPECTED_MOUNTS,
         "boundary probe": boundary.get("passed") is True,
         "workspace positive": self_test.get("workspace_round_trip") is True,
+        "active vault positive": (
+            self_test.get("active_vault", {}).get("path") == ACTIVE_VAULT_CONTAINER_PATH
+            and self_test.get("active_vault", {}).get("round_trip") is True
+            and self_test.get("active_vault", {}).get("cleanup") is True
+        ),
+        "active vault host/container proof": active_vault_proof.get("passed") is True,
         "runtime HTTPS": self_test.get("runtime_https", {}).get("status") == 200,
         "Desktop Commander version": self_test.get("tools", {}).get("desktop_commander") == "0.2.50",
     }
@@ -429,16 +502,64 @@ def main() -> int:
             timeout=120,
         ).stdout
     )
+    active_vault_proof_output = args.output.with_name("active-vault-proof.json")
+    active_vault = active_vault_proof(source_dir, active_vault_proof_output)
     container, image = inspect_runtime()
     runtime_summary = summarize_runtime(container, image)
     image_credentials = image_credential_scan()
-    runtime_errors = validate_runtime(runtime_summary, boundary, self_test)
+    runtime_errors = validate_runtime(runtime_summary, boundary, self_test, active_vault)
     if any(image_credentials.values()):
         runtime_errors.append("credential/control paths are present in the immutable image")
     if not mcp_stdio.get("all_required_tools_present"):
         runtime_errors.append("Desktop Commander MCP stdio proof lacks required tools")
     if "--no-persist-session" not in remote_help:
         runtime_errors.append("pinned package remote help lacks --no-persist-session")
+
+    compose(source_dir, "restart", "toolbox", timeout=180)
+    remote_clean = run(
+        ["docker", "exec", CONTAINER, "/usr/local/bin/toolbox-entrypoint", "remote-clean"],
+        timeout=30,
+    )
+    recovery_nonce = f"recovery-{secrets.token_hex(12)}"
+    recovery_self_test = json.loads(
+        run(
+            [
+                "docker",
+                "exec",
+                CONTAINER,
+                "/usr/local/bin/toolbox-entrypoint",
+                "self-test",
+                "--nonce",
+                recovery_nonce,
+                "--network",
+            ],
+            timeout=120,
+        ).stdout
+    )
+    recovery_boundary = json.loads(
+        run(
+            [
+                "docker",
+                "exec",
+                CONTAINER,
+                "/usr/local/bin/toolbox-entrypoint",
+                "boundary-probe",
+            ],
+            timeout=120,
+        ).stdout
+    )
+    recovery_active_vault_output = args.output.with_name("active-vault-recovery-proof.json")
+    recovery_active_vault = active_vault_proof(source_dir, recovery_active_vault_output)
+    recovery_container, recovery_image = inspect_runtime()
+    recovery_summary = summarize_runtime(recovery_container, recovery_image)
+    recovery_errors = validate_runtime(
+        recovery_summary,
+        recovery_boundary,
+        recovery_self_test,
+        recovery_active_vault,
+    )
+    if recovery_errors:
+        runtime_errors.extend(f"recovery: {error}" for error in recovery_errors)
 
     receipt = {
         "schema": "chatgpt-toolbox-runtime-proof-v1",
@@ -460,6 +581,7 @@ def main() -> int:
         },
         "container_existed_before": existed,
         "self_test": self_test,
+        "active_vault_proof": active_vault,
         "boundary_probe": boundary,
         "immutable_image_credential_path_presence": image_credentials,
         "runtime_inspection": runtime_summary,
@@ -485,6 +607,16 @@ def main() -> int:
             "passed": not runtime_errors,
             "errors": runtime_errors,
         },
+        "recovery": {
+            "compose_restart": "passed",
+            "remote_clean_exit_code": remote_clean.returncode,
+            "self_test": recovery_self_test,
+            "active_vault_proof": recovery_active_vault,
+            "boundary_probe": recovery_boundary,
+            "runtime_inspection": recovery_summary,
+            "passed": not recovery_errors,
+            "errors": recovery_errors,
+        },
         "passed": not source_errors and not runtime_errors,
     }
 
@@ -496,6 +628,7 @@ def main() -> int:
             "observed_at": receipt["observed_at"],
             "canonical_source_dir": receipt["source_dir"],
             "runtime_proof_path": str(args.output),
+            "active_vault_proof": receipt["active_vault_proof"],
             "boundary_probe": receipt["boundary_probe"],
             "immutable_image_credential_path_presence": receipt[
                 "immutable_image_credential_path_presence"

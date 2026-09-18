@@ -15,7 +15,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     XDG_CACHE_HOME=/session/xdg/cache \
     XDG_DATA_HOME=/session/xdg/data \
     NPM_CONFIG_CACHE=/tmp/npm-cache \
-    TOOLBOX_WORKSPACE=/workspace \
+    TOOLBOX_WORKSPACE=/workspace/runtime/git/obs-vault-active \
+    TOOLBOX_ACTIVE_VAULT=/workspace/runtime/git/obs-vault-active \
     TOOLBOX_SESSION=/session
 
 RUN apt-get update \
@@ -45,7 +46,7 @@ RUN groupadd --gid 10001 toolbox \
         /session/xdg/config \
         /session/xdg/cache \
         /session/xdg/data \
-        /workspace \
+        /workspace/runtime/git/obs-vault-active \
     && chown -R 10001:10001 /session /workspace \
     && chmod 0700 /session/home /session/xdg/config /session/xdg/cache /session/xdg/data \
     && chmod 0750 /workspace
@@ -54,8 +55,8 @@ COPY --chmod=0755 bin/entrypoint.sh /usr/local/bin/toolbox-entrypoint
 COPY --chmod=0755 bin/self_test.py /opt/toolbox/bin/self-test
 COPY --chmod=0755 bin/boundary_probe.py /opt/toolbox/bin/boundary-probe
 
-VOLUME ["/workspace", "/session"]
+VOLUME ["/session"]
 USER 10001:10001
-WORKDIR /workspace
+WORKDIR /workspace/runtime/git/obs-vault-active
 ENTRYPOINT ["/usr/local/bin/toolbox-entrypoint"]
 CMD ["idle"]
