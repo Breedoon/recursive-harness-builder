@@ -284,7 +284,11 @@ class TestCreateOptions:
             options = mgr.create_options()
 
         assert options.model == "local-custom"
-        assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        # Local sessions route through the cache proxy like everything else;
+        # the proxy forwards local-* on to OBS_LOCAL_LLM_BASE_URL.
+        assert options.env["ANTHROPIC_BASE_URL"] == (
+            f"http://127.0.0.1:{config.cache_proxy_port}"
+        )
         assert "ANTHROPIC_AUTH_TOKEN" not in options.env
         assert "ANTHROPIC_API_KEY" not in options.env
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "96000"
@@ -304,12 +308,47 @@ class TestCreateOptions:
             options = mgr.create_options()
 
         assert options.model == "local-gemma4-31b"
-        assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        assert options.env["ANTHROPIC_BASE_URL"] == (
+            f"http://127.0.0.1:{config.cache_proxy_port}"
+        )
+        # The gate credential still travels with the session; the proxy forwards
+        # it to the local upstream untouched.
         assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-profile-token"
         assert "ANTHROPIC_API_KEY" not in options.env
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "48000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "48000"
         assert mgr.hook_state.effective_model == "local-gemma4-31b[48k]"
+
+    def test_local_provider_falls_back_to_gate_when_proxy_unavailable(
+        self,
+        config,
+        monkeypatch,
+    ):
+        """With the proxy down, local sessions must still reach the gate."""
+        config.cache_proxy_enabled = True
+        monkeypatch.setenv("OBS_LOCAL_LLM_BASE_URL", "http://local-llm:8080")
+        monkeypatch.setenv("OBS_LOCAL_LLM_AUTH_TOKEN", "local-profile-token")
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-gemma4-31b"
+
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=False):
+            options = mgr.create_options()
+
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-profile-token"
+
+    def test_hosted_session_still_routes_through_proxy(self, config, monkeypatch):
+        """Regression guard: the hosted path is untouched by the local fix."""
+        config.cache_proxy_enabled = True
+        mgr = SessionManager(config=config)
+        mgr.model_override = "claude-opus-4-6"
+
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
+            options = mgr.create_options()
+
+        assert options.env["ANTHROPIC_BASE_URL"] == (
+            f"http://127.0.0.1:{config.cache_proxy_port}"
+        )
 
     def test_child_local_provider_env_overrides_process_profile(self, config, monkeypatch):
         monkeypatch.setenv("OBS_LOCAL_LLM_BASE_URL", "http://profile-llm:8080")

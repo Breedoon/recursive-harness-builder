@@ -44,6 +44,13 @@ except Exception:  # pragma: no cover - keep proxy usable as a standalone script
 ANTHROPIC_UPSTREAM = "https://api.anthropic.com"
 CLI_PROXY_UPSTREAM = os.environ.get("CLI_PROXY_BASE_URL", "http://127.0.0.1:8317")
 CLI_PROXY_API_KEY = os.environ.get("CLI_PROXY_API_KEY", "sk-anything")
+# Local Anthropic-compatible provider (the authenticated local LLM gate).
+# Inherited from the daemon's environment — the proxy is spawned by
+# cache_proxy_lifecycle.start_cache_proxy() without an explicit env, and the
+# prod wrapper exports OBS_LOCAL_LLM_BASE_URL before launching the daemon.
+# Empty means "no local upstream configured"; local-* requests then fail
+# explicitly rather than falling back to a hosted upstream.
+LOCAL_UPSTREAM = os.environ.get("OBS_LOCAL_LLM_BASE_URL", "").strip().rstrip("/")
 DEFAULT_PORT = 18923
 _CODEBASE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.environ.get(
@@ -85,7 +92,8 @@ stats = {
     "reminders_stripped": 0, "git_status_normalized": 0,
     "tools_sorted": 0, "metadata_normalized": 0,
     "errors": 0,
-    "routed_anthropic": 0, "routed_cli_proxy": 0,
+    "routed_anthropic": 0, "routed_cli_proxy": 0, "routed_local": 0,
+    "local_unconfigured": 0,
     "schemas_sanitized": 0,
 }
 
@@ -108,13 +116,40 @@ def _normalize_model_name(model: str) -> str:
     return _strip_context_suffix(_resolve_obs_model(normalized))
 
 
+# Matches a JSON "model": "local-…" pair in a raw request body, tolerating
+# arbitrary whitespace. Only used on the body-did-not-parse path.
+_RAW_LOCAL_MODEL_RE = re.compile(rb'"model"\s*:\s*"local-', re.IGNORECASE)
+
+
+def _route_label(upstream: str, is_local: bool) -> str:
+    """Short label for logs and the usage JSONL."""
+    if is_local:
+        return "local"
+    if upstream == ANTHROPIC_UPSTREAM:
+        return "anthropic"
+    return "cli-proxy"
+
+
+def _is_local_model(model: str) -> bool:
+    """True if *model* names a local Anthropic-compatible provider."""
+    return _normalize_model_name(model).lower().startswith("local-")
+
+
 def _resolve_upstream(model: str) -> str:
     """Determine upstream URL based on model name.
 
-    Claude models → Anthropic API (direct, no CLIProxyAPI dependency).
+    local-* models → the local LLM gate (OBS_LOCAL_LLM_BASE_URL).
+    Claude models  → Anthropic API (direct, no CLIProxyAPI dependency).
     Everything else → CLIProxyAPI (local proxy for GPT, Gemini, etc.).
+
+    Returns "" for a local-* model when no local upstream is configured.
+    Callers must treat that as a hard error: local traffic must never fall
+    back to a hosted upstream (wrong provider, and it would ship the gate
+    credential to a third party).
     """
     clean = _normalize_model_name(model)
+    if clean.lower().startswith("local-"):
+        return LOCAL_UPSTREAM
     if clean.startswith("claude"):
         return ANTHROPIC_UPSTREAM
     return CLI_PROXY_UPSTREAM
@@ -428,11 +463,17 @@ def log(msg: str):
     sys.stderr.flush()
 
 
-def log_usage_entry(norm_action: str, usage: dict):
-    """Append a usage entry to the structured JSONL log."""
+def log_usage_entry(norm_action: str, usage: dict, model: str = "", route: str = ""):
+    """Append a usage entry to the structured JSONL log.
+
+    ``model`` and ``route`` let a reader tell local turns apart from hosted
+    ones. Both are additive keys; existing readers do keyed lookups.
+    """
     entry = {
         "ts": time.time(),
         "norm_action": norm_action,
+        "model": model,
+        "route": route,
         "cache_read": usage.get("cache_read_input_tokens", 0),
         "cache_creation": usage.get("cache_creation_input_tokens", 0),
         "input_tokens": usage.get("input_tokens", 0),
@@ -450,7 +491,9 @@ def log_usage_entry(norm_action: str, usage: dict):
     ip = entry["input_tokens"]
     tot = entry["total"]
     rate = entry["cache_rate"]
-    log(f"USAGE: tot={tot:,} cr={cr:,} cc={cc:,} ip={ip} ({rate:.0%} cached) [{norm_action}]")
+    suffix = f" route={route}" if route else ""
+    log(f"USAGE: tot={tot:,} cr={cr:,} cc={cc:,} ip={ip} ({rate:.0%} cached) "
+        f"[{norm_action}]{suffix}")
 
 
 def parse_sse_usage(sse_chunks: list[bytes]) -> dict:
@@ -525,14 +568,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
         is_streaming = False
         norm_action = "error"
         upstream = ANTHROPIC_UPSTREAM  # default; overridden after model extraction
+        log_model = ""
+        route_label = "anthropic"
         try:
             data = json.loads(raw_body)
             is_streaming = data.get("stream", False)
 
             # Determine upstream based on model
             raw_model = data.get("model") or ""
+            is_local = _is_local_model(raw_model)
             upstream = _resolve_upstream(raw_model)
-            if upstream == ANTHROPIC_UPSTREAM:
+            if is_local and not upstream:
+                # Fail local: never fall back to a hosted upstream.
+                stats["local_unconfigured"] += 1
+                stats["errors"] += 1
+                log(f"REQ#{stats['requests']}: model={raw_model} has no local "
+                    f"upstream (OBS_LOCAL_LLM_BASE_URL unset) — refusing")
+                self.send_error(
+                    502,
+                    "no local upstream configured for local-* model "
+                    "(OBS_LOCAL_LLM_BASE_URL is unset)",
+                )
+                return
+            if is_local:
+                stats["routed_local"] += 1
+            elif upstream == ANTHROPIC_UPSTREAM:
                 stats["routed_anthropic"] += 1
             else:
                 stats["routed_cli_proxy"] += 1
@@ -553,8 +613,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Apply all normalizations
             data, info = normalize_request(data)
 
-            # Sanitize tool schemas for non-Claude models (OpenAI compat)
-            if upstream != ANTHROPIC_UPSTREAM:
+            # Sanitize tool schemas for CLIProxyAPI-routed models (OpenAI compat).
+            # Deliberately NOT applied to local-* upstreams: those spoke the
+            # Anthropic API directly before this proxy sat in front of them, and
+            # sanitizing is an untested change that does not belong in a routing fix.
+            if upstream == CLI_PROXY_UPSTREAM:
                 info["schema_sanitized"] = sanitize_tool_schemas_for_openai(data)
 
             body = json.dumps(data, separators=(",", ":")).encode()
@@ -566,7 +629,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     json.dump(data, f, indent=2)
 
             norm_action = info["action"]
-            route_label = "anthropic" if upstream == ANTHROPIC_UPSTREAM else "cli-proxy"
+            route_label = _route_label(upstream, is_local)
+            log_model = clean_model
             log(f"REQ#{stats['requests']}: {norm_action} model={clean_model} route={route_label} "
                 f"(billing={info.get('billing', 0)} strings={info.get('strings', 0)} "
                 f"skill={info.get('skill', {}).get('action', '?')} "
@@ -581,6 +645,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
             body = raw_body
             stats["errors"] += 1
             is_streaming = b'"stream":true' in raw_body or b'"stream": true' in raw_body
+            # The body did not parse, so the model is unknown. Hosted traffic keeps
+            # its historical pass-through-to-Anthropic behaviour. But a local body
+            # carries the gate credential, so sniff the raw bytes rather than
+            # forwarding that credential to a third party.
+            if _RAW_LOCAL_MODEL_RE.search(raw_body):
+                if not LOCAL_UPSTREAM:
+                    stats["local_unconfigured"] += 1
+                    log("unparseable local-* body and no local upstream — refusing")
+                    self.send_error(
+                        502,
+                        "no local upstream configured for local-* model "
+                        "(OBS_LOCAL_LLM_BASE_URL is unset)",
+                    )
+                    return
+                upstream = LOCAL_UPSTREAM
+                route_label = "local"
 
         headers = self._upstream_headers(upstream)
         headers["content-length"] = str(len(body))
@@ -590,7 +670,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             with httpx.Client(timeout=timeout) as client:
                 if is_streaming:
-                    self._stream_upstream(client, url, body, headers, norm_action)
+                    self._stream_upstream(client, url, body, headers, norm_action,
+                                          model=log_model, route=route_label)
                 else:
                     resp = client.post(url, content=body, headers=headers)
                     self.send_response(resp.status_code)
@@ -605,7 +686,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         resp_data = resp.json()
                         usage = resp_data.get("usage", {})
                         if usage:
-                            log_usage_entry(norm_action, usage)
+                            log_usage_entry(norm_action, usage,
+                                            model=log_model, route=route_label)
                         else:
                             log(f"NON-STREAM: no usage in response (status={resp.status_code})")
                     except Exception as e:
@@ -618,7 +700,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 pass
 
     def _stream_upstream(self, client: httpx.Client, url: str,
-                         body: bytes, headers: dict, norm_action: str):
+                         body: bytes, headers: dict, norm_action: str,
+                         model: str = "", route: str = ""):
         with client.stream("POST", url, content=body, headers=headers) as resp:
             self.send_response(resp.status_code)
             for k, v in resp.headers.multi_items():
@@ -635,7 +718,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             usage = parse_sse_usage(chunks)
             if usage:
-                log_usage_entry(norm_action, usage)
+                log_usage_entry(norm_action, usage, model=model, route=route)
             else:
                 # Log chunk sizes for debugging
                 chunk_info = [len(c) for c in chunks]
@@ -681,6 +764,7 @@ def main():
     log(f"listening on :{port}")
     log(f"upstream (claude): {ANTHROPIC_UPSTREAM}")
     log(f"upstream (other):  {CLI_PROXY_UPSTREAM}")
+    log(f"upstream (local):  {LOCAL_UPSTREAM or '<unconfigured>'}")
     log(f"logs: {LOG_DIR}")
     log(f"save_bodies: {SAVE_BODIES}")
     log(f"normalizations: billing, string→list, strip all system reminders, "

@@ -332,10 +332,23 @@ class SessionManager:
         }
 
         if is_local_provider:
+            from obs_agent.cache_proxy_lifecycle import should_use_proxy
+
             local_base_url = os.environ.get("OBS_LOCAL_LLM_BASE_URL", "").strip()
             local_auth_token = os.environ.get("OBS_LOCAL_LLM_AUTH_TOKEN", "").strip()
             local_api_key = os.environ.get("OBS_LOCAL_LLM_API_KEY", "").strip()
-            if local_base_url and "ANTHROPIC_BASE_URL" not in effective_env:
+            # Local traffic goes through the cache proxy like everything else;
+            # the proxy routes local-* on to this same gate. Pointing the session
+            # straight at the gate here would pre-empt the proxy branch below and
+            # cost local sessions every cache normalization. Keep the direct path
+            # as the fallback for when the proxy is disabled or unhealthy.
+            if (
+                local_base_url
+                and "ANTHROPIC_BASE_URL" not in effective_env
+                and not should_use_proxy(
+                    cache_proxy_enabled=self.config.cache_proxy_enabled
+                )
+            ):
                 effective_env["ANTHROPIC_BASE_URL"] = local_base_url
             if not any(key in effective_env for key in _ANTHROPIC_AUTH_ENV_KEYS):
                 if local_auth_token:
@@ -414,9 +427,11 @@ class SessionManager:
         ):
             effective_env["ANTHROPIC_API_KEY"] = self.config.cli_proxy_api_key
 
-        # Route CC API traffic through the cache-normalizing proxy by default.
-        # Explicit per-session and local-provider profile URLs take precedence
-        # so one child can select its provider without changing the parent.
+        # Route ALL CC API traffic through the cache-normalizing proxy by
+        # default, including local-* models; the proxy then forwards each
+        # request to the upstream its model selects. An explicit per-session
+        # ANTHROPIC_BASE_URL still takes precedence, so one child can select
+        # its provider without changing the parent.
         from obs_agent.cache_proxy_lifecycle import should_use_proxy
         if (
             should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled)
