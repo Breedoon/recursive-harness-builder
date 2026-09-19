@@ -320,7 +320,7 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "gpt-5.6-sol"
+    model: str = "gpt-5.6-luna"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
     # Resolved via MODEL_RESOLUTION (e.g. "sol" → "gpt-5.6-sol");
     # full model names pass through unchanged.
@@ -405,7 +405,7 @@ class OBSConfig:
         if model := os.environ.get("OBS_AGENT_MODEL") or os.environ.get("OBS_MODEL"):
             kwargs["model"] = resolve_model(model.strip())
         else:
-            dm = kwargs.get("default_model", "sol")
+            dm = kwargs.get("default_model", "luna")
             kwargs["model"] = resolve_model(dm)
         from obs_agent.effort import normalize_effort
 
