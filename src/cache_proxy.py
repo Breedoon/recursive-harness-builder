@@ -11,7 +11,8 @@ placement is left untouched — cache_control is not part of the cache key
 Normalizations (applied in order):
 1. Billing header: replaced with fixed value
 2. String→list: bare-string user content converted to list format
-3. Claude Code system-reminders: stripped from all user messages
+3. Claude Code system-reminders: every reminder span stripped from all user
+   messages, including spans nested inside tool_result content
 4. Git status: normalized in system prompt to fixed placeholder
 5. Tool sorting: tools[] sorted alphabetically by name
 6. Metadata: session-specific IDs normalized
@@ -51,7 +52,16 @@ CLI_PROXY_API_KEY = os.environ.get("CLI_PROXY_API_KEY", "sk-anything")
 # Empty means "no local upstream configured"; local-* requests then fail
 # explicitly rather than falling back to a hosted upstream.
 LOCAL_UPSTREAM = os.environ.get("OBS_LOCAL_LLM_BASE_URL", "").strip().rstrip("/")
+# Credential the local gate expects. Used ONLY to recognise a local request on
+# endpoints that carry no model name (see _forward_simple). Never logged.
+LOCAL_AUTH_TOKEN = os.environ.get("OBS_LOCAL_LLM_AUTH_TOKEN", "").strip()
 DEFAULT_PORT = 18923
+# The port the production instance listens on; a different port means this is a
+# test/private instance (used only for a startup hygiene warning).
+try:
+    PROD_PORT = int(os.environ.get("OBS_PROD_CACHE_PROXY_PORT") or 28925)
+except ValueError:
+    PROD_PORT = 28925
 _CODEBASE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.environ.get(
     "CACHE_PROXY_LOG_DIR",
@@ -89,7 +99,8 @@ stats = {
     "requests": 0,
     "skill_stripped": 0, "skill_missing": 0,
     "billing_normalized": 0, "strings_converted": 0,
-    "reminders_stripped": 0, "git_status_normalized": 0,
+    "reminders_stripped": 0, "messages_placeholdered": 0,
+    "git_status_normalized": 0,
     "tools_sorted": 0, "metadata_normalized": 0,
     "errors": 0,
     "routed_anthropic": 0, "routed_cli_proxy": 0, "routed_local": 0,
@@ -242,36 +253,135 @@ def _is_strippable_system_reminder(block: dict) -> bool:
     return "<system-reminder>" in text
 
 
+# A single reminder span: the opening tag through its closing tag (DOTALL), or —
+# when the opening tag is never closed — through the end of that block's text.
+# Whitespace on both sides of the span is consumed: Claude Code splices reminders
+# into existing text with a "\n\n" separator in the live path and leaves a
+# trailing newline after the closing tag in the replayed (JSONL) path, so the two
+# forms only converge if the adjoining whitespace goes with the span.
+_REMINDER_SPAN_RE = re.compile(
+    r"\s*<system-reminder>(?:.*?</system-reminder>\s*|.*\Z)",
+    re.DOTALL,
+)
+
+# Kept for a user message (or a tool_result) that would otherwise be left with no
+# content at all. Fixed literal, non-empty and non-whitespace: a message is never
+# dropped, so `messages` can never become empty and a conversation can never end
+# on an assistant turn because of this rule.
+REMINDER_PLACEHOLDER = "[reminder stripped]"
+
+
+def strip_reminder_spans(text: str) -> tuple[str, int]:
+    """Remove every reminder span from *text*.
+
+    Returns ``(new_text, spans_removed)``. Pure function of the input, so replays
+    of the same conversation produce byte-identical output.
+
+    When at least one span is removed the result is additionally ``strip()``ed:
+    Claude Code trims the surrounding string when it splices a reminder into a
+    tool result in the live path but not when the same content is replayed from
+    the JSONL, so the two forms differ by leading/trailing whitespace exactly on
+    the blocks that carried a reminder. Text with no span is returned unchanged.
+    """
+    if not isinstance(text, str) or "<system-reminder>" not in text:
+        return text, 0
+    new_text, removed = _REMINDER_SPAN_RE.subn("", text)
+    if removed:
+        new_text = new_text.strip()
+    return new_text, removed
+
+
+def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
+    """Strip reminder spans inside one content block, recursively.
+
+    Handles top-level ``text`` blocks, ``tool_result`` blocks whose ``content``
+    is a string, and ``tool_result`` blocks whose ``content`` is a list of
+    blocks. Every other block type (image, tool_use, …) is left untouched.
+
+    Returns ``(spans_removed, block_is_now_empty)``.
+    """
+    if not isinstance(block, dict):
+        return 0, False
+
+    btype = block.get("type")
+
+    if btype == "text":
+        new_text, removed = strip_reminder_spans(block.get("text", ""))
+        if removed:
+            block["text"] = new_text
+            return removed, not new_text.strip()
+        return 0, False
+
+    if btype == "tool_result":
+        content = block.get("content")
+        if isinstance(content, str):
+            new_text, removed = strip_reminder_spans(content)
+            if removed:
+                block["content"] = new_text or REMINDER_PLACEHOLDER
+            return removed, False
+        if isinstance(content, list):
+            removed = 0
+            kept: list = []
+            for sub in content:
+                if isinstance(sub, dict) and sub.get("type") == "text":
+                    new_text, sub_removed = strip_reminder_spans(sub.get("text", ""))
+                    removed += sub_removed
+                    if sub_removed:
+                        sub["text"] = new_text
+                        if not new_text.strip():
+                            continue
+                kept.append(sub)
+            if removed:
+                block["content"] = kept or [
+                    {"type": "text", "text": REMINDER_PLACEHOLDER}
+                ]
+            return removed, False
+        return 0, False
+
+    return 0, False
+
+
 def strip_all_system_reminders(body: dict) -> int:
-    """Rule 3: Strip every Claude Code <system-reminder> from user messages."""
+    """Rule 3: Strip every Claude Code <system-reminder> span from user messages.
+
+    Span-level and recursive: a block that holds a reminder *and* real content
+    keeps the real content, and reminders nested inside ``tool_result`` content
+    are stripped too (they are the dominant remaining cache-divergence class).
+
+    A block left with nothing but whitespace is dropped; a user message left with
+    no blocks keeps a single placeholder block. User messages are never removed,
+    so message indices stay aligned between a live process and a process replaying
+    the same conversation from its JSONL.
+    """
     messages = body.get("messages", [])
     if not isinstance(messages, list):
         return 0
     count = 0
-    kept_messages: list[dict] = []
+    placeholdered = 0
     for msg in messages:
         if not isinstance(msg, dict):
-            kept_messages.append(msg)
             continue
         if msg.get("role") != "user":
-            kept_messages.append(msg)
             continue
         content = msg.get("content")
         if not isinstance(content, list):
-            kept_messages.append(msg)
             continue
-        original_len = len(content)
-        filtered = [
-            block for block in content if not _is_strippable_system_reminder(block)
-        ]
-        stripped = original_len - len(filtered)
-        count += stripped
-        if original_len > 0 and stripped == original_len:
-            continue
-        msg["content"] = filtered
-        kept_messages.append(msg)
-    body["messages"] = kept_messages
+        kept: list = []
+        for block in content:
+            removed, now_empty = _strip_reminders_in_block(block)
+            count += removed
+            if now_empty:
+                continue
+            kept.append(block)
+        if content and not kept:
+            kept = [{"type": "text", "text": REMINDER_PLACEHOLDER}]
+            placeholdered += 1
+        msg["content"] = kept
     stats["reminders_stripped"] += count
+    stats["messages_placeholdered"] += placeholdered
+    if placeholdered:
+        log(f"WARN: {placeholdered} user message(s) were entirely reminders — "
+            f"kept with a placeholder block instead of being dropped")
     return count
 
 
@@ -497,18 +607,35 @@ def log_usage_entry(norm_action: str, usage: dict, model: str = "", route: str =
 
 
 def parse_sse_usage(sse_chunks: list[bytes]) -> dict:
-    """Extract usage from the message_start SSE event."""
+    """Extract usage from an SSE response, merging message_start and message_delta.
+
+    Anthropic reports the full usage in ``message_start``. The local gate reports
+    the whole prompt as ``input_tokens`` in ``message_start`` and only emits the
+    cache split (``cache_read_input_tokens`` / ``cache_creation_input_tokens``)
+    in ``message_delta``, so reading ``message_start`` alone logged
+    ``cache_read: 0`` for every streaming local turn. Merge both, last value
+    wins per key. A stream that carries only ``message_start`` yields exactly
+    what it yielded before.
+    """
     full = b"".join(sse_chunks).decode("utf-8", errors="replace")
+    usage: dict = {}
     for line in full.split("\n"):
         if not line.startswith("data: "):
             continue
         try:
             event = json.loads(line[6:])
-            if event.get("type") == "message_start":
-                return event.get("message", {}).get("usage", {})
         except Exception:
             continue
-    return {}
+        etype = event.get("type")
+        if etype == "message_start":
+            chunk_usage = event.get("message", {}).get("usage", {})
+        elif etype == "message_delta":
+            chunk_usage = event.get("usage", {})
+        else:
+            continue
+        if isinstance(chunk_usage, dict):
+            usage.update(chunk_usage)
+    return usage
 
 
 # ── HTTP Handler ─────────────────────────────────────────────────────────
@@ -540,15 +667,48 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _request_credential(self) -> str:
+        """The caller's API credential, from Authorization: Bearer or x-api-key.
+
+        Never logged: the value is only ever compared against LOCAL_AUTH_TOKEN.
+        """
+        auth = self.headers.get("Authorization") or ""
+        if auth[:7].lower() == "bearer ":
+            return auth[7:].strip()
+        return (self.headers.get("x-api-key") or "").strip()
+
     def _forward_simple(self, method: str):
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else b""
-        headers = self._upstream_headers(ANTHROPIC_UPSTREAM)
-        url = ANTHROPIC_UPSTREAM + self.path
+
+        # A non-/v1/messages request carries no model, so the upstream cannot be
+        # chosen the way _forward_messages chooses it. Use the credential
+        # instead: a request presenting the local gate token belongs to the gate
+        # and must never be forwarded to a hosted provider.
+        upstream = ANTHROPIC_UPSTREAM
+        route = "anthropic"
+        if LOCAL_AUTH_TOKEN and self._request_credential() == LOCAL_AUTH_TOKEN:
+            if not LOCAL_UPSTREAM:
+                stats["local_unconfigured"] += 1
+                stats["errors"] += 1
+                log(f"SIMPLE: {method} {self.path} route=local status=502 "
+                    f"(local credential but OBS_LOCAL_LLM_BASE_URL is unset)")
+                self.send_error(
+                    502,
+                    "no local upstream configured for a local-credential request "
+                    "(OBS_LOCAL_LLM_BASE_URL is unset)",
+                )
+                return
+            upstream = LOCAL_UPSTREAM
+            route = "local"
+
+        headers = self._upstream_headers(upstream)
+        url = upstream + self.path
 
         try:
             with httpx.Client(timeout=120) as client:
                 resp = client.request(method, url, content=body or None, headers=headers)
+                log(f"SIMPLE: {method} {self.path} route={route} status={resp.status_code}")
                 self.send_response(resp.status_code)
                 for k, v in resp.headers.multi_items():
                     if k.lower() not in ("transfer-encoding", "connection", "content-encoding"):
@@ -557,7 +717,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(resp.content)
         except Exception as e:
-            log(f"upstream error ({method} {self.path}): {e}")
+            log(f"SIMPLE: {method} {self.path} route={route} upstream error: {e}")
             self.send_error(502, str(e))
 
     def _forward_messages(self):
@@ -766,6 +926,10 @@ def main():
     log(f"upstream (other):  {CLI_PROXY_UPSTREAM}")
     log(f"upstream (local):  {LOCAL_UPSTREAM or '<unconfigured>'}")
     log(f"logs: {LOG_DIR}")
+    if port != PROD_PORT:
+        log(f"WARN: port {port} is not the production port ({PROD_PORT}) but usage "
+            f"and bodies go to {LOG_DIR} — set CACHE_PROXY_LOG_DIR to a private "
+            f"directory so this instance does not mix into production data")
     log(f"save_bodies: {SAVE_BODIES}")
     log(f"normalizations: billing, string→list, strip all system reminders, "
         f"git status, tool sort, metadata (cache_control: passthrough)")

@@ -599,13 +599,20 @@ class TestStripDynamicReminders:
         assert body["messages"][0]["content"][0]["text"] == "hello"
 
     def test_strips_skill_listing_too(self):
-        """Skill blocks are no longer preserved — they get stripped like other reminders."""
+        """Skill blocks are no longer preserved — they get stripped like other reminders.
+
+        The message itself survives with a placeholder block: an empty
+        ``messages`` array is rejected upstream ("at least one message is
+        required"), which killed live turns before the span-level rewrite.
+        """
         body = _make_body(messages=[
             _user_msg([_skill_block(), _dynamic_reminder_block()]),
         ])
         count = cache_proxy.strip_dynamic_reminders(body)
         assert count == 2
-        assert body["messages"] == []
+        assert body["messages"][0]["content"] == [
+            {"type": "text", "text": cache_proxy.REMINDER_PLACEHOLDER}
+        ]
 
     def test_strips_claudemd_too(self):
         body = _make_body(messages=[
@@ -613,7 +620,9 @@ class TestStripDynamicReminders:
         ])
         count = cache_proxy.strip_dynamic_reminders(body)
         assert count == 2
-        assert body["messages"] == []
+        assert body["messages"][0]["content"] == [
+            {"type": "text", "text": cache_proxy.REMINDER_PLACEHOLDER}
+        ]
 
     def test_strips_multiple_reminders(self):
         body = _make_body(messages=[
@@ -657,7 +666,10 @@ class TestStripDynamicReminders:
         count = cache_proxy.strip_dynamic_reminders(body)
         assert count == 0
 
-    def test_removes_user_message_left_only_with_reminders(self):
+    def test_placeholders_user_message_left_only_with_reminders(self):
+        """A message emptied by stripping keeps a placeholder rather than being
+        removed, so message indices stay aligned between a live process and one
+        replaying the same conversation from its JSONL."""
         body = _make_body(messages=[
             _user_msg([_text_block("first")]),
             _user_msg([_dynamic_reminder_block(), _skill_block(), _claudemd_block()]),
@@ -667,6 +679,7 @@ class TestStripDynamicReminders:
         assert count == 3
         assert [msg["content"][0]["text"] for msg in body["messages"]] == [
             "first",
+            cache_proxy.REMINDER_PLACEHOLDER,
             "last",
         ]
 
