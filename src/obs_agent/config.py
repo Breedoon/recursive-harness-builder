@@ -325,7 +325,7 @@ class OBSConfig:
     # Resolved via MODEL_RESOLUTION (e.g. "sol" → "gpt-5.6-sol");
     # full model names pass through unchanged.
     # Change this to e.g. "claude" to make root sessions default to Claude.
-    default_model: str = "sol"
+    default_model: str = "luna"
     effort_level: str | None = None
     model_effort_levels: dict[str, str] = field(default_factory=dict)
     claude_dir: str = ".claude"
