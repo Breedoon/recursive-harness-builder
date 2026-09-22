@@ -44,9 +44,9 @@ MODEL_REGISTRY = {
         "deprecated": True,
     },
     "ltx": {
-        "label": "LTX 2.5 (qualification pending)",
+        "label": "LTX 2.5 (qualified)",
         "media_kind": "video",
-        "qualified": False,
+        "qualified": True,
         "deprecated": False,
     },
 }
@@ -209,22 +209,28 @@ class MediaBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
             return await self.deny(update)
-        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3 (H3 Eros Max beta5 checkpoint).")
+        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3|ltx (H3 Eros Max beta5 checkpoint or qualified LTX 2.5).")
+
+    @staticmethod
+    def _settings_keyboard(user_id: int, settings: Settings) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"Kind: {settings.media_kind}", callback_data=f"s:{user_id}:kind")],
+            [InlineKeyboardButton(f"Preset: {settings.preset}", callback_data=f"s:{user_id}:preset")],
+            [InlineKeyboardButton(f"Model: {MODEL_REGISTRY.get(settings.model, {}).get('label', settings.model)}", callback_data=f"s:{user_id}:model")],
+            [InlineKeyboardButton(f"Steps: {settings.steps}", callback_data=f"s:{user_id}:steps")],
+            [InlineKeyboardButton(f"Mode: {settings.mode}", callback_data=f"s:{user_id}:mode")],
+            [InlineKeyboardButton(f"LoRA: {settings.lora or 'none'}", callback_data=f"s:{user_id}:lora")],
+            [InlineKeyboardButton(f"Strength: {settings.lora_strength or 'default'}", callback_data=f"s:{user_id}:strength")],
+        ])
 
     async def settings_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
             return await self.deny(update)
         settings = self.state.get_settings(update.effective_user.id)
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"Kind: {settings.media_kind}", callback_data=f"s:{update.effective_user.id}:kind")],
-            [InlineKeyboardButton(f"Preset: {settings.preset}", callback_data=f"s:{update.effective_user.id}:preset")],
-            [InlineKeyboardButton(f"Model: {MODEL_REGISTRY.get(settings.model, {}).get('label', settings.model)}", callback_data=f"s:{update.effective_user.id}:model")],
-            [InlineKeyboardButton(f"Steps: {settings.steps}", callback_data=f"s:{update.effective_user.id}:steps")],
-            [InlineKeyboardButton(f"Mode: {settings.mode}", callback_data=f"s:{update.effective_user.id}:mode")],
-            [InlineKeyboardButton(f"LoRA: {settings.lora or 'none'}", callback_data=f"s:{update.effective_user.id}:lora")],
-            [InlineKeyboardButton(f"Strength: {settings.lora_strength or 'default'}", callback_data=f"s:{update.effective_user.id}:strength")],
-        ])
-        await update.effective_message.reply_text(self._settings_text(settings), reply_markup=keyboard)
+        await update.effective_message.reply_text(
+            self._settings_text(settings),
+            reply_markup=self._settings_keyboard(update.effective_user.id, settings),
+        )
 
     @staticmethod
     def _settings_text(settings: Settings) -> str:
@@ -240,7 +246,7 @@ class MediaBot:
         cmd = update.effective_message.text.split()[0].split("@", 1)[0].lower()
         settings = self.state.get_settings(update.effective_user.id)
         if not args:
-            return await update.effective_message.reply_text("Usage: /kind image|video, /model qwen-image-2.1|h3, /mode t2i|edit|t2v|i2v, /preset low|high, /steps N, /duration SECONDS, /variant turbo|int8|w4a8, /lora none|aftermidnight|aftermidnight-softer|hmnsfw|naughtytimes, /strength 0.0-2.0")
+            return await update.effective_message.reply_text("Usage: /kind image|video, /model qwen-image-2.1|h3|ltx, /mode t2i|edit|t2v|i2v, /preset low|high, /steps N, /duration SECONDS, /variant turbo|uncensored|int8|w4a8, /lora none|aftermidnight|aftermidnight-softer|hmnsfw|naughtytimes, /strength 0.0-2.0")
         value = args[0].lower()
         data = asdict(settings)
         try:
@@ -256,11 +262,12 @@ class MediaBot:
                 data["mode"] = "t2i" if value == "qwen-image-2.1" else "t2v"
                 if value == "qwen-image-2.1": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
                 elif value == "h3": data.update(variant="turbo", width=640, height=384, steps=4)
-                else: data.update(variant="uncensored", width=640, height=384, steps=8, lora=None, lora_strength=None)
+                else: data.update(variant="uncensored", width=576, height=576 if settings.mode == "i2v" else 384, steps=8, lora=None, lora_strength=None)
             elif cmd == "/mode":
                 valid_modes = {"t2i", "edit"} if settings.media_kind == "image" else {"t2v", "i2v"}
                 if value not in valid_modes: raise ValueError
                 data["mode"] = value
+                if settings.model == "ltx": data.update(width=576, height=576 if value == "i2v" else 384, steps=8)
             elif cmd == "/lora":
                 if settings.model != "h3" or value not in {"none", "aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"}: raise ValueError
                 data["lora"] = None if value == "none" else value
@@ -330,11 +337,17 @@ class MediaBot:
         if field == "model":
             data.update(media_kind="image" if value == "qwen-image-2.1" else "video", mode="t2i" if value == "qwen-image-2.1" else "t2v")
             if value == "qwen-image-2.1": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
-            else: data.update(width=640, height=384, steps=4)
+            elif value == "h3": data.update(width=640, height=384, steps=4, variant="turbo")
+            else: data.update(width=576, height=576 if settings.mode == "i2v" else 384, steps=8, variant="uncensored", lora=None, lora_strength=None)
+        if field == "mode" and settings.model == "ltx":
+            data.update(width=576, height=576 if value == "i2v" else 384, steps=8)
         new_settings = Settings(**data)
         self.state.put_settings(user.id, new_settings)
         await query.answer("Saved")
-        await query.edit_message_text(self._settings_text(new_settings), reply_markup=query.message.reply_markup)
+        await query.edit_message_text(
+            self._settings_text(new_settings),
+            reply_markup=self._settings_keyboard(user.id, new_settings),
+        )
 
     async def result_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
