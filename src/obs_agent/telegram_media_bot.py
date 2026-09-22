@@ -32,6 +32,7 @@ class Settings:
     variant: str = "turbo"
     lora: str | None = None
     lora_strength: float | None = None
+    strength: float = 0.75
     steps: int = 20
     seconds: float = 4.0
     width: int = 512
@@ -186,7 +187,7 @@ class MediaBot:
     def _settings_text(settings: Settings) -> str:
         return (f"kind={settings.media_kind} model={settings.model} mode={settings.mode}\n"
                 f"preset={settings.preset} {settings.width}x{settings.height} steps={settings.steps} seconds={settings.seconds:g}\n"
-                f"variant={settings.variant} lora={settings.lora or 'none'} strength={settings.lora_strength or 'default'}")
+                f"variant={settings.variant} lora={settings.lora or 'none'} strength={(settings.lora_strength if settings.media_kind == 'video' and settings.lora and settings.lora_strength is not None else settings.strength):g}")
 
     async def setting_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
@@ -220,8 +221,9 @@ class MediaBot:
                 data["lora"] = None if value == "none" else value
             elif cmd == "/strength":
                 strength = float(args[0])
-                if settings.media_kind != "video" or not 0.0 <= strength <= 2.0: raise ValueError
-                data["lora_strength"] = strength
+                if not 0.0 <= strength <= 2.0: raise ValueError
+                if settings.media_kind == "video": data["lora_strength"] = strength
+                else: data["strength"] = strength
             elif cmd == "/preset":
                 if value not in {"low", "high"}: raise ValueError
                 if settings.media_kind == "video":
@@ -265,7 +267,7 @@ class MediaBot:
             "steps": ("steps", [12, 20]),
             "mode": ("mode", ["t2i", "edit"] if settings.media_kind == "image" else ["t2v", "i2v"]),
             "lora": ("lora", [None, "aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"]),
-            "strength": ("lora_strength", [None, 0.5, 1.0, 1.5, 2.0]),
+            "strength": (("lora_strength" if settings.media_kind == "video" else "strength"), ([None, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0] if settings.media_kind == "video" else [0.25, 0.5, 0.75, 1.0, 1.5, 2.0])),
         }
         key = parts[2]
         field, values = choices.get(key, (None, []))
@@ -323,7 +325,7 @@ class MediaBot:
             request.update(seconds=settings.seconds, variant=settings.variant)
             if settings.lora: request.update(lora=settings.lora, lora_strength=settings.lora_strength)
         if settings.media_kind == "image":
-            request.update(cfg=4.0, strength=0.75)
+            request.update(cfg=4.0, strength=settings.strength)
         job_id = self.state.create_job(user_id=update.effective_user.id, chat_id=message.chat_id, message_id=message.message_id, prompt=prompt, request=request)
         ack = await message.reply_text(f"Queued {job_id[:12]} ({settings.model}/{mode}, {settings.preset} {settings.width}x{settings.height})")
         self.state.update_job(job_id, status_message_id=ack.message_id)
