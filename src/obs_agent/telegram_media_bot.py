@@ -269,6 +269,9 @@ class MediaBot:
             return
         settings = self.state.get_settings(update.effective_user.id)
         has_image = bool(message.photo or (message.document and (message.document.mime_type or "").startswith("image/")))
+        if message.document and not has_image:
+            await message.reply_text("Only image documents are supported as media input.")
+            return
         prompt = (message.caption or message.text or "").strip()
         if has_image and not message.caption:
             await message.reply_text("Add a caption describing the edit or image-to-video request; a photo alone is not generated.")
@@ -369,7 +372,7 @@ class MediaBot:
         for command in ("kind", "model", "preset", "steps", "duration", "variant"):
             app.add_handler(CommandHandler(command, self.setting_command))
         app.add_handler(CallbackQueryHandler(self.callback, pattern=r"^s:"))
-        app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, self.message))
+        app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, self.message))
         self.application = app
         return app
 
