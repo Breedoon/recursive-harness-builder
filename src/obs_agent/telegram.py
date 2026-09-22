@@ -7946,24 +7946,12 @@ class TelegramBot:
                 # Otherwise the model can process queued updates before users have
                 # seen prior assistant messages still pending delivery.
                 continue
-            # Nothing to deliver.  This MUST be tested BEFORE the gate is
-            # consulted: otherwise every idle route on a saturated branch logs
-            # "deferring wake-class turn start" on every poll pass, which is
-            # false (there was nothing to defer) and loud enough to bury the
-            # routes that genuinely are deferred.  Non-destructive on purpose —
-            # the drain below is the destructive one.
+            # Leave queue ownership with the route until delivery starts.
             pending_depth = state.hook_state.message_queue.qsize() + len(
                 state.pending_messages
             )
             if pending_depth == 0:
                 continue
-            # Tier A: a same-branch sibling is mid-turn.  Leave the queue in
-            # place; the next poll after the branch quiets down delivers it.
-            if self._branch_wake_gate_blocks(
-                state, site="poller", pending=pending_depth
-            ):
-                continue
-
             if self._get_route_lock(state.route).locked():
                 continue
             task = asyncio.create_task(self._deliver_background_queue(state))
@@ -7989,7 +7977,6 @@ class TelegramBot:
                 or state.busy
                 or state.hook_state.pause_queue_delivery
                 or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
-                or self._branch_wake_gate_blocks(state, site="poller-recheck")
             ):
                 return
             queued = _drain_queue(state.hook_state.message_queue)
@@ -8001,8 +7988,7 @@ class TelegramBot:
             )
             state.pending_messages.extend(queued)
             trigger_message = state.pending_messages[-1]
-            # Reserve admission before _run_and_send's first (session/transport)
-            # await; siblings dispatched in this same pass must see this slot.
+            # Reserve this route before asynchronous session/transport startup.
             state.busy = True
             try:
                 await self._run_and_send(
@@ -9312,125 +9298,6 @@ class TelegramBot:
             extra_pending=queued_before if queued_before else None,
         )
 
-    # ------------------------------------------------------------------
-    # Tier A — per-branch gating of wake-class turn starts
-    # ------------------------------------------------------------------
-    #
-    # A "wake-class" turn start is one nobody explicitly asked for right now:
-    # an inbox wake, a team-worker wake, or the background poller's queued
-    # auto-delivery.  Those are gated per branch.  Explicit AgentTask launches,
-    # resumes, user messages, and scheduled runs are NEVER gated: gating an
-    # explicit launch lets a parent blocked in AgentTaskOutput(block=true) hold
-    # the branch's only slot while waiting for a child that can never be
-    # admitted, which makes the parent silently return retrieval_status
-    # "timeout".  Because explicit launches are never gated, Tier A is
-    # deadlock-free by construction.  (User-facing docs land with vault-aay.4.)
-    #
-    # Gating suppresses only the *turn start*.  The message itself takes the
-    # deferral path that already exists (_queue_running_team_worker_notice /
-    # record.wake_requested), and the durable inbox JSON is untouched, so the
-    # recipient still sees it at its next ReadInbox.
-
-    def _branch_anchor_for(self, state: TelegramSessionState) -> tuple[str, ...] | None:
-        """Return the identity of ``state``'s same-depth sibling branch.
-
-        A branch is the set of agents with the same parent lineage and depth.
-        The root name, depth, and chat identity are encoded so a root and its
-        immediate children cannot collide, and identical roots in different
-        chats remain independent.  Ancestors and descendants are deliberately
-        excluded: a coordinator must be able to wake while its workers run.
-        """
-        lineage = state.agent_lineage
-        if not lineage:
-            return None
-        return (
-            lineage[0],
-            f"depth:{len(lineage)}",
-            f"chat:{state.route.chat_id}",
-            *tuple(lineage[:-1]),
-        )
-
-    def _branch_turn_load(self, state: TelegramSessionState) -> int:
-        """Count busy same-depth siblings in the state's branch.
-
-        In-memory scan over ``_states_by_route``; no I/O. ``state`` itself is
-        excluded so a wake never gates itself out.
-        """
-        anchor = self._branch_anchor_for(state)
-        if anchor is None:
-            return 0
-        load = 0
-        for other in self._states_by_route.values():
-            if other is state:
-                continue
-            other_anchor = self._branch_anchor_for(other)
-            if other_anchor != anchor:
-                continue
-            if other.busy:
-                load += 1
-        return load
-
-    def _effective_branch_turn_cap(self, state: TelegramSessionState) -> int:
-        """Tier A's effective cap: the configured value, or 1 when unset.
-
-        ``0`` (or negative) disables the gate.  Tier B will resolve this from
-        the per-agent parameter with subtree inheritance; Tier A reads the
-        process-level config only.
-        """
-        configured = getattr(self._config, "max_concurrent_turns", None)
-        if configured is None:
-            return 1
-        try:
-            return int(configured)
-        except (TypeError, ValueError):
-            return 1
-
-    def _branch_wake_gate_blocks(
-        self,
-        state: TelegramSessionState,
-        *,
-        site: str | None = None,
-        pending: int | None = None,
-    ) -> bool:
-        """True when a wake-class turn start for ``state`` must be deferred.
-
-        Pass ``site`` to log the deferral.  Tier A is on by default on every
-        backend and changes the outcome of the large majority of inbox wakes,
-        so a silent gate would leave no way to answer — after deploy — whether
-        it is firing, how often, for which branch, or whether anything is
-        starving.  Logged at INFO to match the codebase's existing treatment of
-        the same class of event (``"[process_message] queued while busy"``,
-        ``"Auto-delivering queued updates"``).
-
-        ``pending`` is how much work is actually waiting on this route.  It is
-        what makes starvation *distinguishable* rather than merely *logged*: a
-        starved route reports a non-zero and non-shrinking ``pending`` across
-        successive deferrals, which an idle route can never do.  Callers that
-        cannot cheaply compute it pass ``None`` and the field is omitted.
-
-        Callers must not consult this predicate for a route with nothing to
-        defer — the log line would be factually wrong.
-        """
-        cap = self._effective_branch_turn_cap(state)
-        if cap <= 0:
-            return False
-        load = self._branch_turn_load(state)
-        if load < cap:
-            return False
-        if site is not None:
-            anchor = self._branch_anchor_for(state)
-            logger.info(
-                "[branch-gate] deferring wake-class turn start site=%s route=%s "
-                "branch=%s load=%d cap=%d pending=%s",
-                site,
-                state.route,
-                "/".join(anchor) if anchor else None,
-                load,
-                cap,
-                "-" if pending is None else pending,
-            )
-        return True
-
     def _on_detached_wake_done(self, task: asyncio.Task) -> None:
         self._detached_wake_tasks.discard(task)
         if task.cancelled():
@@ -9470,10 +9337,6 @@ class TelegramBot:
                     state.busy
                     or state.hook_state.pause_queue_delivery
                     or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
-                    # Tier A: re-check inside the lock.  The pre-check above is
-                    # racy by construction; a sibling can start a turn while we
-                    # wait for the lock.
-                    or self._branch_wake_gate_blocks(state, site="route-wake-recheck")
                 ):
                     self._queue_running_team_worker_notice(
                         state=state,
@@ -9517,9 +9380,6 @@ class TelegramBot:
         if state.busy or state.hook_state.pause_queue_delivery:
             return False
         if self._chat_pending_ops.get(state.route.chat_id, 0) > 0:
-            return False
-        # Tier A: a same-branch sibling is mid-turn — defer this wake.
-        if self._branch_wake_gate_blocks(state, site="route-wake"):
             return False
         lock = self._get_route_lock(state.route)
         if lock.locked():
@@ -9669,15 +9529,12 @@ class TelegramBot:
             _mark_direct_send_notified()
             return {"delivered": True}
 
-        # Tier A: a same-branch sibling is mid-turn — defer this wake exactly
-        # the way a busy recipient is already deferred, just above.
         child_state = self._get_state(record.child_route, create=False)
         if child_state is not None and (
             child_state.busy
             or child_state.hook_state.pause_queue_delivery
             or self._get_route_lock(child_state.route).locked()
             or self._chat_pending_ops.get(child_state.route.chat_id, 0) > 0
-            or self._branch_wake_gate_blocks(child_state, site="team-worker-wake")
         ):
             self._queue_running_team_worker_notice(
                 state=child_state,
@@ -10454,23 +10311,7 @@ class TelegramBot:
         self._remove_team_worker_mappings_for_task(task_id)
 
     async def _replay_pending_team_worker_wake(self, record: _ForkTaskRecord) -> None:
-        """Drain ``record.wake_requested`` when a team worker's task ends.
-
-        This is a WAKE-CLASS turn start, not an explicit launch: it replays an
-        inbox wake that was deferred while the worker was mid-turn.  Tier A
-        therefore gates it, exactly like the other drain
-        (``_queue_running_team_worker_notice``, consumed by the background
-        poller).  ``record.wake_requested`` is the second of the two deferral
-        mechanisms named in the Tier A header comment, and leaving its drain
-        ungated would let a deferred wake start a turn under the very branch
-        saturation that caused the deferral.
-
-        Kept OUT of ``_execute_fork_task`` deliberately: that function also
-        performs explicit-launch execution, which must never be gated (see
-        ``test_explicit_paths_are_not_gated``).  Splitting the two lets the
-        structural test keep protecting the explicit path while this one is
-        gated.
-        """
+        """Replay a pending worker wake once that recipient can accept a turn."""
         if not record.wake_requested:
             return
         child_state = self._get_state(record.child_route, create=False)
@@ -10479,12 +10320,9 @@ class TelegramBot:
             or child_state.hook_state.pause_queue_delivery
             or self._get_route_lock(child_state.route).locked()
             or self._chat_pending_ops.get(child_state.route.chat_id, 0) > 0
-            or self._branch_wake_gate_blocks(child_state, site="team-worker-wake-replay")
         ):
-            # Convert the deferral into the other, poller-drained mechanism so
-            # it stays recoverable: the poller (itself gated) delivers it once
-            # the branch quiets down.  The message itself is untouched in the
-            # durable inbox either way.
+            # Keep the wake recoverable until this recipient and its transport
+            # are ready. Other agents do not affect admission.
             record.wake_requested = False
             self._queue_running_team_worker_notice(
                 state=child_state,
