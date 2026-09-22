@@ -272,7 +272,7 @@ class MediaBot:
             [InlineKeyboardButton(f"Steps: {settings.steps}", callback_data=f"s:{user_id}:steps")],
             [InlineKeyboardButton(f"Mode: {settings.mode}", callback_data=f"s:{user_id}:mode")],
             [InlineKeyboardButton(f"LoRA: {settings.lora or 'none'}", callback_data=f"s:{user_id}:lora")],
-            [InlineKeyboardButton(f"Strength: {settings.lora_strength or 'default'}", callback_data=f"s:{user_id}:strength")],
+            [InlineKeyboardButton(f"Strength: {settings.lora_strength if settings.lora_strength is not None else 'default'}", callback_data=f"s:{user_id}:strength")],
             [InlineKeyboardButton(f"Width: {settings.width if not settings.auto_size and settings.width is not None else 'auto'}", callback_data=f"s:{user_id}:width")],
             [InlineKeyboardButton(f"Height: {settings.height if not settings.auto_size and settings.height is not None else 'auto'}", callback_data=f"s:{user_id}:height")],
             [InlineKeyboardButton(f"Longest: {settings.longest}", callback_data=f"s:{user_id}:longest")],
