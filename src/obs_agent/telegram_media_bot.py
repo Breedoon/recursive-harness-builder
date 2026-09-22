@@ -264,6 +264,12 @@ class MediaBot:
         await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3|ltx (H3 Eros Max beta5 checkpoint or qualified LTX 2.5).")
 
     @staticmethod
+    def _display_strength(settings: Settings) -> float | str:
+        if settings.media_kind == "video":
+            return settings.lora_strength if settings.lora_strength is not None else "default"
+        return settings.strength
+
+    @staticmethod
     def _settings_keyboard(user_id: int, settings: Settings) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton(f"Kind: {settings.media_kind}", callback_data=f"s:{user_id}:kind")],
@@ -272,7 +278,7 @@ class MediaBot:
             [InlineKeyboardButton(f"Steps: {settings.steps}", callback_data=f"s:{user_id}:steps")],
             [InlineKeyboardButton(f"Mode: {settings.mode}", callback_data=f"s:{user_id}:mode")],
             [InlineKeyboardButton(f"LoRA: {settings.lora or 'none'}", callback_data=f"s:{user_id}:lora")],
-            [InlineKeyboardButton(f"Strength: {settings.lora_strength if settings.lora_strength is not None else 'default'}", callback_data=f"s:{user_id}:strength")],
+            [InlineKeyboardButton(f"Strength: {MediaBot._display_strength(settings)}", callback_data=f"s:{user_id}:strength")],
             [InlineKeyboardButton(f"Width: {settings.width if not settings.auto_size and settings.width is not None else 'auto'}", callback_data=f"s:{user_id}:width")],
             [InlineKeyboardButton(f"Height: {settings.height if not settings.auto_size and settings.height is not None else 'auto'}", callback_data=f"s:{user_id}:height")],
             [InlineKeyboardButton(f"Longest: {settings.longest}", callback_data=f"s:{user_id}:longest")],
@@ -292,10 +298,11 @@ class MediaBot:
         model_label = MODEL_REGISTRY.get(settings.model, {}).get("label", settings.model)
         width, height = _resolve_dimensions(settings)
         size = f"auto {width}x{height} longest={settings.longest}" if settings.auto_size else f"manual {width}x{height}"
-        strength = settings.lora_strength if settings.media_kind == 'video' and settings.lora and settings.lora_strength is not None else settings.strength
+        strength = MediaBot._display_strength(settings)
+        strength_text = f"{strength:g}" if isinstance(strength, float) else strength
         return (f"kind={settings.media_kind} model={model_label} mode={settings.mode}\n"
                 f"preset={settings.preset} {size} steps={settings.steps} seconds={settings.seconds:g}\n"
-                f"variant={settings.variant} lora={settings.lora or 'none'} strength={strength:g}")
+                f"variant={settings.variant} lora={settings.lora or 'none'} strength={strength_text}")
 
     @staticmethod
     def _apply_setting(settings: Settings, key: str, raw: str) -> Settings:
@@ -410,7 +417,7 @@ class MediaBot:
             await query.answer("LoRA controls are available only in video mode", show_alert=True); return
         current = settings.lora if key == "lora" else (settings.lora_strength if key == "strength" and settings.media_kind == "video" else settings.strength if key == "strength" else getattr(settings, key if key != "kind" else "media_kind"))
         current_value = "none" if current is None and key in {"lora", "strength"} else current
-        if key in {"width", "height"} and settings.auto_size:
+        if key in {"width", "height"} and (settings.auto_size or getattr(settings, key) is None):
             current_value = "auto"
         value = values[(values.index(current_value) + 1) % len(values)] if current_value in values else values[0]
         try:

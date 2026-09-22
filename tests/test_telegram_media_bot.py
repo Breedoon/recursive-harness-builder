@@ -25,8 +25,12 @@ def test_settings_keyboard_rebuilds_model_label_after_cycle(tmp_path):
     assert h3_keyboard.inline_keyboard[2][0].text == "Model: H3 Eros Max beta5 (checkpoint)"
     assert qwen_keyboard.inline_keyboard[2][0].text == "Model: Qwen Image 2.1"
     assert h3_keyboard.inline_keyboard[2][0].callback_data == qwen_keyboard.inline_keyboard[2][0].callback_data
-    ltx_keyboard = bot._settings_keyboard(5129431382, Settings(model="ltx", media_kind="video"))
+    ltx_settings = Settings(model="ltx", media_kind="video")
+    ltx_keyboard = bot._settings_keyboard(5129431382, ltx_settings)
     assert ltx_keyboard.inline_keyboard[2][0].text == "Model: LTX 2.5 (qualified)"
+    assert "strength=default" in bot._settings_text(ltx_settings)
+    image_keyboard = bot._settings_keyboard(5129431382, Settings(model="qwen-image-2.1", media_kind="image", strength=0.5))
+    assert image_keyboard.inline_keyboard[6][0].text == "Strength: 0.5"
 
 
 def test_adaptive_presets_preserve_portrait_aspect_and_align_model():
