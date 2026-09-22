@@ -31,7 +31,7 @@ def test_no_negative_compaction_threshold(window):
 @pytest.mark.parametrize("model", ["gpt[400k] ", "  gpt[400K]\n", "gpt[400k]\t"])
 def test_whitespace_does_not_erase_context_suffix(model):
     assert split_context_suffix(model) == ("gpt", 400_000)
-    assert parse_context_suffix(model) == ("gpt-6-sol", 400_000)
+    assert parse_context_suffix(model) == ("gpt-5.6-sol", 400_000)
 
 
 @pytest.mark.parametrize("model", ["gpt[0k]", "gpt[0m]", "[400k]", "gpt[400k][1m]"])
@@ -41,4 +41,4 @@ def test_invalid_context_identity_is_rejected(model):
 
 
 def test_obs_identity_retains_arbitrary_context_for_inheritance():
-    assert normalize_model_for_claude_code("gpt[400k]") == "gpt-6-sol[400k]"
+    assert normalize_model_for_claude_code("gpt[400k]") == "gpt-5.6-sol[400k]"
