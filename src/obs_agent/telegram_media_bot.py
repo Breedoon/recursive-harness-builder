@@ -203,15 +203,16 @@ class MediaBot:
             if cmd == "/kind":
                 if value not in {"image", "video"}: raise ValueError
                 data.update(media_kind=value, model="qwen-image-2.1" if value == "image" else "h3", mode="t2i" if value == "image" else "t2v")
-                if value == "video": data.update(width=640, height=384)
+                if value == "image": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
+                else: data.update(width=640, height=384, steps=4)
             elif cmd == "/model":
                 if value not in {"qwen-image-2.1", "h3", "wan", "ltx"}: raise ValueError
                 data["model"] = value
                 data["media_kind"] = "image" if value == "qwen-image-2.1" else "video"
                 data["mode"] = "t2i" if value == "qwen-image-2.1" else "t2v"
-                if value == "h3": data["variant"] = "turbo"
-                elif value != "qwen-image-2.1": data.update(variant="uncensored", lora=None, lora_strength=None)
-                if value != "qwen-image-2.1": data.update(width=640, height=384)
+                if value == "qwen-image-2.1": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
+                elif value == "h3": data.update(variant="turbo", width=640, height=384, steps=4)
+                else: data.update(variant="uncensored", width=640, height=384, steps=8, lora=None, lora_strength=None)
             elif cmd == "/mode":
                 valid_modes = {"t2i", "edit"} if settings.media_kind == "image" else {"t2v", "i2v"}
                 if value not in valid_modes: raise ValueError
@@ -280,10 +281,12 @@ class MediaBot:
         data[field] = value
         if field == "media_kind":
             data.update(model="qwen-image-2.1" if value == "image" else "h3", mode="t2i" if value == "image" else "t2v")
-            if value == "video": data.update(width=640, height=384)
+            if value == "image": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
+            else: data.update(width=640, height=384, steps=4)
         if field == "model":
             data.update(media_kind="image" if value == "qwen-image-2.1" else "video", mode="t2i" if value == "qwen-image-2.1" else "t2v")
-            if value != "qwen-image-2.1": data.update(width=640, height=384)
+            if value == "qwen-image-2.1": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
+            else: data.update(width=640, height=384, steps=4)
         new_settings = Settings(**data)
         self.state.put_settings(user.id, new_settings)
         await query.answer("Saved")
