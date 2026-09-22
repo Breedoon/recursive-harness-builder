@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from obs_agent.telegram_media_bot import ALLOWLIST, MODEL_REGISTRY, SELECTABLE_MODELS, MediaBot, Settings, StateStore
+from obs_agent.telegram_media_bot import ALLOWLIST, MODEL_REGISTRY, SELECTABLE_MODELS, MediaBot, Settings, StateStore, _resolve_dimensions
 
 
 def test_allowlist_is_exact_and_excludes_third_identity():
@@ -27,6 +27,38 @@ def test_settings_keyboard_rebuilds_model_label_after_cycle(tmp_path):
     assert h3_keyboard.inline_keyboard[2][0].callback_data == qwen_keyboard.inline_keyboard[2][0].callback_data
     ltx_keyboard = bot._settings_keyboard(5129431382, Settings(model="ltx", media_kind="video"))
     assert ltx_keyboard.inline_keyboard[2][0].text == "Model: LTX 2.5 (qualified)"
+
+
+def test_adaptive_presets_preserve_portrait_aspect_and_align_model():
+    settings = Settings(media_kind="video", model="h3", mode="i2v", longest=500, auto_size=True, width=None, height=None)
+    low = _resolve_dimensions(settings, (2, 3))
+    medium = _resolve_dimensions(Settings(**{**settings.__dict__, "longest": 700}), (2, 3))
+    high = _resolve_dimensions(Settings(**{**settings.__dict__, "longest": 1000}), (2, 3))
+    assert low[0] % 32 == 0 and low[1] % 32 == 0
+    assert medium[1] > low[1] and high[1] > medium[1]
+    assert abs((low[0] / low[1]) - (2 / 3)) < 0.03
+
+
+def test_manual_dimension_precedence_and_auto_reset():
+    settings = Settings(model="ltx", media_kind="video", mode="t2v", longest=700, auto_size=True, width=None, height=None)
+    manual = MediaBot._apply_setting(settings, "width", "640")
+    manual = MediaBot._apply_setting(manual, "height", "480")
+    assert manual.auto_size is False
+    assert _resolve_dimensions(manual, (9, 16)) == (640, 480)
+    reset = MediaBot._apply_setting(manual, "auto", "auto")
+    assert reset.auto_size is True and reset.width is None and reset.height is None
+    assert _resolve_dimensions(reset, (9, 16))[1] > _resolve_dimensions(manual, (9, 16))[1]
+
+
+def test_supported_four_step_control_is_model_specific():
+    h3 = MediaBot._apply_setting(Settings(model="h3", media_kind="video", mode="t2v"), "steps", "4")
+    assert h3.steps == 4
+    try:
+        MediaBot._apply_setting(Settings(model="ltx", media_kind="video", mode="t2v"), "variant", "turbo")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unsupported LTX variant accepted")
 
 
 def test_stale_hidden_model_settings_fall_back_to_h3(tmp_path):
