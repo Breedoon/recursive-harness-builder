@@ -176,6 +176,9 @@ class MediaBot:
             [InlineKeyboardButton(f"Preset: {settings.preset}", callback_data=f"s:{update.effective_user.id}:preset")],
             [InlineKeyboardButton(f"Model: {settings.model}", callback_data=f"s:{update.effective_user.id}:model")],
             [InlineKeyboardButton(f"Steps: {settings.steps}", callback_data=f"s:{update.effective_user.id}:steps")],
+            [InlineKeyboardButton(f"Mode: {settings.mode}", callback_data=f"s:{update.effective_user.id}:mode")],
+            [InlineKeyboardButton(f"LoRA: {settings.lora or 'none'}", callback_data=f"s:{update.effective_user.id}:lora")],
+            [InlineKeyboardButton(f"Strength: {settings.lora_strength or 'default'}", callback_data=f"s:{update.effective_user.id}:strength")],
         ])
         await update.effective_message.reply_text(self._settings_text(settings), reply_markup=keyboard)
 
@@ -192,7 +195,7 @@ class MediaBot:
         cmd = update.effective_message.text.split()[0].split("@", 1)[0].lower()
         settings = self.state.get_settings(update.effective_user.id)
         if not args:
-            return await update.effective_message.reply_text("Usage: /kind image|video, /model qwen-image-2.1|h3, /preset low|high, /steps N, /duration SECONDS, /variant turbo|int8|w4a8")
+            return await update.effective_message.reply_text("Usage: /kind image|video, /model qwen-image-2.1|h3, /mode t2i|edit|t2v|i2v, /preset low|high, /steps N, /duration SECONDS, /variant turbo|int8|w4a8, /lora none|aftermidnight|aftermidnight-softer|hmnsfw|naughtytimes, /strength 0.0-2.0")
         value = args[0].lower()
         data = asdict(settings)
         try:
@@ -205,7 +208,20 @@ class MediaBot:
                 data["model"] = value
                 data["media_kind"] = "image" if value == "qwen-image-2.1" else "video"
                 data["mode"] = "t2i" if value == "qwen-image-2.1" else "t2v"
+                if value == "h3": data["variant"] = "turbo"
+                elif value != "qwen-image-2.1": data.update(variant="uncensored", lora=None, lora_strength=None)
                 if value != "qwen-image-2.1": data.update(width=640, height=384)
+            elif cmd == "/mode":
+                valid_modes = {"t2i", "edit"} if settings.media_kind == "image" else {"t2v", "i2v"}
+                if value not in valid_modes: raise ValueError
+                data["mode"] = value
+            elif cmd == "/lora":
+                if settings.model != "h3" or value not in {"none", "aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"}: raise ValueError
+                data["lora"] = None if value == "none" else value
+            elif cmd == "/strength":
+                strength = float(args[0])
+                if settings.media_kind != "video" or not 0.0 <= strength <= 2.0: raise ValueError
+                data["lora_strength"] = strength
             elif cmd == "/preset":
                 if value not in {"low", "high"}: raise ValueError
                 if settings.media_kind == "video":
@@ -217,7 +233,12 @@ class MediaBot:
             elif cmd == "/duration":
                 data["seconds"] = max(1.0, min(10.0, float(args[0])))
             elif cmd == "/variant":
-                if value not in {"turbo", "int8", "w4a8"}: raise ValueError
+                valid_variants = {
+                    "h3": {"turbo", "int8", "w4a8"},
+                    "wan": {"uncensored", "remix", "smoothmix"},
+                    "ltx": {"uncensored"},
+                }.get(settings.model, set())
+                if value not in valid_variants: raise ValueError
                 data["variant"] = value
             else: raise ValueError
         except (ValueError, TypeError):
@@ -242,11 +263,16 @@ class MediaBot:
             "preset": ("preset", ["low", "high"]),
             "model": ("model", ["qwen-image-2.1", "h3"]),
             "steps": ("steps", [12, 20]),
+            "mode": ("mode", ["t2i", "edit"] if settings.media_kind == "image" else ["t2v", "i2v"]),
+            "lora": ("lora", [None, "aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"]),
+            "strength": ("lora_strength", [None, 0.5, 1.0, 1.5, 2.0]),
         }
         key = parts[2]
         field, values = choices.get(key, (None, []))
         if field is None:
             await query.answer("Unknown setting", show_alert=True); return
+        if key in {"lora", "strength"} and settings.media_kind != "video":
+            await query.answer("LoRA controls are available only in video mode", show_alert=True); return
         current = data[field]
         value = values[(values.index(current) + 1) % len(values)] if current in values else values[0]
         data[field] = value
@@ -282,13 +308,16 @@ class MediaBot:
             await message.reply_text("Image mode requires qwen-image-2.1."); return
         if settings.media_kind == "video" and settings.model == "qwen-image-2.1":
             await message.reply_text("Video mode requires a video model such as h3 or wan."); return
+        if not has_image and settings.mode in {"edit", "i2v"}:
+            await message.reply_text(f"Mode {settings.mode} requires an image attachment.")
+            return
         if has_image:
             if settings.media_kind == "image":
                 mode = "edit"
             else:
                 mode = "i2v"
         else:
-            mode = "t2i" if settings.media_kind == "image" else "t2v"
+            mode = settings.mode
         request = {"model": settings.model, "mode": mode, "prompt": prompt, "width": settings.width, "height": settings.height, "steps": settings.steps}
         if settings.media_kind == "video":
             request.update(seconds=settings.seconds, variant=settings.variant)
@@ -301,6 +330,19 @@ class MediaBot:
         task = asyncio.create_task(self._submit_and_watch(job_id, update.effective_user.id, message.chat_id, message, settings, has_image))
         self.tasks.add(task); task.add_done_callback(self.tasks.discard)
 
+    async def _normalize_image(self, raw: bytes, settings: Settings) -> bytes:
+        """Apply aspect-cover crop and model-valid resize before upload."""
+        vf = f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=increase,crop={settings.width}:{settings.height}"
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+            "-vf", vf, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        output, error = await process.communicate(raw)
+        if process.returncode != 0 or not output:
+            raise RuntimeError(f"image normalization failed: {error.decode(errors='replace')[-300:]}")
+        return output
+
     async def _submit_and_watch(self, job_id: str, user_id: int, chat_id: int, message, settings: Settings, has_image: bool) -> None:
         row = self.state.get_job(job_id)
         request = json.loads(row["request_json"])
@@ -309,8 +351,8 @@ class MediaBot:
                 attachment = message.photo[-1] if message.photo else message.document
                 telegram_file = await attachment.get_file()
                 raw = bytes(await telegram_file.download_as_bytearray())
-                mime = "image/jpeg" if message.photo else (message.document.mime_type or "image/jpeg")
-                request["image_path"] = await self.api.upload(raw, mime)
+                raw = await self._normalize_image(raw, settings)
+                request["image_path"] = await self.api.upload(raw, "image/png")
                 self.state.update_job(job_id, request_json=json.dumps(request, separators=(",", ":")))
             submitted = await self.api.submit(request)
             backend_id = submitted["job_id"]
