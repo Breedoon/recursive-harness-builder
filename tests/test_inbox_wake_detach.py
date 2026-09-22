@@ -373,5 +373,3 @@ class TestA1DeliverySemanticsPreserved:
             "a wake that lost the busy race must be queued, not dropped"
         )
         await bot.shutdown()
-
-
