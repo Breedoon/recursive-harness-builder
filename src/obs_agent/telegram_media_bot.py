@@ -262,7 +262,7 @@ class MediaBot:
                 data["mode"] = "t2i" if value == "qwen-image-2.1" else "t2v"
                 if value == "qwen-image-2.1": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
                 elif value == "h3": data.update(variant="turbo", width=640, height=384, steps=4)
-                else: data.update(variant="uncensored", width=576, height=576 if settings.mode == "i2v" else 384, steps=8, lora=None, lora_strength=None)
+                else: data.update(variant="uncensored", width=576, height=576 if data["mode"] == "i2v" else 384, steps=8, lora=None, lora_strength=None)
             elif cmd == "/mode":
                 valid_modes = {"t2i", "edit"} if settings.media_kind == "image" else {"t2v", "i2v"}
                 if value not in valid_modes: raise ValueError
@@ -338,7 +338,7 @@ class MediaBot:
             data.update(media_kind="image" if value == "qwen-image-2.1" else "video", mode="t2i" if value == "qwen-image-2.1" else "t2v")
             if value == "qwen-image-2.1": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
             elif value == "h3": data.update(width=640, height=384, steps=4, variant="turbo")
-            else: data.update(width=576, height=576 if settings.mode == "i2v" else 384, steps=8, variant="uncensored", lora=None, lora_strength=None)
+            else: data.update(width=576, height=576 if data["mode"] == "i2v" else 384, steps=8, variant="uncensored", lora=None, lora_strength=None)
         if field == "mode" and settings.model == "ltx":
             data.update(width=576, height=576 if value == "i2v" else 384, steps=8)
         new_settings = Settings(**data)
