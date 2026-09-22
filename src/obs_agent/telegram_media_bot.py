@@ -577,18 +577,28 @@ class MediaBot:
             if current is not None and current["state"] == "delivering":
                 self.state.update_job(job_id, last_status="delivery_ambiguous", error_code=error_code)
                 try:
-                    await message.reply_text(f"Job {job_id[:12]} delivery is ambiguous; use /result {job_id[:12]} for explicit recovery.")
+                    await message.reply_text(f"Job {job_id[:12]} delivery failed; resubmit from Telegram if needed.")
                 except Exception:
-                    LOG.debug("ambiguous-delivery notice failed")
+                    LOG.debug("delivery notice failed")
                 return
-            self.state.update_job(job_id, state="failed", last_status="failed", error_code=error_code)
-            await message.reply_text(f"Job {job_id[:12]} failed: {error_code}; use /result {job_id[:12]} if delivery needs recovery")
+            if backend_id:
+                self.state.update_job(job_id, state="cleanup_pending", last_status="cleanup_pending", error_code=error_code)
+            else:
+                self.state.update_job(job_id, state="failed", last_status="failed", error_code=error_code)
+            await message.reply_text(f"Job {job_id[:12]} failed: {error_code}; resubmit from Telegram if needed")
 
     async def _purge_backend(self, job_id: str, backend_id: str) -> bool:
         for attempt in range(3):
             try:
                 await self.api.purge(backend_id)
                 return True
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    return True
+                if attempt == 2:
+                    LOG.error("media content cleanup failed job=%s error_code=http_%s", job_id, exc.response.status_code)
+                else:
+                    await asyncio.sleep(1)
             except Exception as exc:
                 if attempt == 2:
                     LOG.error("media content cleanup failed job=%s error_code=%s", job_id, type(exc).__name__)
@@ -624,9 +634,9 @@ class MediaBot:
             try:
                 status = await self.api.status(backend_id)
             except Exception as exc:
-                self.state.update_job(job_id, state="failed", last_status="aborted_restart", error_code=type(exc).__name__)
+                self.state.update_job(job_id, state="cleanup_pending", last_status="cleanup_pending", error_code=type(exc).__name__)
                 if self.application:
-                    await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: aborted after restart; resubmit from Telegram")
+                    await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: status unavailable; resubmit from Telegram")
                 return
             state = str(status.get("state", "unknown"))
             self.state.update_job(job_id, state=state, last_status=state)
