@@ -54,6 +54,7 @@ SELECTABLE_MODELS = tuple(name for name, spec in MODEL_REGISTRY.items() if spec[
 SELECTABLE_VIDEO_MODELS = tuple(name for name in SELECTABLE_MODELS if MODEL_REGISTRY[name]["media_kind"] == "video")
 PRESET_LONGEST = {"low": 500, "medium": 700, "high": 1000}
 VIDEO_LORAS = {"aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"}
+ABANDONED_JOB_SECONDS = 24 * 60 * 60
 
 
 def _alignment(model: str, mode: str) -> int:
@@ -138,13 +139,29 @@ class StateStore:
         );
         CREATE TABLE IF NOT EXISTS jobs (
           job_id TEXT PRIMARY KEY, backend_job_id TEXT, user_id INTEGER NOT NULL,
-          chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, prompt TEXT NOT NULL,
-          request_json TEXT NOT NULL, state TEXT NOT NULL, output_path TEXT,
-          status_message_id INTEGER, last_status TEXT, created_at REAL NOT NULL,
-          updated_at REAL NOT NULL, delivered_at REAL
+          chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, prompt TEXT NOT NULL DEFAULT '',
+          request_json TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL, output_path TEXT,
+          status_message_id INTEGER, last_status TEXT, error_code TEXT,
+          created_at REAL NOT NULL, updated_at REAL NOT NULL, delivered_at REAL
         );
         CREATE INDEX IF NOT EXISTS jobs_nonterminal ON jobs(state);
         """)
+        self._ensure_column("error_code", "TEXT")
+        self._scrub_legacy_content()
+
+    def _ensure_column(self, name: str, definition: str) -> None:
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
+        if name not in columns:
+            self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+            self.db.commit()
+
+    def _scrub_legacy_content(self) -> None:
+        self.db.execute("UPDATE jobs SET prompt='', request_json='{}', output_path=NULL")
+        self.db.commit()
+        self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.db.execute("PRAGMA journal_mode=DELETE")
+        self.db.execute("VACUUM")
+        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.commit()
 
     def get_settings(self, user_id: int) -> Settings:
@@ -166,9 +183,10 @@ class StateStore:
         self.db.commit()
 
     def create_job(self, *, user_id: int, chat_id: int, message_id: int, prompt: str, request: dict[str, Any]) -> str:
+        del prompt, request
         job_id = uuid.uuid4().hex
         now = time.time()
-        self.db.execute("INSERT INTO jobs(job_id,user_id,chat_id,message_id,prompt,request_json,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (job_id, user_id, chat_id, message_id, prompt, json.dumps(request, separators=(",", ":")), "submitting", now, now))
+        self.db.execute("INSERT INTO jobs(job_id,user_id,chat_id,message_id,prompt,request_json,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (job_id, user_id, chat_id, message_id, "", "{}", "submitting", now, now))
         self.db.commit()
         return job_id
 
@@ -234,6 +252,10 @@ class MediaAPI:
         response.raise_for_status()
         return response.content, response.headers.get("content-type", "application/octet-stream")
 
+    async def purge(self, backend_job_id: str) -> None:
+        response = await self.client.post(f"{self.base_url}/v1/jobs/{backend_job_id}/purge", headers=self.headers(), timeout=60)
+        response.raise_for_status()
+
     async def close(self) -> None:
         await self.client.aclose()
 
@@ -243,7 +265,6 @@ class MediaBot:
         self.state = state
         self.api = api
         self.result_root = result_root
-        self.result_root.mkdir(parents=True, exist_ok=True)
         self.application: Application | None = None
         self.tasks: set[asyncio.Task[Any]] = set()
 
@@ -448,7 +469,8 @@ class MediaBot:
             return
         status = await self.api.status(backend_id)
         if status.get("state") != "succeeded":
-            self.state.update_job(job_id, state=str(status.get("state", "unknown")), last_status=json.dumps(status, separators=(",", ":")))
+            terminal_state = str(status.get("state", "unknown"))
+            self.state.update_job(job_id, state=terminal_state, last_status=terminal_state, error_code=terminal_state if terminal_state not in {"queued", "running", "succeeded"} else None)
             await update.effective_message.reply_text(f"Job {job_id[:12]} is {status.get('state', 'unknown')}; try /result later.")
             return
         await update.effective_message.reply_text(f"Recovering {job_id[:12]}. If Telegram accepted the earlier send, this explicit retry can create a duplicate.")
@@ -539,36 +561,45 @@ class MediaBot:
                 request.update(width=width, height=height)
                 raw = await self._normalize_image(raw, effective_settings)
                 request["image_path"] = await self.api.upload(raw, "image/png")
-                self.state.update_job(job_id, request_json=json.dumps(request, separators=(",", ":")))
+                del raw
             submitted = await self.api.submit(request)
             backend_id = submitted["job_id"]
             self.state.update_job(job_id, backend_job_id=backend_id, state="queued")
             await self._watch(job_id, backend_id, chat_id)
         except Exception as exc:
-            LOG.exception("media job failed job=%s", job_id)
+            error_code = type(exc).__name__
+            LOG.error("media job failed job=%s error_code=%s", job_id, error_code)
             current = self.state.get_job(job_id)
             if current is not None and current["state"] == "delivering":
-                self.state.update_job(job_id, last_status=f"delivery ambiguous: {type(exc).__name__}")
+                self.state.update_job(job_id, last_status="delivery_ambiguous", error_code=error_code)
                 try:
                     await message.reply_text(f"Job {job_id[:12]} delivery is ambiguous; use /result {job_id[:12]} for explicit recovery.")
                 except Exception:
-                    LOG.debug("ambiguous-delivery notice failed", exc_info=True)
+                    LOG.debug("ambiguous-delivery notice failed")
                 return
-            self.state.update_job(job_id, state="failed", last_status=str(exc)[:500])
-            await message.reply_text(f"Job {job_id[:12]} failed: {type(exc).__name__}; use /result {job_id[:12]} if delivery needs recovery")
+            self.state.update_job(job_id, state="failed", last_status="failed", error_code=error_code)
+            await message.reply_text(f"Job {job_id[:12]} failed: {error_code}; use /result {job_id[:12]} if delivery needs recovery")
 
     async def _deliver_backend_result(self, job_id: str, backend_id: str, chat_id: int, *, explicit: bool = False) -> None:
-        self.state.update_job(job_id, state="delivering")
+        del explicit
+        self.state.update_job(job_id, state="delivering", last_status="delivering")
         content, content_type = await self.api.result(backend_id)
-        suffix = ".png" if content_type.startswith("image/") else ".mp4"
-        output = self.result_root / f"{job_id}{suffix}"
-        output.write_bytes(content)
-        self.state.update_job(job_id, output_path=str(output))
-        if content_type.startswith("image/"):
-            await self.application.bot.send_photo(chat_id=chat_id, photo=content, caption=f"Job {job_id[:12]} complete")
+        try:
+            if content_type.startswith("image/"):
+                await self.application.bot.send_photo(chat_id=chat_id, photo=content, caption=f"Job {job_id[:12]} complete")
+            else:
+                await self.application.bot.send_video(chat_id=chat_id, video=content, caption=f"Job {job_id[:12]} complete", supports_streaming=True)
+        except Exception:
+            raise
         else:
-            await self.application.bot.send_video(chat_id=chat_id, video=content, caption=f"Job {job_id[:12]} complete", supports_streaming=True)
-        self.state.update_job(job_id, state="delivered", delivered_at=time.time())
+            self.state.update_job(job_id, state="delivered", last_status="delivered", delivered_at=time.time())
+            try:
+                await self.api.purge(backend_id)
+            except Exception as exc:
+                LOG.error("media content cleanup pending job=%s error_code=%s", job_id, type(exc).__name__)
+                self.state.update_job(job_id, last_status="cleanup_pending", error_code=type(exc).__name__)
+        finally:
+            del content
 
     async def _watch(self, job_id: str, backend_id: str, chat_id: int) -> None:
         row = self.state.get_job(job_id)
@@ -577,7 +608,7 @@ class MediaBot:
         while True:
             status = await self.api.status(backend_id)
             state = str(status.get("state", "unknown"))
-            self.state.update_job(job_id, state=state, last_status=json.dumps(status, separators=(",", ":")))
+            self.state.update_job(job_id, state=state, last_status=state)
             now = time.monotonic()
             if now - last_update >= 30 and self.application:
                 try:
@@ -589,15 +620,31 @@ class MediaBot:
                 break
             await asyncio.sleep(5)
         if state != "succeeded":
+            self.state.update_job(job_id, state=state, last_status=state, error_code=None if state == "cancelled" else state)
+            try:
+                await self.api.purge(backend_id)
+            except Exception as exc:
+                LOG.error("terminal media cleanup pending job=%s error_code=%s", job_id, type(exc).__name__)
+                self.state.update_job(job_id, last_status="cleanup_pending", error_code=type(exc).__name__)
             await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: {state}")
             return
         await self._deliver_backend_result(job_id, backend_id, chat_id)
 
     async def reconcile(self, application: Application) -> None:
         self.application = application
+        now = time.time()
         for row in self.state.nonterminal():
             if not row["backend_job_id"]:
-                self.state.update_job(row["job_id"], state="failed", last_status="bot restarted before backend submission")
+                self.state.update_job(row["job_id"], state="failed", last_status="aborted_restart", error_code="aborted_restart")
+                continue
+            if now - float(row["updated_at"]) > ABANDONED_JOB_SECONDS:
+                try:
+                    await self.api.purge(row["backend_job_id"])
+                except Exception as exc:
+                    LOG.error("abandoned media cleanup pending job=%s error_code=%s", row["job_id"], type(exc).__name__)
+                    self.state.update_job(row["job_id"], last_status="cleanup_pending", error_code=type(exc).__name__)
+                else:
+                    self.state.update_job(row["job_id"], state="failed", last_status="abandoned_timeout", error_code="abandoned_timeout")
                 continue
             task = asyncio.create_task(self._watch(row["job_id"], row["backend_job_id"], row["chat_id"]))
             self.tasks.add(task); task.add_done_callback(self.tasks.discard)

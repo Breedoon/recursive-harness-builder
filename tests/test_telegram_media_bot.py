@@ -87,7 +87,9 @@ def test_settings_and_job_snapshots_survive_restart(tmp_path):
     assert reopened.get_settings(5129431382) == settings
     row = reopened.get_job(job)
     assert row["backend_job_id"] == "backend-1"
-    assert json.loads(row["request_json"])["steps"] == 4
+    assert row["prompt"] == ""
+    assert json.loads(row["request_json"]) == {}
+    assert row["output_path"] is None
     assert [item["job_id"] for item in reopened.nonterminal()] == [job]
 
 
@@ -121,6 +123,9 @@ def test_send_failure_leaves_explicitly_recoverable_delivery_state(tmp_path):
         async def result(self, _backend_id):
             return b"png", "image/png"
 
+        async def purge(self, _backend_id):
+            raise AssertionError("failed Telegram send must remain explicitly recoverable")
+
     class Bot:
         async def send_photo(self, **_kwargs):
             raise RuntimeError("synthetic send-after-accept crash")
@@ -139,5 +144,6 @@ def test_send_failure_leaves_explicitly_recoverable_delivery_state(tmp_path):
         pass
     row = store.get_job(job)
     assert row["state"] == "delivering"
-    assert row["output_path"]
+    assert row["output_path"] is None
     assert store.nonterminal() == []
+    assert not list((tmp_path / "results").glob("*"))
