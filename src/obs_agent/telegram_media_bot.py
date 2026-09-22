@@ -515,7 +515,7 @@ class MediaBot:
         job_id = self.state.create_job(user_id=update.effective_user.id, chat_id=message.chat_id, message_id=message.message_id, prompt=prompt, request=request)
         ack = await message.reply_text(f"Queued {job_id[:12]} ({settings.model}/{mode}, {settings.preset} {width}x{height})")
         self.state.update_job(job_id, status_message_id=ack.message_id)
-        task = asyncio.create_task(self._submit_and_watch(job_id, update.effective_user.id, message.chat_id, message, settings, has_image))
+        task = asyncio.create_task(self._submit_and_watch(job_id, update.effective_user.id, message.chat_id, message, settings, has_image, request))
         self.tasks.add(task); task.add_done_callback(self.tasks.discard)
 
     async def _probe_image_size(self, raw: bytes) -> tuple[int, int]:
@@ -545,9 +545,8 @@ class MediaBot:
             raise RuntimeError(f"image normalization failed: {error.decode(errors='replace')[-300:]}")
         return output
 
-    async def _submit_and_watch(self, job_id: str, user_id: int, chat_id: int, message, settings: Settings, has_image: bool) -> None:
-        row = self.state.get_job(job_id)
-        request = json.loads(row["request_json"])
+    async def _submit_and_watch(self, job_id: str, user_id: int, chat_id: int, message, settings: Settings, has_image: bool, request: dict[str, Any]) -> None:
+        request = dict(request)
         uploaded_path = None
         backend_id = None
         try:
