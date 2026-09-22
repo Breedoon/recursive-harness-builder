@@ -257,6 +257,10 @@ class MediaAPI:
         response = await self.client.post(f"{self.base_url}/v1/jobs/{backend_job_id}/purge", headers=self.headers(), timeout=60)
         response.raise_for_status()
 
+    async def purge_upload(self, image_path: str) -> None:
+        response = await self.client.post(f"{self.base_url}/v1/uploads/purge", headers=self.headers(), json={"image_path": image_path}, timeout=60)
+        response.raise_for_status()
+
     async def close(self) -> None:
         await self.client.aclose()
 
@@ -551,6 +555,8 @@ class MediaBot:
     async def _submit_and_watch(self, job_id: str, user_id: int, chat_id: int, message, settings: Settings, has_image: bool) -> None:
         row = self.state.get_job(job_id)
         request = json.loads(row["request_json"])
+        uploaded_path = None
+        backend_id = None
         try:
             if has_image:
                 attachment = message.photo[-1] if message.photo else message.document
@@ -561,7 +567,8 @@ class MediaBot:
                 effective_settings = replace(settings, width=width, height=height, auto_size=False)
                 request.update(width=width, height=height)
                 raw = await self._normalize_image(raw, effective_settings)
-                request["image_path"] = await self.api.upload(raw, "image/png")
+                uploaded_path = await self.api.upload(raw, "image/png")
+                request["image_path"] = uploaded_path
                 del raw
             submitted = await self.api.submit(request)
             backend_id = submitted["job_id"]
@@ -570,6 +577,11 @@ class MediaBot:
         except Exception as exc:
             error_code = type(exc).__name__
             LOG.error("media job failed job=%s error_code=%s", job_id, error_code)
+            if uploaded_path and not backend_id:
+                try:
+                    await self.api.purge_upload(uploaded_path)
+                except Exception as cleanup_exc:
+                    LOG.error("uploaded media cleanup pending job=%s error_code=%s", job_id, type(cleanup_exc).__name__)
             current = self.state.get_job(job_id)
             if current is not None and current["state"] == "delivering":
                 self.state.update_job(job_id, last_status="delivery_ambiguous", error_code=error_code)
