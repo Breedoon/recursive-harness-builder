@@ -22,6 +22,37 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 LOG = logging.getLogger("obs_agent.telegram_media_bot")
 ALLOWLIST = frozenset({227177188, 5129431382})
 
+# This registry is the bot's advertised surface, not a claim about weights on disk.
+# A model remains hidden until its backend path has real qualification evidence.
+MODEL_REGISTRY = {
+    "qwen-image-2.1": {
+        "label": "Qwen Image 2.1",
+        "media_kind": "image",
+        "qualified": True,
+        "deprecated": False,
+    },
+    "h3": {
+        "label": "H3 Eros Max beta5 (checkpoint)",
+        "media_kind": "video",
+        "qualified": True,
+        "deprecated": False,
+    },
+    "wan": {
+        "label": "Wan 2.2 (deprecated)",
+        "media_kind": "video",
+        "qualified": True,
+        "deprecated": True,
+    },
+    "ltx": {
+        "label": "LTX 2.5 (qualification pending)",
+        "media_kind": "video",
+        "qualified": False,
+        "deprecated": False,
+    },
+}
+SELECTABLE_MODELS = tuple(name for name, spec in MODEL_REGISTRY.items() if spec["qualified"] and not spec["deprecated"])
+SELECTABLE_VIDEO_MODELS = tuple(name for name in SELECTABLE_MODELS if MODEL_REGISTRY[name]["media_kind"] == "video")
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -70,7 +101,10 @@ class StateStore:
             return Settings()
         try:
             data = json.loads(row[0])
-            return Settings(**{k: data[k] for k in asdict(Settings()) if k in data})
+            settings = Settings(**{k: data[k] for k in asdict(Settings()) if k in data})
+            if settings.model not in SELECTABLE_MODELS:
+                return Settings(media_kind="video", model="h3", mode="t2v", variant="turbo", steps=4, width=640, height=384)
+            return settings
         except (TypeError, ValueError, KeyError):
             return Settings()
 
@@ -175,7 +209,7 @@ class MediaBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
             return await self.deny(update)
-        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3.")
+        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3 (H3 Eros Max beta5 checkpoint).")
 
     async def settings_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
@@ -184,7 +218,7 @@ class MediaBot:
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"Kind: {settings.media_kind}", callback_data=f"s:{update.effective_user.id}:kind")],
             [InlineKeyboardButton(f"Preset: {settings.preset}", callback_data=f"s:{update.effective_user.id}:preset")],
-            [InlineKeyboardButton(f"Model: {settings.model}", callback_data=f"s:{update.effective_user.id}:model")],
+            [InlineKeyboardButton(f"Model: {MODEL_REGISTRY.get(settings.model, {}).get('label', settings.model)}", callback_data=f"s:{update.effective_user.id}:model")],
             [InlineKeyboardButton(f"Steps: {settings.steps}", callback_data=f"s:{update.effective_user.id}:steps")],
             [InlineKeyboardButton(f"Mode: {settings.mode}", callback_data=f"s:{update.effective_user.id}:mode")],
             [InlineKeyboardButton(f"LoRA: {settings.lora or 'none'}", callback_data=f"s:{update.effective_user.id}:lora")],
@@ -194,7 +228,8 @@ class MediaBot:
 
     @staticmethod
     def _settings_text(settings: Settings) -> str:
-        return (f"kind={settings.media_kind} model={settings.model} mode={settings.mode}\n"
+        model_label = MODEL_REGISTRY.get(settings.model, {}).get("label", settings.model)
+        return (f"kind={settings.media_kind} model={model_label} mode={settings.mode}\n"
                 f"preset={settings.preset} {settings.width}x{settings.height} steps={settings.steps} seconds={settings.seconds:g}\n"
                 f"variant={settings.variant} lora={settings.lora or 'none'} strength={(settings.lora_strength if settings.media_kind == 'video' and settings.lora and settings.lora_strength is not None else settings.strength):g}")
 
@@ -215,7 +250,7 @@ class MediaBot:
                 if value == "image": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
                 else: data.update(width=640, height=384, steps=4)
             elif cmd == "/model":
-                if value not in {"qwen-image-2.1", "h3", "wan", "ltx"}: raise ValueError
+                if value not in SELECTABLE_MODELS: raise ValueError
                 data["model"] = value
                 data["media_kind"] = "image" if value == "qwen-image-2.1" else "video"
                 data["mode"] = "t2i" if value == "qwen-image-2.1" else "t2v"
@@ -273,7 +308,7 @@ class MediaBot:
         choices = {
             "kind": ("media_kind", ["image", "video"]),
             "preset": ("preset", ["low", "high"]),
-            "model": ("model", ["qwen-image-2.1", "h3"]),
+            "model": ("model", list(SELECTABLE_MODELS)),
             "steps": ("steps", [12, 20]),
             "mode": ("mode", ["t2i", "edit"] if settings.media_kind == "image" else ["t2v", "i2v"]),
             "lora": ("lora", [None, "aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"]),
@@ -347,7 +382,7 @@ class MediaBot:
         if settings.media_kind == "image" and settings.model != "qwen-image-2.1":
             await message.reply_text("Image mode requires qwen-image-2.1."); return
         if settings.media_kind == "video" and settings.model == "qwen-image-2.1":
-            await message.reply_text("Video mode requires a video model such as h3 or wan."); return
+            await message.reply_text("Video mode requires the qualified H3 Eros Max beta5 checkpoint."); return
         if not has_image and settings.mode in {"edit", "i2v"}:
             await message.reply_text(f"Mode {settings.mode} requires an image attachment.")
             return

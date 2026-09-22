@@ -3,12 +3,28 @@ from __future__ import annotations
 import asyncio
 import json
 
-from obs_agent.telegram_media_bot import ALLOWLIST, MediaBot, Settings, StateStore
+from obs_agent.telegram_media_bot import ALLOWLIST, MODEL_REGISTRY, SELECTABLE_MODELS, MediaBot, Settings, StateStore
 
 
 def test_allowlist_is_exact_and_excludes_third_identity():
     assert ALLOWLIST == {227177188, 5129431382}
     assert 1350518665 not in ALLOWLIST
+
+
+def test_model_registry_only_advertises_qualified_nondeprecated_paths():
+    assert SELECTABLE_MODELS == ("qwen-image-2.1", "h3")
+    assert MODEL_REGISTRY["h3"]["label"] == "H3 Eros Max beta5 (checkpoint)"
+    assert MODEL_REGISTRY["wan"]["deprecated"] is True
+    assert MODEL_REGISTRY["ltx"]["qualified"] is False
+
+
+def test_stale_hidden_model_settings_fall_back_to_h3(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.put_settings(5129431382, Settings(media_kind="video", model="ltx", mode="t2v"))
+    settings = store.get_settings(5129431382)
+    assert settings.model == "h3"
+    assert settings.width == 640
+    assert settings.height == 384
 
 
 def test_settings_and_job_snapshots_survive_restart(tmp_path):
