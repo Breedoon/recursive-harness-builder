@@ -120,11 +120,14 @@ def test_delivering_jobs_are_not_replayed_after_restart(tmp_path):
 
 def test_send_failure_leaves_explicitly_recoverable_delivery_state(tmp_path):
     class API:
+        def __init__(self):
+            self.purged = []
+
         async def result(self, _backend_id):
             return b"png", "image/png"
 
-        async def purge(self, _backend_id):
-            raise AssertionError("failed Telegram send must remain explicitly recoverable")
+        async def purge(self, backend_id):
+            self.purged.append(backend_id)
 
     class Bot:
         async def send_photo(self, **_kwargs):
@@ -136,14 +139,13 @@ def test_send_failure_leaves_explicitly_recoverable_delivery_state(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     job = store.create_job(user_id=5129431382, chat_id=99, message_id=9, prompt="x", request={"model": "qwen-image-2.1"})
     store.update_job(job, backend_job_id="backend-3", state="succeeded")
-    bot = MediaBot(token="", state=store, api=API(), result_root=tmp_path / "results")
+    api = API()
+    bot = MediaBot(token="", state=store, api=api, result_root=tmp_path / "results")
     bot.application = Application()
-    try:
-        asyncio.run(bot._deliver_backend_result(job, "backend-3", 99))
-    except RuntimeError:
-        pass
+    asyncio.run(bot._deliver_backend_result(job, "backend-3", 99))
     row = store.get_job(job)
-    assert row["state"] == "delivering"
+    assert row["state"] == "delivery_failed"
     assert row["output_path"] is None
+    assert api.purged == ["backend-3"]
     assert store.nonterminal() == []
     assert not list((tmp_path / "results").glob("*"))

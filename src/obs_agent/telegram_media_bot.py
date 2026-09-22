@@ -157,7 +157,7 @@ class StateStore:
             self.db.commit()
 
     def _scrub_legacy_content(self) -> None:
-        self.db.execute("UPDATE jobs SET prompt='', request_json='{}', output_path=NULL")
+        self.db.execute("UPDATE jobs SET prompt='', request_json='{}', output_path=NULL, last_status=state, error_code=CASE WHEN state IN ('failed','cancelled','delivery_failed') THEN state ELSE NULL END")
         self.db.commit()
         self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self.db.execute("PRAGMA journal_mode=DELETE")
@@ -212,7 +212,10 @@ class StateStore:
     def nonterminal(self):
         # Delivery is deliberately at-most-once: a crash after Telegram accepts the
         # message but before the delivered mark must not resend it on restart.
-        return self.db.execute("SELECT * FROM jobs WHERE state NOT IN ('delivered','delivering','failed','cancelled') ORDER BY created_at").fetchall()
+        return self.db.execute("SELECT * FROM jobs WHERE state NOT IN ('delivered','delivering','delivery_failed','failed','cancelled') ORDER BY created_at").fetchall()
+
+    def cleanup_candidates(self):
+        return self.db.execute("SELECT * FROM jobs WHERE state IN ('delivery_failed','cleanup_pending') AND backend_job_id IS NOT NULL ORDER BY updated_at").fetchall()
 
 
 class MediaAPI:
@@ -225,7 +228,7 @@ class MediaAPI:
         token = self.token_file.read_text().strip()
         if not token:
             raise RuntimeError("media API secret is empty")
-        return {"Authorization": f"Bearer {token}"}
+        return {"Authorization": f"Bearer {token}", "X-Telegram-Ephemeral": "1"}
 
     async def capabilities(self) -> dict[str, Any]:
         response = await self.client.get(f"{self.base_url}/v1/capabilities", headers=self.headers())
@@ -272,6 +275,7 @@ class MediaBot:
         self.result_root = result_root
         self.application: Application | None = None
         self.tasks: set[asyncio.Task[Any]] = set()
+        self.reaper_task: asyncio.Task[Any] | None = None
 
     @staticmethod
     def authorized(update: Update) -> bool:
@@ -466,20 +470,9 @@ class MediaBot:
             return
         job_id = row["job_id"]
         if row["state"] == "delivered":
-            await update.effective_message.reply_text(f"Job {job_id[:12]} is already delivered; no automatic resend was performed.")
+            await update.effective_message.reply_text(f"Job {job_id[:12]} is already delivered; no local media copy is retained.")
             return
-        backend_id = row["backend_job_id"]
-        if not backend_id:
-            await update.effective_message.reply_text(f"Job {job_id[:12]} has no submitted backend job to recover.")
-            return
-        status = await self.api.status(backend_id)
-        if status.get("state") != "succeeded":
-            terminal_state = str(status.get("state", "unknown"))
-            self.state.update_job(job_id, state=terminal_state, last_status=terminal_state, error_code=terminal_state if terminal_state not in {"queued", "running", "succeeded"} else None)
-            await update.effective_message.reply_text(f"Job {job_id[:12]} is {status.get('state', 'unknown')}; try /result later.")
-            return
-        await update.effective_message.reply_text(f"Recovering {job_id[:12]}. If Telegram accepted the earlier send, this explicit retry can create a duplicate.")
-        await self._deliver_backend_result(job_id, backend_id, int(row["chat_id"]), explicit=True)
+        await update.effective_message.reply_text(f"Job {job_id[:12]} has no locally retained result. Check Telegram delivery or resubmit the original request.")
 
     async def message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
@@ -593,6 +586,18 @@ class MediaBot:
             self.state.update_job(job_id, state="failed", last_status="failed", error_code=error_code)
             await message.reply_text(f"Job {job_id[:12]} failed: {error_code}; use /result {job_id[:12]} if delivery needs recovery")
 
+    async def _purge_backend(self, job_id: str, backend_id: str) -> bool:
+        for attempt in range(3):
+            try:
+                await self.api.purge(backend_id)
+                return True
+            except Exception as exc:
+                if attempt == 2:
+                    LOG.error("media content cleanup failed job=%s error_code=%s", job_id, type(exc).__name__)
+                else:
+                    await asyncio.sleep(1)
+        return False
+
     async def _deliver_backend_result(self, job_id: str, backend_id: str, chat_id: int, *, explicit: bool = False) -> None:
         del explicit
         self.state.update_job(job_id, state="delivering", last_status="delivering")
@@ -602,15 +607,14 @@ class MediaBot:
                 await self.application.bot.send_photo(chat_id=chat_id, photo=content, caption=f"Job {job_id[:12]} complete")
             else:
                 await self.application.bot.send_video(chat_id=chat_id, video=content, caption=f"Job {job_id[:12]} complete", supports_streaming=True)
-        except Exception:
-            raise
+        except Exception as exc:
+            purged = await self._purge_backend(job_id, backend_id)
+            self.state.update_job(job_id, state="delivery_failed", last_status="delivery_failed", error_code=type(exc).__name__ if purged else "cleanup_failed")
+            if not purged:
+                LOG.error("delivery cleanup pending job=%s", job_id)
         else:
-            self.state.update_job(job_id, state="delivered", last_status="delivered", delivered_at=time.time())
-            try:
-                await self.api.purge(backend_id)
-            except Exception as exc:
-                LOG.error("media content cleanup pending job=%s error_code=%s", job_id, type(exc).__name__)
-                self.state.update_job(job_id, last_status="cleanup_pending", error_code=type(exc).__name__)
+            purged = await self._purge_backend(job_id, backend_id)
+            self.state.update_job(job_id, state="delivered", last_status="delivered" if purged else "cleanup_pending", delivered_at=time.time(), error_code=None if purged else "cleanup_failed")
         finally:
             del content
 
@@ -619,7 +623,13 @@ class MediaBot:
         status_message_id = row["status_message_id"]
         last_update = 0.0
         while True:
-            status = await self.api.status(backend_id)
+            try:
+                status = await self.api.status(backend_id)
+            except Exception as exc:
+                self.state.update_job(job_id, state="failed", last_status="aborted_restart", error_code=type(exc).__name__)
+                if self.application:
+                    await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: aborted after restart; resubmit from Telegram")
+                return
             state = str(status.get("state", "unknown"))
             self.state.update_job(job_id, state=state, last_status=state)
             now = time.monotonic()
@@ -643,9 +653,19 @@ class MediaBot:
             return
         await self._deliver_backend_result(job_id, backend_id, chat_id)
 
+    async def _reaper(self) -> None:
+        while True:
+            for row in self.state.cleanup_candidates():
+                if await self._purge_backend(row["job_id"], row["backend_job_id"]):
+                    self.state.update_job(row["job_id"], last_status="cleanup_complete", error_code=None)
+            await asyncio.sleep(60)
+
     async def reconcile(self, application: Application) -> None:
         self.application = application
         now = time.time()
+        for row in self.state.cleanup_candidates():
+            if await self._purge_backend(row["job_id"], row["backend_job_id"]):
+                self.state.update_job(row["job_id"], last_status="cleanup_complete", error_code=None)
         for row in self.state.nonterminal():
             if not row["backend_job_id"]:
                 self.state.update_job(row["job_id"], state="failed", last_status="aborted_restart", error_code="aborted_restart")
@@ -664,6 +684,7 @@ class MediaBot:
 
     async def configure(self, application: Application) -> None:
         await self.reconcile(application)
+        self.reaper_task = asyncio.create_task(self._reaper())
         await application.bot.set_my_commands([
             ("start", "show the private media bot welcome"),
             ("settings", "show and cycle current settings"),
@@ -710,6 +731,9 @@ async def run() -> None:
     try:
         await asyncio.Event().wait()
     finally:
+        if bot.reaper_task:
+            bot.reaper_task.cancel()
+            await asyncio.gather(bot.reaper_task, return_exceptions=True)
         await app.updater.stop(); await app.stop(); await app.shutdown(); await api.close()
 
 
