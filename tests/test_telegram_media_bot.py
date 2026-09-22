@@ -48,7 +48,7 @@ def test_manual_dimension_precedence_and_auto_reset():
     manual = MediaBot._apply_setting(settings, "width", "640")
     manual = MediaBot._apply_setting(manual, "height", "480")
     assert manual.auto_size is False
-    assert _resolve_dimensions(manual, (9, 16)) == (640, 480)
+    assert _resolve_dimensions(manual, (9, 16)) == (704, 512)
     reset = MediaBot._apply_setting(manual, "auto", "auto")
     assert reset.auto_size is True and reset.width is None and reset.height is None
     assert _resolve_dimensions(reset, (9, 16))[1] > _resolve_dimensions(manual, (9, 16))[1]

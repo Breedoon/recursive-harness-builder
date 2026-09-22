@@ -62,7 +62,7 @@ def _alignment(model: str, mode: str) -> int:
     if model == "h3":
         return 32 if mode == "i2v" else 16
     if model == "ltx":
-        return 32
+        return 64
     return 16
 
 
