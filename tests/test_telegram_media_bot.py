@@ -3,12 +3,39 @@ from __future__ import annotations
 import asyncio
 import json
 
-from obs_agent.telegram_media_bot import ALLOWLIST, MediaBot, Settings, StateStore
+from obs_agent.telegram_media_bot import ALLOWLIST, MODEL_REGISTRY, SELECTABLE_MODELS, MediaBot, Settings, StateStore
 
 
 def test_allowlist_is_exact_and_excludes_third_identity():
     assert ALLOWLIST == {227177188, 5129431382}
     assert 1350518665 not in ALLOWLIST
+
+
+def test_model_registry_only_advertises_qualified_nondeprecated_paths():
+    assert SELECTABLE_MODELS == ("qwen-image-2.1", "h3", "ltx")
+    assert MODEL_REGISTRY["h3"]["label"] == "H3 Eros Max beta5 (checkpoint)"
+    assert MODEL_REGISTRY["wan"]["deprecated"] is True
+    assert MODEL_REGISTRY["ltx"]["qualified"] is True
+
+
+def test_settings_keyboard_rebuilds_model_label_after_cycle(tmp_path):
+    bot = MediaBot(token="", state=StateStore(tmp_path / "state.sqlite3"), api=None, result_root=tmp_path / "results")
+    h3_keyboard = bot._settings_keyboard(5129431382, Settings(model="h3", media_kind="video"))
+    qwen_keyboard = bot._settings_keyboard(5129431382, Settings(model="qwen-image-2.1", media_kind="image"))
+    assert h3_keyboard.inline_keyboard[2][0].text == "Model: H3 Eros Max beta5 (checkpoint)"
+    assert qwen_keyboard.inline_keyboard[2][0].text == "Model: Qwen Image 2.1"
+    assert h3_keyboard.inline_keyboard[2][0].callback_data == qwen_keyboard.inline_keyboard[2][0].callback_data
+    ltx_keyboard = bot._settings_keyboard(5129431382, Settings(model="ltx", media_kind="video"))
+    assert ltx_keyboard.inline_keyboard[2][0].text == "Model: LTX 2.5 (qualified)"
+
+
+def test_stale_hidden_model_settings_fall_back_to_h3(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.put_settings(5129431382, Settings(media_kind="video", model="wan", mode="t2v"))
+    settings = store.get_settings(5129431382)
+    assert settings.model == "h3"
+    assert settings.width == 640
+    assert settings.height == 384
 
 
 def test_settings_and_job_snapshots_survive_restart(tmp_path):
