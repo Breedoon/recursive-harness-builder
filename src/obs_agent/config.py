@@ -37,16 +37,16 @@ MODEL_RESOLUTION: dict[str, str] = {
     "haiku": "claude-haiku-4-5",
     "claude-haiku": "claude-haiku-4-5",
     # OpenAI tiers – "gpt" resolves to main production model
-    "gpt": "gpt-5.6-sol",
-    "gpt-pro": "gpt-5.6-sol",
+    "gpt": "gpt-6-sol",
+    "gpt-pro": "gpt-6-sol",
     "astra": "gpt-6-astra",
-    "sol": "gpt-5.6-sol",
-    "gpt-sol": "gpt-5.6-sol",
+    "sol": "gpt-6-sol",
+    "gpt-sol": "gpt-6-sol",
     "terra": "gpt-5.6-terra",
-    "luna": "gpt-5.6-luna",
+    "luna": "gpt-6-luna",
     "gpt-mini": "gpt-5.4-mini",
-    "openai": "gpt-5.6-sol",
-    "chatgpt": "gpt-5.6-sol",
+    "openai": "gpt-6-sol",
+    "chatgpt": "gpt-6-sol",
     # Google tiers
     "gemini": "gemini-3.1-flash-lite-preview",
     "gemini-pro": "gemini-3.1-pro-preview",
@@ -67,6 +67,8 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "local-qwen3.8-27b": 262_000,
     "local-gemma4-31b": 48_000,
     "gpt-6-astra": 900_000,
+    "gpt-6-sol": 900_000,
+    "gpt-6-luna": 900_000,
     "gpt-5.6-sol": 900_000,
     "gpt-5.6-luna": 900_000,
     "gpt-5.6-terra": 900_000,
@@ -90,6 +92,8 @@ MODEL_EFFORT_LEVELS: dict[str, str] = {
     "claude-sonnet-4-6": "high",
     "local-qwen3.8-27b": "medium",
     "gpt-6-astra": "medium",
+    "gpt-6-sol": "medium",
+    "gpt-6-luna": "medium",
     "gpt-5.6-sol": "medium",
     "gpt-5.6-luna": "medium",
     "gpt-5.6-terra": "medium",
@@ -320,9 +324,9 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "gpt-5.6-luna"
+    model: str = "gpt-6-luna"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
-    # Resolved via MODEL_RESOLUTION (e.g. "sol" → "gpt-5.6-sol");
+    # Resolved via MODEL_RESOLUTION (e.g. "sol" → "gpt-6-sol");
     # full model names pass through unchanged.
     # Change this to e.g. "claude" to make root sessions default to Claude.
     default_model: str = "luna"

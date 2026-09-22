@@ -1148,11 +1148,11 @@ class TestNormalizeModelName:
         assert cache_proxy._normalize_model_name("haiku[1m]") == "claude-haiku-4-5"
 
     def test_resolves_non_claude_shorthands(self):
-        assert cache_proxy._normalize_model_name("gpt") == "gpt-5.6-sol"
-        assert cache_proxy._normalize_model_name("gpt[200k]") == "gpt-5.6-sol"
+        assert cache_proxy._normalize_model_name("gpt") == "gpt-6-sol"
+        assert cache_proxy._normalize_model_name("gpt[200k]") == "gpt-6-sol"
         assert cache_proxy._normalize_model_name("astra") == "gpt-6-astra"
         assert cache_proxy._normalize_model_name("terra[900k]") == "gpt-5.6-terra"
-        assert cache_proxy._normalize_model_name("luna") == "gpt-5.6-luna"
+        assert cache_proxy._normalize_model_name("luna") == "gpt-6-luna"
         assert cache_proxy._normalize_model_name("qwen") == "local-qwen3.8-27b"
 
 

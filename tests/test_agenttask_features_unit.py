@@ -56,9 +56,9 @@ class TestModelResolution:
 
     @pytest.mark.parametrize(("alias", "model"), [
         ("astra", "gpt-6-astra"),
-        ("sol", "gpt-5.6-sol"),
+        ("sol", "gpt-6-sol"),
         ("terra", "gpt-5.6-terra"),
-        ("luna", "gpt-5.6-luna"),
+        ("luna", "gpt-6-luna"),
     ])
     def test_named_gpt_aliases(self, alias, model):
         assert resolve_model(alias) == model
@@ -93,7 +93,7 @@ class TestModelResolution:
         assert result == "gpt-5.4-mini[200k]"
 
     def test_resolution_does_not_add_default_context_suffix(self):
-        assert resolve_model("gpt") == "gpt-5.6-sol"
+        assert resolve_model("gpt") == "gpt-6-sol"
         assert resolve_model("claude") == "claude-opus-5"
 
 
@@ -103,20 +103,21 @@ class TestModelContextBoundary:
         assert split_context_suffix("gpt-5.4-mini[200k]") == ("gpt-5.4-mini", 200_000)
 
     def test_claude_code_boundary_adds_resolved_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt") == "gpt-5.6-sol[900k]"
+        assert normalize_model_for_claude_code("gpt") == "gpt-6-sol[900k]"
         assert normalize_model_for_claude_code("claude") == "claude-opus-5[1m]"
         assert normalize_model_for_claude_code("haiku") == "claude-haiku-4-5[200k]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
 
     @pytest.mark.parametrize("model", [
-        "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra",
+        "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+        "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra",
         "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
     ])
     def test_current_gpt_models_default_to_900k(self, model):
         assert normalize_model_for_claude_code(model) == f"{model}[900k]"
 
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.6-sol[200k]"
+        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-6-sol[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
     def test_local_provider_boundary_preserves_canonical_model_id(self):

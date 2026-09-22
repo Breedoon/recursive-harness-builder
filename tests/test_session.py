@@ -597,7 +597,7 @@ class TestClientLifecycle:
 
         assert client is mock_client
         options = captured["options"]
-        assert options.model == "gpt-5.6-sol[200k]"
+        assert options.model == "gpt-6-sol[200k]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert 1 <= float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) <= 100
