@@ -10,7 +10,7 @@ import secrets
 import sqlite3
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +52,56 @@ MODEL_REGISTRY = {
 }
 SELECTABLE_MODELS = tuple(name for name, spec in MODEL_REGISTRY.items() if spec["qualified"] and not spec["deprecated"])
 SELECTABLE_VIDEO_MODELS = tuple(name for name in SELECTABLE_MODELS if MODEL_REGISTRY[name]["media_kind"] == "video")
+PRESET_LONGEST = {"low": 500, "medium": 700, "high": 1000}
+VIDEO_LORAS = {"aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"}
+
+
+def _alignment(model: str, mode: str) -> int:
+    if model == "h3":
+        return 32 if mode == "i2v" else 16
+    if model == "ltx":
+        return 32
+    return 16
+
+
+def _default_aspect(model: str, mode: str) -> float:
+    if model == "ltx" and mode == "i2v":
+        return 1.0
+    if model == "qwen-image-2.1":
+        return 1.0
+    return 5 / 3
+
+
+def _aligned_dimensions(model: str, mode: str, longest: int, aspect: float) -> tuple[int, int]:
+    aspect = max(0.05, aspect)
+    if aspect >= 1:
+        width, height = longest, round(longest / aspect)
+    else:
+        width, height = round(longest * aspect), longest
+    unit = _alignment(model, mode)
+    width_steps = max(1, round(width / unit))
+    height_steps = max(1, round(height / unit))
+    candidates = []
+    for width_step in range(max(1, width_steps - 1), width_steps + 2):
+        for height_step in range(max(1, height_steps - 1), height_steps + 2):
+            candidate_width, candidate_height = width_step * unit, height_step * unit
+            ratio_error = abs((candidate_width / candidate_height) - aspect)
+            size_error = abs(max(candidate_width, candidate_height) - longest)
+            candidates.append((ratio_error, size_error, candidate_width, candidate_height))
+    _, _, width, height = min(candidates)
+    return width, height
+
+
+def _resolve_dimensions(settings: "Settings", source_size: tuple[int, int] | None = None) -> tuple[int, int]:
+    aspect = (source_size[0] / source_size[1]) if source_size else _default_aspect(settings.model, settings.mode)
+    if not settings.auto_size:
+        if settings.width is not None and settings.height is not None:
+            return _aligned_dimensions(settings.model, settings.mode, max(settings.width, settings.height), settings.width / settings.height)
+        if settings.width is not None:
+            return _aligned_dimensions(settings.model, settings.mode, settings.width, aspect)
+        if settings.height is not None:
+            return _aligned_dimensions(settings.model, settings.mode, settings.height * aspect, aspect)
+    return _aligned_dimensions(settings.model, settings.mode, settings.longest, aspect)
 
 
 @dataclass(frozen=True)
@@ -66,8 +116,10 @@ class Settings:
     strength: float = 0.75
     steps: int = 20
     seconds: float = 4.0
-    width: int = 512
-    height: int = 512
+    width: int | None = 512
+    height: int | None = 512
+    longest: int = 500
+    auto_size: bool = True
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"), sort_keys=True)
@@ -221,6 +273,9 @@ class MediaBot:
             [InlineKeyboardButton(f"Mode: {settings.mode}", callback_data=f"s:{user_id}:mode")],
             [InlineKeyboardButton(f"LoRA: {settings.lora or 'none'}", callback_data=f"s:{user_id}:lora")],
             [InlineKeyboardButton(f"Strength: {settings.lora_strength or 'default'}", callback_data=f"s:{user_id}:strength")],
+            [InlineKeyboardButton(f"Width: {settings.width if not settings.auto_size and settings.width is not None else 'auto'}", callback_data=f"s:{user_id}:width")],
+            [InlineKeyboardButton(f"Height: {settings.height if not settings.auto_size and settings.height is not None else 'auto'}", callback_data=f"s:{user_id}:height")],
+            [InlineKeyboardButton(f"Longest: {settings.longest}", callback_data=f"s:{user_id}:longest")],
         ])
 
     async def settings_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -235,9 +290,70 @@ class MediaBot:
     @staticmethod
     def _settings_text(settings: Settings) -> str:
         model_label = MODEL_REGISTRY.get(settings.model, {}).get("label", settings.model)
+        width, height = _resolve_dimensions(settings)
+        size = f"auto {width}x{height} longest={settings.longest}" if settings.auto_size else f"manual {width}x{height}"
+        strength = settings.lora_strength if settings.media_kind == 'video' and settings.lora and settings.lora_strength is not None else settings.strength
         return (f"kind={settings.media_kind} model={model_label} mode={settings.mode}\n"
-                f"preset={settings.preset} {settings.width}x{settings.height} steps={settings.steps} seconds={settings.seconds:g}\n"
-                f"variant={settings.variant} lora={settings.lora or 'none'} strength={(settings.lora_strength if settings.media_kind == 'video' and settings.lora and settings.lora_strength is not None else settings.strength):g}")
+                f"preset={settings.preset} {size} steps={settings.steps} seconds={settings.seconds:g}\n"
+                f"variant={settings.variant} lora={settings.lora or 'none'} strength={strength:g}")
+
+    @staticmethod
+    def _apply_setting(settings: Settings, key: str, raw: str) -> Settings:
+        data = asdict(settings)
+        key = key.lower().lstrip("/")
+        value = raw.lower()
+        if key in {"auto", "reset-auto"}:
+            if value not in {"auto", "reset", "true"}: raise ValueError
+            data.update(auto_size=True, width=None, height=None)
+        elif key in {"kind", "media_kind"}:
+            if value not in {"image", "video"}: raise ValueError
+            data.update(media_kind=value, model="qwen-image-2.1" if value == "image" else "h3", mode="t2i" if value == "image" else "t2v", auto_size=True, width=None, height=None)
+            data.update(steps=20 if value == "image" else 4, lora=None if value == "image" else data["lora"], lora_strength=None if value == "image" else data["lora_strength"])
+        elif key == "model":
+            if value not in SELECTABLE_MODELS: raise ValueError
+            data.update(model=value, media_kind="image" if value == "qwen-image-2.1" else "video", mode="t2i" if value == "qwen-image-2.1" else "t2v", auto_size=True, width=None, height=None)
+            data.update(variant="turbo" if value == "h3" else "uncensored", steps=20 if value == "qwen-image-2.1" else (4 if value == "h3" else 8), lora=None if value != "h3" else data["lora"], lora_strength=None if value != "h3" else data["lora_strength"])
+        elif key == "mode":
+            valid = {"t2i", "edit"} if settings.media_kind == "image" else {"t2v", "i2v"}
+            if value not in valid: raise ValueError
+            data["mode"] = value
+        elif key == "preset":
+            if value not in PRESET_LONGEST: raise ValueError
+            data.update(preset=value, longest=PRESET_LONGEST[value], auto_size=True, width=None, height=None)
+        elif key == "longest":
+            longest = int(raw)
+            if not 256 <= longest <= 2048: raise ValueError
+            data.update(longest=longest, auto_size=True, width=None, height=None)
+            data["preset"] = min(PRESET_LONGEST, key=lambda name: abs(PRESET_LONGEST[name] - longest))
+        elif key in {"width", "height"}:
+            if value == "auto":
+                data[key] = None
+                data["auto_size"] = data["width"] is None and data["height"] is None
+            else:
+                dimension = int(raw)
+                if not 64 <= dimension <= 4096: raise ValueError
+                data.update({key: dimension, "auto_size": False})
+        elif key in {"steps", "duration", "seconds", "strength", "lora_strength", "variant", "lora"}:
+            if key == "steps":
+                data["steps"] = int(raw)
+                if not 1 <= data["steps"] <= 40: raise ValueError
+            elif key in {"duration", "seconds"}:
+                data["seconds"] = float(raw)
+                if not 1.0 <= data["seconds"] <= 15.0: raise ValueError
+            elif key in {"strength", "lora_strength"}:
+                target = "lora_strength" if settings.media_kind == "video" and key == "strength" else key
+                data[target] = None if value == "none" else float(raw)
+                if data[target] is not None and not 0.0 <= data[target] <= 2.0: raise ValueError
+            elif key == "variant":
+                valid = {"h3": {"turbo", "int8", "w4a8"}, "ltx": {"uncensored"}, "qwen-image-2.1": set()}.get(settings.model, set())
+                if value not in valid: raise ValueError
+                data["variant"] = value
+            else:
+                if settings.model != "h3" or value not in VIDEO_LORAS | {"none"}: raise ValueError
+                data["lora"] = None if value == "none" else value
+        else:
+            raise ValueError
+        return Settings(**data)
 
     async def setting_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
@@ -245,61 +361,23 @@ class MediaBot:
         args = context.args
         cmd = update.effective_message.text.split()[0].split("@", 1)[0].lower()
         settings = self.state.get_settings(update.effective_user.id)
-        if not args:
-            return await update.effective_message.reply_text("Usage: /kind image|video, /model qwen-image-2.1|h3|ltx, /mode t2i|edit|t2v|i2v, /preset low|high, /steps N, /duration SECONDS, /variant turbo|uncensored|int8|w4a8, /lora none|aftermidnight|aftermidnight-softer|hmnsfw|naughtytimes, /strength 0.0-2.0")
-        value = args[0].lower()
-        data = asdict(settings)
+        usage = "Usage: /set KEY VALUE (model, mode, preset, longest, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|h3|ltx"
+        if cmd == "/set":
+            if len(args) != 2:
+                return await update.effective_message.reply_text(usage)
+            key, raw = args
+        elif cmd == "/auto":
+            key, raw = "auto", "auto"
+        else:
+            if not args:
+                return await update.effective_message.reply_text(usage)
+            key, raw = cmd, args[0]
         try:
-            if cmd == "/kind":
-                if value not in {"image", "video"}: raise ValueError
-                data.update(media_kind=value, model="qwen-image-2.1" if value == "image" else "h3", mode="t2i" if value == "image" else "t2v")
-                if value == "image": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
-                else: data.update(width=640, height=384, steps=4)
-            elif cmd == "/model":
-                if value not in SELECTABLE_MODELS: raise ValueError
-                data["model"] = value
-                data["media_kind"] = "image" if value == "qwen-image-2.1" else "video"
-                data["mode"] = "t2i" if value == "qwen-image-2.1" else "t2v"
-                if value == "qwen-image-2.1": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
-                elif value == "h3": data.update(variant="turbo", width=640, height=384, steps=4)
-                else: data.update(variant="uncensored", width=576, height=576 if data["mode"] == "i2v" else 384, steps=8, lora=None, lora_strength=None)
-            elif cmd == "/mode":
-                valid_modes = {"t2i", "edit"} if settings.media_kind == "image" else {"t2v", "i2v"}
-                if value not in valid_modes: raise ValueError
-                data["mode"] = value
-                if settings.model == "ltx": data.update(width=576, height=576 if value == "i2v" else 384, steps=8)
-            elif cmd == "/lora":
-                if settings.model != "h3" or value not in {"none", "aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"}: raise ValueError
-                data["lora"] = None if value == "none" else value
-            elif cmd == "/strength":
-                strength = float(args[0])
-                if not 0.0 <= strength <= 2.0: raise ValueError
-                if settings.media_kind == "video": data["lora_strength"] = strength
-                else: data["strength"] = strength
-            elif cmd == "/preset":
-                if value not in {"low", "high"}: raise ValueError
-                if settings.media_kind == "video":
-                    data.update(preset=value, width=640, height=384)
-                else:
-                    data.update(preset=value, width=512 if value == "low" else 640, height=512 if value == "low" else 640)
-            elif cmd == "/steps":
-                data["steps"] = max(1, min(40, int(args[0])))
-            elif cmd == "/duration":
-                data["seconds"] = max(1.0, min(10.0, float(args[0])))
-            elif cmd == "/variant":
-                valid_variants = {
-                    "h3": {"turbo", "int8", "w4a8"},
-                    "wan": {"uncensored", "remix", "smoothmix"},
-                    "ltx": {"uncensored"},
-                }.get(settings.model, set())
-                if value not in valid_variants: raise ValueError
-                data["variant"] = value
-            else: raise ValueError
+            new_settings = self._apply_setting(settings, key, raw)
         except (ValueError, TypeError):
-            return await update.effective_message.reply_text("Invalid setting. Use /settings for current values and supported choices.")
-        new_settings = Settings(**data)
+            return await update.effective_message.reply_text("Invalid setting. Use /settings or /set KEY VALUE; /set auto reset restores adaptive sizing.")
         self.state.put_settings(update.effective_user.id, new_settings)
-        await update.effective_message.reply_text(self._settings_text(new_settings))
+        await update.effective_message.reply_text(self._settings_text(new_settings), reply_markup=self._settings_keyboard(update.effective_user.id, new_settings))
 
     async def callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -311,43 +389,37 @@ class MediaBot:
             await query.answer("This control belongs to another user", show_alert=True)
             return
         settings = self.state.get_settings(user.id)
-        data = asdict(settings)
+        step_values = [4, 20] if settings.model == "h3" else ([8, 20] if settings.model == "ltx" else [12, 20])
         choices = {
-            "kind": ("media_kind", ["image", "video"]),
-            "preset": ("preset", ["low", "high"]),
-            "model": ("model", list(SELECTABLE_MODELS)),
-            "steps": ("steps", [12, 20]),
-            "mode": ("mode", ["t2i", "edit"] if settings.media_kind == "image" else ["t2v", "i2v"]),
-            "lora": ("lora", [None, "aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"]),
-            "strength": (("lora_strength" if settings.media_kind == "video" else "strength"), ([None, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0] if settings.media_kind == "video" else [0.25, 0.5, 0.75, 1.0, 1.5, 2.0])),
+            "kind": ["image", "video"],
+            "preset": list(PRESET_LONGEST),
+            "model": list(SELECTABLE_MODELS),
+            "steps": step_values,
+            "mode": ["t2i", "edit"] if settings.media_kind == "image" else ["t2v", "i2v"],
+            "lora": ["none", *sorted(VIDEO_LORAS)],
+            "strength": ["none", 0.25, 0.5, 0.75, 1.0, 1.5, 2.0],
+            "width": ["auto", 512, 704, 992],
+            "height": ["auto", 512, 704, 992],
+            "longest": [500, 700, 1000],
         }
         key = parts[2]
-        field, values = choices.get(key, (None, []))
-        if field is None:
+        values = choices.get(key)
+        if values is None:
             await query.answer("Unknown setting", show_alert=True); return
         if key in {"lora", "strength"} and settings.media_kind != "video":
             await query.answer("LoRA controls are available only in video mode", show_alert=True); return
-        current = data[field]
-        value = values[(values.index(current) + 1) % len(values)] if current in values else values[0]
-        data[field] = value
-        if field == "media_kind":
-            data.update(model="qwen-image-2.1" if value == "image" else "h3", mode="t2i" if value == "image" else "t2v")
-            if value == "image": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
-            else: data.update(width=640, height=384, steps=4)
-        if field == "model":
-            data.update(media_kind="image" if value == "qwen-image-2.1" else "video", mode="t2i" if value == "qwen-image-2.1" else "t2v")
-            if value == "qwen-image-2.1": data.update(width=512, height=512, steps=20, lora=None, lora_strength=None)
-            elif value == "h3": data.update(width=640, height=384, steps=4, variant="turbo")
-            else: data.update(width=576, height=576 if data["mode"] == "i2v" else 384, steps=8, variant="uncensored", lora=None, lora_strength=None)
-        if field == "mode" and settings.model == "ltx":
-            data.update(width=576, height=576 if value == "i2v" else 384, steps=8)
-        new_settings = Settings(**data)
+        current = settings.lora if key == "lora" else (settings.lora_strength if key == "strength" and settings.media_kind == "video" else settings.strength if key == "strength" else getattr(settings, key if key != "kind" else "media_kind"))
+        current_value = "none" if current is None and key in {"lora", "strength"} else current
+        if key in {"width", "height"} and settings.auto_size:
+            current_value = "auto"
+        value = values[(values.index(current_value) + 1) % len(values)] if current_value in values else values[0]
+        try:
+            new_settings = self._apply_setting(settings, key, str(value))
+        except (ValueError, TypeError):
+            await query.answer("Unsupported setting", show_alert=True); return
         self.state.put_settings(user.id, new_settings)
         await query.answer("Saved")
-        await query.edit_message_text(
-            self._settings_text(new_settings),
-            reply_markup=self._settings_keyboard(user.id, new_settings),
-        )
+        await query.edit_message_text(self._settings_text(new_settings), reply_markup=self._settings_keyboard(user.id, new_settings))
 
     async def result_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
@@ -406,20 +478,35 @@ class MediaBot:
                 mode = "i2v"
         else:
             mode = settings.mode
-        request = {"model": settings.model, "mode": mode, "prompt": prompt, "width": settings.width, "height": settings.height, "steps": settings.steps}
+        width, height = _resolve_dimensions(settings)
+        request = {"model": settings.model, "mode": mode, "prompt": prompt, "width": width, "height": height, "steps": settings.steps}
         if settings.media_kind == "video":
             request.update(seconds=settings.seconds, variant=settings.variant)
             if settings.lora: request.update(lora=settings.lora, lora_strength=settings.lora_strength)
         if settings.media_kind == "image":
             request.update(cfg=4.0, strength=settings.strength)
         job_id = self.state.create_job(user_id=update.effective_user.id, chat_id=message.chat_id, message_id=message.message_id, prompt=prompt, request=request)
-        ack = await message.reply_text(f"Queued {job_id[:12]} ({settings.model}/{mode}, {settings.preset} {settings.width}x{settings.height})")
+        ack = await message.reply_text(f"Queued {job_id[:12]} ({settings.model}/{mode}, {settings.preset} {width}x{height})")
         self.state.update_job(job_id, status_message_id=ack.message_id)
         task = asyncio.create_task(self._submit_and_watch(job_id, update.effective_user.id, message.chat_id, message, settings, has_image))
         self.tasks.add(task); task.add_done_callback(self.tasks.discard)
 
+    async def _probe_image_size(self, raw: bytes) -> tuple[int, int]:
+        process = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-f", "image2pipe", "-i", "pipe:0",
+            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        output, error = await process.communicate(raw)
+        if process.returncode != 0 or b"x" not in output:
+            raise RuntimeError(f"image dimensions unavailable: {error.decode(errors='replace')[-300:]}")
+        width, height = output.decode().strip().split("x", 1)
+        return int(width), int(height)
+
     async def _normalize_image(self, raw: bytes, settings: Settings) -> bytes:
         """Apply aspect-cover crop and model-valid resize before upload."""
+        if settings.width is None or settings.height is None:
+            raise RuntimeError("resolved dimensions are required before image normalization")
         vf = f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=increase,crop={settings.width}:{settings.height}"
         process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
@@ -439,7 +526,11 @@ class MediaBot:
                 attachment = message.photo[-1] if message.photo else message.document
                 telegram_file = await attachment.get_file()
                 raw = bytes(await telegram_file.download_as_bytearray())
-                raw = await self._normalize_image(raw, settings)
+                source_size = await self._probe_image_size(raw)
+                width, height = _resolve_dimensions(settings, source_size)
+                effective_settings = replace(settings, width=width, height=height, auto_size=False)
+                request.update(width=width, height=height)
+                raw = await self._normalize_image(raw, effective_settings)
                 request["image_path"] = await self.api.upload(raw, "image/png")
                 self.state.update_job(job_id, request_json=json.dumps(request, separators=(",", ":")))
             submitted = await self.api.submit(request)
@@ -504,14 +595,36 @@ class MediaBot:
             task = asyncio.create_task(self._watch(row["job_id"], row["backend_job_id"], row["chat_id"]))
             self.tasks.add(task); task.add_done_callback(self.tasks.discard)
 
+    async def configure(self, application: Application) -> None:
+        await self.reconcile(application)
+        await application.bot.set_my_commands([
+            ("start", "show the private media bot welcome"),
+            ("settings", "show and cycle current settings"),
+            ("set", "set KEY VALUE; use auto to reset sizing"),
+            ("auto", "reset width and height to adaptive sizing"),
+            ("kind", "set image or video kind"),
+            ("model", "select a qualified model"),
+            ("mode", "select t2i, edit, t2v, or i2v"),
+            ("preset", "select low, medium, or high longest side"),
+            ("longest", "set adaptive longest side"),
+            ("width", "set manual width or auto"),
+            ("height", "set manual height or auto"),
+            ("steps", "set sampling steps"),
+            ("duration", "set requested video seconds"),
+            ("variant", "set a supported model variant"),
+            ("lora", "set the H3 LoRA"),
+            ("strength", "set edit or LoRA strength"),
+            ("result", "recover an explicitly requested result"),
+        ])
+
     def build(self) -> Application:
         token = os.environ.get("TELEGRAM_MEDIA_BOT_TOKEN", "").strip()
         if not token:
             raise RuntimeError("TELEGRAM_MEDIA_BOT_TOKEN is required")
-        app = Application.builder().token(token).post_init(self.reconcile).build()
+        app = Application.builder().token(token).build()
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("settings", self.settings_cmd))
-        for command in ("kind", "model", "mode", "preset", "steps", "duration", "variant", "lora", "strength"):
+        for command in ("set", "auto", "kind", "model", "mode", "preset", "longest", "width", "height", "steps", "duration", "variant", "lora", "strength"):
             app.add_handler(CommandHandler(command, self.setting_command))
         app.add_handler(CommandHandler("result", self.result_command))
         app.add_handler(CallbackQueryHandler(self.callback, pattern=r"^s:"))
@@ -526,7 +639,7 @@ async def run() -> None:
     api = MediaAPI(os.environ.get("TELEGRAM_MEDIA_API_URL", "http://host.docker.internal:8190"), Path(os.environ.get("TELEGRAM_MEDIA_API_TOKEN_FILE", "/run/secrets/media_api_key")))
     bot = MediaBot(token=os.environ.get("TELEGRAM_MEDIA_BOT_TOKEN", ""), state=StateStore(db), api=api, result_root=results)
     app = bot.build()
-    await app.initialize(); await bot.reconcile(app); await app.start(); await app.updater.start_polling(drop_pending_updates=True)
+    await app.initialize(); await bot.configure(app); await app.start(); await app.updater.start_polling(drop_pending_updates=True)
     try:
         await asyncio.Event().wait()
     finally:
