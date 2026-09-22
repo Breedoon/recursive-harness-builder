@@ -403,6 +403,10 @@ class MediaBot:
             current = self.state.get_job(job_id)
             if current is not None and current["state"] == "delivering":
                 self.state.update_job(job_id, last_status=f"delivery ambiguous: {type(exc).__name__}")
+                try:
+                    await message.reply_text(f"Job {job_id[:12]} delivery is ambiguous; use /result {job_id[:12]} for explicit recovery.")
+                except Exception:
+                    LOG.debug("ambiguous-delivery notice failed", exc_info=True)
                 return
             self.state.update_job(job_id, state="failed", last_status=str(exc)[:500])
             await message.reply_text(f"Job {job_id[:12]} failed: {type(exc).__name__}; use /result {job_id[:12]} if delivery needs recovery")
