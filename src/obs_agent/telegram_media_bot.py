@@ -97,6 +97,13 @@ class StateStore:
     def get_job(self, job_id: str):
         return self.db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
 
+    def get_user_job(self, user_id: int, reference: str):
+        row = self.db.execute("SELECT * FROM jobs WHERE job_id=? AND user_id=?", (reference, user_id)).fetchone()
+        if row:
+            return row
+        matches = self.db.execute("SELECT * FROM jobs WHERE job_id LIKE ? AND user_id=? ORDER BY created_at DESC", (reference + "%", user_id)).fetchall()
+        return matches[0] if len(matches) == 1 else None
+
     def nonterminal(self):
         # Delivery is deliberately at-most-once: a crash after Telegram accepts the
         # message but before the delivered mark must not resend it on restart.
@@ -294,6 +301,32 @@ class MediaBot:
         await query.answer("Saved")
         await query.edit_message_text(self._settings_text(new_settings), reply_markup=query.message.reply_markup)
 
+    async def result_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.authorized(update):
+            return await self.deny(update)
+        if not context.args or len(context.args) != 1:
+            await update.effective_message.reply_text("Usage: /result JOB_ID — explicitly recover an ambiguous or pending delivery; an ambiguous retry may duplicate a Telegram message that was already accepted.")
+            return
+        row = self.state.get_user_job(update.effective_user.id, context.args[0].strip())
+        if row is None:
+            await update.effective_message.reply_text("Job not found for this user.")
+            return
+        job_id = row["job_id"]
+        if row["state"] == "delivered":
+            await update.effective_message.reply_text(f"Job {job_id[:12]} is already delivered; no automatic resend was performed.")
+            return
+        backend_id = row["backend_job_id"]
+        if not backend_id:
+            await update.effective_message.reply_text(f"Job {job_id[:12]} has no submitted backend job to recover.")
+            return
+        status = await self.api.status(backend_id)
+        if status.get("state") != "succeeded":
+            self.state.update_job(job_id, state=str(status.get("state", "unknown")), last_status=json.dumps(status, separators=(",", ":")))
+            await update.effective_message.reply_text(f"Job {job_id[:12]} is {status.get('state', 'unknown')}; try /result later.")
+            return
+        await update.effective_message.reply_text(f"Recovering {job_id[:12]}. If Telegram accepted the earlier send, this explicit retry can create a duplicate.")
+        await self._deliver_backend_result(job_id, backend_id, int(row["chat_id"]), explicit=True)
+
     async def message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
             return
@@ -367,8 +400,25 @@ class MediaBot:
             await self._watch(job_id, backend_id, chat_id)
         except Exception as exc:
             LOG.exception("media job failed job=%s", job_id)
+            current = self.state.get_job(job_id)
+            if current is not None and current["state"] == "delivering":
+                self.state.update_job(job_id, last_status=f"delivery ambiguous: {type(exc).__name__}")
+                return
             self.state.update_job(job_id, state="failed", last_status=str(exc)[:500])
-            await message.reply_text(f"Job {job_id[:12]} failed: {type(exc).__name__}")
+            await message.reply_text(f"Job {job_id[:12]} failed: {type(exc).__name__}; use /result {job_id[:12]} if delivery needs recovery")
+
+    async def _deliver_backend_result(self, job_id: str, backend_id: str, chat_id: int, *, explicit: bool = False) -> None:
+        self.state.update_job(job_id, state="delivering")
+        content, content_type = await self.api.result(backend_id)
+        suffix = ".png" if content_type.startswith("image/") else ".mp4"
+        output = self.result_root / f"{job_id}{suffix}"
+        output.write_bytes(content)
+        self.state.update_job(job_id, output_path=str(output))
+        if content_type.startswith("image/"):
+            await self.application.bot.send_photo(chat_id=chat_id, photo=content, caption=f"Job {job_id[:12]} complete")
+        else:
+            await self.application.bot.send_video(chat_id=chat_id, video=content, caption=f"Job {job_id[:12]} complete", supports_streaming=True)
+        self.state.update_job(job_id, state="delivered", delivered_at=time.time())
 
     async def _watch(self, job_id: str, backend_id: str, chat_id: int) -> None:
         row = self.state.get_job(job_id)
@@ -391,16 +441,7 @@ class MediaBot:
         if state != "succeeded":
             await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: {state}")
             return
-        content, content_type = await self.api.result(backend_id)
-        suffix = ".png" if content_type.startswith("image/") else ".mp4"
-        output = self.result_root / f"{job_id}{suffix}"
-        output.write_bytes(content)
-        self.state.update_job(job_id, state="delivering", output_path=str(output))
-        if content_type.startswith("image/"):
-            await self.application.bot.send_photo(chat_id=chat_id, photo=content, caption=f"Job {job_id[:12]} complete")
-        else:
-            await self.application.bot.send_video(chat_id=chat_id, video=content, caption=f"Job {job_id[:12]} complete", supports_streaming=True)
-        self.state.update_job(job_id, state="delivered", delivered_at=time.time())
+        await self._deliver_backend_result(job_id, backend_id, chat_id)
 
     async def reconcile(self, application: Application) -> None:
         self.application = application
@@ -420,6 +461,7 @@ class MediaBot:
         app.add_handler(CommandHandler("settings", self.settings_cmd))
         for command in ("kind", "model", "mode", "preset", "steps", "duration", "variant", "lora", "strength"):
             app.add_handler(CommandHandler(command, self.setting_command))
+        app.add_handler(CommandHandler("result", self.result_command))
         app.add_handler(CallbackQueryHandler(self.callback, pattern=r"^s:"))
         app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, self.message))
         self.application = app
