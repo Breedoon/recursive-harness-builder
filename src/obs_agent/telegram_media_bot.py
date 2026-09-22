@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import os
+import resource
 import secrets
 import sqlite3
 import time
@@ -746,6 +747,7 @@ async def run() -> None:
 
 
 def main() -> None:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "WARNING"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
