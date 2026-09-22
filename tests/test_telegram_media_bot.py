@@ -44,3 +44,10 @@ def test_image_normalization_is_aspect_cover(tmp_path):
         check=True, capture_output=True, text=True,
     )
     assert probe.stdout.strip() == "32,32"
+
+
+def test_delivering_jobs_are_not_replayed_after_restart(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    job = store.create_job(user_id=5129431382, chat_id=99, message_id=8, prompt="x", request={"model": "qwen-image-2.1"})
+    store.update_job(job, backend_job_id="backend-2", state="delivering")
+    assert store.nonterminal() == []

@@ -98,7 +98,9 @@ class StateStore:
         return self.db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
 
     def nonterminal(self):
-        return self.db.execute("SELECT * FROM jobs WHERE state NOT IN ('delivered','failed','cancelled') ORDER BY created_at").fetchall()
+        # Delivery is deliberately at-most-once: a crash after Telegram accepts the
+        # message but before the delivered mark must not resend it on restart.
+        return self.db.execute("SELECT * FROM jobs WHERE state NOT IN ('delivered','delivering','failed','cancelled') ORDER BY created_at").fetchall()
 
 
 class MediaAPI:
