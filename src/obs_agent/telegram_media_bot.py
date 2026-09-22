@@ -413,7 +413,7 @@ class MediaBot:
         app = Application.builder().token(token).post_init(self.reconcile).build()
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("settings", self.settings_cmd))
-        for command in ("kind", "model", "preset", "steps", "duration", "variant"):
+        for command in ("kind", "model", "mode", "preset", "steps", "duration", "variant", "lora", "strength"):
             app.add_handler(CommandHandler(command, self.setting_command))
         app.add_handler(CallbackQueryHandler(self.callback, pattern=r"^s:"))
         app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, self.message))
