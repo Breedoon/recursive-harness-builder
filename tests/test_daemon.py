@@ -40,6 +40,67 @@ def _make_mock_client(messages: list) -> AsyncMock:
     return client
 
 
+class TestQueuedInputRecovery:
+    @pytest.mark.parametrize("endpoint", ["/chat", "/chat/stream"])
+    @pytest.mark.parametrize("stage", ["initial", "continuation"])
+    @patch("obs_agent.session.SessionManager.get_client")
+    def test_failed_query_returns_owned_input_to_http_state(self, mock_get_client, config, endpoint, stage):
+        from claude_agent_sdk import CLINotFoundError
+        from obs_agent.queueing import QueuedMessage
+
+        msg = MagicMock(content=[TextBlock(text="Done")], session_id=None)
+        sdk = _make_mock_client([msg])
+        mock_get_client.return_value = sdk
+        application = create_app(config)
+        batch = [QueuedMessage("same", 1), QueuedMessage("same", 2)]
+        if stage == "initial":
+            application.state.pending_messages = batch
+        else:
+            for item in batch:
+                application.state.hook_state.message_queue.put_nowait(item)
+        calls = 0
+
+        async def query(prompt):
+            nonlocal calls
+            calls += 1
+            if calls == (1 if stage == "initial" else 2):
+                raise CLINotFoundError("query not accepted")
+
+        sdk.query.side_effect = query
+        client = TestClient(application)
+        response = client.post(endpoint, json={"message": "start"})
+        assert "query not accepted" in response.text
+        assert application.state.pending_messages == batch
+        assert application.state.hook_state.message_queue.empty()
+        sdk.query.reset_mock(side_effect=True)
+        response = client.post(endpoint, json={"message": "retry"})
+        assert response.status_code == 200
+        assert sdk.query.call_count == 1
+        assert sdk.query.call_args.args[0].count("[Queued message from user]: same") == 2
+        assert application.state.pending_messages == []
+
+
+    @pytest.mark.asyncio
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_stream_consumer_close_preserves_new_arrivals(self, mock_get_client, config):
+        from obs_agent.queueing import QueuedMessage
+
+        msg = MagicMock(content=[TextBlock(text="partial")], session_id=None)
+        mock_get_client.return_value = _make_mock_client([msg])
+        application = create_app(config)
+        endpoint = next(route.endpoint for route in application.routes if route.path == "/chat/stream")
+        response = await endpoint(ChatRequest(message="start"))
+        assert "partial" in await anext(response.body_iterator)
+        late = QueuedMessage("arrived during transport", 44)
+        application.state.hook_state.message_queue.put_nowait(late)
+
+        await response.body_iterator.aclose()
+
+        assert application.state.pending_messages == [late]
+        assert application.state.hook_state.message_queue.empty()
+        assert not application.state.turn_lock.locked()
+
+
 # --- App Factory ---
 
 

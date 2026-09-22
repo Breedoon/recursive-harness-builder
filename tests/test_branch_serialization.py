@@ -18,6 +18,8 @@ serialization assertion against code that never had concurrency proves nothing.
 import asyncio
 import json
 
+import pytest
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from obs_agent.queueing import QueuedMessage
@@ -74,6 +76,11 @@ async def _drain_detached(bot: TelegramBot, timeout: float = 2.0) -> None:
     deadline = loop.time() + timeout
     while bot._detached_wake_tasks and loop.time() < deadline:
         await asyncio.sleep(0.01)
+
+
+async def _poll_and_drain(bot: TelegramBot) -> None:
+    await bot._poll_background_queues_once()
+    await _drain_detached(bot)
 
 
 class _SlowTurn:
@@ -184,6 +191,134 @@ class TestInboxWakeGating:
 
         await bot.shutdown()
 
+    async def test_busy_descendant_does_not_block_ancestor_inbox_wake(self, config):
+        """A parent coordinator may wake while a descendant is busy."""
+        bot = _make_bot(config)
+        busy = _make_route_target(
+            bot,
+            thread_id=226,
+            team_name="t",
+            agent_name="busy",
+            lineage=("Trunk", "Parent", "Busy"),
+        )
+        busy.busy = True
+        _make_route_target(
+            bot,
+            thread_id=227,
+            team_name="t",
+            agent_name="parent",
+            lineage=("Trunk", "Parent"),
+        )
+        run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="OK"))
+        with patch.object(bot, "_run_and_send", run_mock):
+            result = await _notify(bot, team_name="t", recipient="parent")
+            await _drain_detached(bot)
+        assert result == {"delivered": True}
+        run_mock.assert_awaited_once()
+        await bot.shutdown()
+
+    async def test_busy_ancestor_does_not_block_descendant_inbox_wake(self, config):
+        """A worker may wake while its coordinator is busy."""
+        bot = _make_bot(config)
+        ancestor = _make_route_target(
+            bot,
+            thread_id=228,
+            team_name="t",
+            agent_name="parent",
+            lineage=("Trunk", "Parent"),
+        )
+        ancestor.busy = True
+        _make_route_target(
+            bot,
+            thread_id=229,
+            team_name="t",
+            agent_name="child",
+            lineage=("Trunk", "Parent", "Child"),
+        )
+        run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="OK"))
+        with patch.object(bot, "_run_and_send", run_mock):
+            result = await _notify(bot, team_name="t", recipient="child")
+            await _drain_detached(bot)
+        assert result == {"delivered": True}
+        run_mock.assert_awaited_once()
+        await bot.shutdown()
+
+    async def test_same_parent_cousins_are_not_gated(self, config):
+        """Different parents under one root are independent wake branches."""
+        bot = _make_bot(config)
+        busy = _make_route_target(
+            bot,
+            thread_id=228,
+            team_name="t",
+            agent_name="busy",
+            lineage=("Trunk", "ParentA", "Busy"),
+        )
+        busy.busy = True
+        target = _make_route_target(
+            bot,
+            thread_id=229,
+            team_name="t",
+            agent_name="target",
+            lineage=("Trunk", "ParentB", "Target"),
+        )
+        assert bot._branch_turn_load(target) == 0
+        assert bot._branch_wake_gate_blocks(target) is False
+        await bot.shutdown()
+
+    async def test_root_and_child_keys_do_not_collide(self, config):
+        """A busy root does not consume a child's sibling wake slot."""
+        bot = _make_bot(config)
+        root = _make_route_target(
+            bot, thread_id=230, team_name="t", agent_name="root", lineage=("Trunk",)
+        )
+        root.busy = True
+        child = _make_route_target(
+            bot,
+            thread_id=231,
+            team_name="t",
+            agent_name="child",
+            lineage=("Trunk", "Child"),
+        )
+        assert bot._branch_turn_load(child) == 0
+        assert bot._branch_wake_gate_blocks(child) is False
+        await bot.shutdown()
+
+    async def test_key_matrix_preserves_root_depth_chat_and_unknown_isolation(self, config):
+        """The sibling key matrix keeps every isolation boundary explicit."""
+        bot = _make_bot(config)
+        target = _make_route_target(
+            bot,
+            thread_id=232,
+            team_name="t",
+            agent_name="target",
+            lineage=("Root", "P", "Target"),
+        )
+        busy = _make_route_target(
+            bot,
+            thread_id=233,
+            team_name="t",
+            agent_name="busy",
+            lineage=("Root", "P", "Busy"),
+        )
+        busy.busy = True
+        matrix = [
+            (("Root", "P", "Busy"), -1009876543, 1),
+            (("Root", "Q", "Busy"), -1009876543, 0),
+            (("Root", "P"), -1009876543, 0),
+            (("Root", "P", "Target", "Deep"), -1009876543, 0),
+            (("Other", "P", "Busy"), -1009876543, 0),
+            (("Root", "P", "Busy"), -1005555, 0),
+            ((), -1009876543, 0),
+        ]
+        for lineage, chat_id, expected in matrix:
+            busy.agent_lineage = lineage
+            busy.route = TelegramRoute(chat_id=chat_id, thread_id=233)
+            assert bot._branch_turn_load(target) == expected, (lineage, chat_id)
+        target.agent_lineage = ()
+        assert bot._branch_anchor_for(target) is None
+        assert bot._branch_turn_load(target) == 0
+        await bot.shutdown()
+
     async def test_gate_fails_open_without_lineage(self, config):
         """A state with no lineage cannot be classified, so it is not gated."""
         bot = _make_bot(config)
@@ -265,7 +400,7 @@ class TestBackgroundPollerGating:
         bot, _busy, idle = self._setup(config, base_thread=301)
         run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="OK"))
         with patch.object(bot, "_run_and_send", run_mock):
-            await bot._poll_background_queues_once()
+            await _poll_and_drain(bot)
         assert run_mock.await_count == 1, (
             "POSITIVE CONTROL FAILED: the ungated poller did not start a turn while a "
             "same-branch sibling was busy — the gated assertion below would be vacuous"
@@ -279,7 +414,7 @@ class TestBackgroundPollerGating:
         bot, _busy, idle = self._setup(config, base_thread=311)
         run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="OK"))
         with patch.object(bot, "_run_and_send", run_mock):
-            await bot._poll_background_queues_once()
+            await _poll_and_drain(bot)
         run_mock.assert_not_awaited()
         assert idle.hook_state.message_queue.qsize() == 1, (
             "the poller dropped the queued update instead of deferring it"
@@ -292,14 +427,122 @@ class TestBackgroundPollerGating:
         bot, busy, idle = self._setup(config, base_thread=321)
         run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="OK"))
         with patch.object(bot, "_run_and_send", run_mock):
-            await bot._poll_background_queues_once()
+            await _poll_and_drain(bot)
             run_mock.assert_not_awaited()
             busy.busy = False  # the sibling's turn ends
-            await bot._poll_background_queues_once()
+            await _poll_and_drain(bot)
         assert run_mock.await_count == 1, (
             "the deferred queue was never delivered after the branch quieted down"
         )
         assert idle.hook_state.message_queue.qsize() == 0
+        await bot.shutdown()
+
+    async def test_ancestor_completion_wake_not_blocked_by_descendant(self, config):
+        """Incident-shaped liveness contract for hierarchical parent/child work.
+
+        The idle recipient is an ancestor coordinating a busy descendant. A
+        root-wide gate incorrectly treats that descendant as a competing sibling
+        and blocks the parent forever; a sibling-scoped gate must admit it.
+        """
+        config.max_concurrent_turns = 1
+        bot = _make_bot(config)
+        busy = _make_route_target(
+            bot,
+            thread_id=331,
+            team_name="t",
+            agent_name="busy",
+            lineage=("Trunk", "Parent", "Busy"),
+        )
+        busy.busy = True
+        idle = _make_route_target(
+            bot,
+            thread_id=332,
+            team_name="t",
+            agent_name="parent",
+            lineage=("Trunk", "Parent"),
+        )
+        idle.hook_state.message_queue.put_nowait(QueuedMessage(text="child completed"))
+        run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="OK"))
+        with patch.object(bot, "_run_and_send", run_mock):
+            await _poll_and_drain(bot)
+        assert run_mock.await_count == 1, (
+            "ancestor completion wake was blocked by a descendant under root-wide gating"
+        )
+        assert idle.hook_state.message_queue.qsize() == 0
+        await bot.shutdown()
+
+    async def test_real_completion_callback_wakes_idle_ancestor_once(self, config):
+        """A real fork completion queues the callback consumed by the poller."""
+        bot = _make_bot(config)
+        parent = _make_route_target(
+            bot,
+            thread_id=601,
+            team_name="verifier",
+            agent_name="parent",
+            lineage=("Root", "Parent"),
+        )
+        completed = _make_route_target(
+            bot,
+            thread_id=602,
+            team_name="verifier",
+            agent_name="completed",
+            lineage=("Root", "Parent", "Completed"),
+        )
+        busy = _make_route_target(
+            bot,
+            thread_id=603,
+            team_name="verifier",
+            agent_name="busy",
+            lineage=("Root", "Parent", "Busy"),
+        )
+        busy.busy = True
+        completed.last_bot.edit_message_text = AsyncMock()
+        record = _ForkTaskRecord(
+            task_id="verify-completion",
+            parent_route=parent.route,
+            parent_session_id_at_launch=parent.session_id,
+            parent_source_uuid="parent-head",
+            child_route=completed.route,
+            child_session_id=completed.session_id,
+            prompt="Complete",
+            description="Complete",
+            team_name="verifier",
+            agent_name="completed",
+            launch_parent_message_id=701,
+            launch_child_message_id=702,
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        bot._fork_task_by_child_route[completed.route] = record.task_id
+        parent.active_fork_task_ids.add(record.task_id)
+        delivered = []
+
+        async def complete_turn(*, state, **kwargs):
+            if state is parent:
+                delivered.extend(state.pending_messages)
+                state.pending_messages = []
+            return _RunOutcome(assistant_text="VERIFIER_COMPLETED")
+
+        run = AsyncMock(side_effect=complete_turn)
+        with (
+            patch.object(bot, "_run_and_send", run),
+            patch.object(bot, "_prune_idle_claude_processes", AsyncMock()),
+            patch.object(bot, "_register_team_worker_record"),
+            patch.object(bot, "_persist_task_handle_record"),
+        ):
+            await bot._execute_fork_task(record.task_id)
+            assert run.await_count == 1
+            assert parent.hook_state.message_queue.qsize() == 1
+            assert parent.last_bot.send_message.await_count >= 1
+            assert not parent.busy and busy.busy
+            await _poll_and_drain(bot)
+            assert run.await_count == 2
+            assert run.await_args.kwargs["state"] is parent
+            assert len(delivered) == 1
+            assert "<task-notification>" in delivered[0].text
+            assert "VERIFIER_COMPLETED" in delivered[0].text
+            assert parent.hook_state.message_queue.empty()
+            await _poll_and_drain(bot)
+            assert run.await_count == 2
         await bot.shutdown()
 
     async def test_background_poller_loop_uses_the_gated_pass(self, config):
@@ -319,6 +562,294 @@ class TestBackgroundPollerGating:
                 await task
             except asyncio.CancelledError:
                 pass
+        await bot.shutdown()
+
+
+class TestBackgroundDeliveryIsolation:
+    @pytest.mark.parametrize("cap", [0, 1])
+    async def test_only_child_completion_wakes_during_unrelated_turn(self, config, cap):
+        """Sep 21 incident: the global poller must not await an unrelated turn."""
+        config.max_concurrent_turns = cap
+        bot = _make_bot(config)
+        unrelated = _make_route_target(
+            bot, thread_id=1101, team_name="other", agent_name="unrelated",
+            lineage=("Other", "Long worker"),
+        )
+        parent = _make_route_target(
+            bot, thread_id=1102, team_name="case", agent_name="parent",
+            lineage=("Case", "Parent"),
+        )
+        child = _make_route_target(
+            bot, thread_id=1103, team_name="case", agent_name="child",
+            lineage=("Case", "Parent", "Only child"),
+        )
+        child.last_bot.edit_message_text = AsyncMock()
+        record = _ForkTaskRecord(
+            task_id="only-child", parent_route=parent.route,
+            parent_session_id_at_launch=parent.session_id, parent_source_uuid="head",
+            child_route=child.route, child_session_id=child.session_id,
+            prompt="Finish", description="Finish", team_name="case", agent_name="child",
+            launch_parent_message_id=101, launch_child_message_id=102,
+        )
+        bot._fork_tasks_by_id[record.task_id] = record
+        bot._fork_task_by_child_route[child.route] = record.task_id
+        parent.active_fork_task_ids.add(record.task_id)
+        unrelated.hook_state.message_queue.put_nowait(QueuedMessage(text="Other work"))
+        entered, release, parent_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        parent_payloads = []
+
+        async def run(*, state, **kwargs):
+            pending = state.pending_messages
+            state.pending_messages = []
+            if state is unrelated:
+                entered.set()
+                await release.wait()
+            elif state is parent:
+                parent_payloads.extend(pending)
+                parent_entered.set()
+            return _RunOutcome(assistant_text="COMPLETE")
+
+        with (
+            patch.object(bot, "_run_and_send", run),
+            patch.object(bot, "_prune_idle_claude_processes", AsyncMock()),
+            patch.object(bot, "_register_team_worker_record"),
+            patch.object(bot, "_persist_task_handle_record"),
+        ):
+            try:
+                await asyncio.wait_for(bot._poll_background_queues_once(), 1)
+                await asyncio.wait_for(entered.wait(), 1)
+                await bot._execute_fork_task(record.task_id)
+                assert parent.last_bot.send_message.await_count >= 1
+                assert parent.hook_state.message_queue.qsize() == 1
+                assert not parent.busy and not child.busy
+                assert not bot._branch_wake_gate_blocks(parent)
+                await asyncio.wait_for(bot._poll_background_queues_once(), 1)
+                await asyncio.wait_for(parent_entered.wait(), 1)
+                assert not release.is_set(), "Parent must wake before unrelated work ends"
+                assert len(parent_payloads) == 1
+                assert "<task-notification>" in parent_payloads[0].text
+                assert "COMPLETE" in parent_payloads[0].text
+                await bot._poll_background_queues_once()
+                await asyncio.sleep(0)
+                assert len(parent_payloads) == 1
+            finally:
+                release.set()
+                await _drain_detached(bot)
+                await bot.shutdown()
+
+    async def test_sibling_admission_reserved_before_session_preflight(self, config):
+        bot = _make_bot(config)
+        states = [
+            _make_route_target(
+                bot, thread_id=1120 + i, team_name="t", agent_name=f"s{i}",
+                lineage=("Root", f"Sibling{i}"),
+            ) for i in range(2)
+        ]
+        for state in states:
+            state.hook_state.message_queue.put_nowait(QueuedMessage(text="Work"))
+        started, release = asyncio.Event(), asyncio.Event()
+        entered = []
+
+        async def preflight(*, state, **kwargs):
+            # Deliberately do not set busy: real session/transport preflight
+            # also precedes _run_and_send's own busy assignment.
+            entered.append(state)
+            started.set()
+            await release.wait()
+            return _RunOutcome(assistant_text="OK")
+
+        with patch.object(bot, "_run_and_send", preflight):
+            try:
+                await bot._poll_background_queues_once()
+                await asyncio.wait_for(started.wait(), 1)
+                await asyncio.sleep(0)
+                assert entered == [states[0]]
+                assert states[0].busy
+                assert states[1].hook_state.message_queue.qsize() == 1
+                await bot._poll_background_queues_once()
+                await asyncio.sleep(0)
+                assert entered == [states[0]], "Repeated poll duplicated in-flight delivery"
+            finally:
+                release.set()
+                await _drain_detached(bot)
+        await bot.shutdown()
+
+    @pytest.mark.parametrize("block", ["busy", "paused", "transport", "lock", "sibling"])
+    async def test_admission_recheck_keeps_queue(self, config, block):
+        bot = _make_bot(config)
+        target = _make_route_target(
+            bot, thread_id=1130, team_name="t", agent_name="target", lineage=("Root", "A"),
+        )
+        sibling = _make_route_target(
+            bot, thread_id=1131, team_name="t", agent_name="sibling", lineage=("Root", "B"),
+        )
+        target.hook_state.message_queue.put_nowait(QueuedMessage(text="Keep me"))
+        lock = bot._get_route_lock(target.route)
+        run = AsyncMock()
+        with patch.object(bot, "_run_and_send", run):
+            await bot._poll_background_queues_once()
+            if block == "busy":
+                target.busy = True
+            elif block == "paused":
+                target.hook_state.pause_queue_delivery = True
+            elif block == "transport":
+                bot._chat_pending_ops[target.route.chat_id] = 1
+            elif block == "lock":
+                await lock.acquire()
+            else:
+                sibling.busy = True
+            await _drain_detached(bot)
+            run.assert_not_awaited()
+            assert target.hook_state.message_queue.qsize() == 1
+            if block == "lock":
+                lock.release()
+        await bot.shutdown()
+
+    @pytest.mark.parametrize("cancel", [False, True])
+    async def test_preflight_failure_retains_pending_and_releases_route(self, config, cancel):
+        bot = _make_bot(config)
+        target = _make_route_target(
+            bot, thread_id=1140, team_name="t", agent_name="target", lineage=("Root",),
+        )
+        target.hook_state.message_queue.put_nowait(QueuedMessage(text="Keep callback"))
+        entered = asyncio.Event()
+        hold = asyncio.Event()
+
+        async def preflight(**kwargs):
+            entered.set()
+            if cancel:
+                await hold.wait()
+            raise RuntimeError("preflight failure")
+
+        with patch.object(bot, "_resolve_session_for_trigger", preflight):
+            await bot._poll_background_queues_once()
+            await asyncio.wait_for(entered.wait(), 1)
+            if cancel:
+                await bot.shutdown()
+            else:
+                await _drain_detached(bot)
+            assert not target.busy
+            assert not bot._get_route_lock(target.route).locked()
+            assert [m.text for m in target.pending_messages] == ["Keep callback"]
+            assert target.route not in bot._background_delivery_tasks
+        if not cancel:
+            await bot.shutdown()
+
+    async def test_cancel_before_admission_keeps_queue(self, config):
+        bot = _make_bot(config)
+        target = _make_route_target(
+            bot, thread_id=1141, team_name="t", agent_name="target", lineage=("Root",),
+        )
+        target.hook_state.message_queue.put_nowait(QueuedMessage(text="Keep callback"))
+        run = AsyncMock()
+        with patch.object(bot, "_run_and_send", run):
+            await bot._poll_background_queues_once()
+            bot._background_delivery_tasks[target.route].cancel()
+            await _drain_detached(bot)
+            run.assert_not_awaited()
+            assert target.hook_state.message_queue.qsize() == 1
+            assert target.route not in bot._background_delivery_tasks
+        await bot.shutdown()
+
+    async def test_user_and_inbox_queue_behind_reserved_background_turn(self, config):
+        bot = _make_bot(config)
+        target = _make_route_target(
+            bot, thread_id=1142, team_name="t", agent_name="target", lineage=("Root",),
+        )
+        target.hook_state.message_queue.put_nowait(QueuedMessage(text="Callback"))
+        started, hold = asyncio.Event(), asyncio.Event()
+
+        async def run(**kwargs):
+            started.set()
+            await hold.wait()
+            return _RunOutcome(assistant_text="OK")
+
+        update = MagicMock()
+        update.effective_message.chat_id = target.route.chat_id
+        update.effective_message.message_thread_id = target.route.thread_id
+        update.effective_message.message_id = 100
+        update.effective_message.reply_to_message = None
+        context = MagicMock(bot=target.last_bot)
+        mock_run = AsyncMock(side_effect=run)
+        with (
+            patch.object(bot, "_run_and_send", mock_run),
+            patch.object(bot, "_send_received_marker", AsyncMock()),
+        ):
+            try:
+                await bot._poll_background_queues_once()
+                await asyncio.wait_for(started.wait(), 1)
+                await _notify(bot, team_name="t", recipient="target")
+                await bot._process_message("User follow-up", update, context)
+                await bot._poll_background_queues_once()
+                await asyncio.sleep(0)
+                mock_run.assert_awaited_once()
+                assert target.hook_state.message_queue.qsize() == 2
+                assert target.pending_messages == [QueuedMessage(text="Callback")]
+            finally:
+                hold.set()
+                await _drain_detached(bot)
+        await bot.shutdown()
+
+    async def test_inbox_poll_transport_does_not_block_callback_dispatch(self, config):
+        bot = _make_bot(config)
+        target = _make_route_target(
+            bot, thread_id=1150, team_name="t", agent_name="target", lineage=("Root",),
+        )
+        target.hook_state.message_queue.put_nowait(QueuedMessage(text="Callback"))
+        started, hold = asyncio.Event(), asyncio.Event()
+
+        async def stalled_inbox_poll():
+            started.set()
+            await hold.wait()
+
+        run = AsyncMock()
+        with (
+            patch.object(bot, "_poll_team_worker_inbox_wakes", stalled_inbox_poll),
+            patch.object(bot, "_run_and_send", run),
+        ):
+            try:
+                await asyncio.wait_for(bot._poll_background_queues_once(), 1)
+                await asyncio.wait_for(started.wait(), 1)
+                await asyncio.sleep(0)
+                run.assert_awaited_once()
+                assert not hold.is_set()
+            finally:
+                hold.set()
+                await _drain_detached(bot)
+        await bot.shutdown()
+
+    async def test_slow_inbox_marker_reserves_slot_against_poller(self, config):
+        bot = _make_bot(config)
+        direct = _make_route_target(
+            bot, thread_id=1160, team_name="t", agent_name="direct", lineage=("Root", "A"),
+        )
+        sibling = _make_route_target(
+            bot, thread_id=1161, team_name="t", agent_name="sibling", lineage=("Root", "B"),
+        )
+        started, hold = asyncio.Event(), asyncio.Event()
+
+        async def marker(**kwargs):
+            started.set()
+            await hold.wait()
+            return []
+
+        run = AsyncMock()
+        with (
+            patch.object(bot, "_send_system_html_message", marker),
+            patch.object(bot, "_run_and_send", run),
+        ):
+            try:
+                await _notify(bot, team_name="t", recipient="direct")
+                await asyncio.wait_for(started.wait(), 1)
+                assert direct.busy
+                sibling.hook_state.message_queue.put_nowait(QueuedMessage(text="Sibling work"))
+                await bot._poll_background_queues_once()
+                await asyncio.sleep(0)
+                run.assert_not_awaited()
+                assert sibling.hook_state.message_queue.qsize() == 1
+            finally:
+                hold.set()
+                await _drain_detached(bot)
         await bot.shutdown()
 
 
@@ -363,6 +894,43 @@ class TestTeamWorkerWakeGating:
         bot._team_worker_records[("t", "worker")] = "task-w"
         return bot, child_state, record
 
+    async def test_slow_worker_marker_reserves_branch_slot(self, config):
+        bot, child, _record = self._setup(config, base_thread=1190)
+        sibling = bot._get_state(TelegramRoute(chat_id=_CHAT_ID, thread_id=1190), create=False)
+        sibling.busy = False
+        started, hold = asyncio.Event(), asyncio.Event()
+
+        async def marker(**kwargs):
+            started.set()
+            await hold.wait()
+            return []
+
+        run = AsyncMock()
+        with (
+            patch.object(bot, "_send_system_html_message", marker),
+            patch.object(bot, "_run_and_send", run),
+            patch.object(bot, "_send_system_message", AsyncMock(return_value=None)),
+            patch.object(bot, "_register_team_worker_record"),
+            patch.object(bot, "_persist_task_handle_record"),
+            patch.object(bot, "_prune_idle_claude_processes", AsyncMock()),
+        ):
+            notify = asyncio.create_task(_notify(bot, team_name="t", recipient="worker"))
+            try:
+                await asyncio.wait_for(started.wait(), 1)
+                assert child.busy
+                sibling.hook_state.message_queue.put_nowait(QueuedMessage(text="Sibling work"))
+                await bot._poll_background_queues_once()
+                await asyncio.sleep(0)
+                run.assert_not_awaited()
+                assert sibling.hook_state.message_queue.qsize() == 1
+            finally:
+                hold.set()
+                await notify
+                await asyncio.gather(*list(bot._fork_task_tasks.values()))
+                await _drain_detached(bot)
+        assert not child.busy
+        await bot.shutdown()
+
     async def test_positive_control_ungated_team_worker_wake_launches(self, config):
         """POSITIVE CONTROL — ungated, an idle team-worker wake launches."""
         config.max_concurrent_turns = 0
@@ -384,6 +952,130 @@ class TestTeamWorkerWakeGating:
         assert child_state.hook_state.message_queue.qsize() == 1
         assert record.status == "completed", "a deferred wake must not mutate the record"
         await bot.shutdown()
+
+
+class TestWakeReservationOwnership:
+    @pytest.mark.parametrize("replay", [False, True])
+    async def test_worker_reservation_survives_scheduled_preflight(self, config, replay):
+        bot, worker, record = TestTeamWorkerWakeGating()._setup(config, base_thread=2101)
+        sibling = bot._get_state(TelegramRoute(chat_id=worker.route.chat_id, thread_id=2101), create=False)
+        sibling.busy = False
+        started, release = asyncio.Event(), asyncio.Event()
+        sibling_started = asyncio.Event()
+
+        async def run(*, state, **kwargs):
+            if state is worker:
+                started.set()
+                await release.wait()
+            else:
+                sibling_started.set()
+            return _RunOutcome(assistant_text="OK")
+
+        with (
+            patch.object(bot, "_send_system_html_message", AsyncMock(return_value=[])),
+            patch.object(bot, "_send_system_message", AsyncMock(return_value=None)),
+            patch.object(bot, "_run_and_send", run),
+            patch.object(bot, "_register_team_worker_record"),
+            patch.object(bot, "_persist_task_handle_record"),
+            patch.object(bot, "_prune_idle_claude_processes", AsyncMock()),
+        ):
+            try:
+                if replay:
+                    record.wake_requested = True
+                    await bot._replay_pending_team_worker_wake(record)
+                else:
+                    await _notify(bot, team_name="t", recipient="worker")
+                await asyncio.wait_for(started.wait(), 1)
+                assert worker.busy
+                assert bot._get_route_lock(worker.route).locked()
+                sibling.hook_state.message_queue.put_nowait(QueuedMessage(text="Sibling work"))
+                await bot._poll_background_queues_once()
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                assert not sibling_started.is_set()
+                assert sibling.hook_state.message_queue.qsize() == 1
+                release.set()
+                await asyncio.gather(*list(bot._fork_task_tasks.values()))
+                assert not worker.busy
+                await bot._poll_background_queues_once()
+                await _drain_detached(bot)
+                assert sibling_started.is_set()
+            finally:
+                release.set()
+                await bot.shutdown()
+
+    @pytest.mark.parametrize("failure", ["preflight", "cancel", "before_start", "missing_record"])
+    async def test_worker_reservation_released_on_failure(self, config, failure):
+        bot, worker, record = TestTeamWorkerWakeGating()._setup(config, base_thread=2151)
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def preflight(**kwargs):
+            started.set()
+            if failure == "cancel":
+                await release.wait()
+            raise RuntimeError("preflight failed")
+
+        with (
+            patch.object(bot, "_resolve_session_for_trigger", preflight),
+            patch.object(bot, "_send_system_message", AsyncMock(return_value=None)),
+            patch.object(bot, "_register_team_worker_record"),
+            patch.object(bot, "_persist_task_handle_record"),
+            patch.object(bot, "_prune_idle_claude_processes", AsyncMock()),
+        ):
+            worker.busy = True
+            try:
+                await bot._schedule_fork_task(task_id=record.task_id, parent_state=worker, wake_reserved=True)
+                task = bot._fork_task_tasks[record.task_id]
+                if failure == "missing_record":
+                    del bot._fork_tasks_by_id[record.task_id]
+                elif failure == "before_start":
+                    task.cancel()
+                elif failure == "cancel":
+                    await asyncio.wait_for(started.wait(), 1)
+                    assert worker.busy
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                assert not worker.busy
+                assert not bot._get_route_lock(worker.route).locked()
+                assert record.task_id not in bot._fork_task_tasks
+                assert record.task_id not in worker.active_fork_task_ids
+            finally:
+                release.set()
+                await bot.shutdown()
+
+    async def test_user_retry_consumes_retained_callback_once(self, config):
+        bot = _make_bot(config)
+        target = _make_route_target(bot, thread_id=2201, team_name="t", agent_name="target", lineage=("Root",))
+        target.hook_state.message_queue.put_nowait(QueuedMessage(text="unique callback"))
+        with patch.object(bot, "_resolve_session_for_trigger", AsyncMock(side_effect=RuntimeError("preflight failed"))):
+            await bot._poll_background_queues_once()
+            await _drain_detached(bot)
+        assert [m.text for m in target.pending_messages] == ["unique callback"]
+        # Identical independent messages must survive; fix ownership, not text dedup.
+        target.pending_messages.append(QueuedMessage(text="unique callback"))
+        captured = []
+
+        def capture(*args, pending_messages, **kwargs):
+            captured.extend(pending_messages)
+            raise RuntimeError("stop after capture")
+
+        update = MagicMock()
+        update.effective_message.chat_id = target.route.chat_id
+        update.effective_message.message_thread_id = target.route.thread_id
+        update.effective_message.message_id = 100
+        update.effective_message.reply_to_message = None
+        with (
+            patch.object(bot, "_resolve_session_for_trigger", AsyncMock(return_value=(True, None))),
+            patch.object(bot, "_recover_route_session_if_needed", AsyncMock()),
+            patch.object(bot, "_send_received_marker", AsyncMock(return_value=[])),
+            patch("obs_agent.telegram.ConversationRunner", side_effect=capture),
+        ):
+            try:
+                with pytest.raises(RuntimeError, match="stop after capture"):
+                    await bot._process_message("so?", update, MagicMock(bot=target.last_bot))
+                assert [m.text for m in captured] == ["unique callback", "unique callback"]
+            finally:
+                await bot.shutdown()
 
 
 class TestExplicitPathsAreNotGated:
@@ -646,15 +1338,15 @@ class TestTeamWorkerWakeReplayGating:
 
         run_mock = AsyncMock(return_value=_RunOutcome(assistant_text="OK"))
         with patch.object(bot, "_run_and_send", run_mock):
-            await bot._poll_background_queues_once()
+            await _poll_and_drain(bot)
             run_mock.assert_not_awaited()  # still gated: sibling busy
             sibling.busy = False
-            await bot._poll_background_queues_once()
+            await _poll_and_drain(bot)
         assert run_mock.await_count == 1, (
             "the converted replay deferral was never delivered after the branch quieted"
         )
         kwargs = run_mock.await_args.kwargs
-        carried = "".join(m.text for m in (kwargs.get("extra_pending") or []))
+        carried = "".join(m.text for m in kwargs["state"].pending_messages)
         assert "process item 7" in carried, "the replayed wake lost its payload"
         await bot.shutdown()
 
@@ -767,7 +1459,7 @@ class TestGateObservability:
         with caplog.at_level(logging.INFO, logger="obs_agent.telegram"):
             with patch.object(bot, "_run_and_send", run_mock):
                 for _ in range(5):
-                    await bot._poll_background_queues_once()
+                    await _poll_and_drain(bot)
 
         run_mock.assert_not_awaited()  # branch stayed saturated throughout
         assert starved.hook_state.message_queue.qsize() == 1, (

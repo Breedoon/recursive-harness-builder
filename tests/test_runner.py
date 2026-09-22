@@ -1012,6 +1012,174 @@ class TestRunnerGetClientRecovery:
             await _collect_events(runner, "hello")
 
 
+class TestCanonicalQueuedDelivery:
+    def make_runner(self, config, state, client, pending=None):
+        from obs_agent.session import SessionManager
+
+        manager = SessionManager(config=config, hook_state=state)
+        manager.get_client = AsyncMock(return_value=client)
+        manager.recover_poisoned_session_if_needed = AsyncMock(return_value=None)
+        return ConversationRunner(manager, state, config, pending_messages=pending)
+
+    @pytest.mark.parametrize("stage", ["initial", "continuation", "background"])
+    @pytest.mark.parametrize("failure", ["error", "cancel"])
+    async def test_unaccepted_batch_survives_query_failure(self, config, stage, failure):
+        state = HookState()
+        batch = [QueuedMessage("same", 101), QueuedMessage("same", 102)]
+        later = QueuedMessage("later", 103, 99)
+        msg = MagicMock(content=[TextBlock(text="first response")], session_id=None)
+        client = _make_mock_client([msg])
+        pending = batch if stage == "initial" else None
+        if stage != "initial":
+            for message in batch:
+                state.message_queue.put_nowait(message)
+        if stage == "background":
+            config.max_queue_continuations = 0
+            complete = asyncio.get_running_loop().create_future()
+            complete.set_result(None)
+            state.background_tasks.add(complete)
+
+        calls = 0
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def query(prompt):
+            nonlocal calls
+            calls += 1
+            if calls == (1 if stage == "initial" else 2):
+                entered.set()
+                if failure == "error":
+                    state.message_queue.put_nowait(later)
+                    raise CLINotFoundError("not accepted")
+                await release.wait()
+
+        client.query.side_effect = query
+        runner = self.make_runner(config, state, client, pending)
+        events = []
+
+        async def consume():
+            async for event in runner.run("start"):
+                events.append(event)
+
+        task = asyncio.create_task(consume())
+        if failure == "cancel":
+            await asyncio.wait_for(entered.wait(), 2)
+            state.message_queue.put_nowait(later)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(CLINotFoundError):
+                await task
+        assert runner.remaining_pending == batch + [later]
+        assert state.message_queue.empty()
+        assert not any(isinstance(e, StatusEvent) and e.type == "queue_delivered" for e in events)
+
+        state.background_tasks.clear()
+        retry_client = _make_mock_client([msg])
+        retry = self.make_runner(config, state, retry_client, runner.remaining_pending)
+        retry_events = await _collect_events(retry, "retry")
+        prompt = retry_client.query.call_args.args[0]
+        assert prompt.count("[Queued message from user]: same") == 2
+        assert prompt.count("[Queued message from user]: later") == 1
+        assert retry.remaining_pending == []
+        delivered = [e for e in retry_events if isinstance(e, StatusEvent) and e.type == "queue_delivered"]
+        assert len(delivered) == 1 and delivered[0].count == 3
+
+    async def test_delivery_status_follows_successful_handoff(self, config):
+        state = HookState()
+        msg = MagicMock(content=[TextBlock(text="ok")], session_id=None)
+        client = _make_mock_client([msg])
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def query(prompt):
+            entered.set()
+            await release.wait()
+
+        client.query.side_effect = query
+        batch = [QueuedMessage("inbox correction", 22)]
+        runner = self.make_runner(config, state, client, batch)
+        events = []
+
+        async def consume():
+            async for event in runner.run("continue"):
+                events.append(event)
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(entered.wait(), 2)
+        assert runner.remaining_pending == batch
+        assert events == []
+        release.set()
+        await task
+        assert runner.remaining_pending == []
+        assert events[0].type == "queue_delivered"
+
+    async def test_accepted_batch_not_requeued_after_stream_failure(self, config):
+        state = HookState()
+        client = _make_mock_client([])
+
+        async def receive():
+            raise CLINotFoundError("stream failed after accepted query")
+            yield
+
+        client.receive_response = receive
+        runner = self.make_runner(config, state, client, [QueuedMessage("accepted")])
+        with pytest.raises(CLINotFoundError):
+            await _collect_events(runner, "continue")
+        assert runner.remaining_pending == []
+
+    @pytest.mark.parametrize("flag", ["pause_queue_delivery", "interrupt_requested", "interrupt_flag"])
+    async def test_stopped_queue_remains_pending(self, config, flag):
+        state = HookState()
+        setattr(state, flag, True)
+        state.message_queue.put_nowait(QueuedMessage("during turn", 2))
+        msg = MagicMock(content=[TextBlock(text="ok")], session_id=None)
+        client = _make_mock_client([msg])
+        runner = self.make_runner(config, state, client, [QueuedMessage("previous", 1)])
+        events = await _collect_events(runner, "explicit user input")
+        assert client.query.call_count == 1
+        assert "previous" not in client.query.call_args.args[0]
+        assert runner.remaining_pending == [QueuedMessage("previous", 1), QueuedMessage("during turn", 2)]
+        assert not any(isinstance(e, StatusEvent) and e.type == "queue_delivered" for e in events)
+
+    async def test_stop_during_reconnect_retains_batch(self, config):
+        state = HookState()
+        state.message_queue.put_nowait(QueuedMessage("not after stop", 1))
+        msg = MagicMock(content=[TextBlock(text="ok")], session_id=None)
+        client = _make_mock_client([msg])
+        client.query.side_effect = [None, CLIConnectionError("lost")]
+        runner = self.make_runner(config, state, client)
+        replacement = _make_mock_client([msg])
+
+        async def reconnect():
+            state.pause_queue_delivery = True
+            return replacement
+
+        runner._session_mgr.reconnect = reconnect
+        events = await _collect_events(runner, "start")
+        replacement.query.assert_not_called()
+        assert runner.remaining_pending == [QueuedMessage("not after stop", 1)]
+        assert not any(isinstance(e, StatusEvent) and e.type == "queue_delivered" for e in events)
+
+    @pytest.mark.parametrize("background", [False, True])
+    async def test_latest_reply_target_defers_whole_batch(self, config, background):
+        state = HookState()
+        if background:
+            config.max_queue_continuations = 0
+            complete = asyncio.get_running_loop().create_future()
+            complete.set_result(None)
+            state.background_tasks.add(complete)
+        batch = [QueuedMessage("plain", 3), QueuedMessage("reply", 2, 1)]
+        for message in batch:
+            state.message_queue.put_nowait(message)
+        msg = MagicMock(content=[TextBlock(text="ok")], session_id=None)
+        client = _make_mock_client([msg])
+        runner = self.make_runner(config, state, client)
+        await _collect_events(runner, "start")
+        assert client.query.call_count == 1
+        assert runner.remaining_pending == batch
+
+
 # --- SessionManager reconnect / soft_reset ---
 
 

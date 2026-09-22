@@ -687,6 +687,8 @@ class TelegramBot:
         # keeps only a weak reference to a running task, so a bare
         # create_task(...) can be garbage-collected mid-flight.
         self._detached_wake_tasks: set[asyncio.Task] = set()
+        self._background_delivery_tasks: dict[TelegramRoute, asyncio.Task] = {}
+        self._inbox_wake_poll_task: asyncio.Task | None = None
         self._team_worker_records: dict[tuple[str, str], str] = {}
         self._route_inbox_targets: dict[tuple[str, str], TelegramRoute] = {}
         self._route_inbox_target_keys_by_route: dict[TelegramRoute, tuple[str, str]] = {}
@@ -7193,7 +7195,6 @@ class TelegramBot:
         pending_messages = list(state.pending_messages)
         if extra_pending:
             pending_messages.extend(extra_pending)
-        state.pending_messages = []
 
         proceed, reply_to_message_id = await self._resolve_session_for_trigger(
             state=state,
@@ -7201,12 +7202,16 @@ class TelegramBot:
             bot=bot,
         )
         if not proceed:
+            state.pending_messages = []
             return _RunOutcome(assistant_text="")
         await self._recover_route_session_if_needed(
             state=state,
             source="run_start",
         )
 
+        # Keep queued work owned by the route until session preflight succeeds.
+        # A cancelled/failed detached delivery can then retry without losing it.
+        state.pending_messages = []
         runner = ConversationRunner(
             state.session_manager,
             state.hook_state,
@@ -7253,6 +7258,7 @@ class TelegramBot:
                 f"{user_text}"
             )
             state.hook_state.interrupt_notice_pending = False
+        runner_events = None
         trigger_status_ids = list(trigger_status_message_ids or [])
         trigger_user_mapped = False
         pending_bootstrap_active: str | None = None
@@ -7335,7 +7341,8 @@ class TelegramBot:
             working_message_id = self._sent_message_id(working_message) if working_message is not None else None
             if isinstance(working_message_id, int):
                 trigger_status_ids.append(working_message_id)
-            async for event in runner.run(run_user_text):
+            runner_events = runner.run(run_user_text)
+            async for event in runner_events:
                 event_count += 1
                 self._flush_deferred_bindings(
                     route=state.route,
@@ -7631,6 +7638,11 @@ class TelegramBot:
                 logger.warning("Soft reset failed", exc_info=True)
 
         finally:
+            # Finish runner queue ownership before another route turn can start,
+            # even if transport failed while the generator was yielding an event.
+            if runner_events is not None:
+                await runner_events.aclose()
+            _store_remaining_pending()
             state.busy = False
             state.hook_state.execution_active = False
             state.hook_state.interrupt_requested = False
@@ -7852,16 +7864,14 @@ class TelegramBot:
         try:
             async with lock:
                 logger.info("[process_message] lock acquired route=%s", route)
-                queued_before = list(state.pending_messages)
                 if state.hook_state.pause_queue_delivery:
-                    queued_before.extend(_drain_queue(state.hook_state.message_queue))
+                    state.pending_messages.extend(_drain_queue(state.hook_state.message_queue))
                     state.hook_state.pause_queue_delivery = False
                 await self._run_and_send(
                     state=state,
                     user_text=user_text,
                     bot=context.bot,
                     trigger_message=incoming,
-                    extra_pending=queued_before if queued_before else None,
                     trigger_status_message_ids=trigger_status_message_ids,
                 )
                 logger.info("[process_message] _run_and_send returned route=%s", route)
@@ -7914,16 +7924,18 @@ class TelegramBot:
                 logger.exception("Schedule poller iteration failed")
 
     async def _poll_background_queues_once(self) -> None:
-        """One background-poller pass: auto-deliver queued updates to idle routes.
-
-        Extracted from ``_background_poller_loop`` so the gating behaviour can
-        be driven directly by a test.  This is a wake-class turn start (nobody
-        asked for it right now), so Tier A gates it.  A2 named this path as the
-        most likely implementation hole: gating the wake sites without gating
-        the poller merely delays the parallel turn by one poll interval.
-        """
-        await self._poll_team_worker_inbox_wakes()
+        """Dispatch queued delivery without awaiting any recipient's full turn."""
+        if self._inbox_wake_poll_task is None or self._inbox_wake_poll_task.done():
+            # Inbox discovery may await a worker's Telegram wake marker. It must
+            # not prevent completed-child queues on other routes being serviced.
+            task = asyncio.create_task(self._poll_team_worker_inbox_wakes())
+            self._inbox_wake_poll_task = task
+            self._detached_wake_tasks.add(task)
+            task.add_done_callback(self._on_detached_wake_done)
         for state in list(self._states_by_route.values()):
+            delivery = self._background_delivery_tasks.get(state.route)
+            if delivery is not None and not delivery.done():
+                continue
             bot = self._bot_for_state(state)
             if bot is None:
                 continue
@@ -7952,43 +7964,55 @@ class TelegramBot:
             ):
                 continue
 
+            if self._get_route_lock(state.route).locked():
+                continue
+            task = asyncio.create_task(self._deliver_background_queue(state))
+            self._background_delivery_tasks[state.route] = task
+            self._detached_wake_tasks.add(task)
+            task.add_done_callback(
+                lambda done, route=state.route: self._on_background_delivery_done(route, done)
+            )
+
+    def _on_background_delivery_done(self, route: TelegramRoute, task: asyncio.Task) -> None:
+        if self._background_delivery_tasks.get(route) is task:
+            self._background_delivery_tasks.pop(route, None)
+        self._on_detached_wake_done(task)
+
+    async def _deliver_background_queue(self, state: TelegramSessionState) -> None:
+        lock = self._get_route_lock(state.route)
+        if lock.locked():
+            return
+        async with lock:
+            bot = self._bot_for_state(state)
+            if (
+                bot is None
+                or state.busy
+                or state.hook_state.pause_queue_delivery
+                or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
+                or self._branch_wake_gate_blocks(state, site="poller-recheck")
+            ):
+                return
             queued = _drain_queue(state.hook_state.message_queue)
-            has_pending = bool(state.pending_messages)
-            if not queued and not has_pending:
-                continue
-
-            lock = self._get_route_lock(state.route)
-            if lock.locked():
-                for message in queued:
-                    state.hook_state.message_queue.put_nowait(message)
-                continue
-
+            if not queued and not state.pending_messages:
+                return
             logger.info(
                 "Auto-delivering queued updates route=%s queued=%d pending=%d",
                 state.route, len(queued), len(state.pending_messages),
             )
-            async with lock:
-                if (
-                    state.busy
-                    or state.hook_state.pause_queue_delivery
-                    or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
-                    or self._branch_wake_gate_blocks(state, site="poller-recheck")
-                ):
-                    for message in queued:
-                        state.hook_state.message_queue.put_nowait(message)
-                    continue
-
+            state.pending_messages.extend(queued)
+            trigger_message = state.pending_messages[-1]
+            # Reserve admission before _run_and_send's first (session/transport)
+            # await; siblings dispatched in this same pass must see this slot.
+            state.busy = True
+            try:
                 await self._run_and_send(
                     state=state,
                     user_text=_AUTO_DELIVERY_PROMPT,
                     bot=bot,
-                    trigger_message=(
-                        (queued or state.pending_messages)[-1]
-                        if (queued or state.pending_messages)
-                        else None
-                    ),
-                    extra_pending=queued if queued else None,
+                    trigger_message=trigger_message,
                 )
+            finally:
+                state.busy = False
 
     async def _background_poller_loop(self) -> None:
         """Poll for queued background messages and auto-deliver when idle."""
@@ -9234,6 +9258,7 @@ class TelegramBot:
         await self._schedule_fork_task(
             task_id=record.task_id,
             parent_state=child_state,
+            wake_reserved=True,
         )
 
     async def _start_idle_route_inbox_wake(
@@ -9307,36 +9332,39 @@ class TelegramBot:
     # recipient still sees it at its next ReadInbox.
 
     def _branch_anchor_for(self, state: TelegramSessionState) -> tuple[str, ...] | None:
-        """The lineage prefix that defines this state's branch.
+        """Return the identity of ``state``'s same-depth sibling branch.
 
-        Tier A anchors on the tree root (``lineage[:1]``), which matches the
-        observed load shape: one tree usually dominates.  Returns ``None`` when
-        the state has no lineage yet — the gate then fails OPEN rather than
-        gating traffic it cannot classify.
+        A branch is the set of agents with the same parent lineage and depth.
+        The root name, depth, and chat identity are encoded so a root and its
+        immediate children cannot collide, and identical roots in different
+        chats remain independent.  Ancestors and descendants are deliberately
+        excluded: a coordinator must be able to wake while its workers run.
         """
         lineage = state.agent_lineage
         if not lineage:
             return None
-        return tuple(lineage[:1])
+        return (
+            lineage[0],
+            f"depth:{len(lineage)}",
+            f"chat:{state.route.chat_id}",
+            *tuple(lineage[:-1]),
+        )
 
     def _branch_turn_load(self, state: TelegramSessionState) -> int:
-        """Count live states in ``state``'s branch that are mid-turn.
+        """Count busy same-depth siblings in the state's branch.
 
-        In-memory prefix scan over ``_states_by_route``; no I/O.  ``state``
-        itself is excluded so a wake never gates itself out.
+        In-memory scan over ``_states_by_route``; no I/O. ``state`` itself is
+        excluded so a wake never gates itself out.
         """
         anchor = self._branch_anchor_for(state)
         if anchor is None:
             return 0
-        depth = len(anchor)
         load = 0
         for other in self._states_by_route.values():
             if other is state:
                 continue
-            other_lineage = other.agent_lineage
-            if not other_lineage:
-                continue
-            if tuple(other_lineage[:depth]) != anchor:
+            other_anchor = self._branch_anchor_for(other)
+            if other_anchor != anchor:
                 continue
             if other.busy:
                 load += 1
@@ -9456,14 +9484,20 @@ class TelegramBot:
                         content=content,
                     )
                     return
-                await self._start_idle_route_inbox_wake(
-                    state=state,
-                    team_name=team_name,
-                    agent_name=agent_name,
-                    sender=sender,
-                    summary=summary,
-                    content=content,
-                )
+                # A slow wake-marker send is already an admitted wake, even
+                # though _run_and_send has not reached its busy flag yet.
+                state.busy = True
+                try:
+                    await self._start_idle_route_inbox_wake(
+                        state=state,
+                        team_name=team_name,
+                        agent_name=agent_name,
+                        sender=sender,
+                        summary=summary,
+                        content=content,
+                    )
+                finally:
+                    state.busy = False
 
         task = asyncio.create_task(_runner())
         self._detached_wake_tasks.add(task)
@@ -9638,8 +9672,12 @@ class TelegramBot:
         # Tier A: a same-branch sibling is mid-turn — defer this wake exactly
         # the way a busy recipient is already deferred, just above.
         child_state = self._get_state(record.child_route, create=False)
-        if child_state is not None and self._branch_wake_gate_blocks(
-            child_state, site="team-worker-wake"
+        if child_state is not None and (
+            child_state.busy
+            or child_state.hook_state.pause_queue_delivery
+            or self._get_route_lock(child_state.route).locked()
+            or self._chat_pending_ops.get(child_state.route.chat_id, 0) > 0
+            or self._branch_wake_gate_blocks(child_state, site="team-worker-wake")
         ):
             self._queue_running_team_worker_notice(
                 state=child_state,
@@ -9655,6 +9693,9 @@ class TelegramBot:
         # Always try to wake regardless of record status (completed, failed,
         # stopped, etc.).  Over-deliver rather than under-deliver.
         record.idle_ready = True
+        if child_state is not None:
+            child_state.busy = True
+        wake_scheduled = False
         try:
             await self._start_idle_team_worker_wake(
                 record=record,
@@ -9662,6 +9703,7 @@ class TelegramBot:
                 summary=summary,
                 content=content,
             )
+            wake_scheduled = True
             _mark_direct_send_notified()
             return {"delivered": True}
         except Exception as exc:
@@ -9679,21 +9721,45 @@ class TelegramBot:
                 "delivered": False,
                 "reason": self._notification_failure_reason(exc),
             }
+        finally:
+            if child_state is not None and not wake_scheduled:
+                child_state.busy = False
 
     async def _schedule_fork_task(
         self,
         *,
         task_id: str,
         parent_state: TelegramSessionState,
+        wake_reserved: bool = False,
     ) -> None:
         parent_state.active_fork_task_ids.add(task_id)
-        task = asyncio.create_task(self._execute_fork_task(task_id))
+        started = False
+
+        async def execute() -> None:
+            nonlocal started
+            started = True
+            if wake_reserved and task_id not in self._fork_tasks_by_id:
+                parent_state.busy = False
+                parent_state.active_fork_task_ids.discard(task_id)
+                return
+            if wake_reserved:
+                await self._execute_fork_task(task_id, wake_reserved=True)
+            else:
+                await self._execute_fork_task(task_id)
+
+        def completed(done: asyncio.Task) -> None:
+            if wake_reserved and not started:
+                # Cancellation before the coroutine's first step bypasses its finally.
+                parent_state.busy = False
+                parent_state.active_fork_task_ids.discard(task_id)
+            if self._fork_task_tasks.get(task_id) is done:
+                self._fork_task_tasks.pop(task_id, None)
+                if wake_reserved:
+                    parent_state.active_fork_task_ids.discard(task_id)
+
+        task = asyncio.create_task(execute())
         self._fork_task_tasks[task_id] = task
-        task.add_done_callback(
-            lambda done: self._fork_task_tasks.pop(task_id, None)
-            if self._fork_task_tasks.get(task_id) is done
-            else None
-        )
+        task.add_done_callback(completed)
 
     async def _resume_fork_task(
         self,
@@ -10140,7 +10206,7 @@ class TelegramBot:
             return False
         return True
 
-    async def _execute_fork_task(self, task_id: str) -> None:
+    async def _execute_fork_task(self, task_id: str, *, wake_reserved: bool = False) -> None:
         record = self._fork_tasks_by_id.get(task_id)
         if record is None:
             return
@@ -10153,6 +10219,8 @@ class TelegramBot:
             or self._primary_bot
         )
         if child_state is None or bot is None:
+            if wake_reserved and child_state is not None:
+                child_state.busy = False
             record.status = record.terminal_request or "failed"
             record.error = record.error or "child route unavailable before launch"
             record.completed_at = time.time()
@@ -10221,6 +10289,10 @@ class TelegramBot:
             record.status = record.terminal_request or "failed"
             record.error = f"{type(exc).__name__}: {exc}"
         finally:
+            if wake_reserved:
+                child_state.busy = False
+                if parent_state is not None:
+                    parent_state.active_fork_task_ids.discard(task_id)
             record.completed_at = time.time()
             result_data = child_state.hook_state.last_result_data if child_state is not None else None
             usage = result_data.get("usage") if isinstance(result_data, dict) else None
@@ -10402,8 +10474,12 @@ class TelegramBot:
         if not record.wake_requested:
             return
         child_state = self._get_state(record.child_route, create=False)
-        if child_state is not None and self._branch_wake_gate_blocks(
-            child_state, site="team-worker-wake-replay"
+        if child_state is not None and (
+            child_state.busy
+            or child_state.hook_state.pause_queue_delivery
+            or self._get_route_lock(child_state.route).locked()
+            or self._chat_pending_ops.get(child_state.route.chat_id, 0) > 0
+            or self._branch_wake_gate_blocks(child_state, site="team-worker-wake-replay")
         ):
             # Convert the deferral into the other, poller-drained mechanism so
             # it stays recoverable: the poller (itself gated) delivers it once
@@ -10420,6 +10496,9 @@ class TelegramBot:
             )
             self._persist_task_handle_record(record)
             return
+        if child_state is not None:
+            child_state.busy = True
+        wake_scheduled = False
         try:
             await self._start_idle_team_worker_wake(
                 record=record,
@@ -10427,6 +10506,7 @@ class TelegramBot:
                 summary=record.wake_source_summary,
                 content=record.wake_source_content,
             )
+            wake_scheduled = True
         except Exception:
             logger.warning(
                 "Failed immediate wake for team worker task_id=%s status=%s",
@@ -10435,6 +10515,9 @@ class TelegramBot:
                 exc_info=True,
             )
             await self._send_bounce_backs_for_dead_agent(record.child_route)
+        finally:
+            if child_state is not None and not wake_scheduled:
+                child_state.busy = False
 
     async def _fork_task_output(
         self,

@@ -33,7 +33,7 @@ class CommandRegistry:
         self._commands: dict[str, str] = {
             "stop": "Interrupt the agent at the next tool boundary",
             "quit": "End the session and exit",
-            "enqueue": "Queue a message for injection at next hook",
+            "enqueue": "Queue a message for persisted delivery at the next turn boundary",
         }
 
     async def execute(self, name: str, **kwargs: Any) -> CommandResult:
@@ -65,7 +65,7 @@ class CommandRegistry:
         return CommandResult(success=True, message="Quit signal sent")
 
     async def _handle_enqueue(self, **kwargs: Any) -> CommandResult:
-        """Queue a message for injection at the next hook boundary."""
+        """Queue a message for persisted delivery at the next turn boundary."""
         message = kwargs.get("message")
         if not message:
             return CommandResult(success=False, message="Message is required")

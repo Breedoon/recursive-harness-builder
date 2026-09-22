@@ -27,9 +27,9 @@ _DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no exp
 # update when new models are released.
 MODEL_RESOLUTION: dict[str, str] = {
     # Anthropic tiers
-    "claude": "claude-opus-5",
-    "opus": "claude-opus-5",
-    "claude-opus": "claude-opus-5",
+    "claude": "claude-opus-5-5",
+    "opus": "claude-opus-5-5",
+    "claude-opus": "claude-opus-5-5",
     "sonnet": "claude-sonnet-5",
     "claude-sonnet": "claude-sonnet-5",
     "fable": "claude-fable-5-1",
@@ -82,6 +82,7 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 # retain provider defaults (auto); explicit efforts are validated by the provider.
 # Keep these beside MODEL_CONTEXT_WINDOWS when adding/changing model aliases.
 MODEL_EFFORT_LEVELS: dict[str, str] = {
+    "claude-opus-5-5": "high",
     "claude-opus-5": "high",
     "claude-sonnet-5": "high",
     "claude-fable-5": "high",

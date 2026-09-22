@@ -29,7 +29,7 @@ from claude_agent_sdk.types import (
 )
 
 from obs_agent.lineage import obs_bootstrap_to_dict, resolve_obs_bootstrap
-from obs_agent.queueing import QueuedMessage, coerce_queued_message
+from obs_agent.queueing import QueuedMessage
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
@@ -445,74 +445,6 @@ def _make_tool_state_check(state: HookState) -> CheckFn:
     return _check
 
 
-def _make_queue_check(state: HookState) -> CheckFn:
-    """Drain queued messages into additionalContext and emit delivery status.
-
-    This event-agnostic helper is registered only as the final PostToolUse
-    check. Do not put it before an awaited/vetoing check: cancellation or a
-    short-circuit after draining would lose messages already marked delivered.
-    PreToolUse only tracks tool state; the runner handles messages left over
-    when a turn ends without another successful tool call.
-    """
-
-    async def _check(
-        hook_input: HookInput,
-        tool_use_id: str | None,
-        context: HookContext,
-    ) -> SyncHookJSONOutput | None:
-        if (
-            state.pause_queue_delivery
-            or state.interrupt_requested
-            or state.interrupt_flag
-        ):
-            return None
-
-        # Keep draining and constructing the response synchronous (no await),
-        # so concurrent callbacks cannot consume the same message or cancel
-        # this callback between dequeue and returning its context.
-        messages: list[str] = []
-        deferred_messages: list[QueuedMessage] = []
-        while not state.message_queue.empty():
-            try:
-                msg = coerce_queued_message(state.message_queue.get_nowait())
-                if msg.reply_to_message_id is not None:
-                    deferred_messages.append(msg)
-                else:
-                    messages.append(msg.text)
-            except asyncio.QueueEmpty:
-                break
-
-        for msg in deferred_messages:
-            state.message_queue.put_nowait(msg)
-
-        if not messages:
-            return None
-
-        # Notify the SSE stream that queued messages were delivered
-        from obs_agent.events import StatusEvent
-
-        state.status_queue.put_nowait(
-            StatusEvent(
-                type="queue_delivered",
-                summary="queued message delivered",
-                count=len(messages),
-                messages=messages,
-            )
-        )
-
-        formatted = "\n".join(
-            f"[Queued message from user]: {msg}" for msg in messages
-        )
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": hook_input["hook_event_name"],
-                "additionalContext": formatted,
-            }
-        }
-
-    return _check
-
-
 def _make_notification_check(state: HookState) -> CheckFn:
     """Create a check that surfaces notification/lifecycle hook events.
 
@@ -862,10 +794,12 @@ def create_hook_matchers(
     """Build hook matcher dict ready for ClaudeAgentOptions(hooks=...).
 
     PreToolUse pipeline: interrupt -> native/immutable guard -> tool state -> [user hook]
-    PostToolUse pipeline: tool state -> [user hook] -> queue delivery
+    PostToolUse pipeline: tool state -> [user hook]
 
-    Queue delivery must be last, after any check that can await or stop the
-    callback. This keeps cancelled/short-circuited messages queued for retry.
+    WARNING: never drain message_queue into hook additionalContext. Native
+    hook context is not persisted in JSONL and the cache proxy MUST strip it
+    for fork/resume prefix fidelity. ConversationRunner owns queued delivery
+    through normal persisted queries at turn boundaries instead.
 
     If *user_hooks* is provided (mapping of event name to
     ``"file_path::function_name"``), the user-supplied check is appended
@@ -875,7 +809,6 @@ def create_hook_matchers(
     interrupt_check = _make_interrupt_check(state)
     immutable_check = _make_immutable_check(config)
     tool_state_check = _make_tool_state_check(state)
-    queue_check = _make_queue_check(state)
     notification_check = _make_notification_check(state)
     stop_check = _make_stop_check(state)
 
@@ -904,8 +837,6 @@ def create_hook_matchers(
         checks = list(builtin)
         if event in _resolved_user_checks:
             checks.append(_resolved_user_checks[event])
-        if event == "PostToolUse":
-            checks.append(queue_check)
         return HookPipeline(checks)
 
     pre_tool_pipeline = _pipeline([interrupt_check, immutable_check, tool_state_check], "PreToolUse")

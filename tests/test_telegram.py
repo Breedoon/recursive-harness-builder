@@ -1222,8 +1222,13 @@ class TestBackgroundPoller:
         state = _state(bot)
         state.last_bot = fake_ptb_bot
         state.hook_state.message_queue.put_nowait("queued bg result")
+        delivered = []
 
-        with patch.object(bot, "_run_and_send", new_callable=AsyncMock) as mock_run:
+        async def consume_pending(**kwargs):
+            delivered.extend(kwargs["state"].pending_messages)
+            kwargs["state"].pending_messages = []
+
+        with patch.object(bot, "_run_and_send", side_effect=consume_pending) as mock_run:
             await bot._ensure_background_poller(fake_ptb_bot)
             await asyncio.sleep(0.06)
             await bot.shutdown()
@@ -1231,7 +1236,8 @@ class TestBackgroundPoller:
             assert mock_run.called
             kwargs = mock_run.call_args.kwargs
             assert kwargs["state"] is state
-            assert kwargs["extra_pending"] == [QueuedMessage(text="queued bg result")]
+            assert mock_run.await_count == 1
+            assert delivered == [QueuedMessage(text="queued bg result")]
             assert "queued updates arrived while idle" in kwargs["user_text"]
 
     async def test_auto_delivery_waits_for_transport_backlog_to_drain(self, config):
@@ -1248,8 +1254,13 @@ class TestBackgroundPoller:
         state.last_bot = fake_ptb_bot
         state.hook_state.message_queue.put_nowait("queued while chat still draining")
         bot._chat_pending_ops[state.route.chat_id] = 1
+        delivered = []
 
-        with patch.object(bot, "_run_and_send", new_callable=AsyncMock) as mock_run:
+        async def consume_pending(**kwargs):
+            delivered.extend(kwargs["state"].pending_messages)
+            kwargs["state"].pending_messages = []
+
+        with patch.object(bot, "_run_and_send", side_effect=consume_pending) as mock_run:
             await bot._ensure_background_poller(fake_ptb_bot)
             await asyncio.sleep(0.05)
             assert mock_run.await_count == 0
@@ -1261,7 +1272,7 @@ class TestBackgroundPoller:
             assert mock_run.await_count == 1
             kwargs = mock_run.call_args.kwargs
             assert kwargs["state"] is state
-            assert kwargs["extra_pending"] == [QueuedMessage(text="queued while chat still draining")]
+            assert delivered == [QueuedMessage(text="queued while chat still draining")]
             assert "queued updates arrived while idle" in kwargs["user_text"]
 
     async def test_auto_delivery_stress_respects_transport_backlog(self, config):
@@ -1397,7 +1408,7 @@ class TestBackgroundPoller:
                 await bot.shutdown()
 
         assert schedule_mock.await_count == 1
-        schedule_mock.assert_awaited_once_with(task_id="task-team", parent_state=child_state)
+        schedule_mock.assert_awaited_once_with(task_id="task-team", parent_state=child_state, wake_reserved=True)
         assert record.status == "launched"
         assert record.idle_ready is False
         assert record.prompt_file is None
@@ -5490,9 +5501,9 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=334))
         assert child_state is not None
-        assert child_state.session_manager.model_override == "gpt-5.6-sol"
+        assert child_state.session_manager.model_override == "gpt-6-sol"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.6-sol[1m]"
+        assert child_options.model == "gpt-6-sol[1m]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "900000"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in child_options.env
@@ -5531,9 +5542,9 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=335))
         assert child_state is not None
-        assert child_state.session_manager.model_override == "gpt-5.6-sol[200k]"
+        assert child_state.session_manager.model_override == "gpt-6-sol[200k]"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-5.6-sol[200k]"
+        assert child_options.model == "gpt-6-sol[200k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in child_options.env
@@ -5989,7 +6000,7 @@ class TestForkTaskRuntime:
                 },
             )
 
-        schedule_mock.assert_awaited_once_with(task_id="task-team", parent_state=child_state)
+        schedule_mock.assert_awaited_once_with(task_id="task-team", parent_state=child_state, wake_reserved=True)
         assert record.status == "launched"
         assert record.idle_ready is False
         assert record.emit_parent_callback is False
@@ -6046,7 +6057,7 @@ class TestForkTaskRuntime:
                 },
             )
 
-        schedule_mock.assert_awaited_once_with(task_id="task-team", parent_state=child_state)
+        schedule_mock.assert_awaited_once_with(task_id="task-team", parent_state=child_state, wake_reserved=True)
         assert record.status == "launched"
         assert record.idle_ready is False
         await bot.shutdown()
@@ -6095,7 +6106,7 @@ class TestForkTaskRuntime:
                 },
             )
 
-        schedule_mock.assert_awaited_once_with(task_id="task-fork-team", parent_state=child_state)
+        schedule_mock.assert_awaited_once_with(task_id="task-fork-team", parent_state=child_state, wake_reserved=True)
         assert record.status == "launched"
         assert record.idle_ready is False
         assert "ReadInbox" in record.prompt
@@ -6325,7 +6336,7 @@ class TestForkTaskRuntime:
         with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock) as schedule_mock:
             await bot._poll_team_worker_inbox_wakes()
 
-        schedule_mock.assert_awaited_once_with(task_id="task-team-b", parent_state=state_b)
+        schedule_mock.assert_awaited_once_with(task_id="task-team-b", parent_state=state_b, wake_reserved=True)
         assert record_a.status == "completed"
         assert record_b.status == "launched"
         assert record_b.idle_ready is False
@@ -9126,6 +9137,7 @@ class TestTelegramStatePersistence:
         schedule_mock.assert_awaited_once_with(
             task_id="task-team-1",
             parent_state=restored_child_state,
+            wake_reserved=True,
         )
         await restored.shutdown()
 
@@ -9180,6 +9192,7 @@ class TestTelegramStatePersistence:
         schedule_mock.assert_awaited_once_with(
             task_id="task-team-primary-bot",
             parent_state=child_state,
+            wake_reserved=True,
         )
         await bot.shutdown()
 
@@ -9244,6 +9257,7 @@ class TestTelegramStatePersistence:
         schedule_mock.assert_awaited_once_with(
             task_id="task-fork-team-1",
             parent_state=restored_child_state,
+            wake_reserved=True,
         )
         await restored.shutdown()
 

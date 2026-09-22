@@ -8,6 +8,21 @@ All other requests are forwarded unmodified. CC's native cache_control
 placement is left untouched — cache_control is not part of the cache key
 (it's a breakpoint hint only), so normalizing it is unnecessary.
 
+WARNING — FORK/RESUME CACHE CORRECTNESS, NOT OPTIONAL TEXT CLEANUP
+The live CLI adds context that it never persists to JSONL. Forks and resumes
+rebuild history from JSONL, so those additions MUST NOT survive normalization:
+one differing historical block breaks the shared prefix from that point on.
+Even useful inbox/correction text in native hook additionalContext is transient.
+Deliver it as a normal, persisted query instead; NEVER exempt it here to fix
+message delivery. Do not rewrite historical JSONL to imitate live-only context.
+
+Before changing normalization, capture the actual bundled CLI's live request,
+its JSONL, and actual fork AND resume requests; compare normalized shared history
+(not just notification visibility or synthetic request fixtures). Run the real
+protocol regressions in tests/test_cache_proxy_reminder_span.py. Unit success
+alone does not prove provider cache-hit behavior. See README.md's critical
+maintainer warning and docs/inflight-message-delivery.md for the delivery boundary.
+
 Normalizations (applied in order):
 1. Billing header: replaced with fixed value
 2. String→list: bare-string user content converted to list format
@@ -89,7 +104,7 @@ SAVE_BODIES = os.environ.get("CACHE_PROXY_SAVE_BODIES", "").lower() in ("1", "tr
 # Format matters: the value must keep the 4-segment "major.minor.patch.build"
 # shape the client normally sends (e.g. 2.1.59.a37). A bare "2.1.251" is
 # REJECTED — verified by live test — so the build suffix must be retained.
-CC_VERSION = os.environ.get("CACHE_PROXY_CC_VERSION", "2.1.251.a37")
+CC_VERSION = os.environ.get("CACHE_PROXY_CC_VERSION", "2.1.280.a37")
 FIXED_BILLING_HEADER = (
     f"x-anthropic-billing-header: cc_version={CC_VERSION}; cc_entrypoint=sdk-py; cch=0;"
 )
@@ -273,6 +288,11 @@ REMINDER_PLACEHOLDER = "[reminder stripped]"
 
 def strip_reminder_spans(text: str) -> tuple[str, int]:
     """Remove every reminder span from *text*.
+
+    WARNING: do not preserve ``hook additional context:`` (or other live-only
+    exceptions) here. The CLI omits it from JSONL; keeping it makes the parent
+    diverge from the fork/resume history. Fix delivery at the persisted-query
+    boundary and prove actual live/fork/resume prefix equality instead.
 
     Returns ``(new_text, spans_removed)``. Pure function of the input, so replays
     of the same conversation produce byte-identical output.
@@ -520,6 +540,11 @@ def sanitize_tool_schemas_for_openai(body: dict) -> int:
 
 def normalize_request(body: dict) -> tuple[dict, dict]:
     """Apply all normalizations to a request body in spec order.
+
+    WARNING: this is the shared-history contract for forking, not merely a
+    performance filter. Never allow non-JSONL runtime additions through to fix
+    a transport/hook bug. Any change requires actual parent/fork/resume
+    normalized-prefix equivalence tests; preserving a notice alone is not proof.
 
     Order: billing → strings → strip all system reminders → git status →
            tool sorting → metadata

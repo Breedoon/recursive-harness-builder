@@ -91,6 +91,20 @@ model, ownership/persistence map, child inheritance rules and architecture revie
 Related policies: [configuration](docs/configuration.md),
 [effort](docs/effort.md), and [context/compaction](docs/context-compaction.md).
 
+## Critical maintainer warning: fork-cache fidelity
+
+`src/cache_proxy.py` is part of the fork/resume correctness contract. Live CLI
+attachments absent from JSONL must be stripped: preserving even useful transient
+hook context makes parent and replayed historical prefixes differ. **Do not fix
+message delivery by weakening normalization.** Deliver semantic input through
+canonical persisted queries instead, as described in
+[in-flight message delivery](docs/inflight-message-delivery.md).
+
+Before changing normalization, compare actual bundled CLI live requests and JSONL
+with actual fork **and** resume requests. Run the real protocol tests in
+`tests/test_cache_proxy_reminder_span.py`; notification visibility alone does not
+establish cache safety. Preserve this invariant even when other tests pass.
+
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE).

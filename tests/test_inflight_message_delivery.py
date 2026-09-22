@@ -1,7 +1,7 @@
 """Regression tests for messages sent while an agent is using tools.
 
-Exercise the registered SDK callbacks, not just the queue-draining helper:
-registration order is part of the delivery contract. No live model is needed.
+Exercise the registered SDK callbacks: tool hooks must leave queued input for
+canonical runner queries, never consume it into non-JSONL context.
 """
 
 from __future__ import annotations
@@ -48,14 +48,10 @@ def _context(result: dict) -> str:
     return result.get("hookSpecificOutput", {}).get("additionalContext", "")
 
 
-def _assert_delivery(state, result, texts):
-    assert result["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
-    expected = "\n".join(f"[Queued message from user]: {text}" for text in texts)
-    assert expected in _context(result)
-    status = state.status_queue.get_nowait()
-    assert status.type == "queue_delivered"
-    assert status.count == len(texts)
-    assert status.messages == texts
+def _assert_retained(state, result, texts):
+    assert "[Queued message from user]:" not in _context(result)
+    messages = list(state.message_queue._queue)
+    assert [message.text if isinstance(message, QueuedMessage) else message for message in messages] == texts
     assert state.status_queue.empty()
 
 
@@ -74,8 +70,8 @@ async def test_pre_tracks_tool_without_consuming_message(tmp_path, monkeypatch, 
     assert state.status_queue.empty()
 
     post = await callbacks["PostToolUse"](_input("PostToolUse", tool_name=tool_name), "tool-1", {})
-    _assert_delivery(state, post, ["use the updated requirements"])
-    assert state.message_queue.empty()
+    _assert_retained(state, post, ["use the updated requirements"])
+    assert not state.message_queue.empty()
     assert state.current_tool_use_id is None
     assert await callbacks["PostToolUse"](_input("PostToolUse"), "tool-1", {}) == {}
     assert state.status_queue.empty()
@@ -97,7 +93,7 @@ async def test_post_preserves_messages_while_delivery_is_disabled(tmp_path, monk
     assert state.status_queue.empty()
     setattr(state, flag, False)
     result = await callbacks["PostToolUse"](_input("PostToolUse", "tool-2"), "tool-2", {})
-    _assert_delivery(state, result, [message.text])
+    _assert_retained(state, result, [message.text])
 
 
 @pytest.mark.parametrize("event", ["PreToolUse", "PostToolUse"])
@@ -159,11 +155,11 @@ async def test_cancelled_post_hook_keeps_message_for_next_callback(tmp_path, mon
     assert state.current_tool_use_id is None
     release.set()
     result = await callbacks["PostToolUse"](_input("PostToolUse", "tool-2"), "tool-2", {})
-    _assert_delivery(state, result, [message.text])
-    assert state.message_queue.empty()
+    _assert_retained(state, result, [message.text])
+    assert not state.message_queue.empty()
 
 
-async def test_message_arriving_during_user_hook_is_in_same_delivery(tmp_path, monkeypatch):
+async def test_message_arriving_during_user_hook_stays_queued(tmp_path, monkeypatch):
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -185,9 +181,9 @@ async def test_message_arriving_during_user_hook_is_in_same_delivery(tmp_path, m
         release.set()
         result = await task
 
-    _assert_delivery(state, result, ["first", "arrived while hook was waiting"])
+    _assert_retained(state, result, ["first", "arrived while hook was waiting"])
     assert "custom hook context" in _context(result)
-    assert state.message_queue.empty()
+    assert not state.message_queue.empty()
 
 
 async def test_parallel_post_callbacks_do_not_lose_message_when_one_is_cancelled(tmp_path, monkeypatch):
@@ -218,8 +214,8 @@ async def test_parallel_post_callbacks_do_not_lose_message_when_one_is_cancelled
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    _assert_delivery(state, result, ["exactly once"])
-    assert state.message_queue.empty()
+    _assert_retained(state, result, ["exactly once"])
+    assert not state.message_queue.empty()
 
 
 async def test_reply_targets_keep_metadata_and_plain_messages_keep_order(tmp_path, monkeypatch):
@@ -231,11 +227,14 @@ async def test_reply_targets_keep_metadata_and_plain_messages_keep_order(tmp_pat
 
     result = await callbacks["PostToolUse"](_input("PostToolUse"), "tool-1", {})
 
-    _assert_delivery(state, result, ["first", "second", "second"])
+    _assert_retained(state, result, ["reply one", "first", "reply two", "second", "second"])
     assert "reply one" not in _context(result)
     assert "reply two" not in _context(result)
     assert state.message_queue.get_nowait() is replies[0]
+    assert state.message_queue.get_nowait() == "first"
     assert state.message_queue.get_nowait() is replies[1]
+    assert state.message_queue.get_nowait() == QueuedMessage("second", 13)
+    assert state.message_queue.get_nowait() == "second"
     assert state.message_queue.empty()
 
 
@@ -302,6 +301,6 @@ async def test_different_agents_cannot_drain_each_others_queue(tmp_path, monkeyp
 
     result = await callbacks["PostToolUse"](_input("PostToolUse"), "tool-1", {})
 
-    _assert_delivery(first, result, ["for first only"])
+    _assert_retained(first, result, ["for first only"])
     assert second.message_queue.get_nowait() == "for second only"
     assert second.status_queue.empty()

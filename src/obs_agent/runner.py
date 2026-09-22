@@ -424,8 +424,10 @@ class ConversationRunner:
             async for event in self._stream_response():
                 yield event
 
-    async def _query_or_reconnect(self, prompt: str) -> None:
-        """Send query; on recoverable error reconnect and retry."""
+    async def _query_or_reconnect(self, prompt: str) -> bool:
+        """Hand off queued input, rechecking pause after reconnect awaits."""
+        if not self._queue_delivery_enabled():
+            return False
         try:
             await self._client.query(prompt)
             self._sync_session_id_from_client()
@@ -446,8 +448,11 @@ class ConversationRunner:
                 except Exception:
                     logger.error("Fresh session also failed", exc_info=True)
                     raise exc from None
+            if not self._queue_delivery_enabled():
+                return False
             await self._client.query(prompt)
             self._sync_session_id_from_client()
+        return True
 
     async def _retry_after_silent_response(self, original_prompt: str) -> str:
         """Reconnect after an SDK result with no visible assistant text.
@@ -525,17 +530,33 @@ class ConversationRunner:
     # ------------------------------------------------------------------
 
     async def run(self, user_message: str) -> AsyncIterator[RunnerEvent]:
-        """Execute one conversation turn, yielding events as they occur.
+        """Run canonical queries, retaining unaccepted queued input on every exit.
 
-        Handles:
-        - Pending message injection from previous turn
-        - Initial query + response streaming
-        - Continuation loop for queued messages
-        - Background fork wait + wake-up
-        - Final queue drain for next turn
+        Hooks must not consume this queue: their additionalContext is absent
+        from JSONL and is stripped by the fork-cache normalization contract.
+        A queued batch stays runner-owned until query() accepts it; adapters
+        must return remaining_pending to their route even on failure/cancellation.
+        This is an SDK handoff, not a durable crash/exactly-once acknowledgement.
         """
-        # 1. Inject pending messages from previous turn
-        pending = self._pending_messages
+        try:
+            async for event in self._run_turn(user_message):
+                yield event
+        finally:
+            self._pending_messages.extend(_drain_queue(self._hook_state.message_queue))
+
+        self._session_mgr.touch()
+        yield DoneEvent()
+
+    def _queue_delivery_enabled(self) -> bool:
+        return not (
+            self._hook_state.pause_queue_delivery
+            or self._hook_state.interrupt_requested
+            or self._hook_state.interrupt_flag
+        )
+
+    async def _run_turn(self, user_message: str) -> AsyncIterator[RunnerEvent]:
+        # 1. Keep ownership until the canonical initial query is accepted.
+        pending = list(self._pending_messages) if self._queue_delivery_enabled() else []
         had_pending = bool(pending)
         pending_count = len(pending)
         actual_message = user_message
@@ -545,15 +566,6 @@ class ConversationRunner:
                 f"[Queued message from user]: {m.text}" for m in pending
             )
             actual_message = f"{prefix}\n\n{user_message}"
-            self._pending_messages = []
-
-        if had_pending:
-            yield StatusEvent(
-                type="queue_delivered",
-                summary="queued message delivered",
-                count=pending_count,
-                messages=queued_texts(pending),
-            )
 
         # 2. Get client and send query (with reconnect on connection loss)
         await self._session_mgr.recover_poisoned_session_if_needed()
@@ -579,6 +591,8 @@ class ConversationRunner:
                 self._client = await self._session_mgr.get_client()
                 self._sync_session_id_from_client()
 
+        if had_pending and not self._queue_delivery_enabled():
+            return
         actual_message = self._session_mgr.prepare_user_message(actual_message)
 
         try:
@@ -591,8 +605,19 @@ class ConversationRunner:
             await self._session_mgr.disconnect()
             self._client = await self._session_mgr.get_client()
             self._sync_session_id_from_client()
+            if had_pending and not self._queue_delivery_enabled():
+                return
             await self._client.query(actual_message)
             self._sync_session_id_from_client()
+
+        if had_pending:
+            del self._pending_messages[:pending_count]
+            yield StatusEvent(
+                type="queue_delivered",
+                summary="queued message delivered",
+                count=pending_count,
+                messages=queued_texts(pending),
+            )
 
         # 3. Stream response (with reconnect on recoverable errors)
         async for event in self._stream_with_silent_recovery(
@@ -608,18 +633,16 @@ class ConversationRunner:
 
         # 4. Continuation loop: process queued messages inline
         continuation_count = 0
-        deferred_pending: list[QueuedMessage] = []
         while (
             continuation_count < self._config.max_queue_continuations
-            and not self._hook_state.pause_queue_delivery
-            and not self._hook_state.interrupt_requested
+            and self._queue_delivery_enabled()
+            and not self._pending_messages
         ):
             remaining = _drain_queue(self._hook_state.message_queue)
             if not remaining:
                 break
-            latest = remaining[-1]
-            if latest.reply_to_message_id is not None:
-                deferred_pending.extend(remaining)
+            self._pending_messages.extend(remaining)
+            if remaining[-1].reply_to_message_id is not None:
                 break
             continuation_count += 1
 
@@ -628,6 +651,9 @@ class ConversationRunner:
                 + "\n\n(User sent these while you were responding. Address them briefly.)"
             )
 
+            if not await self._query_or_reconnect(continuation_prompt):
+                break
+            del self._pending_messages[:len(remaining)]
             yield StatusEvent(
                 type="queue_delivered",
                 summary="queued message delivered",
@@ -635,7 +661,6 @@ class ConversationRunner:
                 messages=queued_texts(remaining),
             )
 
-            await self._query_or_reconnect(continuation_prompt)
             async for event in self._stream_with_silent_recovery(
                 original_prompt=continuation_prompt,
                 retry_prompt=_RECOVERY_PROMPT,
@@ -647,8 +672,8 @@ class ConversationRunner:
         # 5. Background fork wait loop
         while (
             self._hook_state.background_tasks
-            and not self._hook_state.pause_queue_delivery
-            and not self._hook_state.interrupt_requested
+            and self._queue_delivery_enabled()
+            and not self._pending_messages
         ):
             tasks = set(self._hook_state.background_tasks)
             if not tasks:
@@ -665,16 +690,24 @@ class ConversationRunner:
                 break
 
             await asyncio.sleep(0.1)
+            if not self._queue_delivery_enabled():
+                break
 
             bg_remaining = _drain_queue(self._hook_state.message_queue)
             if not bg_remaining:
                 continue
+            self._pending_messages.extend(bg_remaining)
+            if bg_remaining[-1].reply_to_message_id is not None:
+                break
 
             bg_prompt = (
                 "\n".join(f"[Queued message from user]: {m.text}" for m in bg_remaining)
                 + "\n\n(Background fork results arrived. Process and summarize them.)"
             )
 
+            if not await self._query_or_reconnect(bg_prompt):
+                break
+            del self._pending_messages[:len(bg_remaining)]
             yield StatusEvent(
                 type="queue_delivered",
                 summary="background fork result delivered",
@@ -682,7 +715,6 @@ class ConversationRunner:
                 messages=queued_texts(bg_remaining),
             )
 
-            await self._query_or_reconnect(bg_prompt)
             async for event in self._stream_with_silent_recovery(
                 original_prompt=bg_prompt,
                 retry_prompt=_RECOVERY_PROMPT,
@@ -690,9 +722,3 @@ class ConversationRunner:
             ):
                 yield event
             self._refresh_last_result_data()
-
-        # 6. Drain remaining queue for next turn
-        self._pending_messages = deferred_pending + _drain_queue(self._hook_state.message_queue)
-
-        self._session_mgr.touch()
-        yield DoneEvent()

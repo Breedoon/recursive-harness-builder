@@ -17,6 +17,8 @@ Covers the takeover-1 Step-1 fix:
       carrying the gate token (F1).
 """
 
+import asyncio
+import copy
 import json
 import socket
 import sys
@@ -71,6 +73,176 @@ def test_module_under_test_comes_from_this_checkout():
 
 
 # ── (a) span-level stripping ──────────────────────────────────────────────
+
+
+class TestNativeHookJSONLFidelity:
+    @pytest.mark.parametrize("event", ["PreToolUse:Bash", "PostToolUse:Bash", "SessionStart:startup", "FutureHook:unknown"])
+    @pytest.mark.parametrize("location", ["text", "tool_string", "tool_list"])
+    def test_transient_hook_context_is_stripped_in_all_locations(self, event, location):
+        # Native additionalContext is absent from JSONL and cannot survive replay.
+        text = _reminder(f"{event} hook additional context: [Queued message from user]: Revised instruction; read the inbox.")
+        block = _text(text) if location == "text" else _tool_result(text if location == "tool_string" else [_text(text)])
+        body = _body([_user([_text("persisted input"), block])])
+        normalized, _ = cache_proxy.normalize_request(body)
+        assert "hook additional context:" not in json.dumps(normalized)
+        assert "persisted input" in json.dumps(normalized)
+        again, _ = cache_proxy.normalize_request(copy.deepcopy(normalized))
+        assert again == normalized
+
+    def test_hook_context_does_not_exempt_colocated_reminders(self):
+        live = _reminder("PostToolUse:Bash hook additional context: transient notice")
+        text = "persisted input\n" + live + "\n" + _reminder()
+        body = _body([_user([_text(text)])])
+        assert cache_proxy.strip_all_system_reminders(body) == 2
+        assert body["messages"][0]["content"] == [_text("persisted input")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event", ["PreToolUse", "PostToolUse"])
+    @pytest.mark.parametrize("delivery", ["transient_hook", "canonical_runner"])
+    async def test_real_sdk_hook_parent_fork_and_resume_share_jsonl_prefix(self, tmp_path, monkeypatch, event, delivery):
+        """Live CLI vs JSONL replay must normalize identically, with no provider calls."""
+        from dataclasses import replace
+
+        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
+        from obs_agent.context_jsonl import find_session_jsonl
+        from obs_agent.config import OBSConfig
+        from obs_agent.hooks import HookState, create_hook_matchers
+        from obs_agent.queueing import QueuedMessage
+        from obs_agent.runner import ConversationRunner
+        from obs_agent.session import SessionManager
+        from unittest.mock import AsyncMock
+
+        marker = "native-hook-wire: exact queued correction"
+        captured = []
+        state = HookState()
+        state.message_queue.put_nowait(QueuedMessage(text=marker))
+
+        def endpoint(path, body):
+            if path.split("?")[0].endswith("/count_tokens"):
+                return "application/json", json.dumps({"input_tokens": 100})
+            if not path.split("?")[0].endswith("/messages"):
+                return "application/json", "{}"
+            normalized, _ = cache_proxy.normalize_request(copy.deepcopy(body))
+            captured.append((body, normalized))
+            has_result = any(
+                block.get("type") == "tool_result" and block.get("tool_use_id") == "toolu_probe"
+                for msg in body.get("messages", [])
+                for block in (msg.get("content", []) if isinstance(msg.get("content"), list) else [])
+            )
+            start = {
+                "id": f"msg_probe_{len(captured)}", "type": "message", "role": "assistant",
+                "model": body.get("model", "claude-sonnet-4-6"), "content": [],
+                "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 1},
+            }
+            block = {"type": "text", "text": ""} if has_result else {"type": "tool_use", "id": "toolu_probe", "name": "Bash", "input": {}}
+            delta = {"type": "text_delta", "text": "Done."} if has_result else {"type": "input_json_delta", "partial_json": json.dumps({"command": "true", "description": "Loopback protocol test"})}
+            events = [
+                ("message_start", {"type": "message_start", "message": start}),
+                ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": block}),
+                ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta}),
+                ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn" if has_result else "tool_use", "stop_sequence": None}, "usage": {"output_tokens": 10}}),
+                ("message_stop", {"type": "message_stop"}),
+            ]
+            return "text/event-stream", "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events)
+
+        async def handle(reader, writer):
+            try:
+                header = (await reader.readuntil(b"\r\n\r\n")).decode()
+                lines = header.split("\r\n")
+                headers = {k.lower(): v for k, v in (line.split(":", 1) for line in lines[1:] if ":" in line)}
+                data = await reader.readexactly(int(headers.get("content-length", "0")))
+                content_type, text = endpoint(lines[0].split()[1], json.loads(data) if data else {})
+                payload = text.encode()
+                writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode() + payload)
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.delenv("CLAUDECODE", raising=False)
+        config = OBSConfig(vault_path=tmp_path)
+
+        async def transient_hook(hook_input, tool_use_id, context):
+            # Historical negative control only; production hooks must not do this.
+            notice = state.message_queue.get_nowait()
+            return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": notice.text}}
+
+        hooks = create_hook_matchers(config, state) if delivery == "canonical_runner" else {
+            event: [HookMatcher(hooks=[transient_hook])],
+        }
+        options = ClaudeAgentOptions(
+            cwd=str(tmp_path), model="claude-sonnet-4-6", max_turns=2,
+            permission_mode="bypassPermissions", setting_sources=[], hooks=hooks,
+            env={"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}", "ANTHROPIC_API_KEY": "loopback-test-only", "ANTHROPIC_AUTH_TOKEN": "loopback-test-only", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1"},
+        )
+        def without_cache_control(value):
+            if isinstance(value, dict):
+                return {key: without_cache_control(item) for key, item in value.items() if key != "cache_control"}
+            if isinstance(value, list):
+                return [without_cache_control(item) for item in value]
+            return value
+
+        try:
+            session_id = None
+            async with asyncio.timeout(90):
+                async with ClaudeSDKClient(options=options) as client:
+                    if delivery == "canonical_runner":
+                        manager = SessionManager(config=config, hook_state=state)
+                        manager.get_client = AsyncMock(return_value=client)
+                        manager.recover_poisoned_session_if_needed = AsyncMock(return_value=None)
+                        runner = ConversationRunner(manager, state, config)
+                        events = [message async for message in runner.run("Run Bash true once and finish.")]
+                        session_id = manager.session_id
+                        assert runner.remaining_pending == []
+                        assert sum(getattr(item, "type", None) == "queue_delivered" for item in events) == 1
+                        assert marker not in json.dumps(captured[0][0])
+                    else:
+                        await client.query("Run Bash true once and finish.")
+                        async for message in client.receive_response():
+                            session_id = getattr(message, "session_id", None) or session_id
+                assert session_id
+                assert state.message_queue.empty()
+                matching = [(raw, normalized) for raw, normalized in captured if marker in json.dumps(raw)]
+                assert matching, "The CLI must submit the notice on the live wire"
+                raw_parent, normalized_parent = matching[-1]
+                session_path = find_session_jsonl(session_id=session_id, cwd=tmp_path)
+                assert session_path is not None
+                if delivery == "canonical_runner":
+                    assert marker in json.dumps(normalized_parent)
+                    assert "hook additional context:" not in json.dumps(raw_parent)
+                    persisted = [json.loads(line) for line in session_path.read_text().splitlines()]
+                    assert sum(record.get("type") == "user" and marker in json.dumps(record.get("message", {})) for record in persisted) == 1
+                else:
+                    assert f"{event}:Bash hook additional context:" in json.dumps(raw_parent)
+                    assert marker not in json.dumps(normalized_parent)
+                    assert marker not in session_path.read_text(), "Transient hooks are not canonical JSONL history"
+                parent_prefix = without_cache_control(normalized_parent["messages"])
+
+                for fork_session in (True, False):
+                    capture_start = len(captured)
+                    replay_options = replace(options, hooks={}, resume=session_id, fork_session=fork_session)
+                    async with ClaudeSDKClient(options=replay_options) as replay:
+                        await replay.query("Continue briefly without tools.")
+                        async for _ in replay.receive_response():
+                            pass
+                    replay_requests = captured[capture_start:]
+                    assert replay_requests
+                    raw_replay, normalized_replay = replay_requests[0]
+                    if delivery == "canonical_runner":
+                        assert marker in json.dumps(raw_replay)
+                        assert marker in json.dumps(normalized_replay)
+                    else:
+                        assert marker not in json.dumps(raw_replay)
+                        # Keeping transient hooks would break the shared historical prefix.
+                        assert without_cache_control(raw_parent["messages"]) != without_cache_control(raw_replay["messages"][:len(parent_prefix)])
+                    assert parent_prefix == without_cache_control(normalized_replay["messages"][:len(parent_prefix)])
+        finally:
+            server.close()
+            await server.wait_closed()
 
 
 class TestPureReminderBlockIsUnchangedFromBefore:

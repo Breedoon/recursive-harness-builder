@@ -110,7 +110,7 @@ def create_app(config: OBSConfig) -> FastAPI:
 
     @application.post("/chat/enqueue")
     async def chat_enqueue(request: ChatRequest):
-        """Queue a message for injection at the next hook boundary."""
+        """Queue a message for persisted delivery at the next turn boundary."""
         registry: CommandRegistry = application.state.commands
         result = await registry.execute("enqueue", message=request.message)
         if not result.success:
@@ -182,27 +182,27 @@ def create_app(config: OBSConfig) -> FastAPI:
         """
         session_mgr: SessionManager = application.state.session_manager
         cfg: OBSConfig = application.state.config
-        pending = getattr(application.state, "pending_messages", [])
-
-        runner = ConversationRunner(
-            session_mgr, hook_state, cfg,
-            pending_messages=pending,
-        )
-
         result_parts: list[str] = []
         try:
             async with application.state.turn_lock:
-                async for event in runner.run(request.message):
-                    if isinstance(event, TextEvent):
-                        result_parts.append(event.text)
+                runner = ConversationRunner(
+                    session_mgr, hook_state, cfg,
+                    pending_messages=application.state.pending_messages,
+                )
+                runner_events = runner.run(request.message)
+                try:
+                    async for event in runner_events:
+                        if isinstance(event, TextEvent):
+                            result_parts.append(event.text)
+                finally:
+                    await runner_events.aclose()
+                    application.state.pending_messages = runner.remaining_pending
         except Exception as exc:
             logger.exception("Error in /chat")
             return JSONResponse(
                 status_code=500,
                 content={"error": f"{type(exc).__name__}: {str(exc)[:200]}"},
             )
-
-        application.state.pending_messages = runner.remaining_pending
 
         return ChatResponse(
             response="\n".join(result_parts),
@@ -217,26 +217,27 @@ def create_app(config: OBSConfig) -> FastAPI:
         """
         session_mgr: SessionManager = application.state.session_manager
         cfg: OBSConfig = application.state.config
-        pending = getattr(application.state, "pending_messages", [])
-
-        runner = ConversationRunner(
-            session_mgr, hook_state, cfg,
-            pending_messages=pending,
-        )
-
         async def event_generator():
             try:
                 async with application.state.turn_lock:
-                    async for event in runner.run(request.message):
-                        if isinstance(event, TextEvent):
-                            for text_line in event.text.split("\n"):
-                                yield f"data: {text_line}\n"
-                            yield "\n"
-                        elif isinstance(event, StatusEvent):
-                            yield event.to_sse()
-                        elif isinstance(event, DoneEvent):
-                            application.state.pending_messages = runner.remaining_pending
-                            yield "data: [DONE]\n\n"
+                    runner = ConversationRunner(
+                        session_mgr, hook_state, cfg,
+                        pending_messages=application.state.pending_messages,
+                    )
+                    runner_events = runner.run(request.message)
+                    try:
+                        async for event in runner_events:
+                            if isinstance(event, TextEvent):
+                                for text_line in event.text.split("\n"):
+                                    yield f"data: {text_line}\n"
+                                yield "\n"
+                            elif isinstance(event, StatusEvent):
+                                yield event.to_sse()
+                            elif isinstance(event, DoneEvent):
+                                yield "data: [DONE]\n\n"
+                    finally:
+                        await runner_events.aclose()
+                        application.state.pending_messages = runner.remaining_pending
             except Exception as exc:
                 logger.exception("Error in SSE stream")
                 error_msg = f"{type(exc).__name__}: {str(exc)[:200]}"

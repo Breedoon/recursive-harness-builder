@@ -27,7 +27,6 @@ from obs_agent.hooks import (
     _make_immutable_check,
     _make_notification_check,
     _make_stop_check,
-    _make_queue_check,
     create_hook_matchers,
     load_hook_function,
     _make_user_hook_check,
@@ -577,133 +576,23 @@ class TestCheckImmutableGuard:
 
 
 class TestCheckMessageQueue:
-    """_make_queue_check drains messages from the queue."""
+    """Native hook context must never own non-replayable queued input."""
 
     @pytest.mark.asyncio
-    async def test_empty_queue_returns_none(self):
-        """Empty queue -> None (no opinion)."""
+    @pytest.mark.parametrize("event", ["PreToolUse", "PostToolUse"])
+    async def test_messages_remain_for_canonical_runner_query(self, config, event):
         state = HookState()
-        check = _make_queue_check(state)
-        result = await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
-        assert result is None
+        messages = ["same", "same", QueuedMessage("reply", 42, 7)]
+        for message in messages:
+            state.message_queue.put_nowait(message)
+        callback = create_hook_matchers(config, state)[event][0].hooks[0]
+        inp = _make_pre_tool_use_input() if event == "PreToolUse" else _make_post_tool_use_input()
 
-    @pytest.mark.asyncio
-    async def test_single_message(self):
-        """Single queued message appears in additionalContext."""
-        state = HookState()
-        state.message_queue.put_nowait("hello from user")
-        check = _make_queue_check(state)
-        result = await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
-        assert result is not None
-        assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
-        ctx = result["hookSpecificOutput"]["additionalContext"]
-        assert "hello from user" in ctx
-        assert "[Queued message from user]" in ctx
+        result = await callback(inp, "tu-123", _EMPTY_CONTEXT)
 
-    @pytest.mark.asyncio
-    async def test_multiple_messages(self):
-        """Multiple queued messages all appear in additionalContext."""
-        state = HookState()
-        state.message_queue.put_nowait("first message")
-        state.message_queue.put_nowait("second message")
-        check = _make_queue_check(state)
-        result = await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
-        assert result is not None
-        assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
-        ctx = result["hookSpecificOutput"]["additionalContext"]
-        assert "first message" in ctx
-        assert "second message" in ctx
-
-    @pytest.mark.asyncio
-    async def test_drains_all_messages(self):
-        """Queue is empty after the check runs."""
-        state = HookState()
-        state.message_queue.put_nowait("msg1")
-        state.message_queue.put_nowait("msg2")
-        check = _make_queue_check(state)
-        await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
-        assert state.message_queue.empty()
-
-    @pytest.mark.asyncio
-    async def test_pushes_status_event_on_drain(self):
-        """Draining messages pushes a queue_delivered StatusEvent to status_queue."""
-        from obs_agent.events import StatusEvent
-
-        state = HookState()
-        state.message_queue.put_nowait("hello")
-        check = _make_queue_check(state)
-        await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
-
-        assert not state.status_queue.empty()
-        event = state.status_queue.get_nowait()
-        assert isinstance(event, StatusEvent)
-        assert event.type == "queue_delivered"
-        assert event.summary == "queued message delivered"
-        assert event.count == 1
-        assert event.messages == ["hello"]
-
-    @pytest.mark.asyncio
-    async def test_status_event_count_matches_messages(self):
-        """StatusEvent count matches the number of drained messages."""
-        state = HookState()
-        state.message_queue.put_nowait("msg1")
-        state.message_queue.put_nowait("msg2")
-        state.message_queue.put_nowait("msg3")
-        check = _make_queue_check(state)
-        await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
-
-        event = state.status_queue.get_nowait()
-        assert event.count == 3
-        assert event.messages == ["msg1", "msg2", "msg3"]
-
-    @pytest.mark.asyncio
-    async def test_no_status_event_on_empty_queue(self):
-        """No StatusEvent pushed when message queue is empty."""
-        state = HookState()
-        check = _make_queue_check(state)
-        await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
+        assert result.get("hookSpecificOutput", {}).get("additionalContext", "") == ""
+        assert [state.message_queue.get_nowait() for _ in messages] == messages
         assert state.status_queue.empty()
-
-    @pytest.mark.asyncio
-    async def test_reply_target_messages_remain_queued(self):
-        """Reply-target queued messages must not be injected as additionalContext."""
-        state = HookState()
-        deferred = QueuedMessage(
-            text="fork me later",
-            telegram_message_id=42,
-            reply_to_message_id=7,
-        )
-        state.message_queue.put_nowait(deferred)
-        check = _make_queue_check(state)
-
-        result = await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
-
-        assert result is None
-        remaining = state.message_queue.get_nowait()
-        assert remaining == deferred
-        assert state.status_queue.empty()
-
-    @pytest.mark.asyncio
-    async def test_plain_messages_drain_while_reply_targets_stay_queued(self):
-        """Plain queued messages inject immediately, reply-targets stay for later routing."""
-        state = HookState()
-        deferred = QueuedMessage(
-            text="fork me later",
-            telegram_message_id=42,
-            reply_to_message_id=7,
-        )
-        state.message_queue.put_nowait("plain message")
-        state.message_queue.put_nowait(deferred)
-        check = _make_queue_check(state)
-
-        result = await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
-
-        assert result is not None
-        ctx = result["hookSpecificOutput"]["additionalContext"]
-        assert "plain message" in ctx
-        assert "fork me later" not in ctx
-        remaining = state.message_queue.get_nowait()
-        assert remaining == deferred
 
 
 class TestHookStateStatusQueue:
@@ -881,16 +770,17 @@ class TestCreateHookMatchers:
         assert state.interrupt_flag is False
 
     @pytest.mark.asyncio
-    async def test_post_tool_use_pipeline_drains_queue(self, config):
-        """The PostToolUse pipeline drains queued messages."""
+    async def test_post_tool_use_pipeline_keeps_queue(self, config):
+        """Tool completion cannot move queued input into transient context."""
         state = HookState()
         state.message_queue.put_nowait("queued msg")
         matchers = create_hook_matchers(config, state)
         pipeline = matchers["PostToolUse"][0].hooks[0]
 
         result = await pipeline(_make_post_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
-        assert result.get("hookSpecificOutput", {}).get("hookEventName") == "PostToolUse"
-        assert "queued msg" in result.get("hookSpecificOutput", {}).get("additionalContext", "")
+        assert result == {}
+        assert state.message_queue.get_nowait() == "queued msg"
+        assert state.status_queue.empty()
 
     @pytest.mark.asyncio
     async def test_notification_pipeline_pushes_status_event(self, config):
