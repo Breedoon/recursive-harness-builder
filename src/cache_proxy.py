@@ -538,6 +538,29 @@ def sanitize_tool_schemas_for_openai(body: dict) -> int:
     return count
 
 
+def strip_unsupported_effort(body: dict) -> int:
+    """Drop harness-injected effort fields from Haiku side requests.
+
+    CLAUDE_CODE_EXTRA_BODY is merged into every request the CLI makes,
+    including its Haiku side calls (titles, WebFetch summaries), and Haiku
+    rejects output_config.effort and adaptive thinking with HTTP 400.
+    """
+    if not str(body.get("model", "")).startswith("claude-haiku"):
+        return 0
+    count = 0
+    output_config = body.get("output_config")
+    if isinstance(output_config, dict) and "effort" in output_config:
+        output_config.pop("effort")
+        if not output_config:
+            body.pop("output_config")
+        count += 1
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "adaptive":
+        body.pop("thinking")
+        count += 1
+    return count
+
+
 def normalize_request(body: dict) -> tuple[dict, dict]:
     """Apply all normalizations to a request body in spec order.
 
@@ -804,6 +827,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # sanitizing is an untested change that does not belong in a routing fix.
             if upstream == CLI_PROXY_UPSTREAM:
                 info["schema_sanitized"] = sanitize_tool_schemas_for_openai(data)
+            elif upstream == ANTHROPIC_UPSTREAM:
+                info["effort_stripped"] = strip_unsupported_effort(data)
 
             body = json.dumps(data, separators=(",", ":")).encode()
 

@@ -118,14 +118,46 @@ def test_openai_wire_options_all_levels_with_context_and_no_global_mutation(conf
 
 
 @pytest.mark.parametrize("level", EFFORT_LEVELS)
-def test_native_claude_uses_effort_env_without_proxy_thinking_override(config, level):
+def test_cli_native_claude_uses_effort_env_without_body_override(config, level):
     manager = SessionManager(config=config)
-    manager.model_override = "opus"
+    manager.model_override = "claude-opus-4-6"
     manager.effort_override = level
     options = manager.create_options()
     assert options.env[EFFORT_ENV] == level
     assert json.loads(options.settings)["env"][EFFORT_ENV] == level
     assert EXTRA_BODY_ENV not in options.env
+
+
+@pytest.mark.parametrize("model", ["opus", "fable", "sonnet[1m]", "claude-opus-4-7"])
+@pytest.mark.parametrize("level", EFFORT_LEVELS)
+def test_cli_unknown_claude_gets_output_config_effort_only(config, model, level):
+    manager = SessionManager(config=config)
+    manager.model_override = model
+    manager.effort_override = level
+    options = manager.create_options()
+    assert options.env[EFFORT_ENV] == level
+    if level == "high":  # API default: omitted so request bytes stay unchanged
+        assert EXTRA_BODY_ENV not in options.env
+        return
+    body = json.loads(options.env[EXTRA_BODY_ENV])
+    assert body == {"output_config": {"effort": level}}
+    assert json.loads(options.settings)["env"][EXTRA_BODY_ENV] == options.env[EXTRA_BODY_ENV]
+
+
+def test_cli_unknown_claude_preserves_operator_body_and_thinking():
+    raw = json.dumps({
+        "thinking": {"type": "disabled"}, "metadata": {"user_id": "op"},
+        "output_config": {"format": {"type": "json"}},
+    })
+    body = json.loads(build_effort_env("claude-fable-5-1", "low", {EXTRA_BODY_ENV: raw})[EXTRA_BODY_ENV])
+    assert body == {
+        "thinking": {"type": "disabled"}, "metadata": {"user_id": "op"},
+        "output_config": {"format": {"type": "json"}, "effort": "low"},
+    }
+
+
+def test_haiku_gets_no_effort_body():
+    assert build_effort_env("claude-haiku-4-5", "low", {}) == {EFFORT_ENV: "low"}
 
 
 @pytest.mark.parametrize("level,expected", [

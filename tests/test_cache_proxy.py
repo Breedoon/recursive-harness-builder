@@ -1394,3 +1394,19 @@ class TestSanitizeToolSchemas:
         }
         cache_proxy.sanitize_tool_schemas_for_openai(body)
         assert cache_proxy.stats["schemas_sanitized"] == 1
+
+
+@pytest.mark.parametrize("body,expected,count", [
+    ({"model": "claude-haiku-4-5-20251001", "output_config": {"effort": "low"}},
+     {"model": "claude-haiku-4-5-20251001"}, 1),
+    ({"model": "claude-haiku-4-5-20251001", "thinking": {"type": "adaptive"},
+      "output_config": {"effort": "max", "format": {"type": "json"}}},
+     {"model": "claude-haiku-4-5-20251001", "output_config": {"format": {"type": "json"}}}, 2),
+    ({"model": "claude-haiku-4-5", "thinking": {"type": "enabled", "budget_tokens": 1024}},
+     {"model": "claude-haiku-4-5", "thinking": {"type": "enabled", "budget_tokens": 1024}}, 0),
+    ({"model": "claude-opus-5-5", "thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}},
+     {"model": "claude-opus-5-5", "thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}, 0),
+])
+def test_strip_unsupported_effort_only_touches_haiku(body, expected, count):
+    assert cache_proxy.strip_unsupported_effort(body) == count
+    assert body == expected

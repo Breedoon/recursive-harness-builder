@@ -21,6 +21,14 @@ QWEN_EFFORT_MAPPING = {
     "xhigh": "xhigh",
     "max": "xhigh",
 }
+# Claude models the bundled Claude Code (2.1.59) does not recognize as
+# effort-capable: it sends no output_config for them, so /effort was a no-op.
+# All five levels are accepted by the API (verified live 2026-09-23 on
+# claude-opus-5-5).
+CLAUDE_BODY_EFFORT_PREFIXES = (
+    "claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-mythos-5",
+    "claude-opus-4-7", "claude-opus-4-8",
+)
 EFFORT_USAGE = "/effort [low|medium|high|xhigh|max|auto]"
 
 
@@ -105,6 +113,24 @@ def build_effort_env(
                 **chat_template_kwargs,
                 "enable_thinking": chat_template_kwargs.get("enable_thinking", False),
             }
+        result[EXTRA_BODY_ENV] = json.dumps(body, separators=(",", ":"))
+        return result
+    if clean_model.startswith(CLAUDE_BODY_EFFORT_PREFIXES):
+        # Only output_config: the CLI's thinking block (enabled + budget) is
+        # left alone, because changing thinking parameters invalidates the
+        # message cache and effort already governs thinking depth under it.
+        # The cache proxy strips the field from side requests to models that
+        # reject it (Haiku).
+        if effort == "high" and "output_config" not in body:
+            # high is the API default. An explicit value is cached separately
+            # from an omitted one once thinking is in the history (measured
+            # 2026-09-23), so omit it: default sessions keep today's request
+            # bytes and the deploy costs them no cache miss.
+            return result
+        output_config = body.get("output_config", {})
+        if not isinstance(output_config, dict):
+            raise ValueError("CLAUDE_CODE_EXTRA_BODY.output_config must be an object")
+        body["output_config"] = {**output_config, "effort": effort}
         result[EXTRA_BODY_ENV] = json.dumps(body, separators=(",", ":"))
         return result
     is_proxy_model = not is_claude_model(clean_model) and not clean_model.startswith("local-")
