@@ -561,6 +561,229 @@ def strip_unsupported_effort(body: dict) -> int:
     return count
 
 
+# ── Mid-session effort pinning ───────────────────────────────────────────
+#
+# Anthropic caches messages per top-level effort: changing
+# output_config.effort re-reads the conversation from its first thinking
+# turn onward. Models with per-message effort accept a
+# {"role":"system","content":[],"output_config":{"effort":X}} message that
+# changes effort from the next user turn WITHOUT touching the cached prefix
+# before it. So for those models the proxy keeps the top-level effort pinned
+# to the conversation's first-seen level and expresses every later /effort
+# change as such a message.
+#
+# The injected messages exist only on the wire (the CLI never sees them), so
+# they must be reproduced byte-identically on every later request, including
+# after a resume, a fork, or a proxy restart. The store therefore keys on
+# content, not session IDs:
+#   bases[hash(model, messages[0])]      -> first-seen top-level effort
+#   anchors[hash(model, messages[:i+1])] -> effort message placed before i
+# A fork shares its parent's prefix, so it reproduces the parent's messages up
+# to the fork point. The store is persisted as JSON next to the usage log.
+#
+# GPT via CLIProxyAPI has no equivalent: CLIProxyAPI v7.2.49 drops a
+# role:system message when translating /v1/messages to Responses (verified
+# 2026-09-23), so GPT keeps the top-level effort (one cache miss per change).
+MID_EFFORT_BETA = "mid-conversation-output-config-2026-07-01"
+MID_EFFORT_MODEL_PREFIXES = tuple(
+    p.strip() for p in os.environ.get(
+        "CACHE_PROXY_MID_EFFORT_MODELS",
+        "claude-opus-5,claude-fable-5-1,claude-mythos-5-1",
+    ).split(",") if p.strip()
+)
+EFFORT_PIN_FILE = os.path.join(LOG_DIR, "effort-pins.json")
+EFFORT_PIN_TTL = 30 * 86400
+EFFORT_PIN_MAX = 200_000
+_DEFAULT = "__default__"  # stored stand-in for "no top-level effort"
+
+
+def _mid_effort_supported(model: str) -> bool:
+    return any(model.startswith(p) for p in MID_EFFORT_MODEL_PREFIXES)
+
+
+def _is_real_user_prompt(msg: dict) -> bool:
+    """A user message that starts a turn (not a tool_result continuation).
+
+    An effort message may not sit between a tool_use and its tool_result, and
+    OBS only changes effort on an idle session, so a change is always followed
+    by a real prompt. Changes seen mid tool-loop are deferred to the next one.
+    """
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if isinstance(content, list):
+        return not any(isinstance(b, dict) and b.get("type") == "tool_result"
+                       for b in content)
+    return True
+
+
+class EffortPinStore:
+    def __init__(self, path: str | None):
+        import threading
+        self.path = path
+        self.lock = threading.Lock()
+        self.bases: dict[str, list] = {}    # key -> [effort, last_used]
+        self.anchors: dict[str, list] = {}  # key -> [effort, last_used]
+        self._load()
+
+    def _load(self):
+        if not self.path or not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+            self.bases = data.get("bases", {})
+            self.anchors = data.get("anchors", {})
+        except Exception as e:
+            log(f"effort pins unreadable, starting empty: {e}")
+
+    def _save(self):
+        if not self.path:
+            return
+        now = time.time()
+        for table in (self.bases, self.anchors):
+            stale = [k for k, v in table.items() if now - v[1] > EFFORT_PIN_TTL]
+            for k in stale:
+                del table[k]
+            if len(table) > EFFORT_PIN_MAX:
+                for k, _ in sorted(table.items(), key=lambda kv: kv[1][1])[
+                        : len(table) - EFFORT_PIN_MAX]:
+                    del table[k]
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"bases": self.bases, "anchors": self.anchors}, f)
+        os.replace(tmp, self.path)
+
+
+_effort_pins: EffortPinStore | None = None
+
+
+def _get_effort_pins() -> EffortPinStore:
+    global _effort_pins
+    if _effort_pins is None:
+        _effort_pins = EffortPinStore(EFFORT_PIN_FILE)
+    return _effort_pins
+
+
+def _strip_cache_control(obj):
+    # cache_control is a breakpoint hint the CLI moves to the newest message on
+    # every request; it is not part of the cached content, so ignore it.
+    if isinstance(obj, dict):
+        return {k: _strip_cache_control(v) for k, v in obj.items()
+                if k != "cache_control"}
+    if isinstance(obj, list):
+        return [_strip_cache_control(v) for v in obj]
+    return obj
+
+
+def _msg_bytes(msg: dict) -> bytes:
+    return json.dumps(_strip_cache_control(msg), sort_keys=True,
+                      separators=(",", ":")).encode()
+
+
+def pin_effort(body: dict, store: EffortPinStore | None = None) -> dict:
+    """Pin top-level effort; express changes as per-message effort.
+
+    Returns {"inserted": n, "changed": bool, "beta": bool}. Mutates body.
+    Must run after normalize_request so hashes cover normalized history.
+    """
+    import hashlib
+    result = {"inserted": 0, "changed": False, "beta": False}
+    model = str(body.get("model", ""))
+    msgs = body.get("messages")
+    if not _mid_effort_supported(model) or not isinstance(msgs, list) or not msgs:
+        return result
+    store = store or _get_effort_pins()
+    oc = body.get("output_config")
+    cur = (oc.get("effort") if isinstance(oc, dict) else None) or _DEFAULT
+    if cur == "high":  # the API default; same behavior as omitting it
+        cur = _DEFAULT
+    now = time.time()
+
+    running = hashlib.sha256(model.encode() + b"\0")
+    prefix_keys = []
+    for m in msgs:
+        running.update(_msg_bytes(m) + b"\0")
+        prefix_keys.append(running.copy().hexdigest())
+    base_key = prefix_keys[0]
+
+    dirty = False
+    with store.lock:
+        entry = store.bases.get(base_key)
+        if entry is None:
+            # A conversation first seen mid-way predates this proxy (or its
+            # store): its history was cached with no top-level effort, which is
+            # what the CLI sent for these models before effort was injected.
+            base = cur if len(msgs) == 1 else _DEFAULT
+            store.bases[base_key] = [base, now]
+            dirty = True
+        else:
+            base = entry[0]
+            entry[1] = now
+
+        inserts: dict[int, str] = {}
+        effective = base
+        for i, m in enumerate(msgs):
+            if i == 0 or not _is_real_user_prompt(m):
+                continue
+            a = store.anchors.get(prefix_keys[i])
+            if a is not None:
+                inserts[i] = a[0]
+                effective = a[0]
+                a[1] = now
+
+        last = len(msgs) - 1
+        if cur != effective:
+            if last > 0 and _is_real_user_prompt(msgs[last]):
+                store.anchors[prefix_keys[last]] = [cur, now]
+                inserts[last] = cur
+                result["changed"] = True
+                dirty = True
+            elif last == 0:
+                # Identical first message to another conversation that used a
+                # different effort: nothing cached to protect, send as asked.
+                return result
+            # else: mid tool-loop; the change applies from the next real prompt.
+        if dirty:
+            try:
+                store._save()
+            except Exception as e:
+                log(f"effort pins save failed: {e}")
+
+    if isinstance(oc, dict):
+        oc.pop("effort", None)
+        if base != _DEFAULT:
+            oc["effort"] = base
+        elif not oc:
+            body.pop("output_config")
+    elif base != _DEFAULT:
+        body["output_config"] = {"effort": base}
+
+    if inserts:
+        out = []
+        for i, m in enumerate(msgs):
+            if i in inserts:
+                eff = inserts[i]
+                out.append({"role": "system", "content": [],
+                            "output_config": {"effort": "high" if eff == _DEFAULT else eff}})
+            out.append(m)
+        body["messages"] = out
+        result["inserted"] = len(inserts)
+        result["beta"] = True
+    return result
+
+
+def _add_beta(headers: dict, beta: str) -> None:
+    for k in list(headers):
+        if k.lower() == "anthropic-beta":
+            parts = [p.strip() for p in headers[k].split(",") if p.strip()]
+            if beta not in parts:
+                headers[k] = ",".join(parts + [beta])
+            return
+    headers["anthropic-beta"] = beta
+
+
 def normalize_request(body: dict) -> tuple[dict, dict]:
     """Apply all normalizations to a request body in spec order.
 
@@ -778,6 +1001,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         upstream = ANTHROPIC_UPSTREAM  # default; overridden after model extraction
         log_model = ""
         route_label = "anthropic"
+        pin_beta = False
         try:
             data = json.loads(raw_body)
             is_streaming = data.get("stream", False)
@@ -829,7 +1053,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 info["schema_sanitized"] = sanitize_tool_schemas_for_openai(data)
             elif upstream == ANTHROPIC_UPSTREAM:
                 info["effort_stripped"] = strip_unsupported_effort(data)
+                try:
+                    info["effort_pin"] = pin_effort(data)
+                except Exception as e:
+                    log(f"effort pin error, sending as-is: {e}")
 
+            pin_beta = bool(info.get("effort_pin", {}).get("beta"))
             body = json.dumps(data, separators=(",", ":")).encode()
 
             # Save post-normalization body
@@ -848,7 +1077,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 f"git_status={info.get('git_status', 0)} "
                 f"tools={info.get('tools', 0)} "
                 f"meta={info.get('metadata', 0)} "
-                f"schema={info.get('schema_sanitized', 0)})")
+                f"schema={info.get('schema_sanitized', 0)} "
+                f"effort_pin={info.get('effort_pin', {}).get('inserted', 0)})")
 
         except Exception as e:
             log(f"normalize error, passing through: {e}")
@@ -874,6 +1104,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         headers = self._upstream_headers(upstream)
         headers["content-length"] = str(len(body))
+        if pin_beta:
+            _add_beta(headers, MID_EFFORT_BETA)
         url = upstream + self.path
 
         timeout = httpx.Timeout(connect=30, read=600, write=30, pool=30)
