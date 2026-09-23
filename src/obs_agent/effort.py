@@ -14,6 +14,13 @@ from obs_agent.config import MODEL_EFFORT_LEVELS, is_claude_model, resolve_model
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
 EXTRA_BODY_ENV = "CLAUDE_CODE_EXTRA_BODY"
+QWEN_EFFORT_MAPPING = {
+    "low": "low",
+    "medium": "medium",
+    "high": "xhigh",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+}
 EFFORT_USAGE = "/effort [low|medium|high|xhigh|max|auto]"
 
 
@@ -83,6 +90,23 @@ def build_effort_env(
         # back to session_env. Respect an operator's raw provider configuration.
         return result
     clean_model = resolve_model_context(model).model.lower()
+    if clean_model.startswith("local-qwen"):
+        output_config = body.get("output_config", {})
+        if not isinstance(output_config, dict):
+            raise ValueError("CLAUDE_CODE_EXTRA_BODY.output_config must be an object")
+        body["output_config"] = {
+            **output_config, "effort": QWEN_EFFORT_MAPPING[effort]
+        }
+        if effort == "low":
+            chat_template_kwargs = body.get("chat_template_kwargs", {})
+            if not isinstance(chat_template_kwargs, dict):
+                raise ValueError("CLAUDE_CODE_EXTRA_BODY.chat_template_kwargs must be an object")
+            body["chat_template_kwargs"] = {
+                **chat_template_kwargs,
+                "enable_thinking": chat_template_kwargs.get("enable_thinking", False),
+            }
+        result[EXTRA_BODY_ENV] = json.dumps(body, separators=(",", ":"))
+        return result
     is_proxy_model = not is_claude_model(clean_model) and not clean_model.startswith("local-")
     thinking = body.get("thinking", {})
     if not isinstance(thinking, dict):

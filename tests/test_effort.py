@@ -128,6 +128,39 @@ def test_native_claude_uses_effort_env_without_proxy_thinking_override(config, l
     assert EXTRA_BODY_ENV not in options.env
 
 
+@pytest.mark.parametrize("level,expected", [
+    ("low", "low"), ("medium", "medium"), ("high", "xhigh"),
+    ("xhigh", "xhigh"), ("max", "xhigh"),
+])
+def test_local_qwen_effort_maps_to_template_values(level, expected):
+    env = build_effort_env("local-qwen3.8-27b", level, {})
+    body = json.loads(env[EXTRA_BODY_ENV])
+    assert env[EFFORT_ENV] == level
+    assert body["output_config"]["effort"] == expected
+    if level == "low":
+        assert body["chat_template_kwargs"]["enable_thinking"] is False
+    else:
+        assert "chat_template_kwargs" not in body
+
+
+def test_local_non_qwen_does_not_receive_qwen_body_override():
+    assert build_effort_env("local-llama", "high", {}) == {EFFORT_ENV: "high"}
+
+
+def test_local_qwen_deep_merges_operator_extra_body_and_preserves_explicit_thinking():
+    env = build_effort_env("local-qwen3.8-27b", "low", {
+        EXTRA_BODY_ENV: json.dumps({
+            "metadata": {"user_id": "operator"},
+            "output_config": {"format": {"type": "json"}},
+            "chat_template_kwargs": {"enable_thinking": True, "other": "kept"},
+        })
+    })
+    body = json.loads(env[EXTRA_BODY_ENV])
+    assert body["metadata"] == {"user_id": "operator"}
+    assert body["output_config"] == {"format": {"type": "json"}, "effort": "low"}
+    assert body["chat_template_kwargs"] == {"enable_thinking": True, "other": "kept"}
+
+
 def test_shell_extra_body_is_merged(monkeypatch, config):
     monkeypatch.setenv(EXTRA_BODY_ENV, '{"metadata":{"user_id":"shell"}}')
     options = SessionManager(config=config).create_options()
