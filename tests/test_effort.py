@@ -161,8 +161,8 @@ def test_haiku_gets_no_effort_body():
 
 
 @pytest.mark.parametrize("level,expected", [
-    ("low", "low"), ("medium", "medium"), ("high", "xhigh"),
-    ("xhigh", "xhigh"), ("max", "xhigh"),
+    ("low", "low"), ("medium", "medium"), ("high", "medium"),
+    ("xhigh", "medium"), ("max", "medium"),
 ])
 def test_local_qwen_effort_maps_to_template_values(level, expected):
     env = build_effort_env("local-qwen3.8-27b", level, {})

@@ -14,12 +14,19 @@ from obs_agent.config import MODEL_EFFORT_LEVELS, is_claude_model, resolve_model
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
 EXTRA_BODY_ENV = "CLAUDE_CODE_EXTRA_BODY"
+# The Qwen chat template writes an effort sentence into the system head for
+# xhigh (and for low while thinking is on). On this hybrid GDN model vLLM can
+# only resume from the previous prompt's end state, so a changed head recomputes
+# the whole conversation, and a sentence placed anywhere outside the history
+# blocks reuse on every turn (measured 2026-09-23). low (thinking off) and
+# medium render identical prompts, so every level above low maps to medium and
+# /effort changes never cost a reprefill.
 QWEN_EFFORT_MAPPING = {
     "low": "low",
     "medium": "medium",
-    "high": "xhigh",
-    "xhigh": "xhigh",
-    "max": "xhigh",
+    "high": "medium",
+    "xhigh": "medium",
+    "max": "medium",
 }
 # Claude models the bundled Claude Code (2.1.59) does not recognize as
 # effort-capable: it sends no output_config for them, so /effort was a no-op.
