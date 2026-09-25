@@ -16,6 +16,7 @@ import html
 import json
 import logging
 import os
+import signal
 import random
 import re
 import shlex
@@ -53,6 +54,7 @@ from obs_agent.jsonl_health import (
     resolve_safe_jsonl_target,
 )
 from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
+from obs_agent import maintenance_restart as _maint
 from obs_agent.lineage import (
     agent_name_for_lineage,
     build_obs_bootstrap_xml,
@@ -687,6 +689,12 @@ class TelegramBot:
         # keeps only a weak reference to a running task, so a bare
         # create_task(...) can be garbage-collected mid-flight.
         self._detached_wake_tasks: set[asyncio.Task] = set()
+        # Opt-in maintenance restart (see obs_agent.maintenance_restart).
+        self._maintenance_resume_task: asyncio.Task | None = None
+        self._maintenance_restart_requested = False
+        # Injectable for tests; default terminates the process group so
+        # supervisord autorestarts OBS exactly like a plain restart.
+        self._maintenance_exit_fn: Any = None
         self._background_delivery_tasks: dict[TelegramRoute, asyncio.Task] = {}
         self._inbox_wake_poll_task: asyncio.Task | None = None
         self._team_worker_records: dict[tuple[str, str], str] = {}
@@ -1868,6 +1876,258 @@ class TelegramBot:
             restored_inbox_keys.add(key)
 
         self._mark_restored_team_inboxes_read(restored_inbox_keys)
+
+    # ------------------------------------------------------------------
+    # Opt-in maintenance restart (Daniel 2026-09-25; not the default).
+    # Plain restart/stop is the kill switch: without a marker, nothing resumes.
+    # ------------------------------------------------------------------
+
+    def _maintenance_marker_path(self) -> Path:
+        return _maint.marker_path(Path(self._config.telegram_state_db_path).parent)
+
+    def _state_model_name(self, state: TelegramSessionState) -> str:
+        return str(state.session_manager.model_override or self._config.model or "")
+
+    def _collect_maintenance_entries(self) -> list[_maint.ResumeEntry]:
+        """Snapshot every route that is mid-turn right now."""
+        entries: list[_maint.ResumeEntry] = []
+        for route, state in list(self._states_by_route.items()):
+            if not (state.busy or state.hook_state.execution_active):
+                continue
+            task_id = self._fork_task_by_child_route.get(route)
+            record = self._fork_tasks_by_id.get(task_id) if task_id else None
+            if record is not None and record.terminal_request:
+                # /stop, /stop_branch or /stop_tree before the restart wins.
+                continue
+            session_id = state.session_id
+            model = self._state_model_name(state)
+            projection = self._state_inbox_projection(state)
+            queued = [
+                _maint.QueuedEntry(
+                    text=item.text,
+                    telegram_message_id=item.telegram_message_id,
+                    reply_to_message_id=item.reply_to_message_id,
+                )
+                for item in (coerce_queued_message(raw) for raw in state.pending_messages)
+                if (item.text or "").strip()
+            ]
+            entries.append(
+                _maint.ResumeEntry(
+                    chat_id=route.chat_id,
+                    thread_id=route.thread_id,
+                    session_id=session_id,
+                    task_id=record.task_id if record is not None else None,
+                    team_name=(record.team_name if record is not None else None)
+                    or (projection[0] if projection is not None else None),
+                    agent_name=(record.agent_name if record is not None else None)
+                    or (projection[1] if projection is not None else None),
+                    is_local=_maint.is_local_model(model),
+                    model=model or None,
+                    jsonl_head_uuid=self._session_heads.get(session_id or ""),
+                    topic_title=state.topic_title,
+                    queued=queued,
+                )
+            )
+        return entries
+
+    def write_maintenance_marker(self, *, source: str) -> tuple[Path, list[_maint.ResumeEntry]]:
+        entries = self._collect_maintenance_entries()
+        marker = _maint.ResumeMarker(requested_at=time.time(), source=source, entries=entries)
+        path = _maint.write_marker(self._maintenance_marker_path(), marker)
+        logger.warning(
+            "[maintenance_restart] marker written path=%s source=%s routes=%d local=%d",
+            path,
+            source,
+            len(entries),
+            sum(1 for entry in entries if entry.is_local),
+        )
+        return path, entries
+
+    def _maintenance_terminate(self) -> None:
+        if self._maintenance_exit_fn is not None:
+            self._maintenance_exit_fn()
+            return
+        # Same blast radius as `supervisorctl restart`: the wrapper, this
+        # process and every CLI child share the supervisord process group.
+        try:
+            os.killpg(os.getpgrp(), signal.SIGTERM)
+        except OSError:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    async def request_maintenance_restart(self, *, source: str, delay_seconds: float = 1.0) -> int:
+        """Write the resume marker, then terminate for supervisord to restart."""
+        if self._maintenance_restart_requested:
+            return 0
+        self._maintenance_restart_requested = True
+        _path, entries = self.write_maintenance_marker(source=source)
+        if delay_seconds > 0:
+            # Let the confirmation message and the marker log line flush.
+            await asyncio.sleep(delay_seconds)
+        self._maintenance_terminate()
+        return len(entries)
+
+    def start_maintenance_resume(self) -> asyncio.Task | None:
+        """Consume a fresh marker (rename first) and resume recorded routes."""
+        marker, reason = _maint.consume_marker(
+            self._maintenance_marker_path(),
+            max_age_seconds=_maint.max_age_from_env(),
+        )
+        if marker is None:
+            if reason != "no_marker":
+                logger.warning("[maintenance_restart] marker ignored reason=%s", reason)
+            return None
+        logger.warning(
+            "[maintenance_restart] resuming routes=%d source=%s requested_at=%.0f",
+            len(marker.entries),
+            marker.source,
+            marker.requested_at,
+        )
+        task = asyncio.create_task(self._run_maintenance_resume(marker))
+        self._maintenance_resume_task = task
+        return task
+
+    async def _run_maintenance_resume(self, marker: _maint.ResumeMarker) -> None:
+        hosted, local = _maint.split_resume_order(marker.entries)
+        stagger = _maint.hosted_stagger_from_env()
+
+        async def _local_chain() -> None:
+            # One local route at a time behind the single inference server.
+            for entry in local:
+                try:
+                    run = await self._resume_maintenance_entry(entry, requested_at=marker.requested_at)
+                    if run is not None:
+                        await asyncio.shield(run)
+                except Exception:
+                    logger.warning("[maintenance_restart] local resume failed entry=%s", entry, exc_info=True)
+
+        local_task = asyncio.create_task(_local_chain()) if local else None
+        for index, entry in enumerate(hosted):
+            if index and stagger:
+                await asyncio.sleep(stagger)
+            try:
+                await self._resume_maintenance_entry(entry, requested_at=marker.requested_at)
+            except Exception:
+                logger.warning("[maintenance_restart] hosted resume failed entry=%s", entry, exc_info=True)
+        if local_task is not None:
+            await local_task
+
+    async def _resume_maintenance_entry(
+        self,
+        entry: _maint.ResumeEntry,
+        *,
+        requested_at: float,
+    ) -> asyncio.Task | None:
+        """Start one resumed turn; returns the task driving it (or None)."""
+        route = TelegramRoute(chat_id=entry.chat_id, thread_id=entry.thread_id)
+        state = self._get_state(route, create=False)
+        if state is None:
+            logger.warning("[maintenance_restart] skip route=%s reason=route_not_restored", route)
+            return None
+        if entry.session_id and state.session_id != entry.session_id:
+            await self._activate_route_session(state, entry.session_id)
+        bot = self._bot_for_state(state)
+        if bot is None:
+            logger.warning("[maintenance_restart] skip route=%s reason=no_bot", route)
+            return None
+        state.last_bot = bot
+        queued = [
+            QueuedMessage(
+                text=item.text,
+                telegram_message_id=item.telegram_message_id,
+                reply_to_message_id=item.reply_to_message_id,
+            )
+            for item in entry.queued
+        ]
+        prompt = _maint.build_resume_prompt(requested_at=requested_at, queued_count=len(queued))
+        record = self._fork_tasks_by_id.get(entry.task_id or "") if entry.task_id else None
+        lock = self._get_route_lock(route)
+        async with lock:
+            if state.busy:
+                logger.warning("[maintenance_restart] skip route=%s reason=already_busy", route)
+                return None
+            state.busy = True
+        try:
+            marker_messages = await self._send_system_html_message(
+                route=route,
+                bot=bot,
+                html_text="maintenance restart: resuming the turn that was cut off",
+                disable_notification=True,
+                underline=False,
+            )
+        except _TopicDeletedError:
+            state.busy = False
+            logger.warning("[maintenance_restart] skip route=%s reason=topic_deleted", route)
+            return None
+        marker_message_id = self._sent_message_id(marker_messages[0]) if marker_messages else None
+        if queued:
+            state.pending_messages = list(state.pending_messages) + queued
+
+        if record is not None:
+            # Re-arm the parent callback so a waiting parent hears about the
+            # resumed child's completion (restore sets it False).
+            record.prompt = prompt
+            record.prompt_file = None
+            record.prompt_file_content = None
+            record.status = "launched"
+            record.error = None
+            record.terminal_request = None
+            record.completed_at = None
+            record.result_text = None
+            record.parent_callback_message_id = None
+            record.child_completion_message_id = None
+            record.launch_child_message_id = marker_message_id
+            record.idle_ready = False
+            record.emit_parent_callback = True
+            parent_state = self._get_state(record.parent_route, create=False)
+            if parent_state is not None and parent_state.last_bot is None:
+                # Restored parents have no bot yet; the callback needs one.
+                parent_state.last_bot = bot
+            self._register_team_worker_record(record)
+            await self._schedule_fork_task(
+                task_id=record.task_id,
+                parent_state=state,
+                wake_reserved=True,
+            )
+            return self._fork_task_tasks.get(record.task_id)
+
+        async def _runner() -> None:
+            try:
+                async with self._get_route_lock(route):
+                    await self._run_and_send(
+                        state=state,
+                        user_text=prompt,
+                        bot=bot,
+                        trigger_message=QueuedMessage(text=prompt, telegram_message_id=marker_message_id),
+                    )
+            finally:
+                state.busy = False
+
+        task = asyncio.create_task(_runner())
+        self._detached_wake_tasks.add(task)
+        task.add_done_callback(self._on_detached_wake_done)
+        return task
+
+    async def handle_maintenance_restart(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /maintenance_restart - snapshot running agents, restart, resume them."""
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        route = self._route_for_message(update.effective_message)
+        entries = self._collect_maintenance_entries()
+        local_count = sum(1 for entry in entries if entry.is_local)
+        await self._send_system_message(
+            route=route,
+            bot=context.bot,
+            text=(
+                f"maintenance restart: {len(entries)} running agent(s) will resume after restart "
+                f"({local_count} local, one at a time). Plain restart/stop remains the no-resume kill switch."
+            ),
+            disable_notification=True,
+        )
+        await self.request_maintenance_restart(source=f"telegram:/maintenance_restart user={update.effective_user.id}")
 
     def _mark_restored_team_inboxes_read(self, inbox_keys: set[tuple[str, str]]) -> None:
         for team_name, agent_name in sorted(inbox_keys):
@@ -10787,6 +11047,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("stop", bot.handle_stop))
     app.add_handler(CommandHandler("stop_branch", bot.handle_stop_branch))
     app.add_handler(CommandHandler("stop_tree", bot.handle_stop_tree))
+    app.add_handler(CommandHandler("maintenance_restart", bot.handle_maintenance_restart))
     app.add_handler(CommandHandler("model", bot.handle_model))
     app.add_handler(CommandHandler("effort", bot.handle_effort))
     app.add_handler(CommandHandler("session", bot.handle_session))
@@ -10844,6 +11105,7 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
         BotCommand("stop_branch", "Interrupt this agent and all recursive descendants"),
         BotCommand("stop_tree", "Interrupt the complete root team tree"),
+        BotCommand("maintenance_restart", "Restart OBS and auto-resume agents that are mid-turn (opt-in)"),
         BotCommand("model", "Select model before the first message of a new or cleared session"),
         BotCommand("effort", "Show or set effort: low, medium, high, xhigh, max, auto"),
         BotCommand("session", "Show agent, model, files, runtime and hooks"),
@@ -10924,6 +11186,8 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
             drop_pending_updates=drop_pending_updates,
             error_callback=_record_polling_error,
         )
+        _install_maintenance_signal_handler(tg_bot)
+        tg_bot.start_maintenance_resume()
 
         while True:
             await asyncio.sleep(_TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS)
@@ -10939,6 +11203,20 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
                 )
     finally:
         await _shutdown_telegram_runtime(app=app, tg_bot=tg_bot)
+
+
+def _install_maintenance_signal_handler(tg_bot: "TelegramBot") -> None:
+    """SIGUSR1 = opt-in maintenance restart (``python -m obs_agent.maintenance_restart``)."""
+    try:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(
+            _maint.MAINTENANCE_SIGNAL,
+            lambda: asyncio.ensure_future(
+                tg_bot.request_maintenance_restart(source="signal:SIGUSR1")
+            ),
+        )
+    except (NotImplementedError, RuntimeError, ValueError):
+        logger.warning("Maintenance-restart signal handler unavailable", exc_info=True)
 
 
 def _is_fatal_telegram_runtime_error(exc: Exception) -> bool:
