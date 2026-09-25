@@ -69,8 +69,8 @@ class TestPreToolUseImmutableGuard:
         assert result is not None
         assert "deny" in str(result).lower() or result.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
 
-    def test_blocks_write_to_env_files(self, config):
-        """Blocks Write/Edit to .env files anywhere."""
+    def test_allows_write_to_env_files(self, config):
+        """.env writes are allowed (Daniel 2026-09-25: guard never wanted)."""
         result = on_pre_tool_use(
             tool_name="Write",
             tool_input={
@@ -79,11 +79,10 @@ class TestPreToolUseImmutableGuard:
             },
             config=config,
         )
-        assert result is not None
-        assert "deny" in str(result).lower() or result.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+        assert result is None
 
-    def test_blocks_edit_to_env_files(self, config):
-        """Blocks Edit targeting .env files."""
+    def test_allows_edit_to_env_files(self, config):
+        """.env edits are allowed (Daniel 2026-09-25: guard never wanted)."""
         result = on_pre_tool_use(
             tool_name="Edit",
             tool_input={
@@ -93,8 +92,7 @@ class TestPreToolUseImmutableGuard:
             },
             config=config,
         )
-        assert result is not None
-        assert "deny" in str(result).lower() or result.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+        assert result is None
 
 
 # --- PreToolUse Guard: Native Tool Denylist ---
@@ -686,16 +684,15 @@ class TestCheckImmutableGuard:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_deny_env(self, config):
-        """Denies Write to .env files."""
+    async def test_allows_env(self, config):
+        """Allows Write to .env files (Daniel 2026-09-25: guard never wanted)."""
         check = _make_immutable_check(config)
         inp = _make_pre_tool_use_input(
             tool_name="Write",
             tool_input={"file_path": "/project/.env", "content": "SECRET=x"},
         )
         result = await check(inp, "tu-123", _EMPTY_CONTEXT)
-        assert result is not None
-        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert not result or result.get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
 
     @pytest.mark.asyncio
     async def test_deny_native_task_tools(self, config):

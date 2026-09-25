@@ -44,9 +44,6 @@ _WRITE_TOOLS = {"Write", "Edit", "NotebookEdit"}
 # Read-only tools that are always allowed
 _READ_TOOLS = {"Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch"}
 
-# File patterns that are always blocked from writes (beyond config immutable_patterns)
-_BLOCKED_FILE_PATTERNS = [".env"]
-
 # Native delegation tools are blocked so orchestration is forced through
 # OBS-managed AgentTask tooling.
 _BLOCKED_NATIVE_TASK_TOOLS = {"Task", "TaskStop"}  # TaskOutput allowed (read-only, useful for background bash)
@@ -160,11 +157,6 @@ def on_pre_tool_use(
         return None
 
     file_path = Path(file_path_str)
-
-    # Check .env files
-    for pattern in _BLOCKED_FILE_PATTERNS:
-        if pattern in file_path.name:
-            return _deny(f"Blocked: cannot modify {pattern} files")
 
     # Check immutable patterns from config
     if config.is_immutable(file_path):
