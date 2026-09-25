@@ -120,6 +120,110 @@ Connected clients are not reconfigured in place. Reconnect/restart affected
 sessions after deployment. Fresh children, inherited children, resumes, and
 reconnects rebuild the plan without replacing 400K OBS metadata with 1M.
 
+## Local models: same window-derived plan (2026-09-25)
+
+Local models used to be special-cased: OBS passed the bare model ID and only
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, which 2.1.59 ignores. It also dropped the
+percentage. So every local session compacted at the CLI's fixed 200K-capacity
+threshold of **167,000** reported tokens, whatever its real window (262K for
+`local-qwen3.8-27b`). Double-counted usage from vLLM made this worse, and was
+fixed separately in the cache proxy (`LocalUsageFixer`, commit `ac20834`).
+
+Local models now go through the same `build_claude_context_plan` as hosted
+ones. The threshold is `window - 33K`, where the window comes from the model's
+suffix or from `MODEL_CONTEXT_WINDOWS`. No per-model constant is added:
+
+- `local-qwen3.8-27b` (262K): selector `[1m]`, percentage approx. 23.367%, target **229,000**.
+- `local-qwen3.8-27b[500k]`: target 467,000.
+- `local-gemma4-31b` (48K): selector `[200k]`, target 15,000.
+
+The cache proxy strips the selector for every route before routing. So the
+gate still receives the literal ID, and the upstream request only gains the
+CLI's `context-1m-2025-08-07` beta header. A live request with that header was
+tested against the gate: HTTP 200, completed stream. **Exception:** a local
+session whose requests reach the gate directly keeps the bare ID. That happens
+when the proxy is disabled, or when the session has an explicit
+`ANTHROPIC_BASE_URL` that is not the proxy. The gate routes on the literal ID
+and would not strip a selector. That session is therefore planned inside the
+CLI's 200K capacity, and OBS logs a warning. The native probe confirms both
+routes on the pinned binary: `local-262k-proxy` gives threshold 229,000 and
+`local-262k-direct` gives 167,000
+(`/workspace/runtime/tmp/compaction-harness/e5-native/`).
+
+## Explicit per-session values win (2026-09-25)
+
+Precedence, highest first:
+
+1. an explicit per-session `env` (AgentTask `env`, `SessionManager.set_sdk_env_overrides`);
+2. the OBS plan;
+3. the daemon's process environment and project settings.
+
+This applies to the plan-owned keys (`OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS`,
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`) at both
+the SDK `env` and the inline `--settings` layer. Earlier, the plan overwrote
+explicit values at both layers, so an AgentTask `env` could not change
+compaction.
+
+`DISABLE_AUTO_COMPACT` / `DISABLE_COMPACT` set explicitly for one session are
+now accepted for **every** model family: Claude, GPT/Luna, and local. OBS
+writes `DISABLE_AUTO_COMPACT=1` at both layers and keeps the selector and
+percentage, so the context display stays correct. A daemon-wide disable switch
+without an explicit per-session choice is still rejected. That is the case the
+original check was written for: never silently reverse an operator's global
+kill switch. An explicit `"0"` shadows a daemon-wide `1` for that session.
+`CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE` is never set by OBS: with compaction
+disabled there is no extra hard limit beyond the provider's own.
+
+The native probe on 2.1.59 confirms that an explicit disable removes the
+`autocompact` threshold diagnostic entirely (`luna-120k-disable`,
+`claude-200k-disable`, `local-262k-disable`).
+
+A launcher that copies a parent's resolved env into a child must not copy
+the plan-owned keys, or they now pin the child's budget.
+
+## PreCompact handoff policy (opt-in, 2026-09-25)
+
+`OBS_COMPACT_POLICY=handoff` in a session's explicit env replaces automatic
+compaction with "stop and hand off from full context". The pinned 2.1.59
+ignores a PreCompact `block`, and it always appends "Please continue the
+conversation from where we left off" after an automatic compaction. Steering
+the summary through PreCompact `systemMessage` or SessionStart(compact) context
+was tested and left no trace in the JSONL: the agent just continued its task.
+So the mechanism is an interrupt:
+
+1. OBS registers `PreCompact`. When an automatic (not manual) compaction
+   fires, the session's user PreCompact hook runs first. Its
+   `additionalContext` becomes the handoff prompt, so the vault owns the text;
+   otherwise `DEFAULT_COMPACTION_HANDOFF_PROMPT` is used. OBS then **awaits
+   `client.interrupt()` inside the callback**, before the CLI sends the summary
+   request. The SDK serves control requests concurrently, so this does not
+   deadlock. The CLI logs an `AbortError` for the aborted hook request; that
+   is expected.
+2. `ConversationRunner` sees the interception. It suppresses the
+   "[Request interrupted by user]" residue, and does not retry on the old
+   process: a running CLI cannot take `DISABLE_AUTO_COMPACT` and re-fires
+   compaction on its next query. It marks the session
+   (`SessionManager.activate_compaction_handoff`, sticky for that session ID)
+   and reconnects. The same session ID is resumed in a new process with
+   `DISABLE_AUTO_COMPACT=1`, and the handoff prompt is sent as a normal,
+   persisted query.
+3. A user Stop hook can now block ending the turn:
+   `HookPipeline` passes `{"decision": "block", "reason": ...}` through for
+   Stop, and 2.1.59 honours it. The vault's `level_composite.stop` uses this
+   to require the handback file.
+
+Evidence:
+
+- E3 harness, 5/5 trials: no `compact_boundary`, full history kept.
+- In-process OBS smoke on hosted Luna, 3/3 trials: the worktree
+  `SessionManager`/`ConversationRunner` and the vault `level_composite` hooks
+  produced 0 compact boundaries, 1 handoff query each, a written
+  `handback.md`, and context that grew past the native threshold without
+  compaction (`/workspace/runtime/tmp/compaction-harness/e5-smoke/`).
+
+Live verification inside the daemon, after restart, is E6 of the enforcement
+mission.
+
 ## Verification layers
 
 1. `test_context_budget_regressions.py` checks parsing and the linear curve.

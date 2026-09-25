@@ -155,3 +155,44 @@ def test_native_capacity_override_does_not_change_the_denominator():
     plan = build_claude_context_plan(model="gpt", context_tokens=400_000,
                                     environ={"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000"})
     assert reference_cli_threshold(plan.cli_model, plan.environment, honors_window=False) == 367_000
+
+
+# --- explicit per-session precedence (vault-u3b.13) ---
+
+
+def test_validation_environment_drops_only_explicitly_chosen_disable_switches():
+    from obs_agent.claude_context import validation_environment
+
+    process = {"DISABLE_AUTO_COMPACT": "1", "DISABLE_COMPACT": "1", "OTHER": "x"}
+    merged = validation_environment(process, {"A": "b"}, {"DISABLE_AUTO_COMPACT": "0"})
+    assert "DISABLE_AUTO_COMPACT" not in merged
+    assert merged["DISABLE_COMPACT"] == "1"  # not explicitly chosen -> still validated
+    assert merged["OTHER"] == "x" and merged["A"] == "b"
+
+
+def test_apply_explicit_context_overrides_precedence_and_disable():
+    from obs_agent.claude_context import apply_explicit_context_overrides
+
+    plan_env = {
+        "OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS": "262000",
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "23.4",
+    }
+    out = apply_explicit_context_overrides(
+        plan_env, {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "10", "UNRELATED": "1"}, auto_compact_disabled=False
+    )
+    assert out["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "10"
+    assert out["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+    assert "UNRELATED" not in out and "DISABLE_AUTO_COMPACT" not in out
+    disabled = apply_explicit_context_overrides(plan_env, {}, auto_compact_disabled=True)
+    assert disabled["DISABLE_AUTO_COMPACT"] == "1"
+    assert "CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE" not in disabled
+
+
+def test_explicit_compaction_disabled_accepts_both_switches():
+    from obs_agent.claude_context import explicit_compaction_disabled
+
+    assert explicit_compaction_disabled({"DISABLE_COMPACT": "true"})
+    assert explicit_compaction_disabled({"DISABLE_AUTO_COMPACT": "1"})
+    assert not explicit_compaction_disabled({"DISABLE_AUTO_COMPACT": "0"})
+    assert not explicit_compaction_disabled({})

@@ -48,11 +48,69 @@ def _enabled(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+COMPACTION_DISABLE_KEYS = ("DISABLE_COMPACT", "DISABLE_AUTO_COMPACT")
+# Keys the context plan writes. An explicit per-session value (AgentTask ``env``)
+# for any of them wins over the plan value at both the process and settings layer.
+CONTEXT_PLAN_ENV_KEYS = (
+    "OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+)
+
+
+def explicit_compaction_disabled(explicit_env: Mapping[str, str]) -> bool:
+    """Return whether a per-session override explicitly disables auto-compaction."""
+    return any(_enabled(explicit_env.get(name)) for name in COMPACTION_DISABLE_KEYS)
+
+
+def validation_environment(
+    process_env: Mapping[str, str],
+    effective_env: Mapping[str, str],
+    explicit_env: Mapping[str, str],
+) -> dict[str, str]:
+    """Environment used to validate a plan, excluding explicit per-session choices.
+
+    ``_validate_environment`` exists to stop OBS from silently reversing a stray
+    daemon-wide compaction kill switch. A disable switch set explicitly for one
+    session (AgentTask ``env``) is a deliberate choice, not a stray value, and is
+    honoured by ``apply_explicit_context_overrides`` instead of rejected. An
+    explicit value (even "0") also shadows the daemon-wide value for that key.
+    """
+    merged = {**process_env, **effective_env}
+    for name in COMPACTION_DISABLE_KEYS:
+        if name in explicit_env:
+            merged.pop(name, None)
+    return merged
+
+
+def apply_explicit_context_overrides(
+    context_env: Mapping[str, str],
+    explicit_env: Mapping[str, str],
+    *,
+    auto_compact_disabled: bool,
+) -> dict[str, str]:
+    """Return the context env with explicit per-session values taking precedence.
+
+    The plan's selector/percentage stay in place (so the CLI's window and
+    context percentage remain correct) unless the session explicitly overrides
+    a key. When auto-compaction is disabled for the session, ``DISABLE_AUTO_COMPACT=1``
+    is added so it is present at both the SDK env and the inline-settings layer.
+    No hard token limit is introduced.
+    """
+    resolved = dict(context_env)
+    for name in CONTEXT_PLAN_ENV_KEYS:
+        value = explicit_env.get(name)
+        if value is not None and str(value).strip():
+            resolved[name] = str(value)
+    if auto_compact_disabled:
+        resolved["DISABLE_AUTO_COMPACT"] = "1"
+    return resolved
+
+
 def _validate_environment(environ: Mapping[str, str], cli_capacity_tokens: int) -> None:
     """Do not silently override an operator's explicit compaction kill switch."""
     for name in (
-        "DISABLE_COMPACT",
-        "DISABLE_AUTO_COMPACT",
+        *COMPACTION_DISABLE_KEYS,
         "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT",
     ):
         if _enabled(environ.get(name)):

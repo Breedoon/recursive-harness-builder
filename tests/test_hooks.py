@@ -2,7 +2,7 @@
 
 - PreToolUse: guards immutable files and .env from writes
 - Stop: triggers memory extraction via fork
-- PreCompact: triggers extraction then denies compaction
+- PreCompact: opt-in handoff policy interrupts automatic compaction
 - HookPipeline: extensible middleware that chains check functions
 - HookState: shared state for message queuing and interrupt
 
@@ -20,7 +20,8 @@ from obs_agent.lineage import build_obs_bootstrap_xml
 from obs_agent.hooks import (
     on_pre_tool_use,
     on_stop,
-    on_pre_compact,
+    _make_pre_compact_callback,
+    DEFAULT_COMPACTION_HANDOFF_PROMPT,
     HookState,
     HookPipeline,
     _make_interrupt_check,
@@ -277,39 +278,183 @@ class TestStopHook:
         mock_fork_runner.extract_memory.assert_called_once()
 
 
-# --- PreCompact Hook: Extraction + Deny ---
+# --- PreCompact Hook: opt-in handoff policy ---
 
 
-class TestPreCompactHook:
-    """PreCompact hook extracts memories then prevents compaction."""
+def _pre_compact_input(trigger: str = "auto") -> dict:
+    return {
+        "hook_event_name": "PreCompact",
+        "session_id": "sess-1",
+        "transcript_path": "/tmp/sess-1.jsonl",
+        "trigger": trigger,
+        "custom_instructions": None,
+    }
 
-    @pytest.mark.asyncio
-    async def test_pre_compact_triggers_extraction(self, config):
-        """PreCompact hook calls extract_memory before denying."""
-        mock_fork_runner = MagicMock()
-        mock_fork_runner.extract_memory = AsyncMock()
 
-        result = await on_pre_compact(
-            config=config,
-            fork_runner=mock_fork_runner,
-        )
-
-        mock_fork_runner.extract_memory.assert_called_once()
+class TestPreCompactHandoffPolicy:
+    """OBS_COMPACT_POLICY=handoff interrupts automatic compaction (E3 design)."""
 
     @pytest.mark.asyncio
-    async def test_pre_compact_prevents_compaction(self, config):
-        """PreCompact returns a deny signal to prevent lossy compaction."""
-        mock_fork_runner = MagicMock()
-        mock_fork_runner.extract_memory = AsyncMock()
+    async def test_default_policy_leaves_compaction_alone(self):
+        state = HookState()
+        interrupter = AsyncMock()
+        state.client_interrupter = interrupter
+        callback = _make_pre_compact_callback(state, None)
 
-        result = await on_pre_compact(
-            config=config,
-            fork_runner=mock_fork_runner,
+        result = await callback(_pre_compact_input(), None, {})
+
+        assert result == {}
+        interrupter.assert_not_called()
+        assert state.compaction_intercepted is False
+
+    @pytest.mark.asyncio
+    async def test_default_policy_passes_user_result_through(self):
+        state = HookState()
+        state.client_interrupter = AsyncMock()
+
+        async def user_check(hook_input, tool_use_id, context):
+            return {"systemMessage": "summarize carefully"}
+
+        callback = _make_pre_compact_callback(state, user_check)
+        assert await callback(_pre_compact_input(), None, {}) == {"systemMessage": "summarize carefully"}
+
+    @pytest.mark.asyncio
+    async def test_handoff_policy_awaits_interrupt_and_records_state(self):
+        state = HookState()
+        state.sdk_env_overrides = {"OBS_COMPACT_POLICY": "handoff"}
+        order: list[str] = []
+
+        async def interrupter():
+            order.append("interrupt")
+
+        state.client_interrupter = interrupter
+        callback = _make_pre_compact_callback(state, None)
+
+        result = await callback(_pre_compact_input(), None, {})
+
+        assert result == {}
+        assert order == ["interrupt"]
+        assert state.compaction_intercepted is True
+        assert state.compaction_handoff_prompt is None  # runner uses the default
+        assert state.compaction_intercept_info["session_id"] == "sess-1"
+
+    @pytest.mark.asyncio
+    async def test_handoff_prompt_comes_from_user_hook_additional_context(self):
+        state = HookState()
+        state.sdk_env_overrides = {"OBS_COMPACT_POLICY": " Handoff "}
+        state.client_interrupter = AsyncMock()
+        calls: list[str] = []
+
+        async def user_check(hook_input, tool_use_id, context):
+            calls.append("user")
+            return {"hookSpecificOutput": {"hookEventName": "PreCompact", "additionalContext": "WRITE THE HANDBACK"}}
+
+        callback = _make_pre_compact_callback(state, user_check)
+        result = await callback(_pre_compact_input(), None, {})
+
+        assert result == {}
+        assert calls == ["user"]
+        assert state.compaction_handoff_prompt == "WRITE THE HANDBACK"
+        state.client_interrupter.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_manual_compact_is_not_intercepted(self):
+        state = HookState()
+        state.sdk_env_overrides = {"OBS_COMPACT_POLICY": "handoff"}
+        state.client_interrupter = AsyncMock()
+        callback = _make_pre_compact_callback(state, None)
+
+        assert await callback(_pre_compact_input("manual"), None, {}) == {}
+        state.client_interrupter.assert_not_called()
+        assert state.compaction_intercepted is False
+
+    @pytest.mark.asyncio
+    async def test_second_firing_does_not_interrupt_twice(self):
+        state = HookState()
+        state.sdk_env_overrides = {"OBS_COMPACT_POLICY": "handoff"}
+        state.client_interrupter = AsyncMock()
+        callback = _make_pre_compact_callback(state, None)
+
+        await callback(_pre_compact_input(), None, {})
+        await callback(_pre_compact_input(), None, {})
+        state.client_interrupter.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_or_failing_interrupter_lets_native_compaction_proceed(self):
+        state = HookState()
+        state.sdk_env_overrides = {"OBS_COMPACT_POLICY": "handoff"}
+        callback = _make_pre_compact_callback(state, None)
+        assert await callback(_pre_compact_input(), None, {}) == {}
+        assert state.compaction_intercepted is False
+
+        state.client_interrupter = AsyncMock(side_effect=RuntimeError("gone"))
+        assert await callback(_pre_compact_input(), None, {}) == {}
+        assert state.compaction_intercepted is False
+
+    def test_default_prompt_demands_verbose_cited_handback(self):
+        text = DEFAULT_COMPACTION_HANDOFF_PROMPT
+        assert "Do NOT continue the task" in text
+        assert "VERBOSELY" in text and "Source-cite" in text and "related-reports" in text
+
+    @pytest.mark.asyncio
+    async def test_create_hook_matchers_registers_pre_compact_with_user_hook(self, config, tmp_path):
+        hook_file = tmp_path / "pc.py"
+        hook_file.write_text(
+            "def pc(hook_input, tool_use_id, context):\n"
+            "    return {'hookSpecificOutput': {'hookEventName': 'PreCompact', 'additionalContext': 'VAULT PROMPT'}}\n"
         )
+        state = HookState()
+        state.sdk_env_overrides = {"OBS_COMPACT_POLICY": "handoff"}
+        state.client_interrupter = AsyncMock()
+        matchers = create_hook_matchers(config, state, user_hooks={"PreCompact": f"{hook_file}::pc"})
+        assert "PreCompact" in matchers
+        callback = matchers["PreCompact"][0].hooks[0]
+        await callback(_pre_compact_input(), None, {})
+        assert state.compaction_handoff_prompt == "VAULT PROMPT"
+        state.client_interrupter.assert_awaited_once()
 
-        # Must return deny to prevent SDK compaction (D022)
-        assert result is not None
-        assert "deny" in str(result).lower() or result.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+
+class TestStopDecisionPassThrough:
+    """User Stop hooks can block ending the turn (CLI 2.1.59 honours it, E3 probe b)."""
+
+    @pytest.mark.asyncio
+    async def test_stop_block_is_passed_through(self):
+        async def blocker(hook_input, tool_use_id, context):
+            return {"decision": "block", "reason": "write handback.md first"}
+
+        pipeline = HookPipeline([AsyncMock(return_value=None), blocker])
+        result = await pipeline({"hook_event_name": "Stop", "stop_hook_active": False}, None, {})
+        assert result["decision"] == "block"
+        assert result["reason"] == "write handback.md first"
+
+    @pytest.mark.asyncio
+    async def test_stop_without_block_is_unchanged(self):
+        async def ctx(hook_input, tool_use_id, context):
+            return {"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": "note"}}
+
+        result = await HookPipeline([ctx])({"hook_event_name": "Stop"}, None, {})
+        assert "decision" not in result
+        assert result["hookSpecificOutput"]["additionalContext"] == "note"
+
+    @pytest.mark.asyncio
+    async def test_decision_block_on_post_tool_use_is_not_passed_through(self):
+        async def blocker(hook_input, tool_use_id, context):
+            return {"decision": "block", "reason": "x"}
+
+        result = await HookPipeline([blocker])({"hook_event_name": "PostToolUse"}, "t1", {})
+        assert "decision" not in result
+
+    @pytest.mark.asyncio
+    async def test_stop_block_through_create_hook_matchers(self, config, tmp_path):
+        hook_file = tmp_path / "st.py"
+        hook_file.write_text(
+            "def st(hook_input, tool_use_id, context):\n"
+            "    return {'decision': 'block', 'reason': 'not yet'}\n"
+        )
+        state = HookState()
+        matchers = create_hook_matchers(config, state, user_hooks={"Stop": f"{hook_file}::st"})
+        result = await matchers["Stop"][0].hooks[0]({"hook_event_name": "Stop", "session_id": "s"}, None, {})
+        assert result["decision"] == "block" and result["reason"] == "not yet"
 
 
 # ---------------------------------------------------------------------------

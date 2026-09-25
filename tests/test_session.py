@@ -283,7 +283,10 @@ class TestCreateOptions:
         with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
             options = mgr.create_options()
 
-        assert options.model == "local-custom"
+        # Local models get the same window-derived selector + percentage plan as
+        # hosted ones; the cache proxy strips the selector before the gate.
+        assert options.model == "local-custom[200k]"
+        assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in options.env
         # Local sessions route through the cache proxy like everything else;
         # the proxy forwards local-* on to OBS_LOCAL_LLM_BASE_URL.
         assert options.env["ANTHROPIC_BASE_URL"] == (
@@ -307,7 +310,7 @@ class TestCreateOptions:
         with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
             options = mgr.create_options()
 
-        assert options.model == "local-gemma4-31b"
+        assert options.model == "local-gemma4-31b[200k]"
         assert options.env["ANTHROPIC_BASE_URL"] == (
             f"http://127.0.0.1:{config.cache_proxy_port}"
         )
@@ -316,7 +319,10 @@ class TestCreateOptions:
         assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-profile-token"
         assert "ANTHROPIC_API_KEY" not in options.env
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "48000"
-        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "48000"
+        # 2.1.59 ignores the window variable; it carries the selector capacity
+        # and the percentage carries the 48K - 33K = 15K target.
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+        assert int(180_000 * float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) / 100) == 15_000
         assert mgr.hook_state.effective_model == "local-gemma4-31b[48k]"
 
     def test_local_provider_falls_back_to_gate_when_proxy_unavailable(
@@ -336,6 +342,8 @@ class TestCreateOptions:
 
         assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
         assert options.env["ANTHROPIC_AUTH_TOKEN"] == "local-profile-token"
+        # The gate routes on the literal id; only the proxy strips selectors.
+        assert options.model == "local-gemma4-31b"
 
     def test_hosted_session_still_routes_through_proxy(self, config, monkeypatch):
         """Regression guard: the hosted path is untouched by the local fix."""
@@ -597,7 +605,7 @@ class TestClientLifecycle:
 
         assert client is mock_client
         options = captured["options"]
-        assert options.model == "gpt-5.6-sol[200k]"
+        assert options.model == "gpt-6-sol[200k]"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert 1 <= float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) <= 100
@@ -806,3 +814,143 @@ class TestIdleClientPruning:
         assert disconnected is False
         assert mgr._client is None
         assert mgr._connected is False
+
+
+class TestWindowDerivedCompactionAndEnvPrecedence:
+    """Compaction/handoff enforcement (vault-u3b.13): no per-model constants,
+    explicit per-session env wins, symmetric disable for every model family."""
+
+    @staticmethod
+    def _settings_env(options):
+        return json.loads(options.settings)["env"]
+
+    def test_local_262k_via_proxy_uses_window_derived_1m_selector(self, config):
+        config.cache_proxy_enabled = True
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.8-27b"
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
+            options = mgr.create_options()
+        assert options.model == "local-qwen3.8-27b[1m]"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "262000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+        # threshold = 262000 - 33000 = 229000 of the 980K effective 1M capacity
+        assert int(980_000 * pct / 100) == 229_000
+        assert self._settings_env(options)["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == options.env[
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+        ]
+        assert "DISABLE_AUTO_COMPACT" not in options.env
+
+    def test_local_suffix_budget_is_derived_not_hardcoded(self, config):
+        config.cache_proxy_enabled = True
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.8-27b[500k]"
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
+            options = mgr.create_options()
+        assert options.model == "local-qwen3.8-27b[1m]"
+        pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+        assert int(980_000 * pct / 100) == 467_000
+
+    def test_local_direct_gate_keeps_bare_model_and_200k_capacity(self, config, monkeypatch):
+        config.cache_proxy_enabled = False
+        monkeypatch.setenv("OBS_LOCAL_LLM_BASE_URL", "http://local-llm:8080")
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.8-27b"
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=False):
+            options = mgr.create_options()
+        assert options.model == "local-qwen3.8-27b"
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "262000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+        pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+        assert int(180_000 * pct / 100) == 167_000
+
+    def test_local_explicit_proxy_base_url_still_uses_selector(self, config):
+        config.cache_proxy_enabled = True
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.8-27b"
+        mgr.set_sdk_env_overrides(
+            {"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{config.cache_proxy_port}"}
+        )
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
+            options = mgr.create_options()
+        assert options.model == "local-qwen3.8-27b[1m]"
+
+    def test_local_explicit_gate_base_url_keeps_bare_model(self, config):
+        config.cache_proxy_enabled = True
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.8-27b"
+        mgr.set_sdk_env_overrides({"ANTHROPIC_BASE_URL": "http://host.docker.internal:8080"})
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
+            options = mgr.create_options()
+        assert options.model == "local-qwen3.8-27b"
+
+    @pytest.mark.parametrize("model", ["gpt-6-luna[120k]", "claude-opus-4-6[200k]", "local-qwen3.8-27b"])
+    @pytest.mark.parametrize("key", ["DISABLE_AUTO_COMPACT", "DISABLE_COMPACT"])
+    def test_explicit_disable_is_accepted_for_every_model_family(self, config, model, key):
+        config.cache_proxy_enabled = True
+        mgr = SessionManager(config=config)
+        mgr.model_override = model
+        mgr.set_sdk_env_overrides({key: "1"})
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
+            options = mgr.create_options()
+        assert options.env["DISABLE_AUTO_COMPACT"] == "1"
+        assert self._settings_env(options)["DISABLE_AUTO_COMPACT"] == "1"
+        # The selector stays so the CLI's window/percentage display is right.
+        assert options.model.endswith("]")
+        assert "CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE" not in options.env
+
+    def test_daemon_global_disable_without_explicit_choice_is_still_rejected(self, config, monkeypatch):
+        from obs_agent.claude_context import ContextBudgetError
+
+        monkeypatch.setenv("DISABLE_AUTO_COMPACT", "1")
+        mgr = SessionManager(config=config)
+        mgr.model_override = "gpt-6-luna[120k]"
+        with pytest.raises(ContextBudgetError):
+            mgr.create_options()
+
+    def test_explicit_zero_shadows_daemon_global_disable(self, config, monkeypatch):
+        monkeypatch.setenv("DISABLE_AUTO_COMPACT", "1")
+        mgr = SessionManager(config=config)
+        mgr.model_override = "gpt-6-luna[120k]"
+        mgr.set_sdk_env_overrides({"DISABLE_AUTO_COMPACT": "0"})
+        options = mgr.create_options()
+        assert options.env["DISABLE_AUTO_COMPACT"] == "0"
+
+    def test_explicit_percentage_and_window_win_at_both_layers(self, config):
+        mgr = SessionManager(config=config)
+        mgr.model_override = "gpt-6-luna[400k]"
+        mgr.set_sdk_env_overrides(
+            {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "12.5", "OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS": "350000"}
+        )
+        options = mgr.create_options()
+        settings_env = self._settings_env(options)
+        assert options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "12.5"
+        assert settings_env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "12.5"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "350000"
+        # Plan-owned keys the session did not override keep the plan value.
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+
+    def test_compaction_handoff_disables_auto_compact_for_that_session_only(self, config):
+        mgr = SessionManager(config=config)
+        mgr.model_override = "gpt-6-luna[120k]"
+        mgr.set_session_id("sess-A")
+        mgr.activate_compaction_handoff()
+        assert mgr.compaction_handoff_active is True
+        options = mgr.create_options()
+        assert options.env["DISABLE_AUTO_COMPACT"] == "1"
+        mgr.set_session_id("sess-B")
+        assert mgr.compaction_handoff_active is False
+        assert "DISABLE_AUTO_COMPACT" not in mgr.create_options().env
+
+    async def test_connect_wires_and_disconnect_clears_client_interrupter(self, config):
+        mgr = SessionManager(config=config)
+        client = MagicMock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.interrupt = AsyncMock()
+        with patch("obs_agent.session.ClaudeSDKClient", return_value=client):
+            await mgr._connect_client_with_retry(options=mgr.create_options())
+        assert mgr.hook_state.client_interrupter is client.interrupt
+        await mgr.disconnect()
+        assert mgr.hook_state.client_interrupter is None

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 # regression test compares this inventory with create_hook_matchers().
 BUILTIN_HOOK_EVENTS = (
     "PreToolUse", "PostToolUse", "Notification", "SubagentStart", "SubagentStop", "Stop",
+    "PreCompact",
 )
 
 

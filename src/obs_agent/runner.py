@@ -25,7 +25,7 @@ from claude_agent_sdk import (
 )
 
 from obs_agent.events import StatusEvent, summarize_tool_use
-from obs_agent.hooks import HookState
+from obs_agent.hooks import DEFAULT_COMPACTION_HANDOFF_PROMPT, HookState
 from obs_agent.metrics import log_result
 from obs_agent.queueing import QueuedMessage, coerce_queued_message, queued_texts
 from obs_agent.session import SessionManager
@@ -359,6 +359,10 @@ class ConversationRunner:
                             summary=thinking_text or "thinking...",
                         )
                     elif isinstance(block, TextBlock):
+                        if self._hook_state.compaction_intercepted:
+                            # Residue of the interrupted (about-to-compact)
+                            # turn, e.g. "[Request interrupted by user]".
+                            continue
                         has_text = True
                         text_parts.append(block.text)
                         yield TextEvent(text=block.text)
@@ -368,6 +372,8 @@ class ConversationRunner:
                 yield system_status
 
             error_text = _error_message_text(message, text_parts)
+            if error_text and self._hook_state.compaction_intercepted:
+                error_text = None
             if error_text and not has_text:
                 has_text = True
                 yield TextEvent(text=error_text)
@@ -403,6 +409,12 @@ class ConversationRunner:
             async for event in self._stream_response():
                 yield event
         except Exception as exc:
+            if self._hook_state.compaction_intercepted:
+                # The interrupted about-to-compact turn ended abnormally. Do not
+                # resend on a compaction-enabled process: the caller resumes the
+                # session with auto-compaction disabled (_run_compaction_handoff).
+                logger.warning("Stream ended after compaction interception: %s", exc)
+                return
             if not _is_recoverable(exc):
                 raise
             logger.warning("Stream error, attempting reconnect: %s", exc)
@@ -495,6 +507,11 @@ class ConversationRunner:
                     saw_status_event = True
                 yield event
 
+            if self._hook_state.compaction_intercepted:
+                async for event in self._run_compaction_handoff():
+                    yield event
+                return
+
             silent_completion = self._last_result_message is not None or not saw_status_event
             if saw_visible_text or not silent_completion:
                 return
@@ -524,6 +541,44 @@ class ConversationRunner:
                 stage,
                 recovery_mode,
             )
+
+    async def _run_compaction_handoff(self) -> AsyncIterator[RunnerEvent]:
+        """Resume an intercepted session with auto-compaction off and ask for a handoff.
+
+        The PreCompact handoff policy interrupted this CLI process before it
+        summarized (hooks._make_pre_compact_callback). A running CLI cannot have
+        DISABLE_AUTO_COMPACT added and re-fires compaction on its next query
+        (E3 trial interrupt-same1), so end that process and resume the SAME
+        session id in a new process with auto-compaction disabled (sticky for
+        this session id), then send the handoff prompt as a persisted query.
+        """
+        state = self._hook_state
+        prompt = state.compaction_handoff_prompt or DEFAULT_COMPACTION_HANDOFF_PROMPT
+        info = dict(state.compaction_intercept_info or {})
+        state.compaction_intercepted = False
+        state.compaction_handoff_prompt = None
+        state.compaction_intercept_info = None
+        self._session_mgr.activate_compaction_handoff()
+        logger.warning(
+            "Compaction handoff: resuming session_id=%s without auto-compaction (trigger=%s)",
+            self._session_mgr.session_id,
+            info.get("trigger"),
+        )
+        yield StatusEvent(
+            type="notification",
+            summary="compaction intercepted: resuming without auto-compaction for handoff",
+        )
+        self._client = await self._session_mgr.reconnect()
+        self._sync_session_id_from_client()
+        handoff_query = f"(System: {prompt})"
+        await self._client.query(handoff_query)
+        self._sync_session_id_from_client()
+        async for event in self._stream_with_silent_recovery(
+            original_prompt=handoff_query,
+            retry_prompt=_RECOVERY_PROMPT,
+            stage="compaction handoff",
+        ):
+            yield event
 
     # ------------------------------------------------------------------
     # Main orchestration

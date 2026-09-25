@@ -86,6 +86,17 @@ def _scrub_process_env(keys: tuple[str, ...]) -> Iterator[None]:
                 os.environ[key] = value
 
 
+def _is_cache_proxy_url(url: str, port: int) -> bool:
+    """Return whether *url* points at the local cache-normalizing proxy."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(url).strip())
+        return parts.hostname in {"127.0.0.1", "localhost", "::1"} and parts.port == int(port)
+    except (TypeError, ValueError):
+        return False
+
+
 _CLIENT_CONNECT_MAX_ATTEMPTS = 3
 _CLIENT_CONNECT_RETRY_DELAY_SECONDS = 1.0
 _CLIENT_CONNECT_ENV_LOCK = asyncio.Lock()
@@ -119,6 +130,22 @@ class SessionManager:
         # ``"file_path::function_name"`` spec.  Threaded to
         # ``create_hook_matchers`` at session creation time.
         self.user_hooks: dict[str, str] | None = None
+        # Set when an OBS_COMPACT_POLICY=handoff PreCompact interception fired
+        # for the current session id: every later CLI process for this session
+        # runs with auto-compaction disabled so the handoff turn (and any later
+        # turn) cannot be compacted. Cleared when the session id changes.
+        self._compaction_handoff_session_id: str | None = None
+
+    @property
+    def compaction_handoff_active(self) -> bool:
+        return (
+            self._compaction_handoff_session_id is not None
+            and self._compaction_handoff_session_id == self._session_id
+        )
+
+    def activate_compaction_handoff(self) -> None:
+        """Disable auto-compaction for every later CLI process of this session."""
+        self._compaction_handoff_session_id = self._session_id
 
     @property
     def session_id(self) -> str | None:
@@ -314,26 +341,44 @@ class SessionManager:
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with hooks, MCP tools, and resume."""
-        from obs_agent.claude_context import build_claude_context_plan
-        from obs_agent.config import (
-            auto_compact_window_for_model,
-            is_claude_model,
-            resolve_model_context,
+        from obs_agent.cache_proxy_lifecycle import should_use_proxy
+        from obs_agent.claude_context import (
+            COMPACTION_DISABLE_KEYS,
+            CONTEXT_PLAN_ENV_KEYS,
+            STANDARD_CONTEXT_TOKENS,
+            apply_explicit_context_overrides,
+            build_claude_context_plan,
+            explicit_compaction_disabled,
+            validation_environment,
         )
+        from obs_agent.config import is_claude_model, resolve_model_context
 
         resolved_model = resolve_model_context(self.effective_model)
         clean_model = resolved_model.model
         context_tokens = resolved_model.context_tokens
         requested_model = resolved_model.model_with_context
         is_local_provider = clean_model.lower().startswith("local-")
+        explicit_env = self._sdk_env_overrides
         effective_env = {
             **_DEFAULT_SDK_ENV,
-            **self._sdk_env_overrides,
+            **explicit_env,
         }
+        proxy_in_use = should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled)
+
+        # Local models whose requests reach the upstream gate directly (proxy
+        # disabled, or an explicit per-session ANTHROPIC_BASE_URL) must keep the
+        # bare model id: the gate routes on it literally and only the cache
+        # proxy strips Claude Code's [200k]/[1m] selector. A bare id gives the
+        # CLI its fixed 200K capacity, so plan within that capacity.
+        explicit_base_url = explicit_env.get("ANTHROPIC_BASE_URL")
+        if explicit_base_url is not None:
+            local_direct = is_local_provider and not _is_cache_proxy_url(
+                explicit_base_url, self.config.cache_proxy_port
+            )
+        else:
+            local_direct = is_local_provider and not proxy_in_use
 
         if is_local_provider:
-            from obs_agent.cache_proxy_lifecycle import should_use_proxy
-
             local_base_url = os.environ.get("OBS_LOCAL_LLM_BASE_URL", "").strip()
             local_auth_token = os.environ.get("OBS_LOCAL_LLM_AUTH_TOKEN", "").strip()
             local_api_key = os.environ.get("OBS_LOCAL_LLM_API_KEY", "").strip()
@@ -345,9 +390,7 @@ class SessionManager:
             if (
                 local_base_url
                 and "ANTHROPIC_BASE_URL" not in effective_env
-                and not should_use_proxy(
-                    cache_proxy_enabled=self.config.cache_proxy_enabled
-                )
+                and not proxy_in_use
             ):
                 effective_env["ANTHROPIC_BASE_URL"] = local_base_url
             if not any(key in effective_env for key in _ANTHROPIC_AUTH_ENV_KEYS):
@@ -356,38 +399,56 @@ class SessionManager:
                 elif local_api_key:
                     effective_env["ANTHROPIC_API_KEY"] = local_api_key
 
-            auto_compact_window = auto_compact_window_for_model(
+        # One window-derived policy for every model, local included: threshold
+        # = window - 33K from the resolved window (suffix or MODEL_CONTEXT_WINDOWS),
+        # no per-model constants. See docs/context-compaction.md "Local models".
+        auto_compact_disabled = (
+            explicit_compaction_disabled(explicit_env) or self.compaction_handoff_active
+        )
+        plan_context_tokens = (
+            min(context_tokens, STANDARD_CONTEXT_TOKENS) if local_direct else context_tokens
+        )
+        context_plan = build_claude_context_plan(
+            model=clean_model,
+            context_tokens=plan_context_tokens,
+            auto_compact_window_tokens=self.config.auto_compact_window_tokens,
+            environ=validation_environment(os.environ, effective_env, explicit_env),
+        )
+        context_env = dict(context_plan.environment)
+        # OBS metadata always carries the real requested budget.
+        context_env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] = str(context_tokens)
+        context_env = apply_explicit_context_overrides(
+            context_env,
+            explicit_env,
+            auto_compact_disabled=auto_compact_disabled,
+        )
+        effective_env.update(context_env)
+        cli_model = clean_model if local_direct else context_plan.cli_model
+        if local_direct and context_tokens > STANDARD_CONTEXT_TOKENS:
+            logger.warning(
+                "Local model %s reaches its gate directly (no cache proxy); the bare "
+                "model id limits Claude Code to a 200K capacity, so compaction targets "
+                "%s instead of %s",
                 clean_model,
-                context_tokens,
-                auto_compact_window_tokens=self.config.auto_compact_window_tokens,
-            )
-            context_env = {
-                "OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS": str(context_tokens),
-                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(auto_compact_window),
-            }
-            effective_env.update(context_env)
-            effective_env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
-            cli_model = resolved_model.model_for_claude_code
-        else:
-            context_plan = build_claude_context_plan(
-                model=clean_model,
-                context_tokens=context_tokens,
-                auto_compact_window_tokens=self.config.auto_compact_window_tokens,
-                environ={**os.environ, **effective_env},
-            )
-            context_env = context_plan.environment
-            effective_env.update(context_env)
-            cli_model = context_plan.cli_model
-            logger.info(
-                "Claude context policy model=%s cli_model=%s context=%s "
-                "compact_window=%s target=%s output_reserve=%s",
-                requested_model,
-                context_plan.cli_model,
-                context_tokens,
-                context_plan.cli_compact_window_tokens,
                 context_plan.threshold_tokens,
-                context_plan.output_reserve_tokens,
+                context_tokens - 33_000,
             )
+        logger.info(
+            "Claude context policy model=%s cli_model=%s context=%s "
+            "compact_window=%s target=%s output_reserve=%s auto_compact_disabled=%s "
+            "explicit_keys=%s",
+            requested_model,
+            cli_model,
+            context_tokens,
+            context_plan.cli_compact_window_tokens,
+            context_plan.threshold_tokens,
+            context_plan.output_reserve_tokens,
+            auto_compact_disabled,
+            sorted(
+                k for k in explicit_env
+                if k in CONTEXT_PLAN_ENV_KEYS or k in COMPACTION_DISABLE_KEYS
+            ),
+        )
 
         from obs_agent.effort import build_effort_env
 
@@ -506,6 +567,9 @@ class SessionManager:
                 continue
             self._client = client
             self._connected = True
+            # The PreCompact handoff policy (hooks._make_pre_compact_callback)
+            # interrupts the CLI process that is about to compact.
+            self.hook_state.client_interrupter = client.interrupt
             self._entry_file_context_pending = self._should_inject_entry_file_context(
                 options.resume
             )
@@ -571,6 +635,7 @@ class SessionManager:
     async def _direct_kill_client_process_unlocked(self) -> None:
         """Best-effort direct teardown of the owned Claude CLI subprocess."""
         client = self._client
+        self.hook_state.client_interrupter = None
         process = getattr(getattr(client, "_transport", None), "_process", None)
         direct_kill_attempted = False
         if process is not None and getattr(process, "returncode", None) is None:
@@ -596,6 +661,7 @@ class SessionManager:
 
     async def _disconnect_unlocked(self) -> None:
         """Disconnect without acquiring lock (called from within locked context)."""
+        self.hook_state.client_interrupter = None
         if self._client is not None:
             try:
                 await self._client.disconnect()
@@ -611,6 +677,7 @@ class SessionManager:
         # Mark client as stale — next get_client() will create fresh
         self._connected = False
         self._client = None
+        self.hook_state.client_interrupter = None
 
     async def reconnect(self) -> ClaudeSDKClient:
         """Reconnect to an existing session after a mid-stream error.

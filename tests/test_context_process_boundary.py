@@ -88,12 +88,13 @@ async def test_actual_sdk_child_receives_requested_budget(
     observed = await observe_sdk_child(options, probe_executable)
 
     model_arg = observed["argv"][observed["argv"].index("--model") + 1]
-    assert model_arg == f"gpt-5.6-sol[{selector}]"
+    assert model_arg == f"gpt-6-sol[{selector}]"
     assert observed["budget_env"] == {key: options.env[key] for key in BUDGET_KEYS}
-    assert observed["budget_env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == (
-        "1000000" if window > 200_000 else "200000"
-    )
-    assert float(observed["budget_env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) > 20
+    # Stale DAEMON-level values (10 / 200000 above) are superseded by the plan,
+    # but explicit PER-SESSION values win (vault-u3b.13, R3: "these environmental
+    # variables ... override our settings").
+    assert observed["budget_env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "150000"
+    assert observed["budget_env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "20"
     settings_arg = observed["argv"][observed["argv"].index("--settings") + 1]
     settings_env = json.loads(settings_arg)["env"]
     assert {key: settings_env[key] for key in BUDGET_KEYS} == observed["budget_env"]
@@ -112,8 +113,14 @@ async def test_inherited_child_keeps_400k_while_fresh_child_can_select_100k(
     inherited.model_override = parent.hook_state.effective_model
     child = SessionManager(config=config)
     child.model_override = "gpt[100k]"
-    # Even inheriting the parent's resolved env must not pin the child's budget.
-    child.set_sdk_env_overrides(dict(parent_options.env))
+    # Inheriting the parent's non-budget env must not pin the child's budget.
+    # (Explicit per-session values for the plan-owned keys now win on purpose,
+    # vault-u3b.13 / R3, so a real launcher must not copy those keys blindly.)
+    from obs_agent.claude_context import CONTEXT_PLAN_ENV_KEYS
+
+    child.set_sdk_env_overrides(
+        {k: v for k, v in parent_options.env.items() if k not in CONTEXT_PLAN_ENV_KEYS}
+    )
 
     inherited_options = inherited.create_options()
     child_options = child.create_options()
@@ -157,8 +164,8 @@ def test_operator_cap_and_requested_metadata_are_distinct(tmp_path, isolated_opt
         cache_proxy_enabled=False,
     ))
     options = manager.create_options()
-    assert options.model == "gpt-5.6-sol[1m]"
+    assert options.model == "gpt-6-sol[1m]"
     assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "400000"
     assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
     assert int(980_000 * float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) / 100) == 117_000
-    assert manager.hook_state.effective_model == "gpt-5.6-sol[400k]"
+    assert manager.hook_state.effective_model == "gpt-6-sol[400k]"

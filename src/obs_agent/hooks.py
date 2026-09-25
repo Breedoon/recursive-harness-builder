@@ -1,8 +1,11 @@
 """SDK hooks for OBS Agent.
 
 - PreToolUse: guards immutable files/.env writes and blocks native tools
-- Stop: triggers memory extraction via fork
-- PreCompact: triggers extraction then denies compaction (D022)
+- Stop: route-local stop notifications; user Stop hooks may block ending the
+  turn with ``{"decision": "block", "reason": ...}``
+- PreCompact: opt-in handoff policy (``OBS_COMPACT_POLICY=handoff``): interrupt
+  the CLI before it summarizes, so the runner can resume the same session with
+  auto-compaction disabled and a handoff prompt (see docs/context-compaction.md)
 - HookPipeline: extensible middleware that chains check functions
 - HookState: shared state for message queuing and interrupt
 
@@ -179,18 +182,125 @@ async def on_stop(
     await fork_runner.extract_memory()
 
 
-async def on_pre_compact(
-    *,
-    config: OBSConfig,
-    fork_runner: ForkRunner,
-) -> dict:
-    """PreCompact hook: extract memories then deny compaction.
+COMPACT_POLICY_ENV = "OBS_COMPACT_POLICY"
+COMPACT_POLICY_HANDOFF = "handoff"
 
-    Per D022: no lossy compaction. Flush memories to vault, then deny
-    so the daemon can restart with a fresh session.
+DEFAULT_COMPACTION_HANDOFF_PROMPT = (
+    "COMPACTION STOPPED — CONTEXT BUDGET REACHED. Your context reached the automatic "
+    "compaction point. Compaction was intercepted before any summary was written, so "
+    "everything you have seen is still loaded, and auto-compaction is now disabled for "
+    "this session. Do NOT continue the task. Your job for the rest of this session is to "
+    "preserve what this context holds.\n"
+    "Write handback.md in your own artifact directory "
+    "(/workspace/runtime/git/obs-artifacts/Drafts/Artifacts/{root_team_key}/{agent_name}/ — "
+    "take both values from session_lineage). Include the task VERBATIM; what you did, how "
+    "and why; everything done, each with an evidence pointer; what is unverified; what is "
+    "not done and why; blockers; wrong assumptions and corrections; what the next attempt "
+    "must do differently; next steps; lessons; and related-reports, meaning every report, "
+    "handback, plan or artifact you read or built on and what you used it for. Write it "
+    "VERBOSELY: it is for other agents, and length is fine. State uncertainty explicitly, "
+    "separating what you verified yourself from what you infer or took from another "
+    "agent's claim. Source-cite every claim (file:line, command and output location, "
+    "commit, artifact path, agent name and session id).\n"
+    "Then commit it, send your caller the path, and end your turn."
+)
+
+
+def _compact_policy(state: "HookState") -> str:
+    return str(state.sdk_env_overrides.get(COMPACT_POLICY_ENV) or "").strip().lower()
+
+
+def _user_result_prompt(result: dict | None) -> str | None:
+    """Extract a handoff prompt from a user PreCompact hook result."""
+    if not isinstance(result, dict):
+        return None
+    hso = result.get("hookSpecificOutput")
+    if isinstance(hso, dict):
+        text = hso.get("additionalContext")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    text = result.get("systemMessage")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    return None
+
+
+def _make_pre_compact_callback(
+    state: "HookState",
+    user_check: "CheckFn | None",
+) -> Callable[[HookInput, str | None, HookContext], Awaitable[SyncHookJSONOutput]]:
+    """Build the PreCompact callback (opt-in handoff policy).
+
+    Pinned Claude Code 2.1.59 ignores a PreCompact "block", so the only way to
+    stop an automatic compaction is to interrupt the CLI before it sends the
+    summary request (E3 harness, 5/5 trials: no compact_boundary written).
+    With ``OBS_COMPACT_POLICY=handoff`` in the session's explicit env and an
+    ``auto`` trigger, this callback:
+
+    1. runs the session's user PreCompact hook (if any) first; its
+       ``additionalContext`` (or ``systemMessage``) becomes the handoff prompt,
+       so the vault stays the single source of the prompt text;
+    2. records the interception on HookState;
+    3. awaits ``client.interrupt()`` inside the callback (awaiting removes the
+       race with the summary request; the SDK serves control requests
+       concurrently, so this does not deadlock);
+    4. returns ``{}``.
+
+    ConversationRunner then ends that CLI process and resumes the same session
+    id with auto-compaction disabled and the handoff prompt. Manual ``/compact``
+    and sessions without the policy keep native behaviour; the user hook's
+    result is passed through unchanged for them.
     """
-    await fork_runner.extract_memory()
-    return _deny("Compaction denied: memories flushed, restart with fresh session")
+
+    async def _callback(
+        hook_input: HookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput:
+        user_result: dict | None = None
+        if user_check is not None:
+            user_result = await user_check(hook_input, tool_use_id, context)
+
+        trigger = str(hook_input.get("trigger") or "").strip().lower()
+        if _compact_policy(state) != COMPACT_POLICY_HANDOFF or trigger == "manual":
+            return user_result or {}
+        if state.compaction_intercepted:
+            return {}
+
+        state.compaction_intercepted = True
+        state.compaction_handoff_prompt = _user_result_prompt(user_result)
+        state.compaction_intercept_info = {
+            "session_id": hook_input.get("session_id"),
+            "trigger": trigger or None,
+            "transcript_path": hook_input.get("transcript_path"),
+        }
+        interrupter = state.client_interrupter
+        if interrupter is None:
+            _log.error(
+                "PreCompact handoff policy fired without a client interrupter; "
+                "native compaction will proceed session_id=%s",
+                hook_input.get("session_id"),
+            )
+            state.compaction_intercepted = False
+            return {}
+        try:
+            await interrupter()
+        except Exception:
+            _log.error(
+                "PreCompact handoff interrupt failed; native compaction may proceed "
+                "session_id=%s",
+                hook_input.get("session_id"),
+                exc_info=True,
+            )
+            state.compaction_intercepted = False
+            return {}
+        _log.warning(
+            "PreCompact handoff: interrupted automatic compaction session_id=%s",
+            hook_input.get("session_id"),
+        )
+        return {}
+
+    return _callback
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +354,13 @@ class HookState:
     triggered_schedule_id: str | None = None
     active_schedule: dict[str, Any] | None = None
     pending_obs_bootstrap_xml: str | None = None  # set by telegram.py when bootstrap is primed
+    # PreCompact handoff policy (OBS_COMPACT_POLICY=handoff). SessionManager
+    # sets client_interrupter to the live client's interrupt(); the PreCompact
+    # callback sets compaction_intercepted; ConversationRunner consumes it.
+    client_interrupter: Callable[[], Awaitable[None]] | None = None
+    compaction_intercepted: bool = False
+    compaction_handoff_prompt: str | None = None
+    compaction_intercept_info: dict[str, Any] | None = None
 
     def reset(self) -> None:
         """Clear all queued state for a fresh session.
@@ -282,6 +399,9 @@ class HookState:
         self.execution_active = False
         self.triggered_schedule_id = None
         self.active_schedule = None
+        self.compaction_intercepted = False
+        self.compaction_handoff_prompt = None
+        self.compaction_intercept_info = None
 
 
 class HookPipeline:
@@ -353,6 +473,22 @@ class HookPipeline:
                 if accumulated_context:
                     merged_hso["additionalContext"] = "\n\n".join(accumulated_context)
                 merged["hookSpecificOutput"] = merged_hso
+                return merged
+
+            # Check for short-circuit: a Stop hook blocks ending the turn.
+            # Claude Code 2.1.59 honours {"decision": "block", "reason": ...}
+            # on Stop (continues the turn with the reason, then re-fires Stop
+            # with stop_hook_active=true). Without this pass-through the block
+            # was silently dropped. Scoped to Stop only.
+            if event_name == "Stop" and result.get("decision") == "block":
+                merged["decision"] = "block"
+                if "reason" in result:
+                    merged["reason"] = result["reason"]
+                if accumulated_context:
+                    merged["hookSpecificOutput"] = {
+                        "hookEventName": event_name,
+                        "additionalContext": "\n\n".join(accumulated_context),
+                    }
                 return merged
 
         # No short-circuit — return accumulated context if any
@@ -795,6 +931,8 @@ def create_hook_matchers(
 
     PreToolUse pipeline: interrupt -> native/immutable guard -> tool state -> [user hook]
     PostToolUse pipeline: tool state -> [user hook]
+    Stop pipeline: stop notification -> [user hook]; a user ``decision: block`` is passed through
+    PreCompact: [user hook] -> opt-in handoff interception (``OBS_COMPACT_POLICY=handoff``)
 
     WARNING: never drain message_queue into hook additionalContext. Native
     hook context is not persisted in JSONL and the cache proxy MUST strip it
@@ -843,8 +981,14 @@ def create_hook_matchers(
     post_tool_pipeline = _pipeline([tool_state_check], "PostToolUse")
     notification_pipeline = _pipeline([notification_check], "Notification")
     stop_pipeline = _pipeline([stop_check], "Stop")
+    pre_compact_callback = _make_pre_compact_callback(
+        state, _resolved_user_checks.get("PreCompact")
+    )
 
     return {
+        "PreCompact": [
+            HookMatcher(matcher=None, hooks=[pre_compact_callback]),
+        ],
         "PreToolUse": [
             HookMatcher(matcher=None, hooks=[pre_tool_pipeline]),
         ],

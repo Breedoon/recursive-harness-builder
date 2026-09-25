@@ -1231,3 +1231,83 @@ class TestSessionManagerReconnect:
 
         await session_mgr.async_reset()
         assert session_mgr.session_id is None
+
+
+# --- PreCompact handoff policy (vault-u3b.13) ---
+
+
+class TestCompactionHandoff:
+    """An intercepted auto-compaction resumes the SAME session with auto-compaction
+    disabled and a persisted handoff query (E3 recommended design)."""
+
+    @staticmethod
+    def _intercepting_client(state: HookState, *, prompt: str | None = None, raise_after: bool = False):
+        client = AsyncMock()
+
+        async def receive():
+            # The PreCompact callback fires mid-turn and awaits interrupt().
+            state.compaction_intercepted = True
+            state.compaction_handoff_prompt = prompt
+            state.compaction_intercept_info = {"session_id": "sess-1", "trigger": "auto"}
+            residue = MagicMock()
+            residue.content = [TextBlock(text="[Request interrupted by user]")]
+            residue.session_id = "sess-1"
+            yield residue
+            if raise_after:
+                raise CLIConnectionError("process ended")
+            yield _make_result_message()
+
+        client.receive_response = receive
+        client.query = AsyncMock()
+        return client
+
+    @staticmethod
+    def _handoff_client():
+        msg = MagicMock()
+        msg.content = [TextBlock(text="handback written at /x/handback.md")]
+        msg.session_id = "sess-1"
+        return _make_mock_client([msg, _make_result_message()])
+
+    async def _run(self, config, *, prompt=None, raise_after=False):
+        from obs_agent.session import SessionManager
+
+        state = HookState()
+        mgr = SessionManager(config=config, hook_state=state)
+        mgr.set_session_id("sess-1")
+        first = self._intercepting_client(state, prompt=prompt, raise_after=raise_after)
+        second = self._handoff_client()
+        with patch.object(SessionManager, "get_client", AsyncMock(return_value=first)), patch.object(
+            SessionManager, "reconnect", AsyncMock(return_value=second)
+        ) as reconnect:
+            runner = ConversationRunner(mgr, state, config)
+            events = await _collect_events(runner, "do the task")
+        return state, mgr, first, second, reconnect, events
+
+    async def test_intercept_resumes_same_session_with_default_handoff_prompt(self, config):
+        from obs_agent.hooks import DEFAULT_COMPACTION_HANDOFF_PROMPT
+
+        state, mgr, first, second, reconnect, events = await self._run(config)
+
+        reconnect.assert_awaited_once()
+        assert mgr.compaction_handoff_active is True
+        assert mgr.session_id == "sess-1"
+        second.query.assert_awaited_once_with(f"(System: {DEFAULT_COMPACTION_HANDOFF_PROMPT})")
+        # The old (compaction-enabled) process never receives another query.
+        assert first.query.await_count == 1
+        texts = [e.text for e in events if isinstance(e, TextEvent)]
+        assert texts == ["handback written at /x/handback.md"]
+        assert state.compaction_intercepted is False
+        assert any(
+            isinstance(e, StatusEvent) and "compaction intercepted" in e.summary for e in events
+        )
+
+    async def test_intercept_uses_vault_supplied_prompt(self, config):
+        _, _, _, second, _, _ = await self._run(config, prompt="VAULT HANDBACK PROMPT")
+        second.query.assert_awaited_once_with("(System: VAULT HANDBACK PROMPT)")
+
+    async def test_stream_error_after_intercept_does_not_resend_on_old_process(self, config):
+        _, mgr, first, second, reconnect, _ = await self._run(config, raise_after=True)
+        assert first.query.await_count == 1
+        reconnect.assert_awaited_once()
+        assert mgr.compaction_handoff_active is True
+        second.query.assert_awaited_once()
