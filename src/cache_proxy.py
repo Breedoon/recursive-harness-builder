@@ -121,6 +121,7 @@ stats = {
     "routed_anthropic": 0, "routed_cli_proxy": 0, "routed_local": 0,
     "local_unconfigured": 0,
     "schemas_sanitized": 0,
+    "local_usage_rewrites": 0,
 }
 
 
@@ -909,6 +910,83 @@ def parse_sse_usage(sse_chunks: list[bytes]) -> dict:
     return usage
 
 
+class LocalUsageFixer:
+    """Rewrite one local-route SSE usage shape so Claude Code sums it correctly.
+
+    The local gate (vLLM's native ``/v1/messages``) reports the whole prompt S
+    as ``input_tokens`` in ``message_start`` and the real split only at the end,
+    in ``message_delta`` (``input_tokens`` = uncached remainder, plus
+    ``cache_read_input_tokens`` / ``cache_creation_input_tokens``). The bundled
+    CLI (2.1.59) merges stream usage field by field, but only when the new value
+    is ``> 0`` (its ``AEH`` merge). When the remainder is exactly 0 — the whole
+    prompt was cache-read or cache-created — the CLI keeps S from
+    ``message_start`` and adds ``cr + cc`` (= S) on top: the turn is recorded
+    as 2S. That doubled number drives auto-compaction, the ``Context: ~N``
+    note, ``context_info`` and the level context guard (seen live: 364,288
+    recorded for a 182,144-token prompt; 67 of 1,395 local turns).
+
+    Fix, applied only in that exact case: move one token from a cache bucket
+    to ``input_tokens`` (``input_tokens: 1``), so the CLI overwrites S and the
+    recorded total ``input + cr + cc`` equals S exactly. Every other event and
+    byte passes through unchanged. Events are re-framed only on SSE event
+    boundaries (blank line), and complete events are forwarded immediately.
+    """
+
+    def __init__(self):
+        self._buf = b""
+        self.rewrites = 0
+
+    @staticmethod
+    def _fix_event(event: bytes) -> bytes:
+        if b'"message_delta"' not in event:
+            return event
+        lines = event.split(b"\n")
+        changed = False
+        for i, line in enumerate(lines):
+            if not line.startswith(b"data: "):
+                continue
+            try:
+                obj = json.loads(line[6:])
+            except Exception:
+                return event
+            if not isinstance(obj, dict) or obj.get("type") != "message_delta":
+                return event
+            usage = obj.get("usage")
+            if not isinstance(usage, dict):
+                return event
+            it = usage.get("input_tokens")
+            cr = usage.get("cache_read_input_tokens") or 0
+            cc = usage.get("cache_creation_input_tokens") or 0
+            if it != 0 or not isinstance(cr, int) or not isinstance(cc, int) or cr + cc <= 0:
+                return event
+            usage["input_tokens"] = 1
+            if cc > 0:
+                usage["cache_creation_input_tokens"] = cc - 1
+            else:
+                usage["cache_read_input_tokens"] = cr - 1
+            lines[i] = b"data: " + json.dumps(obj, separators=(",", ":")).encode()
+            changed = True
+        return b"\n".join(lines) if changed else event
+
+    def feed(self, chunk: bytes) -> bytes:
+        self._buf += chunk
+        cut = self._buf.rfind(b"\n\n")
+        if cut < 0:
+            return b""
+        complete, self._buf = self._buf[:cut + 2], self._buf[cut + 2:]
+        out = []
+        for event in complete.split(b"\n\n")[:-1]:
+            fixed = self._fix_event(event)
+            if fixed is not event:
+                self.rewrites += 1
+            out.append(fixed + b"\n\n")
+        return b"".join(out)
+
+    def flush(self) -> bytes:
+        rest, self._buf = self._buf, b""
+        return rest
+
+
 # ── HTTP Handler ─────────────────────────────────────────────────────────
 
 
@@ -1153,10 +1231,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             chunks: list[bytes] = []
+            fixer = LocalUsageFixer() if route == "local" else None
             for chunk in resp.iter_raw():
+                if fixer is not None:
+                    chunk = fixer.feed(chunk)
+                    if not chunk:
+                        continue
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 chunks.append(chunk)
+            if fixer is not None:
+                tail = fixer.flush()
+                if tail:
+                    self.wfile.write(tail)
+                    self.wfile.flush()
+                    chunks.append(tail)
+                if fixer.rewrites:
+                    stats["local_usage_rewrites"] += fixer.rewrites
 
             usage = parse_sse_usage(chunks)
             if usage:
