@@ -134,6 +134,7 @@ _TELEGRAM_HELP_TEXT = """Usage:
 /stop — interrupt this topic; /stop all interrupts every topic in the chat
 /stop_branch — interrupt this agent and all recursive descendants
 /stop_tree — interrupt the entire agent tree, including its trunk
+/maintenance_restart — restart OBS and auto-resume agents that were mid-turn (opt-in; a plain restart resumes nothing)
 /fork [name] — create a new topic from this head or a replied message
 /new [name] — reset this topic into a new trunk agent
 /clear — clear this topic but keep its agent identity
