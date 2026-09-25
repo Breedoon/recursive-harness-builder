@@ -266,3 +266,81 @@ async def test_local_routes_resume_strictly_one_at_a_time(config):
         gates["b"].set()
         await runner
     assert order[-1] == "end:b"
+
+
+# --- L3 G1: local watchdog (C6) and daemon matching (C7) --------------------
+
+
+@pytest.mark.asyncio
+async def test_local_watchdog_moves_on_without_cancelling_slow_turn(config, monkeypatch):
+    monkeypatch.setenv("OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS", "0.1")
+    bot = _bot(config)
+    order: list[str] = []
+    gates = {"a": asyncio.Event(), "b": asyncio.Event()}
+    turns: dict[str, asyncio.Task] = {}
+
+    async def fake_resume(entry, *, requested_at):
+        order.append(f"start:{entry.session_id}")
+
+        async def turn():
+            await gates[entry.session_id].wait()
+            order.append(f"end:{entry.session_id}")
+
+        turns[entry.session_id] = asyncio.create_task(turn())
+        return turns[entry.session_id]
+
+    marker = _marker(
+        [
+            maint.ResumeEntry(chat_id=1, thread_id=1, session_id="a", is_local=True),
+            maint.ResumeEntry(chat_id=1, thread_id=2, session_id="b", is_local=True),
+        ]
+    )
+    with patch.object(bot, "_resume_maintenance_entry", side_effect=fake_resume):
+        runner = asyncio.create_task(bot._run_maintenance_resume(marker))
+        await asyncio.sleep(0.05)
+        assert order == ["start:a"]
+        await asyncio.sleep(0.2)  # past the 0.1s watchdog: b starts, a still running
+        assert order == ["start:a", "start:b"]
+        assert not turns["a"].done() and not turns["a"].cancelled()
+        gates["b"].set()
+        await runner
+        gates["a"].set()
+        await turns["a"]
+    assert "end:a" in order and "end:b" in order
+    assert not turns["a"].cancelled()
+
+
+def test_local_wait_default_and_unlimited(monkeypatch):
+    monkeypatch.delenv("OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS", raising=False)
+    assert maint.local_resume_wait_from_env(600.0) == 600.0
+    monkeypatch.setenv("OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS", "0")
+    assert maint.local_resume_wait_from_env(600.0) == 0.0
+    monkeypatch.setenv("OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS", "junk")
+    assert maint.local_resume_wait_from_env(600.0) == 600.0
+
+
+def _fake_proc(root: Path, pid: int, argv: list[str], supervisor: str | None = None) -> None:
+    d = root / str(pid)
+    d.mkdir()
+    (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+    env = [b"PATH=/usr/bin"]
+    if supervisor:
+        env.append(f"SUPERVISOR_PROCESS_NAME={supervisor}".encode())
+    (d / "environ").write_bytes(b"\0".join(env) + b"\0")
+
+
+def test_find_daemon_pids_prefers_supervised_prod_and_skips_shells(tmp_path: Path):
+    py = "/workspace/obs/.venv/bin/python"
+    _fake_proc(tmp_path, 100, [py, "-m", "obs_agent.telegram_main", "--prod"], "obs-telegram-prod")
+    _fake_proc(tmp_path, 200, [py, "-m", "obs_agent.telegram_main"])  # test daemon
+    _fake_proc(tmp_path, 300, ["/bin/bash", "-c", "pgrep -f 'python.*-m obs_agent.telegram_main'"])
+    _fake_proc(tmp_path, 400, [py, "-m", "obs_agent.telegram_main_helper"])
+    (tmp_path / "self").mkdir()
+    assert maint.find_daemon_pids(proc_root=tmp_path) == [100]
+
+
+def test_find_daemon_pids_without_supervisor_marker_returns_all_matches(tmp_path: Path):
+    py = "/usr/bin/python3"
+    _fake_proc(tmp_path, 10, [py, "-m", "obs_agent.telegram_main"])
+    _fake_proc(tmp_path, 20, [py, "-m", "obs_agent.telegram_main"])
+    assert maint.find_daemon_pids(proc_root=tmp_path) == [10, 20]

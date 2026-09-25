@@ -46,6 +46,7 @@ DEFAULT_MAX_AGE_SECONDS = 15 * 60
 DEFAULT_HOSTED_STAGGER_SECONDS = 3.0
 MAINTENANCE_SIGNAL = signal.SIGUSR1
 TELEGRAM_MAIN_PATTERN = "obs_agent.telegram_main"
+DAEMON_SUPERVISOR_PROCESS = "obs-telegram-prod"
 
 
 @dataclass
@@ -209,21 +210,82 @@ def hosted_stagger_from_env() -> float:
         return DEFAULT_HOSTED_STAGGER_SECONDS
 
 
+def local_resume_wait_from_env(default: float) -> float:
+    """Seconds the serial local resume waits on one route before moving on.
+
+    The resumed turn is never cancelled: after this wait the chain logs and
+    starts the next local route while the slow one keeps running. ``0`` or a
+    negative value means wait without limit (the pre-watchdog behaviour).
+    """
+    raw = (os.environ.get("OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS") or "").strip()
+    try:
+        return float(raw) if raw else float(default)
+    except ValueError:
+        return float(default)
+
+
 # --- operator CLI ---------------------------------------------------------
 
 
-def find_daemon_pids(pattern: str = TELEGRAM_MAIN_PATTERN) -> list[int]:
+def _proc_argv(pid: int, proc_root: Path = Path("/proc")) -> list[str]:
     try:
-        out = subprocess.run(
-            ["pgrep", "-f", f"python.*-m {pattern}"],
-            check=False,
-            capture_output=True,
-            text=True,
-        ).stdout
-    except FileNotFoundError:
+        raw = (proc_root / str(pid) / "cmdline").read_bytes()
+    except OSError:
         return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def _proc_supervisor_name(pid: int, proc_root: Path = Path("/proc")) -> str | None:
+    try:
+        raw = (proc_root / str(pid) / "environ").read_bytes()
+    except OSError:
+        return None
+    for part in raw.split(b"\0"):
+        if part.startswith(b"SUPERVISOR_PROCESS_NAME="):
+            return part.split(b"=", 1)[1].decode("utf-8", "replace")
+    return None
+
+
+def _is_daemon_argv(argv: list[str], pattern: str) -> bool:
+    """True only for ``<python> -m <pattern> [args]`` - not shells that mention it."""
+    if len(argv) < 3 or "python" not in Path(argv[0]).name:
+        return False
+    return argv[1] == "-m" and argv[2] == pattern
+
+
+def find_daemon_pids(
+    pattern: str = TELEGRAM_MAIN_PATTERN,
+    *,
+    supervisor_process: str = DAEMON_SUPERVISOR_PROCESS,
+    proc_root: Path = Path("/proc"),
+) -> list[int]:
+    """Locate telegram_main, preferring the supervisord-managed prod daemon.
+
+    Exact argv matching skips shells or pgrep invocations whose command line
+    merely contains the pattern. When several daemons match (e.g. a test daemon
+    started from a worktree), the one supervisord runs as ``supervisor_process``
+    wins; if none carries that marker, every match is returned so the caller
+    can refuse to guess.
+    """
     own = os.getpid()
-    return [int(p) for p in out.split() if p.strip().isdigit() and int(p) != own]
+    matches: list[int] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == own:
+            continue
+        if _is_daemon_argv(_proc_argv(pid, proc_root), pattern):
+            matches.append(pid)
+    matches.sort()
+    supervised = [pid for pid in matches if _proc_supervisor_name(pid, proc_root) == supervisor_process]
+    if supervised:
+        return supervised
+    return matches
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -21,8 +21,11 @@ Pick one:
   user.
 - **Shell:** in the OBS container, run
   `/workspace/obs/.venv/bin/python -m obs_agent.maintenance_restart`. This
-  sends `SIGUSR1` to the `obs_agent.telegram_main` process. Use `--pid N` if
-  more than one daemon runs. `--status <state-dir>` prints the pending or last
+  sends `SIGUSR1` to the `obs_agent.telegram_main` process. It matches the
+  exact `python -m obs_agent.telegram_main` argv (never a shell that merely
+  mentions it) and prefers the daemon supervisord runs as `obs-telegram-prod`
+  (`SUPERVISOR_PROCESS_NAME`), so a test daemon started from a worktree is not
+  picked. If several unsupervised daemons match, it refuses; pass `--pid N`. `--status <state-dir>` prints the pending or last
   consumed marker.
 - **Directly:** `kill -USR1 <telegram_main pid>`. Signal the Python process,
   not the supervisord wrapper, which does not forward `USR1`.
@@ -37,6 +40,13 @@ The daemon then:
    request are left out.
 2. Terminates its own process group, the same blast radius as
    `supervisorctl restart`. supervisord's `autorestart=true` brings OBS back.
+   Checked statically on 2026-09-25 (L3 G1): supervisord starts the wrapper
+   `obs-telegram-prod-wrapper.sh` as a process-group leader; `telegram_main`
+   and its Claude CLI children share that group (`ps -o pgid`), and the
+   program has `stopasgroup=true`/`killasgroup=true` in
+   `/etc/supervisor/supervisord.conf`, so `killpg(getpgrp())` matches
+   `supervisorctl restart`. The live confirmation is part of the post-restart
+   bead `vault-u3b.37`.
 
 ## On startup
 
@@ -56,9 +66,19 @@ The daemon then:
   restored children never call back.
 - **Local-model routes** (`local-*`) resume **strictly one at a time**. The
   next starts only after the previous resumed turn ends. This avoids
-  overloading the single inference server and vLLM preemption.
+  overloading the single inference server and vLLM preemption. A watchdog
+  bounds the wait: after `OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS` (default:
+  the configured `bg_fork_timeout`, `OBS_BG_FORK_TIMEOUT`, 600 s unless set)
+  the chain logs and starts the next local route. The slow turn is **not**
+  cancelled; it keeps running, so for that overlap two local turns may run at
+  once. `0` restores an unbounded wait.
 - **Hosted routes** start staggered by `OBS_MAINTENANCE_RESUME_STAGGER_SECONDS`
   (default 3 s).
+- **Trunk and user-facing chats** that were mid-turn are resumed like any other
+  busy route. This is the supervisor's decision of 2026-09-25 21:14Z on
+  Daniel's 18:00Z request ("every running agent that's actively running …
+  resumed automatically"), recorded in bead `vault-u3b.41`. Use a plain
+  restart or `/stop` if nothing should be resumed.
 
 ## Limits and caveats
 

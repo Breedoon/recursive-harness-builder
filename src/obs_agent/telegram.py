@@ -1991,12 +1991,30 @@ class TelegramBot:
         hosted, local = _maint.split_resume_order(marker.entries)
         stagger = _maint.hosted_stagger_from_env()
 
+        local_wait = _maint.local_resume_wait_from_env(
+            float(getattr(self._config, "bg_fork_timeout", 0.0) or 0.0)
+        )
+
         async def _local_chain() -> None:
             # One local route at a time behind the single inference server.
+            # A watchdog bounds how long one resumed turn can hold the chain;
+            # the turn itself is shielded and keeps running past the wait.
             for entry in local:
                 try:
                     run = await self._resume_maintenance_entry(entry, requested_at=marker.requested_at)
-                    if run is not None:
+                    if run is None:
+                        continue
+                    if local_wait > 0:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(run), timeout=local_wait)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "[maintenance_restart] local resume still running after %.0fs; "
+                                "starting next local route (turn not cancelled) entry=%s",
+                                local_wait,
+                                entry,
+                            )
+                    else:
                         await asyncio.shield(run)
                 except Exception:
                     logger.warning("[maintenance_restart] local resume failed entry=%s", entry, exc_info=True)
