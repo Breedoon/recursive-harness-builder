@@ -350,7 +350,6 @@ class SessionManager:
         from obs_agent.claude_context import (
             COMPACTION_DISABLE_KEYS,
             CONTEXT_PLAN_ENV_KEYS,
-            STANDARD_CONTEXT_TOKENS,
             apply_explicit_context_overrides,
             build_claude_context_plan,
             explicit_compaction_disabled,
@@ -371,10 +370,13 @@ class SessionManager:
         proxy_in_use = should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled)
 
         # Local models whose requests reach the upstream gate directly (proxy
-        # disabled, or an explicit per-session ANTHROPIC_BASE_URL) must keep the
-        # bare model id: the gate routes on it literally and only the cache
-        # proxy strips Claude Code's [200k]/[1m] selector. A bare id gives the
-        # CLI its fixed 200K capacity, so plan within that capacity.
+        # disabled, or an explicit per-session ANTHROPIC_BASE_URL): the gate
+        # routes on the model id literally. Claude Code 2.1.59 itself strips a
+        # trailing [1m] before sending (wire model = bare id, plus the
+        # context-1m beta header, which the gate accepts), but sends [200k]
+        # verbatim. So the window-derived [1m] plan is safe on the direct path;
+        # only a [200k] selector is replaced by the bare id, whose CLI capacity
+        # is the same 200K, so the plan's percentage still holds.
         explicit_base_url = explicit_env.get("ANTHROPIC_BASE_URL")
         if explicit_base_url is not None:
             local_direct = is_local_provider and not _is_cache_proxy_url(
@@ -410,12 +412,9 @@ class SessionManager:
         auto_compact_disabled = (
             explicit_compaction_disabled(explicit_env) or self.compaction_handoff_active
         )
-        plan_context_tokens = (
-            min(context_tokens, STANDARD_CONTEXT_TOKENS) if local_direct else context_tokens
-        )
         context_plan = build_claude_context_plan(
             model=clean_model,
-            context_tokens=plan_context_tokens,
+            context_tokens=context_tokens,
             auto_compact_window_tokens=self.config.auto_compact_window_tokens,
             environ=validation_environment(os.environ, effective_env, explicit_env),
         )
@@ -428,16 +427,9 @@ class SessionManager:
             auto_compact_disabled=auto_compact_disabled,
         )
         effective_env.update(context_env)
-        cli_model = clean_model if local_direct else context_plan.cli_model
-        if local_direct and context_tokens > STANDARD_CONTEXT_TOKENS:
-            logger.warning(
-                "Local model %s reaches its gate directly (no cache proxy); the bare "
-                "model id limits Claude Code to a 200K capacity, so compaction targets "
-                "%s instead of %s",
-                clean_model,
-                context_plan.threshold_tokens,
-                context_tokens - 33_000,
-            )
+        cli_model = context_plan.cli_model
+        if local_direct and not cli_model.lower().endswith("[1m]"):
+            cli_model = clean_model
         logger.info(
             "Claude context policy model=%s cli_model=%s context=%s "
             "compact_window=%s target=%s output_reserve=%s auto_compact_disabled=%s "

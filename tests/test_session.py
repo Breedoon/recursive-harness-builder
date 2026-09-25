@@ -851,19 +851,35 @@ class TestWindowDerivedCompactionAndEnvPrecedence:
         pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
         assert int(980_000 * pct / 100) == 467_000
 
-    def test_local_direct_gate_keeps_bare_model_and_200k_capacity(self, config, monkeypatch):
+    def test_local_direct_gate_uses_window_derived_1m_selector(self, config, monkeypatch):
+        # Claude Code 2.1.59 strips a trailing [1m] before sending, so the gate
+        # still receives the bare id (proven live, F2 run evidence).
         config.cache_proxy_enabled = False
         monkeypatch.setenv("OBS_LOCAL_LLM_BASE_URL", "http://local-llm:8080")
         mgr = SessionManager(config=config)
         mgr.model_override = "local-qwen3.8-27b"
         with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=False):
             options = mgr.create_options()
-        assert options.model == "local-qwen3.8-27b"
+        assert options.model == "local-qwen3.8-27b[1m]"
         assert options.env["ANTHROPIC_BASE_URL"] == "http://local-llm:8080"
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "262000"
+        assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
+        pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+        assert int(980_000 * pct / 100) == 229_000
+
+    def test_local_direct_gate_small_window_keeps_bare_model(self, config, monkeypatch):
+        # [200k] is sent verbatim by the CLI, so the direct path uses the bare id;
+        # its CLI capacity is the same 200K, so the percentage is unchanged.
+        config.cache_proxy_enabled = False
+        monkeypatch.setenv("OBS_LOCAL_LLM_BASE_URL", "http://local-llm:8080")
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.8-27b[150k]"
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=False):
+            options = mgr.create_options()
+        assert options.model == "local-qwen3.8-27b"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
-        assert int(180_000 * pct / 100) == 167_000
+        assert int(180_000 * pct / 100) == 117_000
 
     def test_local_explicit_proxy_base_url_still_uses_selector(self, config):
         config.cache_proxy_enabled = True
@@ -876,14 +892,14 @@ class TestWindowDerivedCompactionAndEnvPrecedence:
             options = mgr.create_options()
         assert options.model == "local-qwen3.8-27b[1m]"
 
-    def test_local_explicit_gate_base_url_keeps_bare_model(self, config):
+    def test_local_explicit_gate_base_url_uses_1m_selector(self, config):
         config.cache_proxy_enabled = True
         mgr = SessionManager(config=config)
         mgr.model_override = "local-qwen3.8-27b"
         mgr.set_sdk_env_overrides({"ANTHROPIC_BASE_URL": "http://host.docker.internal:8080"})
         with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
             options = mgr.create_options()
-        assert options.model == "local-qwen3.8-27b"
+        assert options.model == "local-qwen3.8-27b[1m]"
 
     @pytest.mark.parametrize("model", ["gpt-6-luna[120k]", "claude-opus-4-6[200k]", "local-qwen3.8-27b"])
     @pytest.mark.parametrize("key", ["DISABLE_AUTO_COMPACT", "DISABLE_COMPACT"])

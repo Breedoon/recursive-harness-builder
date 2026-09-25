@@ -140,15 +140,29 @@ suffix or from `MODEL_CONTEXT_WINDOWS`. No per-model constant is added:
 The cache proxy strips the selector for every route before routing. So the
 gate still receives the literal ID, and the upstream request only gains the
 CLI's `context-1m-2025-08-07` beta header. A live request with that header was
-tested against the gate: HTTP 200, completed stream. **Exception:** a local
-session whose requests reach the gate directly keeps the bare ID. That happens
-when the proxy is disabled, or when the session has an explicit
-`ANTHROPIC_BASE_URL` that is not the proxy. The gate routes on the literal ID
-and would not strip a selector. That session is therefore planned inside the
-CLI's 200K capacity, and OBS logs a warning. The native probe confirms both
-routes on the pinned binary: `local-262k-proxy` gives threshold 229,000 and
-`local-262k-direct` gives 167,000
-(`/workspace/runtime/tmp/compaction-harness/e5-native/`).
+tested against the gate: HTTP 200, completed stream.
+
+**Direct-to-gate sessions use the same plan (F2, 2026-09-25).** A local session
+reaches the gate directly when the proxy is disabled or unhealthy, or when it
+has an explicit `ANTHROPIC_BASE_URL` that is not the proxy. E5 first kept the
+bare ID there (200K capacity, threshold 167,000) on the assumption that only the
+proxy strips the selector. That assumption was wrong for `[1m]`: Claude Code
+2.1.59 strips a trailing `[1m]` itself before sending. Proven live with the
+bundled 2.1.59 CLI pointed at the real gate through a logging relay: argv model
+`local-qwen3.8-27b[1m]`, wire body model `local-qwen3.8-27b`, `anthropic-beta`
+including `context-1m-2025-08-07`, HTTP 200, reported `contextWindow` 1,000,000
+(evidence: obs-artifacts `…/ad961f738c-f2-direct-to-gate-boundary-and-gate-mirror/evidence/`).
+So direct sessions now get the window-derived `[1m]` plan (229,000 for 262K).
+Only a `[200k]` selector, which the CLI sends verbatim, is swapped for the bare
+ID on the direct path; the bare ID's CLI capacity is the same 200K, so the
+plan's percentage is unchanged.
+
+**Boundary:** the direct path has no double-count correction. `LocalUsageFixer`
+lives in the cache proxy only; mirroring it in the host `gate.py` is tracked as
+`vault-u3b.18` (left open: the gate is a stdlib relay that never parses SSE, the
+port is ~90 lines like `ac20834`, and deploying it restarts `llm-gate`). A direct
+session can therefore still record ~4.8% of turns at 2x and compact early. All
+live local CLIs checked on 2026-09-25 route through the proxy.
 
 ## Explicit per-session values win (2026-09-25)
 
