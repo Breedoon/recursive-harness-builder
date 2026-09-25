@@ -130,6 +130,11 @@ class SessionManager:
         # ``"file_path::function_name"`` spec.  Threaded to
         # ``create_hook_matchers`` at session creation time.
         self.user_hooks: dict[str, str] | None = None
+        # Explicit per-session env overrides supplied at launch (AgentTask
+        # ``env`` plus launch-derived keys such as temperature), kept apart from
+        # the team-identity keys so daemon restore and task resume can re-apply
+        # them after rebuilding the team env (vault-u3b.20).
+        self.explicit_env_overrides: dict[str, str] | None = None
         # Set when an OBS_COMPACT_POLICY=handoff PreCompact interception fired
         # for the current session id: every later CLI process for this session
         # runs with auto-compaction disabled so the handoff turn (and any later

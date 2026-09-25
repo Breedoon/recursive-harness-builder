@@ -1562,6 +1562,14 @@ class TelegramBot:
                 user_hooks_json = json.dumps(state.session_manager.user_hooks, ensure_ascii=True)
             except (TypeError, ValueError):
                 user_hooks_json = None
+        explicit_env_json: str | None = None
+        if state.session_manager.explicit_env_overrides:
+            try:
+                explicit_env_json = json.dumps(
+                    state.session_manager.explicit_env_overrides, ensure_ascii=True, sort_keys=True
+                )
+            except (TypeError, ValueError):
+                explicit_env_json = None
         self._state_store.upsert_route_state(
             chat_id=route.chat_id,
             thread_id=route.thread_id,
@@ -1577,6 +1585,7 @@ class TelegramBot:
             model_override=state.session_manager.model_override,
             user_hooks_json=user_hooks_json,
             effort_override=state.session_manager.effort_override,
+            explicit_env_json=explicit_env_json,
         )
 
     def _restore_state_from_store(self) -> None:
@@ -1615,6 +1624,18 @@ class TelegramBot:
                     state.session_manager.user_hooks = json.loads(entry.user_hooks_json)
                 except (json.JSONDecodeError, TypeError):
                     pass
+            if entry.explicit_env_json:
+                try:
+                    loaded_env = json.loads(entry.explicit_env_json)
+                except (json.JSONDecodeError, TypeError):
+                    loaded_env = None
+                if isinstance(loaded_env, dict):
+                    state.session_manager.explicit_env_overrides = {
+                        str(key): str(value) for key, value in loaded_env.items()
+                    }
+                    state.session_manager.set_sdk_env_overrides(
+                        dict(state.session_manager.explicit_env_overrides)
+                    )
             restored_bootstrap = None
             if entry.pending_obs_bootstrap:
                 try:
@@ -1637,9 +1658,12 @@ class TelegramBot:
             )
             if projection is not None:
                 state.session_manager.set_sdk_env_overrides(
-                    self._build_team_worker_env(
-                        team_name=projection[0],
-                        agent_name=projection[1],
+                    self._with_explicit_env(
+                        state,
+                        self._build_team_worker_env(
+                            team_name=projection[0],
+                            agent_name=projection[1],
+                        ),
                     )
                 )
             if entry.session_id:
@@ -1759,9 +1783,12 @@ class TelegramBot:
             self._fork_task_by_child_route[child_route] = record.task_id
             if record.team_name and record.agent_name:
                 child_state.session_manager.set_sdk_env_overrides(
-                    self._build_team_worker_env(
-                        team_name=record.team_name,
-                        agent_name=record.agent_name,
+                    self._with_explicit_env(
+                        child_state,
+                        self._build_team_worker_env(
+                            team_name=record.team_name,
+                            agent_name=record.agent_name,
+                        ),
                     )
                 )
             self._upsert_route_inbox_target(
@@ -1825,9 +1852,12 @@ class TelegramBot:
             self._team_worker_records[key] = record.task_id
             self._fork_task_by_child_route[child_route] = record.task_id
             child_state.session_manager.set_sdk_env_overrides(
-                self._build_team_worker_env(
-                    team_name=record.team_name,
-                    agent_name=record.agent_name,
+                self._with_explicit_env(
+                    child_state,
+                    self._build_team_worker_env(
+                        team_name=record.team_name,
+                        agent_name=record.agent_name,
+                    ),
                 )
             )
             self._upsert_route_inbox_target(
@@ -3513,6 +3543,21 @@ class TelegramBot:
             env["CLAUDE_CODE_AGENT_NAME"] = normalized_agent
         return env
 
+    @staticmethod
+    def _with_explicit_env(
+        state: TelegramSessionState,
+        team_env: dict[str, str],
+    ) -> dict[str, str]:
+        """Overlay the session's persisted explicit launch env on a rebuilt team env.
+
+        Restore and resume rebuild the team-identity env from scratch; without
+        this overlay the AgentTask ``env`` a child was launched with (compaction
+        policy, thresholds, backend URL, ...) silently disappears (vault-u3b.20).
+        Explicit keys win, matching launch-time precedence.
+        """
+        explicit = state.session_manager.explicit_env_overrides or {}
+        return {**team_env, **explicit}
+
     def _build_team_projection_obs_metadata(
         self,
         *,
@@ -3812,6 +3857,7 @@ class TelegramBot:
             else None
         )
         old_env = state.session_manager.sdk_env_overrides
+        old_explicit_env = state.session_manager.explicit_env_overrides
         old_lineage = self._ensure_state_lineage(state, session_id=session_id)
         old_projection = self._state_inbox_projection(state)
 
@@ -3840,6 +3886,7 @@ class TelegramBot:
         state.session_manager.model_override = old_model_override
         state.session_manager.effort_override = old_effort_override
         state.session_manager.user_hooks = old_user_hooks
+        state.session_manager.explicit_env_overrides = old_explicit_env
         state.session_manager.set_sdk_env_overrides(old_env)
 
         self._prime_obs_bootstrap(
@@ -5186,6 +5233,14 @@ class TelegramBot:
 
         old_manager = state.session_manager
         state.session_manager = SessionManager(config=self._config, hook_state=state.hook_state)
+        # The route's launch configuration belongs to the route, not to one
+        # session id: carry it across session switches so a reply-to-older-
+        # message switch does not silently drop model, hooks, or env.
+        state.session_manager.model_override = old_manager.model_override
+        state.session_manager.effort_override = old_manager.effort_override
+        state.session_manager.user_hooks = old_manager.user_hooks
+        state.session_manager.explicit_env_overrides = old_manager.explicit_env_overrides
+        state.session_manager.set_sdk_env_overrides(dict(old_manager.sdk_env_overrides))
         if session_id:
             state.session_manager.set_session_id(session_id)
             self._route_by_session_id[session_id] = state.route
@@ -8567,6 +8622,13 @@ class TelegramBot:
             body = parse_extra_body(team_env.get("CLAUDE_CODE_EXTRA_BODY"))
             body.update({"temperature": temperature, "thinking": {"type": "disabled"}})
             team_env["CLAUDE_CODE_EXTRA_BODY"] = json.dumps(body)
+        base_team_env = self._build_team_worker_env(
+            team_name=team_name,
+            agent_name=agent_name,
+        )
+        child_state.session_manager.explicit_env_overrides = {
+            key: value for key, value in team_env.items() if base_team_env.get(key) != value
+        } or None
         child_state.session_manager.set_sdk_env_overrides(team_env)
         # Apply per-session model override. resolve_model handles shorthand
         # lookup and context suffix preservation. _build_options in session.py
@@ -9693,9 +9755,12 @@ class TelegramBot:
         record.emit_parent_callback = True
         self._register_team_worker_record(record)
         child_state.session_manager.set_sdk_env_overrides(
-            self._build_team_worker_env(
-                team_name=record.team_name,
-                agent_name=record.agent_name,
+            self._with_explicit_env(
+                child_state,
+                self._build_team_worker_env(
+                    team_name=record.team_name,
+                    agent_name=record.agent_name,
+                ),
             )
         )
 

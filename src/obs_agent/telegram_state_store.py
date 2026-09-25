@@ -31,6 +31,7 @@ class PersistedRouteState:
     model_override: str | None = None
     user_hooks_json: str | None = None
     effort_override: str | None = None
+    explicit_env_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -377,6 +378,11 @@ class TelegramStateStore:
             column="effort_override",
             declaration="TEXT",
         )
+        self._ensure_column_exists(
+            table="route_state",
+            column="explicit_env_json",
+            declaration="TEXT",
+        )
         # Completion summaries are now always-on across all topic types.
         conn.execute(
             """
@@ -428,7 +434,8 @@ class TelegramStateStore:
                 pending_obs_bootstrap,
                 model_override,
                 user_hooks_json,
-                effort_override
+                effort_override,
+                explicit_env_json
             FROM route_state
             ORDER BY updated_at ASC
             """
@@ -578,6 +585,11 @@ class TelegramStateStore:
                 user_hooks_json=(
                     str(row["user_hooks_json"])
                     if row["user_hooks_json"]
+                    else None
+                ),
+                explicit_env_json=(
+                    str(row["explicit_env_json"])
+                    if row["explicit_env_json"]
                     else None
                 ),
             )
@@ -775,6 +787,7 @@ class TelegramStateStore:
         model_override: str | None = None,
         user_hooks_json: str | None = None,
         effort_override: str | None = None,
+        explicit_env_json: str | None = None,
     ) -> None:
         conn = self._require_conn()
         now = time.time()
@@ -797,8 +810,9 @@ class TelegramStateStore:
                 model_override,
                 user_hooks_json,
                 effort_override,
+                explicit_env_json,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(route_key) DO UPDATE SET
                 session_id=excluded.session_id,
                 topic_title=excluded.topic_title,
@@ -812,6 +826,7 @@ class TelegramStateStore:
                 model_override=excluded.model_override,
                 user_hooks_json=excluded.user_hooks_json,
                 effort_override=excluded.effort_override,
+                explicit_env_json=excluded.explicit_env_json,
                 updated_at=excluded.updated_at
             """,
             (
@@ -837,6 +852,7 @@ class TelegramStateStore:
                 model_override,
                 user_hooks_json,
                 effort_override,
+                explicit_env_json,
                 now,
             ),
         )
