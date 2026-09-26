@@ -91,6 +91,9 @@ class ResumeEntry:
     queued: list[QueuedEntry] = field(default_factory=list)
     # How many crash resumes in a row this turn has had (crash-loop guard).
     crash_resume_count: int = 0
+    # The turn's input, recorded only while the route has no session id yet
+    # (no transcript to resume). Older markers lack it; readers default None.
+    inflight_prompt: str | None = None
 
 
 @dataclass
@@ -223,6 +226,7 @@ def _entry_from_dict(raw: dict) -> ResumeEntry:
         topic_title=raw.get("topic_title"),
         queued=queued,
         crash_resume_count=int(raw.get("crash_resume_count") or 0),
+        inflight_prompt=(str(raw.get("inflight_prompt")) if raw.get("inflight_prompt") else None),
     )
 
 
@@ -279,8 +283,38 @@ def split_resume_order(entries: list[ResumeEntry]) -> tuple[list[ResumeEntry], l
     return hosted, local
 
 
-def build_resume_prompt(*, requested_at: float, queued_count: int = 0, kind: str = "maintenance") -> str:
+def build_resume_prompt(
+    *,
+    requested_at: float,
+    queued_count: int = 0,
+    kind: str = "maintenance",
+    original_prompt: str | None = None,
+) -> str:
+    """Resume note for a cut-off turn.
+
+    ``original_prompt`` is given when the route had no session transcript yet;
+    the note then carries the turn's original request instead of "continue".
+    """
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(requested_at))
+    if original_prompt:
+        cause = (
+            f"OBS restarted unexpectedly (a crash, e.g. out of memory) shortly after {stamp}"
+            if kind == "crash"
+            else f"OBS was restarted for maintenance at {stamp}"
+        )
+        lines = [
+            f"(System: {cause} just as your turn was starting, before a session transcript "
+            "existed, so this is a fresh session. Any tool call you had begun may or may not "
+            "have taken effect: check its result or side effect (file contents, git log, bead "
+            "state, sent messages) before repeating it; do not blindly redo non-idempotent actions.)",
+        ]
+        if queued_count:
+            lines.append(
+                f"{queued_count} message(s) that were queued for you before the restart are "
+                "attached after this note."
+            )
+        lines += ["The original request of the cut-off turn follows.", "", original_prompt]
+        return "\n".join(lines)
     if kind == "crash":
         lines = [
             f"(System: OBS restarted unexpectedly (a crash, e.g. out of memory) shortly after "

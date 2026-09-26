@@ -87,11 +87,43 @@ this version (vault-u3b.70).
      agent then replies with one line and stops.
    - Queued messages are replayed after the note.
    - The normal JSONL health recovery repairs poisoned tails from the kill.
+   - **Routes with no session id yet.** The SDK reports a session id with its
+     first message, so a turn cut off in its first seconds (or a fork reserved
+     but still waiting for its child lock) has no transcript to continue. The
+     snapshot still lists such a route (routes are never dropped for lacking a
+     session id) and also records the turn's input text (`inflight_prompt`,
+     only while there is no session id). The resume then starts a fresh
+     session whose note carries that original request instead of "continue".
+     Older markers without the field still parse, and older readers ignore it.
 6. Fork and AgentTask children get `emit_parent_callback` re-armed, so the
    waiting parent is notified when the resumed child finishes. (Unit-tested;
    not yet observed live — in the first live run the resumed children were
    stopped by `/stop_tree` before finishing; bead vault-u3b.71.)
-7. **Local-model routes** (`local-*`) resume strictly one at a time: the next
+7. **Late callbacks (vault-u3b.35).** After a maintenance restart or crash (a
+   fresh marker or crash snapshot and no kill-switch sentinel), a restored
+   child whose persisted status is still `launched`, that has no parent
+   callback yet and whose parent is another route, *owes* its launching parent
+   a callback (log: `[restore] parent callback owed`). Such a child was
+   cut off mid-run but not resumed (for example it started within the
+   snapshot's last 15 s, or the crash-loop guard skipped it). Its next run,
+   including an inbox wake, keeps the original parent for that one run. When
+   it finishes, the parent gets the normal completion callback as a reply to
+   its original launch message (log: `delivering owed parent callback`). The
+   debt is cleared when the wake starts, and the finished run persists a
+   terminal status, so the callback is delivered at most once. A crash during
+   that run keeps the debt, because the record is still `launched` with the
+   original parent. Resumed children (step 6) and explicit `AgentTask` resumes
+   clear the debt, since they call back anyway. A restored parent without a
+   bot uses the primary bot for the callback.
+   - **Not owed:** after a kill switch (plain restart, `supervisorctl`, or no
+     fresh resume file at all), or when the parent was stopped (`/stop*`
+     terminal request on the parent's record, or a stop pending on its route)
+     or is gone. Those cases keep the old behaviour: no callback, nothing
+     woken.
+   - **Scope:** only records restored from the task-handle table are covered.
+     A child without team/agent identity is woken only by a message in its
+     own topic, which is not an AgentTask run and has no parent callback.
+8. **Local-model routes** (`local-*`) resume strictly one at a time: the next
    local route starts only after the previous resumed turn ends, errors or is
    stopped (vault-u3b.86; before 2026-09-26 a 600 s fallback let three local
    turns run concurrently). `OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS`
@@ -99,19 +131,19 @@ this version (vault-u3b.70).
    expires the chain logs an error and starts the next route without
    cancelling the wedged one; `0` waits without limit. **Hosted routes** start
    `OBS_MAINTENANCE_RESUME_STAGGER_SECONDS` apart (default 3 s).
-8. **Crash-loop guard:** a turn already crash-resumed
+9. **Crash-loop guard:** a turn already crash-resumed
    `OBS_CRASH_RESUME_MAX_CONSECUTIVE` times in a row (default 2) is not resumed
    again, and the log says so. The count resets when the resumed turn ends.
-9. **Outage messages (vault-u3b.35):** after a maintenance restart or a crash,
+10. **Outage messages (vault-u3b.35):** after a maintenance restart or a crash,
    unread inbox messages sent since the previous daemon was last alive (minus
    60 s of slack) stay unread and wake their agent. Older ones, and every
    message after a kill switch, are marked read as before.
-10. **Orphaned CLIs (vault-u3b.66):** Claude CLIs (the Agent SDK's bundled
+11. **Orphaned CLIs (vault-u3b.66):** Claude CLIs (the Agent SDK's bundled
     `claude`) with parent PID 1 whose process-group leader is gone get
     SIGTERM, then SIGKILL 5 s later. `OBS_ORPHAN_CLI_REAP=0` turns this off.
     The wrapper now also terminates the rest of its process group when
     `telegram_main` dies on its own, so new orphans should not appear.
-11. Trunk and user-facing chats that were mid-turn are resumed like any other
+12. Trunk and user-facing chats that were mid-turn are resumed like any other
     busy route (supervisor decision 2026-09-25 21:14Z, bead `vault-u3b.41`).
     Use the plain restart or `/stop` if nothing should resume.
 
@@ -161,6 +193,13 @@ times on 2026-09-24/25 (vault-u3b.73).
 - The crash snapshot can be up to 15 s old. A turn that ended in those seconds
   is resumed once and told it may already have finished.
 - Idle agents need nothing: they are restored and wake on their next message.
+- An owed late callback (startup step 7) can arrive long after the parent
+  moved on, because a child's record stays `launched` until a run of it
+  finishes. That includes children cut off by earlier crashes: on the first
+  start of this code, ~65 such prod records existed (2026-09-26 10:10Z,
+  read-only count). It is delivered only if the child is woken again, and at
+  most once. The parent then gets one extra "went idle" notice, which it can
+  ignore. This follows the daemon's over-deliver policy for wakes.
 - A turn killed mid-tool-call may have completed its side effect. The resume
   note says to verify first; residual duplicate-effect risk is low, not zero.
 - Two daemons sharing one state directory would share these files. Only the
@@ -179,10 +218,15 @@ times on 2026-09-24/25 (vault-u3b.73).
   `write_crash_snapshot`, `start_crash_snapshot_writer`,
   `request_maintenance_restart`, `request_plain_restart`, `handle_restart`,
   `_mark_stop_requested` / `_escalate_stop`, `_compute_outage_inbox_floor`,
-  and `_install_kill_switch_sigterm_handler`. No-reconnect-after-stop is in
+  `_restored_record_owes_callback` / `_owed_callback_deliverable` (late
+  callbacks, applied in `_restore_state_from_store` and
+  `_start_idle_team_worker_wake`), `_collect_maintenance_entries`
+  (`inflight_prompt`), and `_install_kill_switch_sigterm_handler`. No-reconnect-after-stop is in
   `src/obs_agent/runner.py`; the OOM score is in `src/obs_agent/session.py`.
 - Wrapper source: `deploy/obs-telegram-prod-wrapper.sh`, installed as
   `/workspace/runtime/bin/obs-telegram-prod-wrapper.sh` by atomic rename.
 - Tests: `tests/test_maintenance_restart.py`, `tests/test_crash_resume.py`,
+  `tests/test_restore_late_callbacks.py` (late callbacks and session-id
+  coverage),
   `tests/test_prod_wrapper.py` (fake daemon; never touches port 28925), and
   the fixture `tests/fixtures/maintenance-resume-19ddec9.json`.

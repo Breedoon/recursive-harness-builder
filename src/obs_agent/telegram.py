@@ -287,6 +287,10 @@ class TelegramSessionState:
     inbox_wake_sender: str | None = None
     inbox_wake_summary: str | None = None
     inbox_wake_content: str | None = None
+    # Input text of the turn in flight. The crash snapshot records it for a
+    # route whose session id is not known yet, so a resume after a crash in
+    # the first seconds of a new session does not lose the original request.
+    inflight_user_text: str | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -345,6 +349,10 @@ class _ForkTaskRecord:
     wake_source_summary: str | None = None
     wake_source_content: str | None = None
     emit_parent_callback: bool = True
+    # Restored after a maintenance restart or crash while mid-turn and not yet
+    # called back: the launching parent is still owed a completion callback.
+    # The next run of this child (inbox wake included) delivers it once.
+    callback_owed: bool = False
 
 
 @dataclass
@@ -1612,6 +1620,11 @@ class TelegramBot:
 
     def _restore_state_from_store(self) -> None:
         snapshot = self._state_store.load_snapshot()
+        # A fresh maintenance marker or crash snapshot (and no kill-switch
+        # sentinel) means the previous daemon did not go down by the kill
+        # switch. Only then are late parent callbacks owed (vault-u3b.35).
+        self._outage_inbox_floor = self._compute_outage_inbox_floor()
+        owe_late_callbacks = self._outage_inbox_floor is not None
         for entry in snapshot.route_states:
             route = TelegramRoute(chat_id=entry.chat_id, thread_id=entry.thread_id)
             if entry.topic_title or entry.topic_icon_custom_emoji_id:
@@ -1801,6 +1814,14 @@ class TelegramBot:
                 idle_ready=entry.idle_ready,
                 emit_parent_callback=False,
             )
+            record.callback_owed = owe_late_callbacks and self._restored_record_owes_callback(record)
+            if record.callback_owed:
+                logger.warning(
+                    "[restore] parent callback owed task_id=%s child=%s parent=%s",
+                    record.task_id,
+                    record.child_route,
+                    record.parent_route,
+                )
             self._fork_tasks_by_id[record.task_id] = record
             self._fork_task_by_child_route[child_route] = record.task_id
             if record.team_name and record.agent_name:
@@ -1889,8 +1910,39 @@ class TelegramBot:
             )
             restored_inbox_keys.add(key)
 
-        self._outage_inbox_floor = self._compute_outage_inbox_floor()
         self._mark_restored_team_inboxes_read(restored_inbox_keys)
+
+    @staticmethod
+    def _restored_record_owes_callback(record: _ForkTaskRecord) -> bool:
+        """True when a restored child was cut off mid-run before its parent heard back.
+
+        Persisted status stays ``launched`` until a run finishes; the finish
+        path persists the terminal status together with the callback id. An
+        inbox wake re-points ``parent_route`` at the child itself, so such runs
+        never owed a parent anything.
+        """
+        return (
+            (record.status or "completed") not in {"completed", "failed", "stopped"}
+            and not record.terminal_request
+            and record.parent_callback_message_id is None
+            and record.parent_route != record.child_route
+        )
+
+    def _owed_callback_deliverable(self, record: _ForkTaskRecord) -> bool:
+        """An owed callback must not wake a parent that was stopped or is gone."""
+        parent_state = self._get_state(record.parent_route, create=False)
+        if parent_state is None:
+            return False
+        if parent_state.hook_state.stop_requested_at is not None:
+            return False
+        parent_task_id = self._fork_task_by_child_route.get(record.parent_route)
+        parent_record = self._fork_tasks_by_id.get(parent_task_id) if parent_task_id else None
+        if parent_record is not None and (
+            parent_record.terminal_request or parent_record.status == "stopped"
+        ):
+            # /stop, /stop_branch or /stop_tree reached the parent.
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Opt-in maintenance restart (Daniel 2026-09-25; not the default).
@@ -1923,6 +1975,18 @@ class TelegramBot:
                 # A stop was requested for this turn (also plain trunk /stop).
                 continue
             session_id = state.session_id
+            inflight_prompt: str | None = None
+            if not session_id:
+                # No transcript to resume yet (the SDK reports the session id
+                # with its first message). Keep the turn's input so the resume
+                # can re-send it instead of a bare "continue" into a new session.
+                inflight_prompt = state.inflight_user_text
+                if not inflight_prompt and record is not None and (record.prompt or record.prompt_file_content):
+                    inflight_prompt = self._compose_prompt_file_context(
+                        prompt=record.prompt,
+                        prompt_file=record.prompt_file,
+                        prompt_file_content=record.prompt_file_content,
+                    )
             model = self._state_model_name(state)
             projection = self._state_inbox_projection(state, allow_jsonl_lookup=allow_jsonl_lookup)
             queued = [
@@ -1950,6 +2014,7 @@ class TelegramBot:
                     topic_title=state.topic_title,
                     queued=queued,
                     crash_resume_count=self._crash_resume_counts.get(route, 0),
+                    inflight_prompt=inflight_prompt or None,
                 )
             )
         return entries
@@ -2188,7 +2253,14 @@ class TelegramBot:
             )
             for item in entry.queued
         ]
-        prompt = _maint.build_resume_prompt(requested_at=requested_at, queued_count=len(queued), kind=kind)
+        prompt = _maint.build_resume_prompt(
+            requested_at=requested_at,
+            queued_count=len(queued),
+            kind=kind,
+            # Only when there is no transcript to continue; otherwise the
+            # session already holds the original request.
+            original_prompt=entry.inflight_prompt if not state.session_id else None,
+        )
         record = self._fork_tasks_by_id.get(entry.task_id or "") if entry.task_id else None
         lock = self._get_route_lock(route)
         async with lock:
@@ -2232,6 +2304,7 @@ class TelegramBot:
             record.launch_child_message_id = marker_message_id
             record.idle_ready = False
             record.emit_parent_callback = True
+            record.callback_owed = False
             parent_state = self._get_state(record.parent_route, create=False)
             if parent_state is not None and parent_state.last_bot is None:
                 # Restored parents have no bot yet; the callback needs one.
@@ -7906,6 +7979,7 @@ class TelegramBot:
             state.route, user_text[:80],
         )
 
+        state.inflight_user_text = user_text
         try:
             if state.pending_obs_bootstrap is None and not self._session_heads.get(state.session_id or ""):
                 had_lineage = state.agent_lineage is not None
@@ -8275,6 +8349,7 @@ class TelegramBot:
                 await runner_events.aclose()
             _store_remaining_pending()
             state.busy = False
+            state.inflight_user_text = None
             state.hook_state.execution_active = False
             state.hook_state.interrupt_requested = False
             try:
@@ -9849,15 +9924,29 @@ class TelegramBot:
         current_child_session_id = (child_state.session_id or "").strip() or record.child_session_id
         if current_child_session_id:
             record.child_session_id = current_child_session_id
-        record.parent_route = record.child_route
-        record.parent_session_id_at_launch = (
-            current_child_session_id
-            or record.parent_session_id_at_launch
-        )
-        record.parent_source_uuid = (
-            self._session_heads.get(current_child_session_id or "")
-            or record.parent_source_uuid
-        )
+        # vault-u3b.35: a child restored mid-run after a maintenance restart or
+        # crash still owes its launching parent a completion callback. Keep the
+        # original parent for this one run so the parent hears back; the flag
+        # is cleared here, and the finish path persists the callback id, so it
+        # is delivered at most once.
+        owed_callback = record.callback_owed and self._owed_callback_deliverable(record)
+        record.callback_owed = False
+        if owed_callback:
+            logger.warning(
+                "[restore] delivering owed parent callback on wake task_id=%s parent=%s",
+                record.task_id,
+                record.parent_route,
+            )
+        else:
+            record.parent_route = record.child_route
+            record.parent_session_id_at_launch = (
+                current_child_session_id
+                or record.parent_session_id_at_launch
+            )
+            record.parent_source_uuid = (
+                self._session_heads.get(current_child_session_id or "")
+                or record.parent_source_uuid
+            )
         record.prompt = wake_prompt
         record.prompt_file = None
         record.prompt_file_content = None
@@ -9870,14 +9959,16 @@ class TelegramBot:
         record.child_completion_message_id = None
         record.tool_use_id = None
         record.launch_tool_name = "AgentTask"
-        record.launch_parent_message_id = wake_message_id
+        if not owed_callback:
+            # An owed callback replies to the parent's original launch message.
+            record.launch_parent_message_id = wake_message_id
         record.launch_child_message_id = wake_message_id
         record.idle_ready = False
         record.wake_requested = False
         record.wake_source_sender = None
         record.wake_source_summary = None
         record.wake_source_content = None
-        record.emit_parent_callback = False
+        record.emit_parent_callback = owed_callback
         self._register_team_worker_record(record)
         await self._schedule_fork_task(
             task_id=record.task_id,
@@ -10329,6 +10420,8 @@ class TelegramBot:
         record.wake_source_summary = None
         record.wake_source_content = None
         record.emit_parent_callback = True
+        # The resumer gets the callback of this run; nothing else is owed.
+        record.callback_owed = False
         self._register_team_worker_record(record)
         child_state.session_manager.set_sdk_env_overrides(
             self._with_explicit_env(
@@ -10867,6 +10960,14 @@ class TelegramBot:
                     role="assistant",
                 )
 
+        if (
+            record.emit_parent_callback
+            and parent_state is not None
+            and parent_state.last_bot is None
+        ):
+            # A parent restored after a restart has no bot until its next turn;
+            # without one its owed callback would be dropped (vault-u3b.35).
+            parent_state.last_bot = self._bot_for_state(parent_state)
         if (
             record.emit_parent_callback
             and parent_state is not None
