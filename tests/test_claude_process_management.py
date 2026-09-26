@@ -68,7 +68,77 @@ def _record(task_id: str, child_route: TelegramRoute, *, completed_at: float, id
 
 @pytest.fixture
 def bot(config):
-    return TelegramBot(config, enable_background_poller=False)
+    bot = TelegramBot(config, enable_background_poller=False)
+    bot._config.claude_idle_evict_seconds = 0  # cap/kill tests; age eviction tested below
+    return bot
+
+
+def _install(bot, records, routes, managers):
+    for route, manager in zip(routes, managers):
+        bot._states_by_route[route] = _state(route, manager)
+    bot._fork_tasks_by_id = {record.task_id: record for record in records}
+    bot._fork_task_by_child_route = {record.child_route: record.task_id for record in records}
+
+
+def test_idle_evict_default_is_on():
+    from obs_agent.config import OBSConfig
+
+    assert OBSConfig.__dataclass_fields__["claude_idle_evict_seconds"].default == 1800.0
+
+
+@pytest.mark.asyncio
+async def test_age_eviction_prunes_only_routes_idle_past_threshold(bot):
+    bot._config.claude_idle_evict_seconds = 1800
+    bot._config.claude_idle_process_cap = None
+    now = time.time()
+    routes = [_route(index) for index in range(1, 4)]
+    managers = [FakeSessionManager() for _ in routes]
+    records = [
+        _record("old", routes[0], completed_at=now - 3600),
+        _record("edge", routes[1], completed_at=now - 1700),
+        _record("fresh", routes[2], completed_at=now - 10),
+    ]
+    _install(bot, records, routes, managers)
+
+    assert await bot._prune_idle_claude_processes() == 1
+    assert managers[0].disconnect_calls == [True]
+    assert managers[1].disconnect_calls == []
+    assert managers[2].disconnect_calls == []
+
+
+@pytest.mark.asyncio
+async def test_age_eviction_combines_with_cap_without_double_pruning(bot):
+    bot._config.claude_idle_evict_seconds = 1800
+    bot._config.claude_idle_process_cap = 2
+    now = time.time()
+    routes = [_route(index) for index in range(1, 5)]
+    managers = [FakeSessionManager() for _ in routes]
+    records = [
+        _record("a", routes[0], completed_at=now - 7200),
+        _record("b", routes[1], completed_at=now - 3600),
+        _record("c", routes[2], completed_at=now - 60),
+        _record("d", routes[3], completed_at=now - 30),
+    ]
+    _install(bot, records, routes, managers)
+
+    # cap selects a,b (overage 2); age adds nothing new; c,d stay.
+    assert await bot._prune_idle_claude_processes() == 2
+    assert [len(m.disconnect_calls) for m in managers] == [1, 1, 0, 0]
+
+
+@pytest.mark.asyncio
+async def test_age_eviction_skips_busy_routes(bot):
+    bot._config.claude_idle_evict_seconds = 60
+    now = time.time()
+    route = _route(1)
+    manager = FakeSessionManager()
+    bot._states_by_route[route] = _state(route, manager, busy=True)
+    record = _record("busy", route, completed_at=now - 3600)
+    bot._fork_tasks_by_id = {record.task_id: record}
+    bot._fork_task_by_child_route = {route: record.task_id}
+
+    assert await bot._prune_idle_claude_processes() == 0
+    assert manager.disconnect_calls == []
 
 
 def test_idle_candidates_exclude_running_busy_execution_active_and_disconnected(bot):

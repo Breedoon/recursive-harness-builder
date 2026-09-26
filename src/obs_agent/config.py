@@ -346,6 +346,9 @@ class OBSConfig:
     context_probe_claude_cli: bool = False
     claude_idle_process_cap: int | None = None
     claude_kill_on_idle: bool = False
+    # vault-u3b.78: evict idle AgentTask child CLIs after this many seconds
+    # (they reconnect lazily with --resume on the next wake); 0 disables.
+    claude_idle_evict_seconds: float = 1800.0
     fork_cache_warmup_delay_seconds: float = 1.0
 
     # Cache proxy
@@ -429,6 +432,8 @@ class OBSConfig:
             kwargs["context_probe_claude_cli"] = probe_cli.strip().lower() in {"1", "true", "yes", "on"}
         if idle_cap := os.environ.get("OBS_CLAUDE_IDLE_PROCESS_CAP"):
             kwargs["claude_idle_process_cap"] = int(idle_cap)
+        if idle_evict := os.environ.get("OBS_CLAUDE_IDLE_EVICT_SECONDS"):
+            kwargs["claude_idle_evict_seconds"] = float(idle_evict)
         if kill_on_idle := os.environ.get("OBS_CLAUDE_KILL_ON_IDLE"):
             kwargs["claude_kill_on_idle"] = kill_on_idle.strip().lower() in {"1", "true", "yes", "on"}
         if fork_cache_delay := os.environ.get("OBS_FORK_CACHE_WARMUP_DELAY_SECONDS"):

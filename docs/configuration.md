@@ -187,7 +187,16 @@ Process/resource settings:
 ```bash
 OBS_CLAUDE_IDLE_PROCESS_CAP=50
 OBS_CLAUDE_KILL_ON_IDLE=false
+OBS_CLAUDE_IDLE_EVICT_SECONDS=1800
 ```
+
+`OBS_CLAUDE_IDLE_EVICT_SECONDS` (default 1800, `0` disables; vault-u3b.78)
+closes the CLI of an idle AgentTask child whose last turn completed at least
+that long ago. A 60 s sweep runs it (not only on fork completion); busy,
+running and execution-active routes are skipped. The child reconnects lazily
+with `--resume` on its next wake, the same path the cap uses. It adds to the
+cap; `OBS_CLAUDE_KILL_ON_IDLE` still wins. Only fork/AgentTask child routes
+are candidates; topic routes are never evicted.
 
 Telegram transport settings:
 

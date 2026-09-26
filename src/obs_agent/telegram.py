@@ -748,6 +748,7 @@ class TelegramBot:
         )
         self._background_task: asyncio.Task | None = None
         self._schedule_poller_task: asyncio.Task | None = None
+        self._idle_evict_task: asyncio.Task | None = None
         self._transport_queue: asyncio.PriorityQueue[_TransportEnvelope] = asyncio.PriorityQueue()
         self._transport_sequence = 0
         self._transport_worker_task: asyncio.Task | None = None
@@ -2516,11 +2517,25 @@ class TelegramBot:
             mode = "kill_on_idle"
             to_prune = candidates
             overage = len(candidates)
-        elif cap is not None:
-            mode = "cap"
-            overage = len(candidates) - max(cap, 0)
-            if overage > 0:
-                to_prune = candidates[:overage]
+        else:
+            if cap is not None:
+                mode = "cap"
+                overage = len(candidates) - max(cap, 0)
+                if overage > 0:
+                    to_prune = candidates[:overage]
+            evict_after = float(getattr(self._config, "claude_idle_evict_seconds", 0.0) or 0.0)
+            if evict_after > 0:
+                # vault-u3b.78: age-based eviction on top of any cap.
+                now = time.time()
+                selected = {id(candidate) for candidate in to_prune}
+                aged = [
+                    candidate
+                    for candidate in candidates
+                    if id(candidate) not in selected and now - candidate.idle_at >= evict_after
+                ]
+                to_prune = to_prune + aged
+                mode = "cap+age" if mode == "cap" else "age"
+                overage = max(overage, 0) + len(aged)
 
         if mode == "disabled":
             logger.debug(
@@ -5365,10 +5380,24 @@ class TelegramBot:
             self._background_task = asyncio.create_task(self._background_poller_loop())
         if self._schedule_poller_task is None or self._schedule_poller_task.done():
             self._schedule_poller_task = asyncio.create_task(self._schedule_poller_loop())
+        if (
+            float(getattr(self._config, "claude_idle_evict_seconds", 0.0) or 0.0) > 0
+            and (self._idle_evict_task is None or self._idle_evict_task.done())
+        ):
+            self._idle_evict_task = asyncio.create_task(self._idle_evict_loop())
+
+    async def _idle_evict_loop(self, interval: float = 60.0) -> None:
+        """Periodic idle-CLI sweep so eviction does not wait for a fork completion."""
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._prune_idle_claude_processes()
+            except Exception:
+                logger.warning("Claude idle process eviction sweep failed", exc_info=True)
 
     async def shutdown(self) -> None:
         """Stop background tasks owned by this adapter."""
-        for task in [self._crash_snapshot_task, *self._stop_escalation_tasks]:
+        for task in [self._crash_snapshot_task, self._idle_evict_task, *self._stop_escalation_tasks]:
             if task is not None and not task.done():
                 task.cancel()
                 try:
