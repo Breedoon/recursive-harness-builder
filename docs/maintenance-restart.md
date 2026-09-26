@@ -103,9 +103,14 @@ this version (vault-u3b.70).
    fresh marker or crash snapshot and no kill-switch sentinel), a restored
    child whose persisted status is still `launched`, that has no parent
    callback yet and whose parent is another route, *owes* its launching parent
-   a callback (log: `[restore] parent callback owed`). Such a child was
-   cut off mid-run but not resumed (for example it started within the
-   snapshot's last 15 s, or the crash-loop guard skipped it). Its next run,
+   a callback (log: `[restore] parent callback owed`) **only if it was cut
+   off by this outage** (vault-u3b.81): the previous daemon listed it in
+   flight (`inflight_task_ids` in its maintenance marker or crash snapshot,
+   i.e. its parent was still waiting), or it was launched after that file's
+   `requested_at` (the snapshot's last 15 s). Historical `launched` rows left
+   over from older outages are never owed, and no stored row is rewritten.
+   Such a child was not resumed (for example it started within the snapshot's
+   last 15 s, or the crash-loop guard skipped it). Its next run,
    including an inbox wake, keeps the original parent for that one run. When
    it finishes, the parent gets the normal completion callback as a reply to
    its original launch message (log: `delivering owed parent callback`). The

@@ -259,12 +259,13 @@ def consume_marker(
         raw = json.loads(consumed.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001 - corrupt marker must never crash startup
         return None, f"unreadable:{type(exc).__name__}"
-    return _marker_from_raw(raw, now=now, max_age_seconds=max_age_seconds)
+    return _marker_from_raw(raw, path=consumed, now=now, max_age_seconds=max_age_seconds)
 
 
 def _marker_from_raw(
     raw: object,
     *,
+    path: Path,
     now: float | None,
     max_age_seconds: float,
 ) -> tuple[ResumeMarker | None, str]:
@@ -275,7 +276,7 @@ def _marker_from_raw(
     except (TypeError, ValueError):
         return None, "unreadable:requested_at"
     current = time.time() if now is None else now
-    age = _write_age_seconds(consumed, requested_at, current)
+    age = _write_age_seconds(path, requested_at, current)
     if age < 0 or age > max_age_seconds:
         return None, f"stale:{int(age)}s"
     entries: list[ResumeEntry] = []
@@ -309,7 +310,7 @@ def peek_marker(path: Path, *, now: float | None = None, max_age_seconds: float)
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - a corrupt marker must never crash startup
         return None
-    marker, _reason = _marker_from_raw(raw, now=now, max_age_seconds=max_age_seconds)
+    marker, _reason = _marker_from_raw(raw, path=Path(path), now=now, max_age_seconds=max_age_seconds)
     return marker
 
 
