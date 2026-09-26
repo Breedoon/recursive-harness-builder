@@ -133,9 +133,12 @@ Local models now go through the same `build_claude_context_plan` as hosted
 ones. The threshold is `window - 33K`, where the window comes from the model's
 suffix or from `MODEL_CONTEXT_WINDOWS`. No per-model constant is added:
 
-- `local-qwen3.8-27b` (262K): selector `[1m]`, percentage approx. 23.367%, target **229,000**.
-- `local-qwen3.8-27b[500k]`: target 467,000.
-- `local-gemma4-31b` (48K): selector `[200k]`, target 15,000.
+- `local-qwen3.8-27b` (262K): selector `[1m]`, target **217,000** (was 229,000
+  until vault-u3b.64; see "Provider input ceiling" below).
+- `local-qwen3.8-27b[500k]`: still 217,000 — a budget above the real window
+  cannot move the target past the provider's input ceiling (was 467,000).
+- `local-gemma4-31b` (48K): selector `[200k]`, target 3,000 (48K - 32K - 13K;
+  a 48K window only holds ~16K of prompt next to the CLI's 32K output request).
 
 The cache proxy strips the selector for every route before routing. So the
 gate still receives the literal ID, and the upstream request only gains the
@@ -152,7 +155,8 @@ bundled 2.1.59 CLI pointed at the real gate through a logging relay: argv model
 `local-qwen3.8-27b[1m]`, wire body model `local-qwen3.8-27b`, `anthropic-beta`
 including `context-1m-2025-08-07`, HTTP 200, reported `contextWindow` 1,000,000
 (evidence: obs-artifacts `…/ad961f738c-f2-direct-to-gate-boundary-and-gate-mirror/evidence/`).
-So direct sessions now get the window-derived `[1m]` plan (229,000 for 262K).
+So direct sessions now get the window-derived `[1m]` plan (217,000 for 262K
+since vault-u3b.64).
 Only a `[200k]` selector, which the CLI sends verbatim, is swapped for the bare
 ID on the direct path; the bare ID's CLI capacity is the same 200K, so the
 plan's percentage is unchanged.
@@ -163,6 +167,70 @@ lives in the cache proxy only; mirroring it in the host `gate.py` is tracked as
 port is ~90 lines like `ac20834`, and deploying it restarts `llm-gate`). A direct
 session can therefore still record ~4.8% of turns at 2x and compact early. All
 live local CLIs checked on 2026-09-25 route through the proxy.
+
+## Provider input ceiling (vault-u3b.64, 2026-09-26)
+
+The reference `T(C) = C - 33K` reserves only 20K for output, but Claude Code
+2.1.59 sends `max_tokens = 32,000` on every request unless
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` is set (bundled binary, function `Dg`: 32,000
+for every current Claude family and for every unknown model). A provider that
+enforces `input + max_tokens <= window` therefore accepts at most
+`window - 32,000` input tokens. vLLM (the local gate) enforces exactly that.
+With `T = 262,000 - 33,000 = 229,000` only ~1.1K was left, and the CLI checks
+its threshold against the *previous* turn, so one tool result overflowed:
+the nvidia 6h reassessment fork (session `4dd3e505`) died on 2026-09-26T03:51Z
+with `HTTP 500 … requested 32000 output tokens and your prompt contains at
+least 230145 input tokens`, no compaction and no handoff.
+
+The target is now
+
+```text
+provider = MODEL_CONTEXT_WINDOWS[model] or the default window (the real window,
+           independent of any [Nk] budget suffix)
+max_out  = CLAUDE_CODE_MAX_OUTPUT_TOKENS if set, else the CLI default 32,000
+target   = min(budget - 33K, provider - max_out - 13K)
+```
+
+The 13K compaction buffer is the room left for one turn's growth after the
+threshold check. A budget well below the provider window keeps the reference
+curve (Luna `[120k]` on a 900K model: 87,000). Numbers for the default 32K
+output: local 262K 229,000 -> 217,000; hosted 1M (Claude, 1M default window)
+967,000 -> 955,000; a 200K Claude model 167,000 -> 155,000; `gpt-5.6-sol[1m]`
+(900K real window) 967,000 -> 855,000. The percentage denominator is unchanged
+(capacity minus `min(max_out, 20K)`, as the CLI computes it).
+
+**Handoff wall (root cause B).** An explicit `DISABLE_AUTO_COMPACT=1` used to
+turn native compaction off completely. Level workers carry the vault context
+guard, but tiers and assessment forks launched with the same `launch-env` did
+not, so nothing stopped them before the provider's hard limit. When a session
+has both `DISABLE_AUTO_COMPACT` (or `DISABLE_COMPACT`) and
+`OBS_COMPACT_POLICY=handoff`, OBS now keeps native compaction armed at the end
+of the usable window and lets the PreCompact handoff intercept it, so there is
+still never a summary, but there is a handoff instead of an HTTP 500:
+
+```text
+wall target = min(budget, provider - max_out) - 13K, clamped to the CLI's
+              native point (capacity - min(max_out, 20K) - 13K)
+```
+
+OBS writes `DISABLE_AUTO_COMPACT=0` (and `DISABLE_COMPACT=0` if it was given)
+at both layers for such sessions; the log line shows `handoff_wall=True`.
+After the handoff fires the session is disabled as before (sticky per session
+ID). An explicit disable **without** the handoff policy is still honoured
+unchanged. Wall numbers: local 262K 217,000; Luna `[120k]` 107,000; hosted 1M
+955,000; a `[200k]` budget on a larger model 167,000 (CLI native cap).
+
+**Proxy translation (defence in depth).** The cache proxy rewrites the local
+gate's vLLM overflow error into Anthropic's 400 wording
+("input length and max_tokens exceed context limit: I + M > W", with
+max_tokens in backticks exactly as Anthropic sends it). The CLI already recovers from
+that shape: it retries with `max_tokens = max(3000, W - I - 1000)`
+(`tengu_max_tokens_context_overflow_adjustment`). So a local turn that still
+grows past the ceiling degrades to a shorter reply, and the next check
+compacts or hands off. Direct-to-gate sessions do not get this translation.
+
+Live since: merged to OBS main on 2026-09-26; takes effect on the next OBS
+restart (the proxy is a child of `telegram_main`).
 
 ## Explicit per-session values win (2026-09-25)
 

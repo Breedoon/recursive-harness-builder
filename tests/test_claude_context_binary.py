@@ -121,7 +121,9 @@ def binary_workspace(tmp_path, monkeypatch):
     ("gpt-5.6-sol", 100_000, 32_000, 67_000, False, False),
     ("gpt-5.6-sol", 200_000, 32_000, 167_000, False, False),
     ("gpt-5.6-sol", 400_000, 32_000, 367_000, False, False),
-    ("gpt-5.6-sol", 1_000_000, 32_000, 967_000, False, False),
+    # vault-u3b.64: gpt-5.6-sol's real window is 900K (MODEL_CONTEXT_WINDOWS),
+    # so a 1M budget is capped at 900K - 32K max_output - 13K buffer.
+    ("gpt-5.6-sol", 1_000_000, 32_000, 855_000, False, False),
     ("claude-opus-4-6", 100_000, 32_000, 67_000, False, False),
     ("claude-opus-4-6", 400_000, 32_000, 367_000, False, False),
     ("gpt-5.6-sol", 128_000, 32_000, 95_000, False, False),

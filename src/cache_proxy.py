@@ -122,6 +122,7 @@ stats = {
     "local_unconfigured": 0,
     "schemas_sanitized": 0,
     "local_usage_rewrites": 0,
+    "local_overflow_translations": 0,
 }
 
 
@@ -910,6 +911,41 @@ def parse_sse_usage(sse_chunks: list[bytes]) -> dict:
     return usage
 
 
+# vLLM rejects input + max_tokens > window with this text (the local gate wraps
+# it in an HTTP 500 internal_error). Claude Code only recovers from Anthropic's
+# wording ("input length and `max_tokens` exceed context limit: I + M > W"):
+# it retries the same request with max_tokens = max(3000, W - I - 1000). So a
+# local turn that grows past window - max_tokens degrades to a shorter reply
+# instead of killing the session (vault-u3b.64). Local route only.
+_VLLM_OVERFLOW_RE = re.compile(
+    r"maximum context length is (\d+) tokens\. However, you requested (\d+) "
+    r"output tokens and your prompt contains at least (\d+) input tokens"
+)
+
+
+def translate_local_overflow_error(status: int, body: bytes) -> bytes | None:
+    """Return an Anthropic-format 400 body for a vLLM max_tokens overflow, else None."""
+    if status < 400 or not body:
+        return None
+    try:
+        text = body.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    match = _VLLM_OVERFLOW_RE.search(text)
+    if not match:
+        return None
+    window, max_tokens, input_tokens = (int(g) for g in match.groups())
+    message = (
+        f"input length and `max_tokens` exceed context limit: "
+        f"{input_tokens} + {max_tokens} > {window}, decrease input length or "
+        f"`max_tokens` and try again"
+    )
+    return json.dumps(
+        {"type": "error", "error": {"type": "invalid_request_error", "message": message}},
+        separators=(",", ":"),
+    ).encode()
+
+
 class LocalUsageFixer:
     """Rewrite one local-route SSE usage shape so Claude Code sums it correctly.
 
@@ -1194,6 +1230,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                           model=log_model, route=route_label)
                 else:
                     resp = client.post(url, content=body, headers=headers)
+                    if route_label == "local" and self._send_translated_overflow(
+                        resp.status_code, resp.content
+                    ):
+                        return
                     self.send_response(resp.status_code)
                     for k, v in resp.headers.multi_items():
                         if k.lower() not in ("transfer-encoding", "connection",
@@ -1219,10 +1259,39 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _send_translated_overflow(self, status: int, error_body: bytes) -> bool:
+        translated = translate_local_overflow_error(status, error_body)
+        if translated is None:
+            return False
+        stats["local_overflow_translations"] += 1
+        log(f"LOCAL OVERFLOW: upstream {status} translated to 400 for CLI "
+            f"max_tokens retry: {translated.decode()}")
+        self.send_response(400)
+        self.send_header("content-type", "application/json")
+        self.send_header("Content-Length", str(len(translated)))
+        self.end_headers()
+        self.wfile.write(translated)
+        return True
+
     def _stream_upstream(self, client: httpx.Client, url: str,
                          body: bytes, headers: dict, norm_action: str,
                          model: str = "", route: str = ""):
         with client.stream("POST", url, content=body, headers=headers) as resp:
+            if route == "local" and resp.status_code >= 400:
+                error_body = resp.read()
+                if self._send_translated_overflow(resp.status_code, error_body):
+                    return
+                self.send_response(resp.status_code)
+                for k, v in resp.headers.multi_items():
+                    if k.lower() not in ("transfer-encoding", "connection",
+                                          "content-encoding", "content-length"):
+                        self.send_header(k, v)
+                self.send_header("Content-Length", str(len(error_body)))
+                self.end_headers()
+                self.wfile.write(error_body)
+                log(f"STREAM: local upstream error status={resp.status_code} "
+                    f"{error_body[:300].decode('utf-8', errors='replace')}")
+                return
             self.send_response(resp.status_code)
             for k, v in resp.headers.multi_items():
                 if k.lower() not in ("transfer-encoding", "connection",

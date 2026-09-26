@@ -320,9 +320,11 @@ class TestCreateOptions:
         assert "ANTHROPIC_API_KEY" not in options.env
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "48000"
         # 2.1.59 ignores the window variable; it carries the selector capacity
-        # and the percentage carries the 48K - 33K = 15K target.
+        # and the percentage carries the target: min(48K - 33K, 48K - 32K
+        # max_output - 13K) = 3K (vault-u3b.64: the CLI asks 32K output tokens
+        # per request, so a 48K window only fits ~16K of prompt).
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
-        assert int(180_000 * float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) / 100) == 15_000
+        assert int(180_000 * float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) / 100) == 3_000
         assert mgr.hook_state.effective_model == "local-gemma4-31b[48k]"
 
     def test_local_provider_falls_back_to_gate_when_proxy_unavailable(
@@ -834,8 +836,9 @@ class TestWindowDerivedCompactionAndEnvPrecedence:
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "262000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
-        # threshold = 262000 - 33000 = 229000 of the 980K effective 1M capacity
-        assert int(980_000 * pct / 100) == 229_000
+        # vault-u3b.64: threshold = min(262000 - 33000, 262000 - 32000 max_output
+        # - 13000 buffer) = 217000 of the 980K effective 1M capacity
+        assert int(980_000 * pct / 100) == 217_000
         assert self._settings_env(options)["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == options.env[
             "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
         ]
@@ -849,7 +852,9 @@ class TestWindowDerivedCompactionAndEnvPrecedence:
             options = mgr.create_options()
         assert options.model == "local-qwen3.8-27b[1m]"
         pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
-        assert int(980_000 * pct / 100) == 467_000
+        # A budget above the model's real window cannot move the target past
+        # the provider input ceiling (262000 - 32000 - 13000).
+        assert int(980_000 * pct / 100) == 217_000
 
     def test_local_direct_gate_uses_window_derived_1m_selector(self, config, monkeypatch):
         # Claude Code 2.1.59 strips a trailing [1m] before sending, so the gate
@@ -865,7 +870,7 @@ class TestWindowDerivedCompactionAndEnvPrecedence:
         assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "262000"
         assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
-        assert int(980_000 * pct / 100) == 229_000
+        assert int(980_000 * pct / 100) == 217_000
 
     def test_local_direct_gate_small_window_keeps_bare_model(self, config, monkeypatch):
         # [200k] is sent verbatim by the CLI, so the direct path uses the bare id;
@@ -915,6 +920,57 @@ class TestWindowDerivedCompactionAndEnvPrecedence:
         # The selector stays so the CLI's window/percentage display is right.
         assert options.model.endswith("]")
         assert "CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE" not in options.env
+
+    @pytest.mark.parametrize(
+        "model, capacity_effective, expected",
+        [
+            # local: capped by the provider input ceiling 262000 - 32000 - 13000
+            ("local-qwen3.8-27b", 980_000, 217_000),
+            # Luna[120k]: a budget far below the 900K provider window; the
+            # handoff backstop sits at the end of the budget (120000 - 13000)
+            ("gpt-6-luna[120k]", 180_000, 107_000),
+            # hosted 1M: min(1M, 1M - 32000) - 13000
+            ("claude-opus-4-6[1m]", 980_000, 955_000),
+        ],
+    )
+    def test_disable_with_handoff_policy_arms_native_compaction_at_the_wall(
+        self, config, model, capacity_effective, expected
+    ):
+        # vault-u3b.64 root cause B: disable + handoff must not leave a session
+        # without any stop before the provider's hard limit.
+        config.cache_proxy_enabled = True
+        mgr = SessionManager(config=config)
+        mgr.model_override = model
+        mgr.set_sdk_env_overrides(
+            {"DISABLE_AUTO_COMPACT": "1", "OBS_COMPACT_POLICY": "handoff"}
+        )
+        with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
+            options = mgr.create_options()
+        assert options.env["DISABLE_AUTO_COMPACT"] == "0"
+        assert self._settings_env(options)["DISABLE_AUTO_COMPACT"] == "0"
+        pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+        assert int(capacity_effective * pct / 100) == expected
+
+    def test_handoff_wall_is_disabled_after_the_handoff_fires(self, config):
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.8-27b"
+        mgr.set_sdk_env_overrides(
+            {"DISABLE_AUTO_COMPACT": "1", "OBS_COMPACT_POLICY": "handoff"}
+        )
+        mgr.set_session_id("sess-A")
+        mgr.activate_compaction_handoff()
+        options = mgr.create_options()
+        assert options.env["DISABLE_AUTO_COMPACT"] == "1"
+        assert self._settings_env(options)["DISABLE_AUTO_COMPACT"] == "1"
+
+    def test_explicit_max_output_moves_the_local_target(self, config):
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.8-27b"
+        mgr.set_sdk_env_overrides({"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000"})
+        options = mgr.create_options()
+        pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+        # 262000 - 64000 - 13000
+        assert int(980_000 * pct / 100) == 185_000
 
     def test_daemon_global_disable_without_explicit_choice_is_still_rejected(self, config, monkeypatch):
         from obs_agent.claude_context import ContextBudgetError

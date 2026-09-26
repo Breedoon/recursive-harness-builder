@@ -356,6 +356,7 @@ class SessionManager:
             validation_environment,
         )
         from obs_agent.config import is_claude_model, resolve_model_context
+        from obs_agent.hooks import COMPACT_POLICY_ENV, COMPACT_POLICY_HANDOFF
 
         resolved_model = resolve_model_context(self.effective_model)
         clean_model = resolved_model.model
@@ -406,17 +407,37 @@ class SessionManager:
                 elif local_api_key:
                     effective_env["ANTHROPIC_API_KEY"] = local_api_key
 
-        # One window-derived policy for every model, local included: threshold
-        # = window - 33K from the resolved window (suffix or MODEL_CONTEXT_WINDOWS),
-        # no per-model constants. See docs/context-compaction.md "Local models".
-        auto_compact_disabled = (
-            explicit_compaction_disabled(explicit_env) or self.compaction_handoff_active
+        # One window-derived policy for every model, local included (see
+        # docs/context-compaction.md "Local models" and "Provider input ceiling").
+        # target = min(budget - 33K, provider window - CLI max_output - 13K):
+        # the provider window comes from MODEL_CONTEXT_WINDOWS/default for the
+        # clean model, the budget from the suffix; no per-model constants.
+        #
+        # vault-u3b.64 root cause B: an explicit DISABLE_AUTO_COMPACT together
+        # with OBS_COMPACT_POLICY=handoff means "never summarize, hand off
+        # instead". Disabling native compaction outright left sessions without
+        # a context guard (tiers, assessment forks) running into the provider's
+        # hard limit. So in that combination OBS keeps native compaction armed
+        # at the end of the usable window ("wall") and lets the PreCompact
+        # handoff intercept it: still no summary, but a handoff instead of an
+        # HTTP 500. An explicit disable without the handoff policy is honoured.
+        handoff_policy = (
+            str(explicit_env.get(COMPACT_POLICY_ENV) or "").strip().lower()
+            == COMPACT_POLICY_HANDOFF
         )
+        explicit_disable = explicit_compaction_disabled(explicit_env)
+        wall = explicit_disable and handoff_policy and not self.compaction_handoff_active
+        auto_compact_disabled = (
+            (explicit_disable and not wall) or self.compaction_handoff_active
+        )
+        provider_window = resolve_model_context(clean_model).context_tokens
         context_plan = build_claude_context_plan(
             model=clean_model,
             context_tokens=context_tokens,
             auto_compact_window_tokens=self.config.auto_compact_window_tokens,
             environ=validation_environment(os.environ, effective_env, explicit_env),
+            provider_window_tokens=provider_window,
+            wall=wall,
         )
         context_env = dict(context_plan.environment)
         # OBS metadata always carries the real requested budget.
@@ -426,6 +447,12 @@ class SessionManager:
             explicit_env,
             auto_compact_disabled=auto_compact_disabled,
         )
+        if wall:
+            # Explicit env reaches the CLI through effective_env; neutralize the
+            # disable keys at both layers so native compaction stays armed.
+            for name in COMPACTION_DISABLE_KEYS:
+                if name in explicit_env:
+                    context_env[name] = "0"
         effective_env.update(context_env)
         cli_model = context_plan.cli_model
         if local_direct and not cli_model.lower().endswith("[1m]"):
@@ -433,7 +460,7 @@ class SessionManager:
         logger.info(
             "Claude context policy model=%s cli_model=%s context=%s "
             "compact_window=%s target=%s output_reserve=%s auto_compact_disabled=%s "
-            "explicit_keys=%s",
+            "explicit_keys=%s provider_window=%s max_output=%s handoff_wall=%s",
             requested_model,
             cli_model,
             context_tokens,
@@ -445,6 +472,9 @@ class SessionManager:
                 k for k in explicit_env
                 if k in CONTEXT_PLAN_ENV_KEYS or k in COMPACTION_DISABLE_KEYS
             ),
+            context_plan.provider_window_tokens,
+            context_plan.max_output_tokens,
+            wall,
         )
 
         from obs_agent.effort import build_effort_env

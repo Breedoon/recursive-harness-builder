@@ -18,12 +18,54 @@ STANDARD_CONTEXT_TOKENS = 200_000
 EXTENDED_CONTEXT_TOKENS = 1_000_000
 DEFAULT_OUTPUT_RESERVE_TOKENS = 20_000
 COMPACTION_BUFFER_TOKENS = 13_000
+# The CLI's per-request max_tokens when CLAUDE_CODE_MAX_OUTPUT_TOKENS is unset.
+# Claude Code 2.1.59 (function Dg in the bundled binary): 32,000 for every
+# current Claude family and for every unknown model (local, GPT, ...). A
+# provider that enforces input + max_tokens <= window (vLLM does) therefore
+# accepts at most window - 32,000 input tokens. The CLI only recovers from an
+# Anthropic-format overflow error; see docs/context-compaction.md.
+CLI_DEFAULT_MAX_OUTPUT_TOKENS = 32_000
 # A 35K budget leaves a 2K target: at least 1% of a 200K CLI window.
 MIN_OBS_CONTEXT_TOKENS = 35_000
 
 
 class ContextBudgetError(ValueError):
     """The requested budget cannot be represented safely by the CLI controls."""
+
+
+def input_ceiling_tokens(provider_window_tokens: int, max_output_tokens: int) -> int:
+    """Largest prompt a provider enforcing input + max_tokens <= window accepts."""
+    return max(0, provider_window_tokens - max_output_tokens)
+
+
+def safe_compaction_threshold(
+    context_tokens: int,
+    *,
+    provider_window_tokens: int | None = None,
+    max_output_tokens: int = CLI_DEFAULT_MAX_OUTPUT_TOKENS,
+    wall: bool = False,
+) -> int:
+    """Return the compaction/handoff target, never above the provider's input ceiling.
+
+    ``context_tokens`` is the OBS budget (after any operator cap).
+    ``provider_window_tokens`` is the model's real window (MODEL_CONTEXT_WINDOWS
+    or the default), which may exceed the budget; it defaults to the budget.
+    The target is the reference ``budget - 33K`` (or, with ``wall``, the budget
+    itself minus the 13K buffer: the handoff-policy backstop placed at the end of
+    the usable window), but never above
+    ``provider window - max_output - 13K buffer``: the CLI checks the threshold
+    against the previous turn, so one turn's growth must still fit under the
+    provider's input ceiling. vault-u3b.64: 262,000 - 33,000 = 229,000 left
+    ~1.1K below the local ceiling of 262,144 - 32,000 and a session died.
+    """
+    provider_window = provider_window_tokens or context_tokens
+    ceiling = input_ceiling_tokens(provider_window, max_output_tokens) - COMPACTION_BUFFER_TOKENS
+    if wall:
+        base = min(context_tokens, input_ceiling_tokens(provider_window, max_output_tokens))
+        base = max(0, base - COMPACTION_BUFFER_TOKENS)
+    else:
+        base = default_compaction_threshold(context_tokens)
+    return max(0, min(base, ceiling))
 
 
 def default_compaction_threshold(context_tokens: int) -> int:
@@ -132,19 +174,25 @@ def _validate_environment(environ: Mapping[str, str], cli_capacity_tokens: int) 
         )
 
 
+def cli_max_output_tokens(environ: Mapping[str, str]) -> int:
+    """The max_tokens the CLI sends per request: explicit value or the CLI default."""
+    value = (environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") or "").strip()
+    if not value:
+        return CLI_DEFAULT_MAX_OUTPUT_TOKENS
+    if not value.isascii() or not value.isdecimal() or int(value) <= 0:
+        raise ContextBudgetError("CLAUDE_CODE_MAX_OUTPUT_TOKENS must be a positive decimal integer")
+    return int(value)
+
+
 def _output_reserve(environ: Mapping[str, str]) -> int:
     """Account for an explicit smaller output cap without changing that cap.
 
-    The reference CLI reserves min(max_output_tokens, 20K). All of OBS's default
-    model families have at least a 20K output allowance. For unusual providers or
+    The reference CLI reserves min(max_output_tokens, 20K) in its percentage
+    denominator. This is the denominator only; the target itself reserves the
+    full max output (safe_compaction_threshold). For unusual providers or
     changed CLI versions, run the binary compatibility test before deployment.
     """
-    value = (environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") or "").strip()
-    if not value:
-        return DEFAULT_OUTPUT_RESERVE_TOKENS
-    if not value.isascii() or not value.isdecimal() or int(value) <= 0:
-        raise ContextBudgetError("CLAUDE_CODE_MAX_OUTPUT_TOKENS must be a positive decimal integer")
-    return min(int(value), DEFAULT_OUTPUT_RESERVE_TOKENS)
+    return min(cli_max_output_tokens(environ), DEFAULT_OUTPUT_RESERVE_TOKENS)
 
 
 @dataclass(frozen=True)
@@ -157,6 +205,9 @@ class ClaudeContextPlan:
     cli_compact_window_tokens: int
     threshold_tokens: int
     output_reserve_tokens: int
+    provider_window_tokens: int = 0
+    max_output_tokens: int = CLI_DEFAULT_MAX_OUTPUT_TOKENS
+    wall: bool = False
 
     @property
     def environment(self) -> dict[str, str]:
@@ -193,6 +244,8 @@ def build_claude_context_plan(
     context_tokens: int,
     auto_compact_window_tokens: int = 0,
     environ: Mapping[str, str] | None = None,
+    provider_window_tokens: int | None = None,
+    wall: bool = False,
 ) -> ClaudeContextPlan:
     """Build the CLI selector and controls without changing OBS model metadata.
 
@@ -234,12 +287,24 @@ def build_claude_context_plan(
         )
         compact_window = min(context_tokens, auto_compact_window_tokens)
 
+    max_output = cli_max_output_tokens(environment)
+    provider_window = provider_window_tokens or context_tokens
+    effective_capacity = cli_capacity - output_reserve
     # Keep the percentage in the documented 1..100 range even when an operator
     # asks for an unusually small cap on a session using the 1M selector.
-    threshold = default_compaction_threshold(compact_window)
-    effective_capacity = cli_capacity - output_reserve
+    threshold = safe_compaction_threshold(
+        compact_window,
+        provider_window_tokens=provider_window,
+        max_output_tokens=max_output,
+        wall=wall,
+    )
+    # The CLI never compacts later than its own native point; do not promise more.
+    threshold = min(threshold, effective_capacity - COMPACTION_BUFFER_TOKENS)
     if threshold * 100 < effective_capacity:
-        minimum_cap = 33_000 + (effective_capacity + 99) // 100
+        minimum_cap = (
+            DEFAULT_OUTPUT_RESERVE_TOKENS + COMPACTION_BUFFER_TOKENS
+            + (effective_capacity + 99) // 100
+        )
         raise ContextBudgetError(
             "auto-compact cap must retain at least a 1% CLI threshold; "
             f"use {minimum_cap:,} tokens or more for this capacity selector"
@@ -257,4 +322,7 @@ def build_claude_context_plan(
         cli_compact_window_tokens=cli_capacity,
         threshold_tokens=threshold,
         output_reserve_tokens=output_reserve,
+        provider_window_tokens=provider_window,
+        max_output_tokens=max_output,
+        wall=wall,
     )

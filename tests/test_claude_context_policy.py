@@ -7,6 +7,15 @@ import pytest
 
 from obs_agent.claude_context import ContextBudgetError, build_claude_context_plan
 
+# The reference-curve tests below plan an OBS *budget* on a provider whose real
+# window is 1M (hosted). Since vault-u3b.64 the target is also capped by that
+# provider window minus the CLI's max_output and the 13K buffer.
+HOSTED_WINDOW = 1_000_000
+
+
+def expected_target(budget: int, *, provider: int = HOSTED_WINDOW, max_output: int = 32_000) -> int:
+    return min(budget - 33_000, provider - max_output - 13_000)
+
 
 def reference_cli_threshold(model: str, environment: dict[str, str], output_cap=32_000, *, honors_window=True) -> int:
     """Independent transcription of the documented/observed reference contract.
@@ -31,15 +40,15 @@ def reference_cli_threshold(model: str, environment: dict[str, str], output_cap=
 @pytest.mark.parametrize("model", ["claude-opus-4-6", "gpt-5.6-sol", "gemini-2.5-pro"])
 @pytest.mark.parametrize("honors_window", [False, True])
 def test_policy_reaches_linear_target_in_reference_cli(model, window, honors_window):
-    plan = build_claude_context_plan(model=model, context_tokens=window)
+    plan = build_claude_context_plan(model=model, context_tokens=window, provider_window_tokens=HOSTED_WINDOW)
     selector = "[1m]" if window > 200_000 else "[200k]"
     assert plan.cli_model == model + selector
     assert plan.context_tokens == window
-    assert plan.threshold_tokens == window - 33_000
+    assert plan.threshold_tokens == expected_target(window)
     assert plan.environment["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == str(window)
     assert reference_cli_threshold(
         plan.cli_model, plan.environment, honors_window=honors_window
-    ) == window - 33_000
+    ) == expected_target(window)
     assert 1 <= float(plan.environment["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) <= 100
 
 
@@ -47,10 +56,10 @@ def test_policy_reaches_linear_target_in_reference_cli(model, window, honors_win
 def test_every_supported_k_suffix_has_exact_integer_target(honors_window):
     for thousands in range(35, 1001):
         window = thousands * 1000
-        plan = build_claude_context_plan(model="gpt-5.6-sol", context_tokens=window)
+        plan = build_claude_context_plan(model="gpt-5.6-sol", context_tokens=window, provider_window_tokens=HOSTED_WINDOW)
         assert reference_cli_threshold(
             plan.cli_model, plan.environment, honors_window=honors_window
-        ) == window - 33_000
+        ) == expected_target(window)
 
 
 @pytest.mark.parametrize("output_cap", [1, 8_000, 16_000, 19_999, 20_000, 32_000, 64_000, 128_000])
@@ -58,8 +67,11 @@ def test_every_supported_k_suffix_has_exact_integer_target(honors_window):
 @pytest.mark.parametrize("honors_window", [False, True])
 def test_smaller_explicit_output_allowance_does_not_move_target_later(output_cap, window, honors_window):
     original_env = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(output_cap)}
-    plan = build_claude_context_plan(model="gpt-5.6-sol", context_tokens=window, environ=original_env)
-    assert reference_cli_threshold(plan.cli_model, plan.environment, output_cap, honors_window=honors_window) == window - 33_000
+    plan = build_claude_context_plan(model="gpt-5.6-sol", context_tokens=window, environ=original_env,
+                                      provider_window_tokens=HOSTED_WINDOW)
+    assert reference_cli_threshold(plan.cli_model, plan.environment, output_cap, honors_window=honors_window) == expected_target(
+        window, max_output=output_cap)
+    assert expected_target(window, max_output=output_cap) <= window - 33_000
     assert original_env == {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(output_cap)}
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in plan.environment
 
@@ -69,6 +81,7 @@ def test_smaller_explicit_output_allowance_does_not_move_target_later(output_cap
 def test_operator_cap_can_only_advance_compaction(cap, expected):
     plan = build_claude_context_plan(
         model="gpt-5.6-sol", context_tokens=400_000, auto_compact_window_tokens=cap,
+        provider_window_tokens=HOSTED_WINDOW,
     )
     assert plan.context_tokens == 400_000
     assert plan.cli_model == "gpt-5.6-sol[1m]"
@@ -132,7 +145,8 @@ def test_raw_stale_controls_are_replaced_without_mutating_the_caller():
         "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "10",
         "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200000",
     }
-    plan = build_claude_context_plan(model="gpt", context_tokens=400_000, environ=inherited)
+    plan = build_claude_context_plan(model="gpt", context_tokens=400_000, environ=inherited,
+                                      provider_window_tokens=HOSTED_WINDOW)
     assert reference_cli_threshold(plan.cli_model, {**inherited, **plan.environment}) == 367_000
     assert inherited["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "10"
 
@@ -153,7 +167,8 @@ def test_matching_requested_max_context_still_conflicts_with_native_selector():
 
 def test_native_capacity_override_does_not_change_the_denominator():
     plan = build_claude_context_plan(model="gpt", context_tokens=400_000,
-                                    environ={"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000"})
+                                    environ={"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000"},
+                                    provider_window_tokens=HOSTED_WINDOW)
     assert reference_cli_threshold(plan.cli_model, plan.environment, honors_window=False) == 367_000
 
 
@@ -196,3 +211,49 @@ def test_explicit_compaction_disabled_accepts_both_switches():
     assert explicit_compaction_disabled({"DISABLE_AUTO_COMPACT": "1"})
     assert not explicit_compaction_disabled({"DISABLE_AUTO_COMPACT": "0"})
     assert not explicit_compaction_disabled({})
+
+
+# --- provider input ceiling (vault-u3b.64) ---
+
+
+@pytest.mark.parametrize("budget, provider, max_output, wall, expected", [
+    # live defect: 262K local, CLI max_tokens 32K -> ceiling 230,000 (262,000-32,000)
+    (262_000, 262_000, 32_000, False, 217_000),
+    (262_000, 262_000, 32_000, True, 217_000),
+    # a budget above the real window cannot move the target past the ceiling
+    (500_000, 262_000, 32_000, False, 217_000),
+    # a budget far below the provider window keeps the reference curve
+    (120_000, 900_000, 32_000, False, 87_000),
+    # ...and the handoff wall sits at the end of that budget
+    (120_000, 900_000, 32_000, True, 107_000),
+    (1_000_000, 1_000_000, 32_000, False, 955_000),
+    (1_000_000, 1_000_000, 32_000, True, 955_000),
+    # a smaller explicit max output never moves the target later than reference
+    (262_000, 262_000, 8_000, False, 229_000),
+])
+def test_target_never_exceeds_provider_window_minus_max_output(budget, provider, max_output, wall, expected):
+    from obs_agent.claude_context import COMPACTION_BUFFER_TOKENS, safe_compaction_threshold
+
+    target = safe_compaction_threshold(
+        budget, provider_window_tokens=provider, max_output_tokens=max_output, wall=wall,
+    )
+    assert target == expected
+    assert target + max_output + COMPACTION_BUFFER_TOKENS <= provider
+
+
+def test_plan_without_provider_window_treats_budget_as_the_real_window():
+    plan = build_claude_context_plan(model="local-qwen3.8-27b", context_tokens=262_000)
+    assert plan.threshold_tokens == 217_000
+    assert plan.provider_window_tokens == 262_000
+    assert plan.max_output_tokens == 32_000
+    assert reference_cli_threshold(plan.cli_model, plan.environment) == 217_000
+
+
+def test_wall_plan_is_clamped_to_the_cli_native_point():
+    # 200K budget on a 900K provider: wall = 187K, but the CLI never compacts
+    # past its own native 167K on the 200K selector.
+    plan = build_claude_context_plan(
+        model="gpt-6-luna", context_tokens=200_000, provider_window_tokens=900_000, wall=True,
+    )
+    assert plan.threshold_tokens == 167_000
+    assert reference_cli_threshold(plan.cli_model, plan.environment) == 167_000
