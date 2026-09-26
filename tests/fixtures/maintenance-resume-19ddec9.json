@@ -1,0 +1,39 @@
+{
+  "requested_at": 1790000000.0,
+  "source": "signal:SIGUSR1",
+  "entries": [
+    {
+      "chat_id": -1003780712622,
+      "thread_id": 341621,
+      "session_id": "11111111-2222-3333-4444-555555555555",
+      "task_id": "task-fork-1",
+      "team_name": "team-x",
+      "agent_name": "agent-fork",
+      "is_local": false,
+      "model": "claude-opus-5-5[1m]",
+      "jsonl_head_uuid": "uuid-head",
+      "topic_title": "Fork worker",
+      "queued": [
+        {
+          "text": "queued before restart",
+          "telegram_message_id": 77,
+          "reply_to_message_id": null
+        }
+      ]
+    },
+    {
+      "chat_id": -1003780712622,
+      "thread_id": 341700,
+      "session_id": "66666666-7777-8888-9999-000000000000",
+      "task_id": null,
+      "team_name": null,
+      "agent_name": null,
+      "is_local": true,
+      "model": "local-qwen3.8-27b[1m]",
+      "jsonl_head_uuid": null,
+      "topic_title": "Local trunk",
+      "queued": []
+    }
+  ],
+  "version": 1
+}

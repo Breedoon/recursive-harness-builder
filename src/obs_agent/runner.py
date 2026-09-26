@@ -415,6 +415,12 @@ class ConversationRunner:
                 # session with auto-compaction disabled (_run_compaction_handoff).
                 logger.warning("Stream ended after compaction interception: %s", exc)
                 return
+            if self._hook_state.stop_requested_at is not None:
+                # The user/parent stopped this turn and the CLI then exited
+                # (possibly killed by the stop escalation). Do not reconnect
+                # and "resume the interrupted response" (vault-u3b.65).
+                logger.warning("Stream ended after a stop request; not reconnecting: %s", exc)
+                return
             if not _is_recoverable(exc):
                 raise
             logger.warning("Stream error, attempting reconnect: %s", exc)
@@ -511,6 +517,9 @@ class ConversationRunner:
                 async for event in self._run_compaction_handoff():
                     yield event
                 return
+
+            if self._hook_state.stop_requested_at is not None:
+                return  # stopped turn: no silent-response recovery either
 
             silent_completion = self._last_result_message is not None or not saw_status_event
             if saw_visible_text or not silent_completion:

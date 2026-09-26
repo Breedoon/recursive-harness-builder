@@ -321,6 +321,9 @@ class HookState:
     status_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     interrupt_flag: bool = False
     interrupt_requested: bool = False
+    # Wall time of a /stop, /stop_* or AgentTaskStop for the running turn. While
+    # set, a CLI exit ends the turn instead of reconnecting (vault-u3b.65).
+    stop_requested_at: float | None = None
     interrupt_notice_pending: bool = False
     pause_queue_delivery: bool = False
     session_id: str | None = None
@@ -379,6 +382,7 @@ class HookState:
         self.background_tasks.clear()
         self.interrupt_flag = False
         self.interrupt_requested = False
+        self.stop_requested_at = None
         self.interrupt_notice_pending = False
         self.pause_queue_delivery = False
         self.session_id = None

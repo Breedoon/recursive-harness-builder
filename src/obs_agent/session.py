@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
@@ -69,6 +69,33 @@ def _on_cli_stderr(line: str) -> None:
     visible in structured logs and prevents terminal noise.
     """
     logger.warning("CLI stderr: %s", line.rstrip())
+
+
+def _raise_cli_oom_score(client: Any) -> None:
+    """Make a Claude CLI child the kernel's preferred OOM victim (best effort).
+
+    On 2026-09-24/25 three container OOMs each killed the cache proxy (the
+    largest process), which restarted the whole daemon (vault-u3b.73). Raising
+    the CLIs' ``oom_score_adj`` (allowed without privileges) makes the kernel
+    kill one CLI instead; its turn then reconnects and resumes on its own.
+    ``OBS_CLI_OOM_SCORE_ADJ=0`` turns this off.
+    """
+    raw = (os.environ.get("OBS_CLI_OOM_SCORE_ADJ") or "").strip()
+    try:
+        value = int(raw) if raw else 300
+    except ValueError:
+        value = 300
+    if value <= 0:
+        return
+    process = getattr(getattr(client, "_transport", None), "_process", None)
+    pid = getattr(process, "pid", None)
+    if not pid:
+        return
+    try:
+        with open(f"/proc/{int(pid)}/oom_score_adj", "w", encoding="ascii") as handle:
+            handle.write(str(min(value, 1000)))
+    except OSError:
+        logger.debug("Could not raise oom_score_adj for Claude CLI pid=%s", pid, exc_info=True)
 
 
 @contextmanager
@@ -594,6 +621,7 @@ class SessionManager:
                 continue
             self._client = client
             self._connected = True
+            _raise_cli_oom_score(client)
             # The PreCompact handoff policy (hooks._make_pre_compact_callback)
             # interrupts the CLI process that is about to compact.
             self.hook_state.client_interrupter = client.interrupt

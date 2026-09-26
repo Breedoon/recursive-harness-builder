@@ -134,7 +134,8 @@ _TELEGRAM_HELP_TEXT = """Usage:
 /stop — interrupt this topic; /stop all interrupts every topic in the chat
 /stop_branch — interrupt this agent and all recursive descendants
 /stop_tree — interrupt the entire agent tree, including its trunk
-/maintenance_restart — restart OBS and auto-resume agents that were mid-turn (opt-in; a plain restart resumes nothing)
+/restart — restart OBS and auto-resume agents that were mid-turn (alias /maintenance_restart)
+/restart plain — kill-switch restart: nothing is resumed
 /fork [name] — create a new topic from this head or a replied message
 /new [name] — reset this topic into a new trunk agent
 /clear — clear this topic but keep its agent identity
@@ -696,6 +697,13 @@ class TelegramBot:
         # Injectable for tests; default terminates the process group so
         # supervisord autorestarts OBS exactly like a plain restart.
         self._maintenance_exit_fn: Any = None
+        # Crash resume: periodic snapshot of mid-turn routes (crash-resume.json).
+        self._crash_snapshot_task: asyncio.Task | None = None
+        self._crash_snapshot_disabled = False
+        # Consecutive crash resumes per route; guards against crash loops.
+        self._crash_resume_counts: dict[TelegramRoute, int] = {}
+        # /stop escalation (vault-u3b.65): kill a CLI that ignores the interrupt.
+        self._stop_escalation_tasks: set[asyncio.Task] = set()
         self._background_delivery_tasks: dict[TelegramRoute, asyncio.Task] = {}
         self._inbox_wake_poll_task: asyncio.Task | None = None
         self._team_worker_records: dict[tuple[str, str], str] = {}
@@ -703,6 +711,10 @@ class TelegramBot:
         self._route_inbox_target_keys_by_route: dict[TelegramRoute, tuple[str, str]] = {}
         self._chat_titles: dict[int, str] = {}
         self._daemon_started_at = time.time()
+        # Previous daemon's last-alive time (minus slack) when a fresh
+        # maintenance marker or crash snapshot shows the restart was not a kill
+        # switch; see _inbox_wake_floor (vault-u3b.35).
+        self._outage_inbox_floor: float | None = None
         # Dedup set for inbox wake polling — prevents re-triggering the same
         # unread message every poll cycle within this daemon process. Pre-start
         # inbox messages are ignored after daemon restart.
@@ -1876,6 +1888,7 @@ class TelegramBot:
             )
             restored_inbox_keys.add(key)
 
+        self._outage_inbox_floor = self._compute_outage_inbox_floor()
         self._mark_restored_team_inboxes_read(restored_inbox_keys)
 
     # ------------------------------------------------------------------
@@ -1889,8 +1902,13 @@ class TelegramBot:
     def _state_model_name(self, state: TelegramSessionState) -> str:
         return str(state.session_manager.model_override or self._config.model or "")
 
-    def _collect_maintenance_entries(self) -> list[_maint.ResumeEntry]:
-        """Snapshot every route that is mid-turn right now."""
+    def _collect_maintenance_entries(self, *, allow_jsonl_lookup: bool = True) -> list[_maint.ResumeEntry]:
+        """Snapshot every route that is mid-turn right now.
+
+        The periodic crash snapshot passes ``allow_jsonl_lookup=False`` so it
+        never scans session JSONLs on the event loop; team/agent names in the
+        entry are informational only.
+        """
         entries: list[_maint.ResumeEntry] = []
         for route, state in list(self._states_by_route.items()):
             if not (state.busy or state.hook_state.execution_active):
@@ -1900,9 +1918,12 @@ class TelegramBot:
             if record is not None and record.terminal_request:
                 # /stop, /stop_branch or /stop_tree before the restart wins.
                 continue
+            if state.hook_state.stop_requested_at is not None:
+                # A stop was requested for this turn (also plain trunk /stop).
+                continue
             session_id = state.session_id
             model = self._state_model_name(state)
-            projection = self._state_inbox_projection(state)
+            projection = self._state_inbox_projection(state, allow_jsonl_lookup=allow_jsonl_lookup)
             queued = [
                 _maint.QueuedEntry(
                     text=item.text,
@@ -1927,6 +1948,7 @@ class TelegramBot:
                     jsonl_head_uuid=self._session_heads.get(session_id or ""),
                     topic_title=state.topic_title,
                     queued=queued,
+                    crash_resume_count=self._crash_resume_counts.get(route, 0),
                 )
             )
         return entries
@@ -1967,27 +1989,138 @@ class TelegramBot:
         self._maintenance_terminate()
         return len(entries)
 
-    def start_maintenance_resume(self) -> asyncio.Task | None:
-        """Consume a fresh marker (rename first) and resume recorded routes."""
+    def _state_dir(self) -> Path:
+        return Path(self._config.telegram_state_db_path).parent
+
+    def _crash_snapshot_path(self) -> Path:
+        return _maint.crash_snapshot_path(self._state_dir())
+
+    @property
+    def _inbox_wake_floor(self) -> float:
+        """Unread inbox messages at or after this time wake their agent.
+
+        Normally the daemon start (pre-start messages are stale). After a
+        maintenance restart or crash it is the previous daemon's last-alive time,
+        so messages sent during the outage are not lost (vault-u3b.35).
+        """
+        if self._outage_inbox_floor is None:
+            return self._daemon_started_at
+        return min(self._daemon_started_at, self._outage_inbox_floor)
+
+    def _compute_outage_inbox_floor(self) -> float | None:
+        """Last-alive time of the previous daemon when its restart was not a kill switch."""
+        max_age = _maint.max_age_from_env()
+        candidates = [
+            _maint.peek_requested_at(self._maintenance_marker_path(), max_age_seconds=max_age)
+        ]
+        sentinel = os.environ.get(_maint.KILLSWITCH_SENTINEL_ENV)
+        if not (sentinel and Path(sentinel).exists()):
+            candidates.append(
+                _maint.peek_requested_at(self._crash_snapshot_path(), max_age_seconds=max_age)
+            )
+        fresh = [value for value in candidates if value is not None]
+        if not fresh:
+            return None
+        # Slack covers messages the old poller had not reached before it died.
+        return max(fresh) - 60.0
+
+    def write_crash_snapshot(self) -> Path | None:
+        """Refresh crash-resume.json with every mid-turn route (atomic replace)."""
+        if self._crash_snapshot_disabled:
+            return None
+        marker = _maint.ResumeMarker(
+            requested_at=time.time(),
+            source="periodic",
+            entries=self._collect_maintenance_entries(allow_jsonl_lookup=False),
+        )
+        return _maint.write_marker(self._crash_snapshot_path(), marker)
+
+    def discard_crash_snapshot_for_kill_switch(self) -> bool:
+        """Kill switch: nothing from the crash snapshot may resume. Signal-safe."""
+        self._crash_snapshot_disabled = True
+        return _maint.discard_crash_snapshot(self._state_dir())
+
+    def start_crash_snapshot_writer(self) -> asyncio.Task | None:
+        interval = _maint.crash_snapshot_interval_from_env()
+        if interval <= 0:
+            logger.warning("[crash_resume] disabled (OBS_CRASH_RESUME_SNAPSHOT_SECONDS=0)")
+            return None
+        if self._crash_snapshot_task is None or self._crash_snapshot_task.done():
+            self._crash_snapshot_task = asyncio.create_task(self._crash_snapshot_loop(interval))
+        return self._crash_snapshot_task
+
+    async def _crash_snapshot_loop(self, interval: float) -> None:
+        while True:
+            try:
+                self.write_crash_snapshot()
+            except Exception:
+                logger.warning("[crash_resume] snapshot write failed", exc_info=True)
+            await asyncio.sleep(interval)
+
+    def start_maintenance_resume(self, *, include_crash: bool = True) -> asyncio.Task | None:
+        """Consume a fresh maintenance marker or crash snapshot and resume its routes.
+
+        Both files are renamed before anything acts on them (consume-before-act).
+        A maintenance marker wins over a crash snapshot. A kill-switch stop
+        recorded by the supervisord wrapper discards the crash snapshot first.
+        """
+        max_age = _maint.max_age_from_env()
+        killswitch = _maint.consume_killswitch_sentinel(
+            os.environ.get(_maint.KILLSWITCH_SENTINEL_ENV)
+        )
         marker, reason = _maint.consume_marker(
             self._maintenance_marker_path(),
-            max_age_seconds=_maint.max_age_from_env(),
+            max_age_seconds=max_age,
         )
-        if marker is None:
-            if reason != "no_marker":
-                logger.warning("[maintenance_restart] marker ignored reason=%s", reason)
+        if marker is None and reason != "no_marker":
+            logger.warning("[maintenance_restart] marker ignored reason=%s", reason)
+        crash: _maint.ResumeMarker | None = None
+        if include_crash:
+            if killswitch and _maint.discard_crash_snapshot(self._state_dir()):
+                logger.warning("[crash_resume] kill-switch stop recorded; crash snapshot discarded")
+            crash, crash_reason = _maint.consume_marker(self._crash_snapshot_path(), max_age_seconds=max_age)
+            if crash is None and crash_reason != "no_marker":
+                logger.warning("[crash_resume] snapshot ignored reason=%s", crash_reason)
+        if marker is not None:
+            if crash is not None:
+                logger.warning(
+                    "[crash_resume] maintenance marker present; crash snapshot not used routes=%d",
+                    len(crash.entries),
+                )
+            kind = "maintenance"
+        elif crash is not None:
+            limit = _maint.crash_max_consecutive_from_env()
+            kept: list[_maint.ResumeEntry] = []
+            for entry in crash.entries:
+                if entry.crash_resume_count >= limit:
+                    logger.warning(
+                        "[crash_resume] not resuming route chat=%s thread=%s session=%s: "
+                        "crash-resumed %d times in a row (limit %d)",
+                        entry.chat_id,
+                        entry.thread_id,
+                        entry.session_id,
+                        entry.crash_resume_count,
+                        limit,
+                    )
+                    continue
+                kept.append(entry)
+            crash.entries = kept
+            marker = crash
+            kind = "crash"
+        else:
             return None
         logger.warning(
-            "[maintenance_restart] resuming routes=%d source=%s requested_at=%.0f",
+            "[%s] resuming routes=%d source=%s requested_at=%.0f",
+            "maintenance_restart" if kind == "maintenance" else "crash_resume",
             len(marker.entries),
             marker.source,
             marker.requested_at,
         )
-        task = asyncio.create_task(self._run_maintenance_resume(marker))
+        task = asyncio.create_task(self._run_maintenance_resume(marker, kind=kind))
         self._maintenance_resume_task = task
         return task
 
-    async def _run_maintenance_resume(self, marker: _maint.ResumeMarker) -> None:
+    async def _run_maintenance_resume(self, marker: _maint.ResumeMarker, *, kind: str = "maintenance") -> None:
         hosted, local = _maint.split_resume_order(marker.entries)
         stagger = _maint.hosted_stagger_from_env()
 
@@ -2001,7 +2134,7 @@ class TelegramBot:
             # the turn itself is shielded and keeps running past the wait.
             for entry in local:
                 try:
-                    run = await self._resume_maintenance_entry(entry, requested_at=marker.requested_at)
+                    run = await self._resume_maintenance_entry(entry, requested_at=marker.requested_at, kind=kind)
                     if run is None:
                         continue
                     if local_wait > 0:
@@ -2024,7 +2157,7 @@ class TelegramBot:
             if index and stagger:
                 await asyncio.sleep(stagger)
             try:
-                await self._resume_maintenance_entry(entry, requested_at=marker.requested_at)
+                await self._resume_maintenance_entry(entry, requested_at=marker.requested_at, kind=kind)
             except Exception:
                 logger.warning("[maintenance_restart] hosted resume failed entry=%s", entry, exc_info=True)
         if local_task is not None:
@@ -2035,6 +2168,7 @@ class TelegramBot:
         entry: _maint.ResumeEntry,
         *,
         requested_at: float,
+        kind: str = "maintenance",
     ) -> asyncio.Task | None:
         """Start one resumed turn; returns the task driving it (or None)."""
         route = TelegramRoute(chat_id=entry.chat_id, thread_id=entry.thread_id)
@@ -2057,7 +2191,7 @@ class TelegramBot:
             )
             for item in entry.queued
         ]
-        prompt = _maint.build_resume_prompt(requested_at=requested_at, queued_count=len(queued))
+        prompt = _maint.build_resume_prompt(requested_at=requested_at, queued_count=len(queued), kind=kind)
         record = self._fork_tasks_by_id.get(entry.task_id or "") if entry.task_id else None
         lock = self._get_route_lock(route)
         async with lock:
@@ -2069,7 +2203,11 @@ class TelegramBot:
             marker_messages = await self._send_system_html_message(
                 route=route,
                 bot=bot,
-                html_text="maintenance restart: resuming the turn that was cut off",
+                html_text=(
+                    "crash recovery: OBS restarted unexpectedly; resuming the turn that was cut off"
+                    if kind == "crash"
+                    else "maintenance restart: resuming the turn that was cut off"
+                ),
                 disable_notification=True,
                 underline=False,
             )
@@ -2107,7 +2245,9 @@ class TelegramBot:
                 parent_state=state,
                 wake_reserved=True,
             )
-            return self._fork_task_tasks.get(record.task_id)
+            run = self._fork_task_tasks.get(record.task_id)
+            self._track_crash_resume(route, entry, kind=kind, run=run)
+            return run
 
         async def _runner() -> None:
             try:
@@ -2124,7 +2264,28 @@ class TelegramBot:
         task = asyncio.create_task(_runner())
         self._detached_wake_tasks.add(task)
         task.add_done_callback(self._on_detached_wake_done)
+        self._track_crash_resume(route, entry, kind=kind, run=task)
         return task
+
+    def _track_crash_resume(
+        self,
+        route: TelegramRoute,
+        entry: _maint.ResumeEntry,
+        *,
+        kind: str,
+        run: asyncio.Task | None,
+    ) -> None:
+        """Count consecutive crash resumes of this turn until it ends."""
+        if kind != "crash":
+            return
+        self._crash_resume_counts[route] = entry.crash_resume_count + 1
+        if run is None:
+            return
+
+        def _clear(_task: asyncio.Task) -> None:
+            self._crash_resume_counts.pop(route, None)
+
+        run.add_done_callback(_clear)
 
     async def handle_maintenance_restart(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -2142,11 +2303,56 @@ class TelegramBot:
             bot=context.bot,
             text=(
                 f"maintenance restart: {len(entries)} running agent(s) will resume after restart "
-                f"({local_count} local, one at a time). Plain restart/stop remains the no-resume kill switch."
+                f"({local_count} local, one at a time). Kill switch instead: /restart plain or /stop_tree."
             ),
             disable_notification=True,
         )
         await self.request_maintenance_restart(source=f"telegram:/maintenance_restart user={update.effective_user.id}")
+
+    async def handle_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /restart [plain] - maintenance restart by default; ``plain`` resumes nothing."""
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        args = [str(arg).strip().lower() for arg in (context.args or [])]
+        if not args:
+            await self.handle_maintenance_restart(update, context)
+            return
+        if args != ["plain"]:
+            route = self._route_for_message(update.effective_message)
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text="usage: /restart (resume mid-turn agents) or /restart plain (kill switch: resume nothing)",
+                disable_notification=True,
+            )
+            return
+        await self.request_plain_restart(
+            route=self._route_for_message(update.effective_message),
+            bot=context.bot,
+            source=f"telegram:/restart plain user={update.effective_user.id}",
+        )
+
+    async def request_plain_restart(self, *, route: TelegramRoute, bot: Any, source: str, delay_seconds: float = 1.0) -> None:
+        """Kill-switch restart from inside the daemon: discard every resume file, then exit."""
+        if self._maintenance_restart_requested:
+            return
+        self._maintenance_restart_requested = True
+        self.discard_crash_snapshot_for_kill_switch()
+        logger.warning("[plain_restart] requested source=%s; nothing will be resumed", source)
+        try:
+            await self._send_system_message(
+                route=route,
+                bot=bot,
+                text="plain restart: OBS restarts and nothing is resumed (kill switch).",
+                disable_notification=True,
+            )
+        except Exception:
+            logger.debug("plain restart notice failed", exc_info=True)
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+        self._maintenance_terminate()
 
     def _mark_restored_team_inboxes_read(self, inbox_keys: set[tuple[str, str]]) -> None:
         for team_name, agent_name in sorted(inbox_keys):
@@ -2163,6 +2369,11 @@ class TelegramBot:
             changed = False
             for item in entries:
                 if isinstance(item, dict) and not bool(item.get("read", False)):
+                    message_ts = self._try_parse_rfc3339_timestamp(item.get("timestamp"))
+                    if message_ts is not None and message_ts >= self._inbox_wake_floor:
+                        # Sent during the outage of a non-kill-switch restart:
+                        # leave unread so the inbox poller wakes the agent.
+                        continue
                     item["read"] = True
                     changed = True
             if not changed:
@@ -4674,6 +4885,49 @@ class TelegramBot:
                 logger.debug("Scoped route interrupt failed route=%s", state.route, exc_info=True)
         return counts
 
+    def _mark_stop_requested(self, state: TelegramSessionState) -> None:
+        """Record a stop for the running turn and arm the kill escalation (vault-u3b.65).
+
+        While set, a CLI exit ends the turn instead of reconnecting with
+        "Resume the interrupted response", and the route is left out of crash and
+        maintenance snapshots.
+        """
+        if not (state.busy or state.hook_state.execution_active):
+            return
+        stamp = time.time()
+        state.hook_state.stop_requested_at = stamp
+        grace = _stop_kill_grace_seconds()
+        if grace <= 0:
+            return
+        task = asyncio.create_task(self._escalate_stop(state, stamp=stamp, grace=grace))
+        self._stop_escalation_tasks.add(task)
+        task.add_done_callback(self._stop_escalation_tasks.discard)
+
+    async def _escalate_stop(self, state: TelegramSessionState, *, stamp: float, grace: float) -> None:
+        await asyncio.sleep(grace)
+        if state.hook_state.stop_requested_at != stamp:
+            return  # the stopped turn ended and a new one started
+        if not (state.busy or state.hook_state.execution_active):
+            return
+        session_mgr = state.session_manager
+        client = session_mgr._client
+        process = getattr(getattr(client, "_transport", None), "_process", None)
+        pid = getattr(process, "pid", None)
+        logger.warning(
+            "[stop_escalation] turn still running %.0fs after stop; killing Claude CLI pid=%s route=%s",
+            grace,
+            pid,
+            state.route,
+        )
+        try:
+            await asyncio.wait_for(session_mgr.disconnect_idle_client(direct_kill=True), timeout=10.0)
+        except Exception:
+            logger.warning("[stop_escalation] locked kill failed; killing without the session lock", exc_info=True)
+            try:
+                await session_mgr._direct_kill_client_process_unlocked()
+            except Exception:
+                logger.warning("[stop_escalation] direct kill failed route=%s", state.route, exc_info=True)
+
     async def _request_route_interrupt(self, state: TelegramSessionState) -> bool:
         """Set interrupt intent and attempt SDK interrupt for one route."""
         state.hook_state.interrupt_flag = True
@@ -4681,6 +4935,7 @@ class TelegramBot:
             state.busy or state.hook_state.execution_active
         )
         state.hook_state.interrupt_notice_pending = True
+        self._mark_stop_requested(state)
         session_mgr = state.session_manager
         if session_mgr._client is None or not session_mgr._connected:
             return False
@@ -4711,6 +4966,7 @@ class TelegramBot:
             child_state = self._get_state(record.child_route, create=False)
             if child_state is not None:
                 child_state.hook_state.interrupt_flag = True
+                self._mark_stop_requested(child_state)
                 try:
                     client = await child_state.session_manager.get_client()
                     await client.interrupt()
@@ -5108,6 +5364,13 @@ class TelegramBot:
 
     async def shutdown(self) -> None:
         """Stop background tasks owned by this adapter."""
+        for task in [self._crash_snapshot_task, *self._stop_escalation_tasks]:
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
         if self._background_task is not None and not self._background_task.done():
             self._background_task.cancel()
             try:
@@ -7583,6 +7846,7 @@ class TelegramBot:
         state.last_bot = bot
         state.hook_state.interrupt_flag = False
         state.hook_state.interrupt_requested = False
+        state.hook_state.stop_requested_at = None
         state.hook_state.pause_queue_delivery = False
         run_user_text = user_text
         if state.hook_state.interrupt_notice_pending:
@@ -9408,7 +9672,7 @@ class TelegramBot:
             if bool(item.get("read", False)):
                 continue
             message_ts = self._try_parse_rfc3339_timestamp(item.get("timestamp"))
-            if message_ts is None or message_ts < self._daemon_started_at:
+            if message_ts is None or message_ts < self._inbox_wake_floor:
                 continue
             # Skip must_reply messages that have already been replied to —
             # otherwise the poller keeps nagging for them indefinitely.
@@ -10853,6 +11117,7 @@ class TelegramBot:
         child_state = self._get_state(record.child_route, create=False)
         if child_state is not None:
             child_state.hook_state.interrupt_flag = True
+            self._mark_stop_requested(child_state)
             try:
                 client = await child_state.session_manager.get_client()
                 await client.interrupt()
@@ -11067,6 +11332,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("stop_branch", bot.handle_stop_branch))
     app.add_handler(CommandHandler("stop_tree", bot.handle_stop_tree))
     app.add_handler(CommandHandler("maintenance_restart", bot.handle_maintenance_restart))
+    app.add_handler(CommandHandler("restart", bot.handle_restart))
     app.add_handler(CommandHandler("model", bot.handle_model))
     app.add_handler(CommandHandler("effort", bot.handle_effort))
     app.add_handler(CommandHandler("session", bot.handle_session))
@@ -11124,7 +11390,8 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
         BotCommand("stop_branch", "Interrupt this agent and all recursive descendants"),
         BotCommand("stop_tree", "Interrupt the complete root team tree"),
-        BotCommand("maintenance_restart", "Restart OBS and auto-resume agents that are mid-turn (opt-in)"),
+        BotCommand("restart", "Restart OBS, auto-resuming mid-turn agents; '/restart plain' resumes nothing"),
+        BotCommand("maintenance_restart", "Same as /restart: restart and auto-resume mid-turn agents"),
         BotCommand("model", "Select model before the first message of a new or cleared session"),
         BotCommand("effort", "Show or set effort: low, medium, high, xhigh, max, auto"),
         BotCommand("session", "Show agent, model, files, runtime and hooks"),
@@ -11178,7 +11445,7 @@ async def _shutdown_telegram_runtime(*, app: Application, tg_bot: TelegramBot) -
         logger.warning("Telegram application shutdown failed", exc_info=True)
 
 
-async def _run_telegram_bot_once(config: OBSConfig) -> None:
+async def _run_telegram_bot_once(config: OBSConfig, *, first_start: bool = True) -> None:
     """Run one Telegram runtime instance until cancellation or runtime failure."""
     app = create_telegram_app(config)
     tg_bot: TelegramBot = app.bot_data["obs_telegram_bot"]
@@ -11206,7 +11473,12 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
             error_callback=_record_polling_error,
         )
         _install_maintenance_signal_handler(tg_bot)
-        tg_bot.start_maintenance_resume()
+        # Crash snapshot and orphan reaping belong to process start only; an
+        # in-process runtime restart must not replay this process's own snapshot.
+        tg_bot.start_maintenance_resume(include_crash=first_start)
+        tg_bot.start_crash_snapshot_writer()
+        if first_start:
+            _start_orphan_cli_reaper()
 
         while True:
             await asyncio.sleep(_TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS)
@@ -11224,8 +11496,67 @@ async def _run_telegram_bot_once(config: OBSConfig) -> None:
         await _shutdown_telegram_runtime(app=app, tg_bot=tg_bot)
 
 
+def _stop_kill_grace_seconds() -> float:
+    """Seconds a stopped turn may keep running before its CLI is killed (0 = never)."""
+    raw = (os.environ.get("OBS_STOP_KILL_GRACE_SECONDS") or "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else 30.0
+    except ValueError:
+        return 30.0
+
+
+_orphan_reaper_tasks: set[asyncio.Task] = set()
+
+
+def _start_orphan_cli_reaper() -> None:
+    """Kill Claude CLIs orphaned by a previous daemon (vault-u3b.66), off the event loop."""
+    if (os.environ.get("OBS_ORPHAN_CLI_REAP") or "").strip().lower() in {"0", "false", "no", "off"}:
+        return
+
+    async def _reap() -> None:
+        try:
+            pids = await asyncio.to_thread(_maint.reap_orphaned_agent_clis, own_pgid=os.getpgrp())
+        except Exception:
+            logger.warning("[orphan_reaper] failed", exc_info=True)
+            return
+        if pids:
+            logger.warning("[orphan_reaper] terminated orphaned Claude CLIs pids=%s", pids)
+        else:
+            logger.info("[orphan_reaper] no orphaned Claude CLIs")
+
+    task = asyncio.create_task(_reap())
+    _orphan_reaper_tasks.add(task)
+    task.add_done_callback(_orphan_reaper_tasks.discard)
+
+
+def _install_kill_switch_sigterm_handler(tg_bot: "TelegramBot") -> None:
+    """SIGTERM = kill switch: discard the crash snapshot, then die as before (143).
+
+    ``supervisorctl stop|restart``, a plain restart and the group SIGTERM of a
+    maintenance restart all arrive here, so none of them resumes the crash
+    snapshot. A Python-level handler (not loop.add_signal_handler) runs at the
+    next bytecode boundary even when the event loop is saturated. Crashes (OOM
+    SIGKILL, watchdog SIGKILL fallback, unhandled exit) never run it.
+    """
+
+    def _handler(signum, frame):  # noqa: ARG001
+        try:
+            discarded = tg_bot.discard_crash_snapshot_for_kill_switch()
+            os.write(2, f"[crash_resume] SIGTERM: kill switch, crash snapshot discarded={discarded}\n".encode())
+        except Exception:
+            pass
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, OSError):
+        logger.warning("Kill-switch SIGTERM handler unavailable", exc_info=True)
+
+
 def _install_maintenance_signal_handler(tg_bot: "TelegramBot") -> None:
-    """SIGUSR1 = opt-in maintenance restart (``python -m obs_agent.maintenance_restart``)."""
+    """SIGUSR1 = maintenance restart (``python -m obs_agent.maintenance_restart``); SIGTERM = kill switch."""
+    _install_kill_switch_sigterm_handler(tg_bot)
     try:
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(
@@ -11248,7 +11579,7 @@ async def run_telegram_bot(config: OBSConfig) -> None:
     restart_count = 0
     while True:
         try:
-            await _run_telegram_bot_once(config)
+            await _run_telegram_bot_once(config, first_start=restart_count == 0)
             logger.warning("Telegram runtime exited unexpectedly; scheduling restart")
         except KeyboardInterrupt:
             logger.info("Telegram runtime interrupted; exiting")

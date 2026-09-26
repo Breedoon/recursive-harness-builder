@@ -241,7 +241,7 @@ async def test_local_routes_resume_strictly_one_at_a_time(config):
     order: list[str] = []
     gates = {"a": asyncio.Event(), "b": asyncio.Event()}
 
-    async def fake_resume(entry, *, requested_at):
+    async def fake_resume(entry, *, requested_at, **_kwargs):
         order.append(f"start:{entry.session_id}")
 
         async def turn():
@@ -279,7 +279,7 @@ async def test_local_watchdog_moves_on_without_cancelling_slow_turn(config, monk
     gates = {"a": asyncio.Event(), "b": asyncio.Event()}
     turns: dict[str, asyncio.Task] = {}
 
-    async def fake_resume(entry, *, requested_at):
+    async def fake_resume(entry, *, requested_at, **_kwargs):
         order.append(f"start:{entry.session_id}")
 
         async def turn():

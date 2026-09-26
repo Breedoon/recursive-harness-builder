@@ -1,13 +1,23 @@
-"""Opt-in maintenance restart: snapshot running agents, restart, resume them.
+"""Maintenance restart and crash resume: snapshot running agents, resume them.
 
-A plain restart (``supervisorctl restart obs-telegram-prod``) or ``/stop`` is
-the kill switch and is unchanged. When no marker file exists at startup,
-nothing is resumed.
+Three ways OBS can go down, and what comes back:
 
-A *maintenance* restart is requested explicitly, either with the Telegram
-``/maintenance_restart`` command or with SIGUSR1 to the ``telegram_main``
-process. Running ``python -m obs_agent.maintenance_restart`` sends that signal.
-The running daemon then:
+* **Maintenance restart (the default for planned restarts).** Telegram
+  ``/restart`` (alias ``/maintenance_restart``), SIGUSR1 to ``telegram_main``,
+  or ``python -m obs_agent.maintenance_restart``. Mid-turn agents resume.
+* **Plain restart (the kill switch).** ``supervisorctl restart|stop
+  obs-telegram-prod``, Telegram ``/restart plain`` or ``python -m
+  obs_agent.maintenance_restart --plain``. Nothing resumes. ``/stop``,
+  ``/stop_branch`` and ``/stop_tree`` also still resume nothing: stopped
+  routes are left out of every snapshot.
+* **Crash** (OOM kill, cache-proxy watchdog, unhandled exit). The daemon keeps
+  a periodic snapshot of mid-turn routes (``crash-resume.json``); on the next
+  start the routes in it resume with a "restarted unexpectedly" note. A
+  SIGTERM (supervisord stop, plain restart) discards that snapshot first, and
+  the supervisord wrapper leaves a kill-switch sentinel as a second guard, so
+  the kill switch never resumes anything.
+
+For a maintenance restart the running daemon:
 
 1. writes ``maintenance-resume.json`` next to the Telegram state DB. The file
    lists every route that is mid-turn (``busy`` / ``execution_active``), with
@@ -40,7 +50,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 MARKER_FILENAME = "maintenance-resume.json"
+CRASH_SNAPSHOT_FILENAME = "crash-resume.json"
 CONSUMED_SUFFIX = ".consumed"
+KILLSWITCH_SUFFIX = ".killswitch"
+KILLSWITCH_SENTINEL_ENV = "OBS_KILLSWITCH_SENTINEL"
+DEFAULT_CRASH_SNAPSHOT_SECONDS = 15.0
+DEFAULT_CRASH_MAX_CONSECUTIVE = 2
+DEFAULT_ORPHAN_REAP_GRACE_SECONDS = 5.0
+AGENT_CLI_MARKER = "claude_agent_sdk/_bundled/claude"
 MARKER_VERSION = 1
 DEFAULT_MAX_AGE_SECONDS = 15 * 60
 DEFAULT_HOSTED_STAGGER_SECONDS = 3.0
@@ -69,6 +86,8 @@ class ResumeEntry:
     jsonl_head_uuid: str | None = None
     topic_title: str | None = None
     queued: list[QueuedEntry] = field(default_factory=list)
+    # How many crash resumes in a row this turn has had (crash-loop guard).
+    crash_resume_count: int = 0
 
 
 @dataclass
@@ -81,6 +100,69 @@ class ResumeMarker:
 
 def marker_path(state_dir: Path) -> Path:
     return Path(state_dir) / MARKER_FILENAME
+
+
+def crash_snapshot_path(state_dir: Path) -> Path:
+    return Path(state_dir) / CRASH_SNAPSHOT_FILENAME
+
+
+def discard_crash_snapshot(state_dir: Path) -> bool:
+    """Kill switch: move the crash snapshot aside so the next start resumes nothing.
+
+    Kept as ``crash-resume.json.killswitch`` for diagnosis. Returns True when a
+    snapshot existed. Must be cheap and synchronous: it runs from the SIGTERM
+    handler.
+    """
+    path = crash_snapshot_path(state_dir)
+    try:
+        os.replace(path, path.with_name(path.name + KILLSWITCH_SUFFIX))
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        try:
+            path.unlink()
+            return True
+        except OSError:
+            return False
+
+
+def consume_killswitch_sentinel(sentinel: str | os.PathLike[str] | None) -> bool:
+    """True when the supervisord wrapper recorded a kill-switch stop; removes it.
+
+    The wrapper touches the sentinel from its TERM trap (``supervisorctl
+    stop/restart``, container stop, and the group SIGTERM of a maintenance or
+    plain restart). A crash never runs that trap.
+    """
+    if not sentinel:
+        return False
+    path = Path(sentinel)
+    if not path.exists():
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return True
+
+
+def peek_requested_at(path: Path, *, now: float | None = None, max_age_seconds: float) -> float | None:
+    """Read a marker's ``requested_at`` without consuming it (None if absent/stale)."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(raw, dict) or int(raw.get("version", 0) or 0) != MARKER_VERSION:
+        return None
+    try:
+        requested_at = float(raw.get("requested_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    current = time.time() if now is None else now
+    age = current - requested_at
+    if age < 0 or age > max_age_seconds:
+        return None
+    return requested_at
 
 
 def is_local_model(model: str | None) -> bool:
@@ -120,6 +202,7 @@ def _entry_from_dict(raw: dict) -> ResumeEntry:
         jsonl_head_uuid=raw.get("jsonl_head_uuid"),
         topic_title=raw.get("topic_title"),
         queued=queued,
+        crash_resume_count=int(raw.get("crash_resume_count") or 0),
     )
 
 
@@ -176,16 +259,28 @@ def split_resume_order(entries: list[ResumeEntry]) -> tuple[list[ResumeEntry], l
     return hosted, local
 
 
-def build_resume_prompt(*, requested_at: float, queued_count: int = 0) -> str:
+def build_resume_prompt(*, requested_at: float, queued_count: int = 0, kind: str = "maintenance") -> str:
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(requested_at))
-    lines = [
-        f"(System: OBS was restarted for maintenance at {stamp} while your turn was in progress; "
-        "the turn was cut off mid-way.)",
+    if kind == "crash":
+        lines = [
+            f"(System: OBS restarted unexpectedly (a crash, e.g. out of memory) shortly after "
+            f"{stamp}. Your turn was most likely still in progress and was cut off mid-way.)",
+        ]
+    else:
+        lines = [
+            f"(System: OBS was restarted for maintenance at {stamp} while your turn was in progress; "
+            "the turn was cut off mid-way.)",
+        ]
+    lines += [
         "A tool call that was in flight may or may not have taken effect. Check its result or "
         "side effect (file contents, git log, bead state, sent messages) before repeating it; do "
         "not blindly redo non-idempotent actions.",
         "Continue your task from where you left off.",
     ]
+    if kind == "crash":
+        lines.append(
+            "If your turn had in fact already finished, reply with a one-line status and stop."
+        )
     if queued_count:
         lines.append(
             f"{queued_count} message(s) that were queued for you before the restart are attached "
@@ -210,6 +305,24 @@ def hosted_stagger_from_env() -> float:
         return DEFAULT_HOSTED_STAGGER_SECONDS
 
 
+def crash_snapshot_interval_from_env() -> float:
+    """Seconds between crash-resume snapshots; ``0`` disables crash resume."""
+    raw = (os.environ.get("OBS_CRASH_RESUME_SNAPSHOT_SECONDS") or "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else DEFAULT_CRASH_SNAPSHOT_SECONDS
+    except ValueError:
+        return DEFAULT_CRASH_SNAPSHOT_SECONDS
+
+
+def crash_max_consecutive_from_env() -> int:
+    """A turn crash-resumed this many times in a row is not resumed again."""
+    raw = (os.environ.get("OBS_CRASH_RESUME_MAX_CONSECUTIVE") or "").strip()
+    try:
+        return max(1, int(raw)) if raw else DEFAULT_CRASH_MAX_CONSECUTIVE
+    except ValueError:
+        return DEFAULT_CRASH_MAX_CONSECUTIVE
+
+
 def local_resume_wait_from_env(default: float) -> float:
     """Seconds the serial local resume waits on one route before moving on.
 
@@ -222,6 +335,89 @@ def local_resume_wait_from_env(default: float) -> float:
         return float(raw) if raw else float(default)
     except ValueError:
         return float(default)
+
+
+# --- orphaned agent CLIs (vault-u3b.66) -----------------------------------
+
+
+def _proc_stat_fields(pid: int, proc_root: Path) -> tuple[int, int] | None:
+    """Return ``(ppid, pgid)`` from ``/proc/<pid>/stat`` (comm may contain spaces)."""
+    try:
+        raw = (proc_root / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    try:
+        rest = raw[raw.rindex(")") + 2 :].split()
+        return int(rest[1]), int(rest[2])
+    except (ValueError, IndexError):
+        return None
+
+
+def find_orphaned_agent_clis(*, own_pgid: int, proc_root: Path = Path("/proc")) -> list[int]:
+    """Claude CLIs left behind by a previous daemon.
+
+    A process qualifies only when all hold: its argv[0] is the Agent SDK's
+    bundled ``claude`` binary; it was reparented to PID 1 (its daemon is gone);
+    it is not in this daemon's process group; and its process-group leader no
+    longer exists (the old supervisord wrapper exited). Live CLIs of any other
+    running OBS instance keep a live parent and group leader, so they never
+    match.
+    """
+    found: list[int] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        argv = _proc_argv(pid, proc_root)
+        if not argv or AGENT_CLI_MARKER not in argv[0]:
+            continue
+        fields = _proc_stat_fields(pid, proc_root)
+        if fields is None:
+            continue
+        ppid, pgid = fields
+        if ppid != 1 or pgid == own_pgid or pgid == pid:
+            continue
+        if (proc_root / str(pgid)).exists():
+            continue
+        found.append(pid)
+    return sorted(found)
+
+
+def reap_orphaned_agent_clis(
+    *,
+    own_pgid: int,
+    grace_seconds: float = DEFAULT_ORPHAN_REAP_GRACE_SECONDS,
+    proc_root: Path = Path("/proc"),
+    kill=os.kill,
+    sleep=time.sleep,
+) -> list[int]:
+    """SIGTERM then, after ``grace_seconds``, SIGKILL every orphaned agent CLI.
+
+    SIGKILL matters: the orphans seen on 2026-09-25/26 were spinning at 100 %
+    CPU and never processed stdin EOF (vault-u3b.66, .76). Returns the PIDs
+    that were signalled.
+    """
+    pids = find_orphaned_agent_clis(own_pgid=own_pgid, proc_root=proc_root)
+    for pid in pids:
+        try:
+            kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    if not pids:
+        return []
+    sleep(grace_seconds)
+    survivors = set(find_orphaned_agent_clis(own_pgid=own_pgid, proc_root=proc_root))
+    for pid in pids:
+        if pid in survivors:
+            try:
+                kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    return pids
 
 
 # --- operator CLI ---------------------------------------------------------
@@ -288,32 +484,67 @@ def find_daemon_pids(
     return matches
 
 
+def plain_restart(*, popen=subprocess.Popen) -> int:
+    """Kill-switch restart: ``supervisorctl restart obs-telegram-prod``, resuming nothing.
+
+    Started in its own session so the supervisorctl client survives when
+    supervisord stops the process group it was launched from (an agent's shell
+    is inside that group); otherwise the stop half could run without the
+    start half. The daemon's SIGTERM handler and the wrapper's kill-switch
+    sentinel make sure no crash snapshot is resumed.
+    """
+    popen(
+        ["supervisorctl", "restart", DAEMON_SUPERVISOR_PROCESS],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    print(f"started `supervisorctl restart {DAEMON_SUPERVISOR_PROCESS}` (plain restart: nothing resumes)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m obs_agent.maintenance_restart",
         description=(
-            "Request an OBS maintenance restart: agents that are mid-turn are snapshotted and "
-            "resumed automatically after the restart. A plain `supervisorctl restart "
-            "obs-telegram-prod` stays the kill switch (nothing is resumed)."
+            "Restart OBS. Default: maintenance restart - agents that are mid-turn are "
+            "snapshotted and resumed automatically after the restart. --plain: the kill "
+            "switch, same as `supervisorctl restart obs-telegram-prod` - nothing is resumed."
         ),
     )
     parser.add_argument("--pid", type=int, help="telegram_main PID (default: auto-detect)")
     parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="plain kill-switch restart: resume nothing (runs supervisorctl restart obs-telegram-prod)",
+    )
+    parser.add_argument(
         "--status",
         metavar="STATE_DIR",
-        help="print the pending or last consumed marker in STATE_DIR and exit",
+        help="print the pending or last consumed maintenance marker and crash snapshot in STATE_DIR and exit",
     )
     args = parser.parse_args(argv)
 
     if args.status:
-        base = marker_path(Path(args.status))
-        for candidate in (base, base.with_name(base.name + CONSUMED_SUFFIX)):
-            if candidate.exists():
-                print(f"{candidate}:")
-                print(candidate.read_text(encoding="utf-8"))
-                return 0
-        print(f"no marker in {args.status}")
-        return 1
+        found = False
+        for base in (marker_path(Path(args.status)), crash_snapshot_path(Path(args.status))):
+            for candidate in (
+                base,
+                base.with_name(base.name + CONSUMED_SUFFIX),
+                base.with_name(base.name + KILLSWITCH_SUFFIX),
+            ):
+                if candidate.exists():
+                    found = True
+                    print(f"{candidate}:")
+                    print(candidate.read_text(encoding="utf-8"))
+        if not found:
+            print(f"no marker in {args.status}")
+            return 1
+        return 0
+
+    if args.plain:
+        return plain_restart()
 
     pids = [args.pid] if args.pid else find_daemon_pids()
     if len(pids) != 1:
