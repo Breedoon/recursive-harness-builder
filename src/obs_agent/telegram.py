@@ -2124,31 +2124,27 @@ class TelegramBot:
         hosted, local = _maint.split_resume_order(marker.entries)
         stagger = _maint.hosted_stagger_from_env()
 
-        local_wait = _maint.local_resume_wait_from_env(
-            float(getattr(self._config, "bg_fork_timeout", 0.0) or 0.0)
-        )
+        local_wait = _maint.local_resume_wait_from_env()
 
         async def _local_chain() -> None:
-            # One local route at a time behind the single inference server.
-            # A watchdog bounds how long one resumed turn can hold the chain;
-            # the turn itself is shielded and keeps running past the wait.
+            # Strictly one local route at a time behind the single inference
+            # server (vault-u3b.86): the next route starts only after the
+            # previous resumed turn ends, errors or is stopped. asyncio.wait
+            # never raises for the inner task (incl. cancellation) and never
+            # cancels it; the timeout is a logged last resort only.
             for entry in local:
                 try:
                     run = await self._resume_maintenance_entry(entry, requested_at=marker.requested_at, kind=kind)
                     if run is None:
                         continue
-                    if local_wait > 0:
-                        try:
-                            await asyncio.wait_for(asyncio.shield(run), timeout=local_wait)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "[maintenance_restart] local resume still running after %.0fs; "
-                                "starting next local route (turn not cancelled) entry=%s",
-                                local_wait,
-                                entry,
-                            )
-                    else:
-                        await asyncio.shield(run)
+                    done, _pending = await asyncio.wait({run}, timeout=local_wait if local_wait > 0 else None)
+                    if not done:
+                        logger.error(
+                            "[maintenance_restart] local resume exceeded the %.0fs safety timeout; "
+                            "starting next local route (turn not cancelled) entry=%s",
+                            local_wait,
+                            entry,
+                        )
                 except Exception:
                     logger.warning("[maintenance_restart] local resume failed entry=%s", entry, exc_info=True)
 

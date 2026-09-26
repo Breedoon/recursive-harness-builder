@@ -91,10 +91,13 @@ this version (vault-u3b.70).
    waiting parent is notified when the resumed child finishes. (Unit-tested;
    not yet observed live — in the first live run the resumed children were
    stopped by `/stop_tree` before finishing; bead vault-u3b.71.)
-7. **Local-model routes** (`local-*`) resume strictly one at a time. After
-   `OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS` (default `OBS_BG_FORK_TIMEOUT`,
-   600 s) the chain logs and starts the next local route without cancelling the
-   slow one; `0` waits without limit. **Hosted routes** start
+7. **Local-model routes** (`local-*`) resume strictly one at a time: the next
+   local route starts only after the previous resumed turn ends, errors or is
+   stopped (vault-u3b.86; before 2026-09-26 a 600 s fallback let three local
+   turns run concurrently). `OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS`
+   (default 21600 s = 6 h) is only a last-resort safety timeout: when it
+   expires the chain logs an error and starts the next route without
+   cancelling the wedged one; `0` waits without limit. **Hosted routes** start
    `OBS_MAINTENANCE_RESUME_STAGGER_SECONDS` apart (default 3 s).
 8. **Crash-loop guard:** a turn already crash-resumed
    `OBS_CRASH_RESUME_MAX_CONSECUTIVE` times in a row (default 2) is not resumed

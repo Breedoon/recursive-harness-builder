@@ -343,12 +343,18 @@ def crash_max_consecutive_from_env() -> int:
         return DEFAULT_CRASH_MAX_CONSECUTIVE
 
 
-def local_resume_wait_from_env(default: float) -> float:
-    """Seconds the serial local resume waits on one route before moving on.
+# Local resumes are strictly serial (vault-u3b.86): the next local route starts
+# only after the previous resumed turn ends (or errors / is stopped). This
+# safety timeout is a logged last resort for a wedged turn, not a pacing knob.
+DEFAULT_LOCAL_RESUME_SAFETY_SECONDS = 6 * 3600.0
 
-    The resumed turn is never cancelled: after this wait the chain logs and
-    starts the next local route while the slow one keeps running. ``0`` or a
-    negative value means wait without limit (the pre-watchdog behaviour).
+
+def local_resume_wait_from_env(default: float = DEFAULT_LOCAL_RESUME_SAFETY_SECONDS) -> float:
+    """Safety timeout for one serial local resume before the chain moves on.
+
+    The resumed turn is never cancelled: if this last-resort timeout expires
+    the chain logs an error and starts the next local route while the wedged
+    one keeps running. ``0`` or a negative value means wait without limit.
     """
     raw = (os.environ.get("OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS") or "").strip()
     try:

@@ -310,8 +310,50 @@ async def test_local_watchdog_moves_on_without_cancelling_slow_turn(config, monk
     assert not turns["a"].cancelled()
 
 
+@pytest.mark.asyncio
+async def test_local_chain_waits_past_old_600s_default_and_survives_stopped_turn(config, monkeypatch):
+    # vault-u3b.86: with no env the next local route must not start while the
+    # previous turn runs; a cancelled (stopped) turn must not break the chain.
+    monkeypatch.delenv("OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS", raising=False)
+    config.bg_fork_timeout = 0.05  # the old fallback source must no longer matter
+    bot = _bot(config)
+    order: list[str] = []
+    gate = asyncio.Event()
+    turns: dict[str, asyncio.Task] = {}
+
+    async def fake_resume(entry, *, requested_at, **_kwargs):
+        order.append(f"start:{entry.session_id}")
+
+        async def turn():
+            await gate.wait()
+            order.append(f"end:{entry.session_id}")
+
+        turns[entry.session_id] = asyncio.create_task(turn())
+        return turns[entry.session_id]
+
+    marker = _marker(
+        [
+            maint.ResumeEntry(chat_id=1, thread_id=1, session_id="a", is_local=True),
+            maint.ResumeEntry(chat_id=1, thread_id=2, session_id="b", is_local=True),
+            maint.ResumeEntry(chat_id=1, thread_id=3, session_id="c", is_local=True),
+        ]
+    )
+    with patch.object(bot, "_resume_maintenance_entry", side_effect=fake_resume):
+        runner = asyncio.create_task(bot._run_maintenance_resume(marker))
+        await asyncio.sleep(0.2)
+        assert order == ["start:a"]
+        turns["a"].cancel()  # /stop on the first resumed turn
+        await asyncio.sleep(0.05)
+        assert order == ["start:a", "start:b"]
+        gate.set()
+        await runner
+    assert order == ["start:a", "start:b", "end:b", "start:c", "end:c"]
+
+
 def test_local_wait_default_and_unlimited(monkeypatch):
     monkeypatch.delenv("OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS", raising=False)
+    assert maint.local_resume_wait_from_env() == maint.DEFAULT_LOCAL_RESUME_SAFETY_SECONDS
+    assert maint.DEFAULT_LOCAL_RESUME_SAFETY_SECONDS >= 3600
     assert maint.local_resume_wait_from_env(600.0) == 600.0
     monkeypatch.setenv("OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS", "0")
     assert maint.local_resume_wait_from_env(600.0) == 0.0
