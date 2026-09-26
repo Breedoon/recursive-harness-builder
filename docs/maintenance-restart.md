@@ -88,7 +88,9 @@ this version (vault-u3b.70).
    - Queued messages are replayed after the note.
    - The normal JSONL health recovery repairs poisoned tails from the kill.
 6. Fork and AgentTask children get `emit_parent_callback` re-armed, so the
-   waiting parent is notified when the resumed child finishes.
+   waiting parent is notified when the resumed child finishes. (Unit-tested;
+   not yet observed live — in the first live run the resumed children were
+   stopped by `/stop_tree` before finishing; bead vault-u3b.71.)
 7. **Local-model routes** (`local-*`) resume strictly one at a time. After
    `OBS_MAINTENANCE_RESUME_LOCAL_WAIT_SECONDS` (default `OBS_BG_FORK_TIMEOUT`,
    600 s) the chain logs and starts the next local route without cancelling the
