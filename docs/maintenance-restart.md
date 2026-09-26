@@ -109,7 +109,9 @@ this version (vault-u3b.70).
   2026-09-26.
 - The route is left out of maintenance and crash snapshots.
 - If the turn is still running `OBS_STOP_KILL_GRACE_SECONDS` after the stop
-  (default 30 s; `0` disables), OBS kills that agent's CLI process. This covers
+  (default 30 s; `0` disables), OBS SIGKILLs that agent's CLI process and
+  every tool subprocess it started (not the process group, which is shared
+  with the daemon). This covers
   CLIs stuck at 100 % CPU that ignore the interrupt (vault-u3b.76).
 
 The mark is cleared when the route's next turn starts.

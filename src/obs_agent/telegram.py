@@ -4919,6 +4919,14 @@ class TelegramBot:
             pid,
             state.route,
         )
+        if pid:
+            # Kill the CLI's tool subprocesses too; they would otherwise be
+            # reparented to PID 1 and keep running after the stop.
+            try:
+                killed = await asyncio.to_thread(_maint.kill_process_tree, int(pid))
+                logger.warning("[stop_escalation] killed pids=%s route=%s", killed, state.route)
+            except Exception:
+                logger.warning("[stop_escalation] process-tree kill failed pid=%s", pid, exc_info=True)
         try:
             await asyncio.wait_for(session_mgr.disconnect_idle_client(direct_kill=True), timeout=10.0)
         except Exception:

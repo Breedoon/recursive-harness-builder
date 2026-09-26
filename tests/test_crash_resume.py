@@ -491,6 +491,35 @@ def test_orphan_finder_matches_only_dead_group_sdk_clis(tmp_path: Path):
     assert maint.find_orphaned_agent_clis(own_pgid=500, proc_root=tmp_path) == [501]
 
 
+def test_kill_process_tree_kills_cli_and_its_tool_children(tmp_path: Path):
+    _proc(tmp_path, 600, ["python"], ppid=1, pgid=500)  # daemon
+    _proc(tmp_path, 601, [CLI], ppid=600, pgid=500)  # stuck CLI
+    _proc(tmp_path, 602, ["/bin/bash", "-c", "sleep 999"], ppid=601, pgid=500)  # its tool shell
+    _proc(tmp_path, 603, ["sleep", "999"], ppid=602, pgid=500)
+    _proc(tmp_path, 604, [CLI], ppid=600, pgid=500)  # another agent's CLI
+    sent: list[tuple[int, int]] = []
+    killed = maint.kill_process_tree(601, proc_root=tmp_path, kill=lambda pid, sig: sent.append((pid, sig)))
+    assert sorted(killed) == [601, 602, 603]
+    assert all(sig == signal.SIGKILL for _, sig in sent)
+    assert 600 not in killed and 604 not in killed
+
+
+@pytest.mark.asyncio
+async def test_stop_escalation_kills_process_tree_when_pid_known(config, monkeypatch):
+    monkeypatch.setenv("OBS_STOP_KILL_GRACE_SECONDS", "0.05")
+    bot = _bot(config)
+    state = _busy(bot, TelegramRoute(chat_id=67890, thread_id=54), sid="sid-54")
+    client = MagicMock()
+    client._transport._process.pid = 424242
+    state.session_manager._client = client
+    monkeypatch.setattr(state.session_manager, "disconnect_idle_client", AsyncMock(return_value=True))
+    trees: list[int] = []
+    monkeypatch.setattr(maint, "kill_process_tree", lambda pid: trees.append(pid) or [pid])
+    bot._mark_stop_requested(state)
+    await asyncio.sleep(0.15)
+    assert trees == [424242]
+
+
 def test_orphan_reaper_terms_then_kills_survivors(tmp_path: Path):
     _proc(tmp_path, 501, [CLI], ppid=1, pgid=400)
     _proc(tmp_path, 502, [CLI], ppid=1, pgid=400)

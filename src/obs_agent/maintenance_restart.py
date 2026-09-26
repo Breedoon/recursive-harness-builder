@@ -353,6 +353,45 @@ def _proc_stat_fields(pid: int, proc_root: Path) -> tuple[int, int] | None:
         return None
 
 
+def descendant_pids(root_pid: int, *, proc_root: Path = Path("/proc")) -> list[int]:
+    """All live descendants of ``root_pid`` (children first-found order)."""
+    children: dict[int, list[int]] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        fields = _proc_stat_fields(int(entry.name), proc_root)
+        if fields is not None:
+            children.setdefault(fields[0], []).append(int(entry.name))
+    found: list[int] = []
+    stack = [root_pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in found:
+                found.append(child)
+                stack.append(child)
+    return found
+
+
+def kill_process_tree(root_pid: int, *, proc_root: Path = Path("/proc"), kill=os.kill) -> list[int]:
+    """SIGKILL a Claude CLI and every process it started (tool shells etc.).
+
+    The CLI shares the daemon's process group, so a group kill is not an
+    option; the tree is walked through ``/proc`` instead. Descendants are
+    collected before the root dies so they cannot escape by reparenting.
+    """
+    tree = [root_pid, *descendant_pids(root_pid, proc_root=proc_root)]
+    for pid in tree:
+        try:
+            kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return tree
+
+
 def find_orphaned_agent_clis(*, own_pgid: int, proc_root: Path = Path("/proc")) -> list[int]:
     """Claude CLIs left behind by a previous daemon.
 
