@@ -303,8 +303,32 @@ Evidence:
   `handback.md`, and context that grew past the native threshold without
   compaction (`/workspace/runtime/tmp/compaction-harness/e5-smoke/`).
 
-Live verification inside the daemon, after restart, is E6 of the enforcement
-mission.
+## Live results after the 2026-09-25T23:59:01Z restart (vault-u3b.37)
+
+Prod restarted at 2026-09-25T23:59:01Z on main `19ddec9`. Checked live on
+2026-09-26 (obs-artifacts `Drafts/Artifacts/2026-09-25-09-50-local-fleet/`,
+steps E1-E7 and the strict verifier `174c81acad-v-strict-post-restart`):
+
+- Luna[120k] with `DISABLE_AUTO_COMPACT=1`: accepted at launch, runs past the
+  old 87K native point with 0 compact boundaries; the level guard trips where
+  derived; the Stop hook blocked a tripped turn end once until the handback
+  existed (3 subjects).
+- `OBS_COMPACT_POLICY=handoff` without the disable: PreCompact interrupted
+  native compaction 2/2, logged `PreCompact handoff: interrupted automatic
+  compaction` then `Compaction handoff: resuming ... auto_compact_disabled=True`,
+  same session, one injected handoff turn; one harmless `AbortError` stderr line.
+- Opus 5.5 [1m] with `DISABLE_AUTO_COMPACT=1` only: key present in the child
+  environment and the inline `--settings` JSON, selector/percentage kept.
+- Explicit env (marker + disable) present in the new CLI after inbox wake and
+  after AgentTask resume; `route_state.explicit_env_json` persisted. Restore
+  across a daemon restart and `_activate_route_session` are unit-tested only.
+- Local: `cli_model=local-qwen3.8-27b[1m]`, `target=229000`; 31 fresh turns
+  without a 2x jump; a fresh local agent starts at 73,202 tokens. The 229K
+  target then proved unsafe (two overflow deaths, see "Provider input
+  ceiling"); `af906f2` is merged but not live until the next restart.
+- Not exercised live: local in-daemon PreCompact, the `af906f2` numbers, the
+  proxy overflow translation against the real gate.
+
 
 ## Verification layers
 

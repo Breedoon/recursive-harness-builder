@@ -45,8 +45,12 @@ The daemon then:
    and its Claude CLI children share that group (`ps -o pgid`), and the
    program has `stopasgroup=true`/`killasgroup=true` in
    `/etc/supervisor/supervisord.conf`, so `killpg(getpgrp())` matches
-   `supervisorctl restart`. The live confirmation is part of the post-restart
-   bead `vault-u3b.37`.
+   `supervisorctl restart`. Confirmed on the live daemon on 2026-09-26
+   (vault-u3b.37 E7): wrapper, `telegram_main`, cache proxy and every CLI
+   child share pgid of the wrapper. Readiness check without signalling: bit 10
+   (mask `0x200`) of `SigCgt` in `/proc/<telegram_main pid>/status` is set when
+   the SIGUSR1 handler is installed. Live since the 2026-09-25T23:59:01Z
+   restart; the first real `/maintenance_restart` has not been run yet.
 
 ## On startup
 
