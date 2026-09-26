@@ -102,6 +102,10 @@ class ResumeMarker:
     source: str
     entries: list[ResumeEntry]
     version: int = MARKER_VERSION
+    # Fork/AgentTask runs in flight when the marker was written (their parent
+    # has not heard back yet). Bounds late parent callbacks to the outage this
+    # marker describes (vault-u3b.81). Older markers lack it; readers default [].
+    inflight_task_ids: list[str] = field(default_factory=list)
 
 
 def marker_path(state_dir: Path) -> Path:
@@ -255,9 +259,21 @@ def consume_marker(
         raw = json.loads(consumed.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001 - corrupt marker must never crash startup
         return None, f"unreadable:{type(exc).__name__}"
-    if not isinstance(raw, dict) or int(raw.get("version", 0)) != MARKER_VERSION:
+    return _marker_from_raw(raw, now=now, max_age_seconds=max_age_seconds)
+
+
+def _marker_from_raw(
+    raw: object,
+    *,
+    now: float | None,
+    max_age_seconds: float,
+) -> tuple[ResumeMarker | None, str]:
+    if not isinstance(raw, dict) or int(raw.get("version", 0) or 0) != MARKER_VERSION:
         return None, "unsupported_version"
-    requested_at = float(raw.get("requested_at") or 0.0)
+    try:
+        requested_at = float(raw.get("requested_at") or 0.0)
+    except (TypeError, ValueError):
+        return None, "unreadable:requested_at"
     current = time.time() if now is None else now
     age = _write_age_seconds(consumed, requested_at, current)
     if age < 0 or age > max_age_seconds:
@@ -270,10 +286,31 @@ def consume_marker(
             entries.append(_entry_from_dict(item))
         except (KeyError, TypeError, ValueError):
             continue
+    inflight_raw = raw.get("inflight_task_ids")
+    inflight = (
+        [str(item) for item in inflight_raw if isinstance(item, str) and item]
+        if isinstance(inflight_raw, list)
+        else []
+    )
     return (
-        ResumeMarker(requested_at=requested_at, source=str(raw.get("source") or ""), entries=entries),
+        ResumeMarker(
+            requested_at=requested_at,
+            source=str(raw.get("source") or ""),
+            entries=entries,
+            inflight_task_ids=inflight,
+        ),
         "ok",
     )
+
+
+def peek_marker(path: Path, *, now: float | None = None, max_age_seconds: float) -> ResumeMarker | None:
+    """Parse a fresh marker without consuming it (None if absent, stale or unreadable)."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a corrupt marker must never crash startup
+        return None
+    marker, _reason = _marker_from_raw(raw, now=now, max_age_seconds=max_age_seconds)
+    return marker
 
 
 def split_resume_order(entries: list[ResumeEntry]) -> tuple[list[ResumeEntry], list[ResumeEntry]]:

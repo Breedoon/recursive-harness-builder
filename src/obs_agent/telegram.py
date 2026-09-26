@@ -1625,6 +1625,11 @@ class TelegramBot:
         # switch. Only then are late parent callbacks owed (vault-u3b.35).
         self._outage_inbox_floor = self._compute_outage_inbox_floor()
         owe_late_callbacks = self._outage_inbox_floor is not None
+        # Only runs cut off by *this* outage owe a callback: in flight in the
+        # previous daemon (listed by its last marker/snapshot) or launched after
+        # that file was written. Children left over from older outages never do
+        # (vault-u3b.81).
+        owed_scope = self._last_outage_inflight_scope() if owe_late_callbacks else None
         for entry in snapshot.route_states:
             route = TelegramRoute(chat_id=entry.chat_id, thread_id=entry.thread_id)
             if entry.topic_title or entry.topic_icon_custom_emoji_id:
@@ -1814,7 +1819,11 @@ class TelegramBot:
                 idle_ready=entry.idle_ready,
                 emit_parent_callback=False,
             )
-            record.callback_owed = owe_late_callbacks and self._restored_record_owes_callback(record)
+            record.callback_owed = (
+                owed_scope is not None
+                and self._restored_record_owes_callback(record)
+                and self._record_cut_off_by_last_outage(record, owed_scope)
+            )
             if record.callback_owed:
                 logger.warning(
                     "[restore] parent callback owed task_id=%s child=%s parent=%s",
@@ -1928,6 +1937,59 @@ class TelegramBot:
             and record.parent_route != record.child_route
         )
 
+    def _last_outage_inflight_scope(self) -> tuple[set[str], float] | None:
+        """Runs in flight when the previous daemon last wrote its marker/snapshot.
+
+        Returns ``(task_ids, written_at)`` from the fresh maintenance marker and,
+        unless a kill-switch sentinel exists, the fresh crash snapshot. Both are
+        written only by the daemon that just went down (each start consumes the
+        previous files), so the set cannot reach back to an older outage.
+        """
+        max_age = _maint.max_age_from_env()
+        markers = [_maint.peek_marker(self._maintenance_marker_path(), max_age_seconds=max_age)]
+        sentinel = os.environ.get(_maint.KILLSWITCH_SENTINEL_ENV)
+        if not (sentinel and Path(sentinel).exists()):
+            markers.append(_maint.peek_marker(self._crash_snapshot_path(), max_age_seconds=max_age))
+        fresh = [marker for marker in markers if marker is not None]
+        if not fresh:
+            return None
+        task_ids: set[str] = set()
+        for marker in fresh:
+            task_ids.update(marker.inflight_task_ids)
+        return task_ids, max(marker.requested_at for marker in fresh)
+
+    @staticmethod
+    def _record_cut_off_by_last_outage(
+        record: _ForkTaskRecord,
+        scope: tuple[set[str], float],
+    ) -> bool:
+        """True when the run was live in the daemon that just went down.
+
+        Either the previous daemon listed it as in flight (its parent was still
+        waiting), or it was launched after that daemon's last snapshot write, so
+        no snapshot could list it yet.
+        """
+        task_ids, written_at = scope
+        if record.task_id in task_ids:
+            return True
+        return float(record.created_at or 0.0) >= written_at
+
+    def _collect_inflight_task_ids(self) -> list[str]:
+        """Fork/AgentTask runs whose parent has not heard back yet (for the marker)."""
+        task_ids: set[str] = set()
+        for state in self._states_by_route.values():
+            task_ids.update(state.active_fork_task_ids)
+        for task_id, run in self._fork_task_tasks.items():
+            if not run.done():
+                task_ids.add(task_id)
+        return sorted(
+            task_id
+            for task_id in task_ids
+            if (record := self._fork_tasks_by_id.get(task_id)) is not None
+            and record.parent_route != record.child_route
+            and not record.terminal_request
+        )
+
     def _owed_callback_deliverable(self, record: _ForkTaskRecord) -> bool:
         """An owed callback must not wake a parent that was stopped or is gone."""
         parent_state = self._get_state(record.parent_route, create=False)
@@ -2021,7 +2083,12 @@ class TelegramBot:
 
     def write_maintenance_marker(self, *, source: str) -> tuple[Path, list[_maint.ResumeEntry]]:
         entries = self._collect_maintenance_entries()
-        marker = _maint.ResumeMarker(requested_at=time.time(), source=source, entries=entries)
+        marker = _maint.ResumeMarker(
+            requested_at=time.time(),
+            source=source,
+            entries=entries,
+            inflight_task_ids=self._collect_inflight_task_ids(),
+        )
         path = _maint.write_marker(self._maintenance_marker_path(), marker)
         logger.warning(
             "[maintenance_restart] marker written path=%s source=%s routes=%d local=%d",
@@ -2098,6 +2165,7 @@ class TelegramBot:
             requested_at=time.time(),
             source="periodic",
             entries=self._collect_maintenance_entries(allow_jsonl_lookup=False),
+            inflight_task_ids=self._collect_inflight_task_ids(),
         )
         return _maint.write_marker(self._crash_snapshot_path(), marker)
 
