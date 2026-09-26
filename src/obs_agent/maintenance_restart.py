@@ -28,7 +28,10 @@ For a maintenance restart the running daemon:
 
 On startup the new daemon renames the marker to ``*.consumed`` *before* acting
 on it, so a crash loop can never resurrect agents twice. It ignores markers
-older than :data:`DEFAULT_MAX_AGE_SECONDS`. It then resumes each recorded
+and crash snapshots whose last write is older than
+:data:`DEFAULT_MAX_AGE_SECONDS` (5 minutes): a quick crash plus supervisord
+autorestart resumes, while a server that stayed down longer (unplugged,
+stopped) resumes nothing. It then resumes each recorded
 route with a note saying the turn was cut off. Local-model routes are resumed
 strictly one at a time behind the single inference server; hosted routes are
 staggered.
@@ -59,7 +62,7 @@ DEFAULT_CRASH_MAX_CONSECUTIVE = 2
 DEFAULT_ORPHAN_REAP_GRACE_SECONDS = 5.0
 AGENT_CLI_MARKER = "claude_agent_sdk/_bundled/claude"
 MARKER_VERSION = 1
-DEFAULT_MAX_AGE_SECONDS = 15 * 60
+DEFAULT_MAX_AGE_SECONDS = 5 * 60
 DEFAULT_HOSTED_STAGGER_SECONDS = 3.0
 MAINTENANCE_SIGNAL = signal.SIGUSR1
 TELEGRAM_MAIN_PATTERN = "obs_agent.telegram_main"
@@ -146,6 +149,23 @@ def consume_killswitch_sentinel(sentinel: str | os.PathLike[str] | None) -> bool
     return True
 
 
+def _write_age_seconds(path: Path, requested_at: float, now: float) -> float:
+    """Age of a marker/snapshot: time since its last write.
+
+    Uses the older of ``requested_at`` (stamped at every write) and the file
+    mtime (preserved by the consume rename), so either one being old makes the
+    file stale. A ``requested_at`` in the future is reported as negative.
+    """
+    age = now - requested_at
+    if age < 0:
+        return age
+    try:
+        age = max(age, now - Path(path).stat().st_mtime)
+    except OSError:
+        pass
+    return age
+
+
 def peek_requested_at(path: Path, *, now: float | None = None, max_age_seconds: float) -> float | None:
     """Read a marker's ``requested_at`` without consuming it (None if absent/stale)."""
     try:
@@ -159,7 +179,7 @@ def peek_requested_at(path: Path, *, now: float | None = None, max_age_seconds: 
     except (TypeError, ValueError):
         return None
     current = time.time() if now is None else now
-    age = current - requested_at
+    age = _write_age_seconds(Path(path), requested_at, current)
     if age < 0 or age > max_age_seconds:
         return None
     return requested_at
@@ -235,7 +255,7 @@ def consume_marker(
         return None, "unsupported_version"
     requested_at = float(raw.get("requested_at") or 0.0)
     current = time.time() if now is None else now
-    age = current - requested_at
+    age = _write_age_seconds(consumed, requested_at, current)
     if age < 0 or age > max_age_seconds:
         return None, f"stale:{int(age)}s"
     entries: list[ResumeEntry] = []

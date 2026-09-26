@@ -26,6 +26,10 @@ this version (vault-u3b.70).
     obs-telegram-prod` themselves.
   - `/stop`, `/stop_branch` and `/stop_tree` still stop agents, and **stopped
     agents are never resumed** by any restart or crash.
+  - **Keep OBS down for more than 5 minutes** (unplug the server, stop the
+    container, `supervisorctl stop obs-telegram-prod` and wait): nothing
+    resumes, whatever kind of snapshot was left behind. See the 5-minute
+    window below.
 - **Crash** (out-of-memory kill, the cache-proxy watchdog, an unhandled exit):
   agents that were mid-turn resume automatically, like a maintenance restart,
   with a note saying OBS restarted unexpectedly.
@@ -65,7 +69,14 @@ this version (vault-u3b.70).
 2. `maintenance-resume.json` and `crash-resume.json` are each **renamed to
    `*.consumed` before anything acts on them**, so a crash loop can never
    replay them.
-3. Files older than `OBS_MAINTENANCE_RESUME_MAX_AGE_SECONDS` (default 900 s),
+3. **5-minute window (Daniel, 2026-09-26 11:02Z):** a maintenance marker or
+   crash snapshot resumes only if its **last write is at most 5 minutes old**
+   when the new daemon starts (`OBS_MAINTENANCE_RESUME_MAX_AGE_SECONDS`,
+   default 300 s; was 900 s). The crash snapshot is rewritten every 15 s, so a
+   quick crash plus supervisord autorestart still resumes, while a server that
+   stayed down longer than 5 minutes (unplugged, stopped) resumes nothing.
+   Age = time since the older of the file's `requested_at` stamp and its
+   mtime. Files outside the window,
    corrupt files and unknown versions are ignored.
 4. A maintenance marker wins; otherwise the crash snapshot is used.
 5. Each recorded route gets a new turn in its own topic:
