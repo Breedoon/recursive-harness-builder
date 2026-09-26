@@ -3,7 +3,7 @@
   "source": "signal:SIGUSR1",
   "entries": [
     {
-      "chat_id": -1003780712622,
+      "chat_id": -1000000000777,
       "thread_id": 341621,
       "session_id": "11111111-2222-3333-4444-555555555555",
       "task_id": "task-fork-1",
@@ -22,7 +22,7 @@
       ]
     },
     {
-      "chat_id": -1003780712622,
+      "chat_id": -1000000000777,
       "thread_id": 341700,
       "session_id": "66666666-7777-8888-9999-000000000000",
       "task_id": null,
