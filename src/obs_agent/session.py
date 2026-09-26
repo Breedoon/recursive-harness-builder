@@ -383,7 +383,7 @@ class SessionManager:
             validation_environment,
         )
         from obs_agent.config import is_claude_model, resolve_model_context
-        from obs_agent.hooks import COMPACT_POLICY_ENV, COMPACT_POLICY_HANDOFF
+        from obs_agent.hooks import COMPACT_POLICY_HANDOFF, effective_compact_policy
 
         resolved_model = resolve_model_context(self.effective_model)
         clean_model = resolved_model.model
@@ -448,9 +448,10 @@ class SessionManager:
         # at the end of the usable window ("wall") and lets the PreCompact
         # handoff intercept it: still no summary, but a handoff instead of an
         # HTTP 500. An explicit disable without the handoff policy is honoured.
+        # Local models default to the handoff policy unless the explicit env
+        # sets OBS_COMPACT_POLICY (which always wins, incl. an opt-out value).
         handoff_policy = (
-            str(explicit_env.get(COMPACT_POLICY_ENV) or "").strip().lower()
-            == COMPACT_POLICY_HANDOFF
+            effective_compact_policy(explicit_env, clean_model) == COMPACT_POLICY_HANDOFF
         )
         explicit_disable = explicit_compaction_disabled(explicit_env)
         wall = explicit_disable and handoff_policy and not self.compaction_handoff_active

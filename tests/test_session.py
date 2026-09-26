@@ -912,7 +912,12 @@ class TestWindowDerivedCompactionAndEnvPrecedence:
         config.cache_proxy_enabled = True
         mgr = SessionManager(config=config)
         mgr.model_override = model
-        mgr.set_sdk_env_overrides({key: "1"})
+        env = {key: "1"}
+        if model.startswith("local-"):
+            # Local models default to the handoff policy (which arms the wall);
+            # a plain disable needs an explicit policy opt-out.
+            env["OBS_COMPACT_POLICY"] = "native"
+        mgr.set_sdk_env_overrides(env)
         with patch("obs_agent.cache_proxy_lifecycle.should_use_proxy", return_value=True):
             options = mgr.create_options()
         assert options.env["DISABLE_AUTO_COMPACT"] == "1"
@@ -950,6 +955,24 @@ class TestWindowDerivedCompactionAndEnvPrecedence:
         assert self._settings_env(options)["DISABLE_AUTO_COMPACT"] == "0"
         pct = float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
         assert int(capacity_effective * pct / 100) == expected
+
+    def test_local_disable_without_policy_defaults_to_handoff_wall(self, config):
+        # Local models default to OBS_COMPACT_POLICY=handoff, so an explicit
+        # disable still leaves native compaction armed at the wall.
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.8-27b"
+        mgr.set_sdk_env_overrides({"DISABLE_AUTO_COMPACT": "1"})
+        options = mgr.create_options()
+        assert options.env["DISABLE_AUTO_COMPACT"] == "0"
+
+    def test_local_explicit_policy_opt_out_honours_disable(self, config):
+        mgr = SessionManager(config=config)
+        mgr.model_override = "local-qwen3.8-27b"
+        mgr.set_sdk_env_overrides(
+            {"DISABLE_AUTO_COMPACT": "1", "OBS_COMPACT_POLICY": "native"}
+        )
+        options = mgr.create_options()
+        assert options.env["DISABLE_AUTO_COMPACT"] == "1"
 
     def test_handoff_wall_is_disabled_after_the_handoff_fires(self, config):
         mgr = SessionManager(config=config)

@@ -337,6 +337,53 @@ class TestPreCompactHandoffPolicy:
         assert state.compaction_intercept_info["session_id"] == "sess-1"
 
     @pytest.mark.asyncio
+    async def test_local_model_defaults_to_handoff_without_explicit_env(self):
+        state = HookState()
+        state.effective_model = "local-qwen[200k]"
+        interrupter = AsyncMock()
+        state.client_interrupter = interrupter
+        callback = _make_pre_compact_callback(state, None)
+
+        assert await callback(_pre_compact_input(), None, {}) == {}
+        interrupter.assert_awaited_once()
+        assert state.compaction_intercepted is True
+
+    @pytest.mark.asyncio
+    async def test_local_model_explicit_opt_out_keeps_native_compaction(self):
+        state = HookState()
+        state.effective_model = "local-qwen"
+        state.sdk_env_overrides = {"OBS_COMPACT_POLICY": "native"}
+        interrupter = AsyncMock()
+        state.client_interrupter = interrupter
+        callback = _make_pre_compact_callback(state, None)
+
+        assert await callback(_pre_compact_input(), None, {}) == {}
+        interrupter.assert_not_called()
+        assert state.compaction_intercepted is False
+
+    @pytest.mark.asyncio
+    async def test_hosted_model_keeps_native_default(self):
+        state = HookState()
+        state.effective_model = "claude-opus-4-6[1m]"
+        interrupter = AsyncMock()
+        state.client_interrupter = interrupter
+        callback = _make_pre_compact_callback(state, None)
+
+        await callback(_pre_compact_input(), None, {})
+        interrupter.assert_not_called()
+
+    def test_effective_compact_policy_precedence(self):
+        from obs_agent.hooks import effective_compact_policy
+
+        assert effective_compact_policy({}, "local-qwen") == "handoff"
+        assert effective_compact_policy(None, "LOCAL-qwen[64k]") == "handoff"
+        assert effective_compact_policy({"OBS_COMPACT_POLICY": "native"}, "local-qwen") == "native"
+        assert effective_compact_policy({"OBS_COMPACT_POLICY": " "}, "local-qwen") == "handoff"
+        assert effective_compact_policy({}, "claude-sonnet-4-6") == ""
+        assert effective_compact_policy({"OBS_COMPACT_POLICY": "Handoff"}, "claude-sonnet-4-6") == "handoff"
+        assert effective_compact_policy({}, None) == ""
+
+    @pytest.mark.asyncio
     async def test_handoff_prompt_comes_from_user_hook_additional_context(self):
         state = HookState()
         state.sdk_env_overrides = {"OBS_COMPACT_POLICY": " Handoff "}

@@ -198,8 +198,24 @@ DEFAULT_COMPACTION_HANDOFF_PROMPT = (
 )
 
 
+def effective_compact_policy(explicit_env: dict | None, model: str | None) -> str:
+    """Return the session's compaction policy.
+
+    An explicit ``OBS_COMPACT_POLICY`` in the session env always wins (any
+    non-empty value, e.g. ``native``, opts out). Without one, local models
+    (``local-*``) default to ``handoff`` so no local session compacts lossily
+    or overflows; hosted models keep native compaction.
+    """
+    explicit = (explicit_env or {}).get(COMPACT_POLICY_ENV)
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip().lower()
+    if model and str(model).strip().lower().startswith("local-"):
+        return COMPACT_POLICY_HANDOFF
+    return ""
+
+
 def _compact_policy(state: "HookState") -> str:
-    return str(state.sdk_env_overrides.get(COMPACT_POLICY_ENV) or "").strip().lower()
+    return effective_compact_policy(state.sdk_env_overrides, state.effective_model)
 
 
 def _user_result_prompt(result: dict | None) -> str | None:
@@ -226,8 +242,9 @@ def _make_pre_compact_callback(
     Pinned Claude Code 2.1.59 ignores a PreCompact "block", so the only way to
     stop an automatic compaction is to interrupt the CLI before it sends the
     summary request (E3 harness, 5/5 trials: no compact_boundary written).
-    With ``OBS_COMPACT_POLICY=handoff`` in the session's explicit env and an
-    ``auto`` trigger, this callback:
+    With the handoff policy in effect (``OBS_COMPACT_POLICY=handoff`` in the
+    session's explicit env, or the default for local models; see
+    ``effective_compact_policy``) and an ``auto`` trigger, this callback:
 
     1. runs the session's user PreCompact hook (if any) first; its
        ``additionalContext`` (or ``systemMessage``) becomes the handoff prompt,
