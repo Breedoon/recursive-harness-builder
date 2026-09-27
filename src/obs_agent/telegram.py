@@ -83,9 +83,6 @@ logger = logging.getLogger("obs_agent.telegram")
 
 # Delay between sending split message chunks (Telegram rate limit: ~1 msg/sec/chat)
 _CHUNK_DELAY_SECONDS = 1.0
-# Default env for AgentTask child sessions (forks and fresh, local and hosted).
-# Claude Code 2.1.59 skips claude.ai connectors when this is falsy.
-AGENT_CHILD_DEFAULT_ENV: dict[str, str] = {"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
 _TRANSPORT_BASE_CHAT_INTERVAL_SECONDS = 0.35
 _TRANSPORT_MAX_CHAT_INTERVAL_SECONDS = 5.0
 _TYPING_ACTION_INTERVAL_SECONDS = 4.0
@@ -1843,8 +1840,7 @@ class TelegramBot:
                         self._build_team_worker_env(
                             team_name=record.team_name,
                             agent_name=record.agent_name,
-                            agent_child=True,
-                        ),
+                ),
                     )
                 )
             self._upsert_route_inbox_target(
@@ -1913,7 +1909,6 @@ class TelegramBot:
                     self._build_team_worker_env(
                         team_name=record.team_name,
                         agent_name=record.agent_name,
-                        agent_child=True,
                     ),
                 )
             )
@@ -4175,21 +4170,17 @@ class TelegramBot:
         *,
         team_name: str | None,
         agent_name: str | None = None,
-        agent_child: bool = False,
     ) -> dict[str, str]:
-        """Build the team-identity env; ``agent_child`` adds AgentTask child defaults.
+        """Build team identity env, not route-dependent tool configuration.
 
-        AgentTask children do not load the claude.ai connectors (Canva, Claude
-        Docs: ~32k tokens of tool schemas per fresh session). A launch that
-        needs them passes ``env={"ENABLE_CLAUDEAI_MCP_SERVERS": "true"}``;
-        explicit launch env wins and survives restore via ``_with_explicit_env``.
+        Forked JSONL replays the parent's messages. Tool schemas precede those
+        messages in the cache prefix, so child-only defaults would invalidate
+        the entire shared prefix. Global CLI defaults belong in SessionManager.
         """
-        child_defaults = dict(AGENT_CHILD_DEFAULT_ENV) if agent_child else {}
         normalized_team = (team_name or "").strip()
         if not normalized_team:
-            return child_defaults
+            return {}
         env = {
-            **child_defaults,
             "CLAUDE_CODE_ENABLE_TASKS": "1",
             "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
             "CLAUDE_CODE_TASK_LIST_ID": normalized_team,
@@ -9345,7 +9336,6 @@ class TelegramBot:
         team_env = self._build_team_worker_env(
             team_name=team_name,
             agent_name=agent_name,
-            agent_child=True,
         )
         # Merge user-provided env overrides (from AgentTask env parameter)
         if env_override:
@@ -9360,7 +9350,6 @@ class TelegramBot:
         base_team_env = self._build_team_worker_env(
             team_name=team_name,
             agent_name=agent_name,
-            agent_child=True,
         )
         child_state.session_manager.explicit_env_overrides = {
             key: value for key, value in team_env.items() if base_team_env.get(key) != value
@@ -10514,7 +10503,6 @@ class TelegramBot:
                 self._build_team_worker_env(
                     team_name=record.team_name,
                     agent_name=record.agent_name,
-                    agent_child=True,
                 ),
             )
         )

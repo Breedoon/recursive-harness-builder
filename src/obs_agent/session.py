@@ -57,6 +57,11 @@ _DEFAULT_SDK_ENV: dict[str, str] = {
     # Disable tool search discovery. Uses eager loading of available tools instead.
     # Avoids the nested tool_reference representation bug and reduces startup overhead.
     "ENABLE_TOOL_SEARCH": "false",
+    # Every session (trunks, forks, fresh children, restores, resumes) must have
+    # the same tool schema prefix. Disabling these ~32K tokens of claude.ai
+    # connector schemas only for AgentTask children breaks the parent's entire
+    # cached conversation prefix in every fork. Do not make this child-only.
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
     # NOTE: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC was here until 2026-04-04.
     # Removed because it disables GrowthBook, which gates 1h prompt cache TTL.
     # See Drafts/2026-04/cache-analysis/query-source-investigation.md
@@ -395,6 +400,10 @@ class SessionManager:
             **_DEFAULT_SDK_ENV,
             **explicit_env,
         }
+        # This is a uniform OBS tool policy, not a per-route override: allowing
+        # a child to re-enable these schemas would silently invalidate all
+        # shared parent/fork cache entries before the first conversation turn.
+        effective_env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
         proxy_in_use = should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled)
 
         # Local models whose requests reach the upstream gate directly (proxy

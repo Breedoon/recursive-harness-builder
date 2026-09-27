@@ -1,4 +1,4 @@
-"""AgentTask children skip claude.ai connectors (Canva, Claude Docs) by default."""
+"""Trunks and children share one claude.ai connector policy for cache parity."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ pytestmark = pytest.mark.asyncio
 KEY = "ENABLE_CLAUDEAI_MCP_SERVERS"
 
 
-async def _launch(bot, route, thread_id, env, *, fork=False):
+async def _launch(bot, route, thread_id, env):
     parent = bot._get_state(route)
     parent.last_bot = MagicMock()
     parent.last_bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=thread_id))
@@ -24,45 +24,43 @@ async def _launch(bot, route, thread_id, env, *, fork=False):
     bot._set_session_head(session_id="parent-id", jsonl_uuid="uuid-parent-head")
     with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock):
         await bot._launch_fork_task(route=route, args={
-            "prompt": "Test child", "description": "Worker", "fork": fork,
+            "prompt": "Test child", "description": "Worker", "fork": False,
             "env": env, "task_tool_name": "AgentTask",
         })
     return parent, bot._get_state(TelegramRoute(chat_id=route.chat_id, thread_id=thread_id))
 
 
-async def test_child_launch_disables_claudeai_connectors(config, tmp_path, monkeypatch):
-    # Fork and fresh launches share _create_child_fork_topic, where this env is set.
+async def test_parent_and_child_disable_connectors_with_identical_tool_policy(config, tmp_path, monkeypatch):
     monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+    monkeypatch.setenv(KEY, "true")
     bot = TelegramBot(config, fragment_gap=0.001, enable_background_poller=False)
     route = TelegramRoute(chat_id=-10067890, thread_id=None)
     try:
         parent, child = await _launch(bot, route, 336, None)
-        sm = child.session_manager
-        assert sm.sdk_env_overrides[KEY] == "false"
-        assert sm.create_options().env[KEY] == "false"
-        # Default is not recorded as an explicit launch override.
-        assert KEY not in (sm.explicit_env_overrides or {})
-        # The user-facing parent route is unchanged.
+        assert parent.session_manager.create_options().env[KEY] == "false"
+        assert child.session_manager.create_options().env[KEY] == "false"
         assert KEY not in parent.session_manager.sdk_env_overrides
+        assert KEY not in child.session_manager.sdk_env_overrides
+        assert KEY not in (child.session_manager.explicit_env_overrides or {})
     finally:
         await bot.shutdown()
 
 
-async def test_child_launch_env_override_reenables(config, tmp_path, monkeypatch):
+async def test_child_explicit_override_cannot_change_tool_prefix(config, tmp_path, monkeypatch):
     monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
     bot = TelegramBot(config, fragment_gap=0.001, enable_background_poller=False)
     route = TelegramRoute(chat_id=-10067890, thread_id=None)
     try:
-        _, child = await _launch(bot, route, 337, {KEY: "true"})
-        sm = child.session_manager
-        assert sm.create_options().env[KEY] == "true"
-        assert sm.explicit_env_overrides == {KEY: "true"}
+        parent, child = await _launch(bot, route, 337, {KEY: "true"})
+        assert parent.session_manager.create_options().env[KEY] == "false"
+        assert child.session_manager.create_options().env[KEY] == "false"
+        assert child.session_manager.explicit_env_overrides == {KEY: "true"}
     finally:
         await bot.shutdown()
 
 
 @pytest.mark.parametrize("override", [None, "true"])
-async def test_restore_keeps_child_default_and_override(config, override):
+async def test_restored_child_retains_uniform_connector_policy(config, override):
     first = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
     child_route = TelegramRoute(chat_id=67890, thread_id=660)
     child = _make_child(first, child_route, team="team-alpha", agent="worker-env")
@@ -78,14 +76,14 @@ async def test_restore_keeps_child_default_and_override(config, override):
     restored = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
     await restored.initialize_runtime()
     state = restored._get_state(child_route)
-    assert state.session_manager.sdk_env_overrides[KEY] == (override or "false")
+    assert state.session_manager.create_options().env[KEY] == "false"
     await restored.shutdown()
 
 
-async def test_non_child_team_env_has_no_default(config):
+async def test_team_identity_env_has_no_tool_policy(config):
     bot = TelegramBot(config, fragment_gap=0.05, enable_background_poller=False)
     try:
         assert KEY not in bot._build_team_worker_env(team_name="t", agent_name="a")
-        assert bot._build_team_worker_env(team_name=None, agent_child=True) == {KEY: "false"}
+        assert bot._build_team_worker_env(team_name=None) == {}
     finally:
         await bot.shutdown()

@@ -176,6 +176,24 @@ See [`AgentTask` parsing](../src/obs_agent/tools.py),
 [`_spawn_forked_topic` and `_launch_fork_task`](../src/obs_agent/telegram.py), and
 [`ConversationRunner`](../src/obs_agent/runner.py) for the executable boundaries.
 
+### Fork-prefix invariant (tool and environment changes)
+
+A fork copies the parent's JSONL history, but the provider cache keys the entire
+request prefix: system prompt, **all tool schemas**, then messages. A child-only
+tool toggle changes the prefix *before* that inherited history and prevents
+reuse of every parent cache entry, even with byte-identical JSONL. In September
+2026, disabling the Canva and Claude Docs connectors only in AgentTask children
+had exactly this failure mode. They are now disabled uniformly in
+`SessionManager._build_options` for trunk, child, restored and resumed clients.
+Do not reintroduce a route-dependent override for this tool policy.
+
+Before changing prompts, settings, MCP registrations, environment variables or
+CLI launch options, compare the **effective parent and fork requests** at the
+provider/cache-proxy boundary, not merely the stored transcript or Python env
+maps. Confirm the shared prefix is byte-identical and check real cache-read
+usage after a fork. A feature that deliberately diverges (e.g. another model)
+needs an explicit cache trade-off, not a silent regression.
+
 ## Hooks and SDK/environment parameters
 
 There is one supported built-in pipeline for each of these events; each applies
