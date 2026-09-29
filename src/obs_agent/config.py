@@ -21,6 +21,18 @@ _DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no exp
 # Model resolution
 # ---------------------------------------------------------------------------
 
+# Served model names (what each provider routes on literally).
+#   local-qwen3.8-27b  : Qwen3.8-27B on the RTX 3090 host (authenticated local gate)
+#   local-sparks-*     : DGX Sparks pair, one model at a time (see obs_agent.spark)
+LOCAL_QWEN_27B_MODEL = "local-qwen3.8-27b"
+SPARK_QWEN_MODEL = "local-sparks-qwen3.8-flash-next-abliterated"
+SPARK_GLM_MODEL = "local-sparks-glm-5.3-flash-uncensored"
+
+# What plain "qwen" means. This is the single switch for the default Qwen:
+# SPARK_QWEN_MODEL (Daniel, 2026-09-29) or LOCAL_QWEN_27B_MODEL to move it back
+# to the 3090. qwen-27b / qwen-fn always name their own target.
+DEFAULT_QWEN_MODEL = SPARK_QWEN_MODEL
+
 # Shorthand → full model name. When the user passes a shorthand like "claude"
 # or "gpt", we resolve it to the latest/best model in that tier.  More specific
 # strings (e.g. "gpt-5.4") pass through unchanged.  Maintained as a flat dict;
@@ -30,30 +42,42 @@ MODEL_RESOLUTION: dict[str, str] = {
     "claude": "claude-opus-5-5",
     "opus": "claude-opus-5-5",
     "claude-opus": "claude-opus-5-5",
-    "sonnet": "claude-sonnet-5",
-    "claude-sonnet": "claude-sonnet-5",
+    "sonnet": "claude-sonnet-5-5",
+    "claude-sonnet": "claude-sonnet-5-5",
     "fable": "claude-fable-5-1",
     "claude-fable": "claude-fable-5-1",
     "haiku": "claude-haiku-4-5",
     "claude-haiku": "claude-haiku-4-5",
     # OpenAI tiers – "gpt" resolves to main production model
-    "gpt": "gpt-6-sol",
-    "gpt-pro": "gpt-6-sol",
+    "gpt": "gpt-6.1-sol",
+    "gpt-pro": "gpt-6.1-sol",
     "astra": "gpt-6-astra",
-    "sol": "gpt-6-sol",
-    "gpt-sol": "gpt-6-sol",
+    "sol": "gpt-6.1-sol",
+    "gpt-sol": "gpt-6.1-sol",
     "terra": "gpt-5.6-terra",
     "luna": "gpt-6-luna",
     "gpt-mini": "gpt-5.4-mini",
-    "openai": "gpt-6-sol",
-    "chatgpt": "gpt-6-sol",
+    "openai": "gpt-6.1-sol",
+    "chatgpt": "gpt-6.1-sol",
     # Google tiers
     "gemini": "gemini-3.1-flash-lite-preview",
     "gemini-pro": "gemini-3.1-pro-preview",
     "gemini-flash": "gemini-2.5-flash",
-    # Local durable aliases
-    "qwen": "local-qwen3.8-27b",
-    "local-qwen": "local-qwen3.8-27b",
+    # Local durable aliases. The 3090 names (local-qwen, qwen-27b) and the Spark
+    # names are separate backends; the Spark ones are configured by model name in
+    # obs_agent.spark. Full served names pass through unchanged.
+    "qwen": DEFAULT_QWEN_MODEL,
+    "local-qwen": LOCAL_QWEN_27B_MODEL,
+    "qwen-27b": LOCAL_QWEN_27B_MODEL,
+    "qwen3.8-27b": LOCAL_QWEN_27B_MODEL,
+    "qwen-fn": SPARK_QWEN_MODEL,
+    "qwen-flash-next": SPARK_QWEN_MODEL,
+    "qwen3.8-flash-next": SPARK_QWEN_MODEL,
+    "qwen3.8-flash-next-abliterated": SPARK_QWEN_MODEL,
+    "glm": SPARK_GLM_MODEL,
+    "glm-flash": SPARK_GLM_MODEL,
+    "glm-5.3-flash": SPARK_GLM_MODEL,
+    "glm-5.3-flash-uncensored": SPARK_GLM_MODEL,
 }
 
 # Regex for context-window suffix: [1m], [200k], [128k], etc.
@@ -65,8 +89,13 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5": 200_000,
     "local-qwen": 262_000,
     "local-qwen3.8-27b": 262_000,
+    # Sparks default profile serves 262,144 native; the qwen-1m profile serves
+    # ~1M, selected explicitly with a [1m] suffix (obs_agent.spark checks it).
+    SPARK_QWEN_MODEL: 262_000,
+    SPARK_GLM_MODEL: 262_000,
     "local-gemma4-31b": 48_000,
     "gpt-6-astra": 900_000,
+    "gpt-6.1-sol": 900_000,
     "gpt-6-sol": 900_000,
     "gpt-6-luna": 900_000,
     "gpt-5.6-sol": 900_000,
@@ -84,6 +113,7 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 MODEL_EFFORT_LEVELS: dict[str, str] = {
     "claude-opus-5-5": "high",
     "claude-opus-5": "high",
+    "claude-sonnet-5-5": "high",
     "claude-sonnet-5": "high",
     "claude-fable-5": "high",
     "claude-fable-5-1": "high",
@@ -93,6 +123,7 @@ MODEL_EFFORT_LEVELS: dict[str, str] = {
     "claude-sonnet-4-6": "high",
     "local-qwen3.8-27b": "medium",
     "gpt-6-astra": "medium",
+    "gpt-6.1-sol": "medium",
     "gpt-6-sol": "medium",
     "gpt-6-luna": "medium",
     "gpt-5.6-sol": "medium",
@@ -327,7 +358,7 @@ class OBSConfig:
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
     model: str = "gpt-6-luna"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
-    # Resolved via MODEL_RESOLUTION (e.g. "sol" → "gpt-6-sol");
+    # Resolved via MODEL_RESOLUTION (e.g. "sol" → "gpt-6.1-sol");
     # full model names pass through unchanged.
     # Change this to e.g. "claude" to make root sessions default to Claude.
     default_model: str = "luna"

@@ -9157,6 +9157,16 @@ class TelegramBot:
         from obs_agent.effort import child_effort_override, build_effort_env, resolve_effort
 
         child_model = resolve_model(model) if model else parent_state.session_manager.effective_model
+        if model:
+            # A Spark alias for a model the Sparks are not serving (or a window
+            # larger than the serving profile) fails here with a clear message,
+            # before any topic or JSONL fork exists. Fails open if unreachable.
+            from obs_agent.spark import check_spark_available, is_spark_model
+
+            if is_spark_model(child_model):
+                await asyncio.to_thread(
+                    check_spark_available, child_model, parse_context_suffix(child_model)[1]
+                )
         selected_effort = child_effort_override(
             effort, parent_effort=parent_state.session_manager.effective_effort,
             model=model, session_env=env_override,

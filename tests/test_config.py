@@ -151,7 +151,7 @@ class TestSessionSettings:
     def test_model_from_env_preserves_explicit_context_suffix(self, monkeypatch):
         monkeypatch.setenv("OBS_AGENT_MODEL", "gpt[200k]")
         cfg = OBSConfig.from_env()
-        assert cfg.model == "gpt-6-sol[200k]"
+        assert cfg.model == "gpt-6.1-sol[200k]"
 
     @pytest.mark.parametrize("alias", ["claude", "opus", "claude-opus"])
     def test_current_opus_alias_preserves_effort_and_context(self, alias):

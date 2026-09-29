@@ -5501,9 +5501,9 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=334))
         assert child_state is not None
-        assert child_state.session_manager.model_override == "gpt-6-sol"
+        assert child_state.session_manager.model_override == "gpt-6.1-sol"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-6-sol[1m]"
+        assert child_options.model == "gpt-6.1-sol[1m]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "900000"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in child_options.env
@@ -5542,12 +5542,102 @@ class TestForkTaskRuntime:
 
         child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=335))
         assert child_state is not None
-        assert child_state.session_manager.model_override == "gpt-6-sol[200k]"
+        assert child_state.session_manager.model_override == "gpt-6.1-sol[200k]"
         child_options = child_state.session_manager.create_options()
-        assert child_options.model == "gpt-6-sol[200k]"
+        assert child_options.model == "gpt-6.1-sol[200k]"
         assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
         assert child_options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in child_options.env
+        await bot.shutdown()
+
+    async def test_launch_agent_task_spark_alias_needs_no_env_and_keeps_backend_by_name(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        key = tmp_path / "spark-key"
+        key.write_text("alias-test-key\n", encoding="utf-8")
+        monkeypatch.setenv("OBS_SPARK_LLM_KEY_FILE", str(key))
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.last_bot = MagicMock()
+        state.last_bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=336))
+        state.last_bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=950), MagicMock(message_id=951), MagicMock(message_id=952)]
+        )
+        state.session_manager.set_session_id("sid-root")
+
+        with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock), patch(
+            "obs_agent.spark.check_spark_available"
+        ) as preflight:
+            await bot._launch_fork_task(
+                route=route,
+                args={
+                    "prompt": "Start fresh",
+                    "description": "Spark alias child",
+                    "fork": False,
+                    "model": "qwen-fn",
+                    "task_tool_name": "AgentTask",
+                },
+            )
+
+        preflight.assert_called_once_with(
+            "local-sparks-qwen3.8-flash-next-abliterated", 262_000
+        )
+        child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=336))
+        assert child_state is not None
+        assert (
+            child_state.session_manager.model_override
+            == "local-sparks-qwen3.8-flash-next-abliterated"
+        )
+        env = child_state.session_manager.create_options().env
+        assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:28931"
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "alias-test-key"
+        # Nothing secret is stored as a per-session override that forks could leak.
+        assert not any(
+            key.startswith("ANTHROPIC_")
+            for key in child_state.session_manager.hook_state.sdk_env_overrides
+        )
+        await bot.shutdown()
+
+    async def test_launch_agent_task_spark_alias_not_served_fails_before_topic_creation(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        from obs_agent.spark import SparkUnavailableError
+
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        state.last_bot = MagicMock()
+        state.last_bot.create_forum_topic = AsyncMock()
+        state.last_bot.send_message = AsyncMock()
+        state.session_manager.set_session_id("sid-root")
+
+        with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock), patch(
+            "obs_agent.spark.check_spark_available",
+            side_effect=SparkUnavailableError("not the model the Sparks are serving"),
+        ), pytest.raises(SparkUnavailableError):
+            await bot._launch_fork_task(
+                route=route,
+                args={
+                    "prompt": "Start fresh",
+                    "description": "GLM while Qwen runs",
+                    "fork": False,
+                    "model": "glm",
+                    "task_tool_name": "AgentTask",
+                },
+            )
+
+        state.last_bot.create_forum_topic.assert_not_awaited()
         await bot.shutdown()
 
     async def test_launch_agent_task_inherit_model_keeps_parent_identity_and_adds_1m(

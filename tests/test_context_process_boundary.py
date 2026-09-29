@@ -88,7 +88,7 @@ async def test_actual_sdk_child_receives_requested_budget(
     observed = await observe_sdk_child(options, probe_executable)
 
     model_arg = observed["argv"][observed["argv"].index("--model") + 1]
-    assert model_arg == f"gpt-6-sol[{selector}]"
+    assert model_arg == f"gpt-6.1-sol[{selector}]"
     assert observed["budget_env"] == {key: options.env[key] for key in BUDGET_KEYS}
     # Stale DAEMON-level values (10 / 200000 above) are superseded by the plan,
     # but explicit PER-SESSION values win (vault-u3b.13, R3: "these environmental
@@ -164,8 +164,8 @@ def test_operator_cap_and_requested_metadata_are_distinct(tmp_path, isolated_opt
         cache_proxy_enabled=False,
     ))
     options = manager.create_options()
-    assert options.model == "gpt-6-sol[1m]"
+    assert options.model == "gpt-6.1-sol[1m]"
     assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "400000"
     assert options.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "1000000"
     assert int(980_000 * float(options.env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"]) / 100) == 117_000
-    assert manager.hook_state.effective_model == "gpt-6-sol[400k]"
+    assert manager.hook_state.effective_model == "gpt-6.1-sol[400k]"

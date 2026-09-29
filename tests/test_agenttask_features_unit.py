@@ -30,14 +30,14 @@ from obs_agent.config import (
 
 class TestModelResolution:
     def test_claude_shorthand_resolves_to_opus(self):
-        assert resolve_model("claude") == "claude-opus-5"
+        assert resolve_model("claude") == "claude-opus-5-5"
 
     def test_claude_opus_shorthand(self):
-        assert resolve_model("claude-opus") == "claude-opus-5"
+        assert resolve_model("claude-opus") == "claude-opus-5-5"
 
     def test_claude_sonnet_shorthand(self):
-        assert resolve_model("claude-sonnet") == "claude-sonnet-5"
-        assert resolve_model("sonnet") == "claude-sonnet-5"
+        assert resolve_model("claude-sonnet") == "claude-sonnet-5-5"
+        assert resolve_model("sonnet") == "claude-sonnet-5-5"
 
     def test_claude_fable_shorthand(self):
         assert resolve_model("claude-fable") == "claude-fable-5-1"
@@ -56,15 +56,54 @@ class TestModelResolution:
 
     @pytest.mark.parametrize(("alias", "model"), [
         ("astra", "gpt-6-astra"),
-        ("sol", "gpt-5.6-sol"),
+        ("sol", "gpt-6.1-sol"),
+        ("gpt-sol", "gpt-6.1-sol"),
         ("terra", "gpt-5.6-terra"),
-        ("luna", "gpt-5.6-luna"),
+        ("luna", "gpt-6-luna"),
     ])
     def test_named_gpt_aliases(self, alias, model):
         assert resolve_model(alias) == model
 
     def test_qwen_shorthand(self):
-        assert resolve_model("qwen") == "local-qwen3.8-27b"
+        # Plain "qwen" is the Spark Qwen Flash Next since 2026-09-29; the 3090
+        # Qwen keeps its own handles.
+        assert resolve_model("qwen") == "local-sparks-qwen3.8-flash-next-abliterated"
+        assert resolve_model("local-qwen") == "local-qwen3.8-27b"
+
+    @pytest.mark.parametrize(("alias", "model"), [
+        ("qwen", "local-sparks-qwen3.8-flash-next-abliterated"),
+        ("qwen-fn", "local-sparks-qwen3.8-flash-next-abliterated"),
+        ("qwen-flash-next", "local-sparks-qwen3.8-flash-next-abliterated"),
+        ("qwen3.8-flash-next", "local-sparks-qwen3.8-flash-next-abliterated"),
+        ("QWEN-FN", "local-sparks-qwen3.8-flash-next-abliterated"),
+        ("qwen-27b", "local-qwen3.8-27b"),
+        ("qwen3.8-27b", "local-qwen3.8-27b"),
+        ("local-qwen", "local-qwen3.8-27b"),
+        ("local-qwen3.8-27b", "local-qwen3.8-27b"),
+        ("glm", "local-sparks-glm-5.3-flash-uncensored"),
+        ("glm-flash", "local-sparks-glm-5.3-flash-uncensored"),
+        ("glm-5.3-flash", "local-sparks-glm-5.3-flash-uncensored"),
+        ("glm-5.3-flash-uncensored", "local-sparks-glm-5.3-flash-uncensored"),
+        ("local-sparks-glm-5.3-flash-uncensored", "local-sparks-glm-5.3-flash-uncensored"),
+        # Hosted Z.AI GLM served through CLIProxyAPI is a different backend.
+        ("glm-5.3", "glm-5.3"),
+        # Unknown names pass through unchanged (the provider rejects them).
+        ("qwen-9000", "qwen-9000"),
+    ])
+    def test_spark_and_3090_aliases(self, alias, model):
+        assert resolve_model(alias) == model
+
+    @pytest.mark.parametrize(("alias", "suffix"), [
+        ("qwen", "[1m]"), ("qwen-fn", "[262k]"), ("glm", "[200k]"), ("qwen-27b", "[262k]"),
+    ])
+    def test_alias_keeps_context_suffix(self, alias, suffix):
+        assert resolve_model(alias + suffix) == resolve_model(alias) + suffix
+
+    def test_default_qwen_is_one_switch(self):
+        from obs_agent import config as config_module
+
+        assert config_module.MODEL_RESOLUTION["qwen"] == config_module.DEFAULT_QWEN_MODEL
+        assert config_module.DEFAULT_QWEN_MODEL == config_module.SPARK_QWEN_MODEL
 
     def test_gemini_shorthand_resolves_to_pro(self):
         resolved = resolve_model("gemini")
@@ -86,15 +125,15 @@ class TestModelResolution:
 
     def test_shorthand_with_context_suffix_preserved(self):
         result = resolve_model("claude[1m]")
-        assert result == "claude-opus-5[1m]"
+        assert result == "claude-opus-5-5[1m]"
 
     def test_explicit_with_context_suffix_preserved(self):
         result = resolve_model("gpt-5.4-mini[200k]")
         assert result == "gpt-5.4-mini[200k]"
 
     def test_resolution_does_not_add_default_context_suffix(self):
-        assert resolve_model("gpt") == "gpt-5.6-sol"
-        assert resolve_model("claude") == "claude-opus-5"
+        assert resolve_model("gpt") == "gpt-6.1-sol"
+        assert resolve_model("claude") == "claude-opus-5-5"
 
 
 class TestModelContextBoundary:
@@ -103,35 +142,35 @@ class TestModelContextBoundary:
         assert split_context_suffix("gpt-5.4-mini[200k]") == ("gpt-5.4-mini", 200_000)
 
     def test_claude_code_boundary_adds_resolved_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt") == "gpt-5.6-sol[900k]"
-        assert normalize_model_for_claude_code("claude") == "claude-opus-5[1m]"
+        assert normalize_model_for_claude_code("gpt") == "gpt-6.1-sol[900k]"
+        assert normalize_model_for_claude_code("claude") == "claude-opus-5-5[1m]"
         assert normalize_model_for_claude_code("haiku") == "claude-haiku-4-5[200k]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
 
     @pytest.mark.parametrize("model", [
-        "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra",
+        "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra",
         "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
     ])
     def test_current_gpt_models_default_to_900k(self, model):
         assert normalize_model_for_claude_code(model) == f"{model}[900k]"
 
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-5.6-sol[200k]"
+        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-6.1-sol[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
     def test_local_provider_boundary_preserves_canonical_model_id(self):
         assert normalize_model_for_claude_code("local-gemma4-31b") == "local-gemma4-31b"
         assert normalize_model_for_claude_code("local-qwen3.8-27b[262k]") == "local-qwen3.8-27b"
-        assert normalize_model_for_claude_code("qwen") == "local-qwen3.8-27b"
+        assert normalize_model_for_claude_code("qwen-27b") == "local-qwen3.8-27b"
         assert normalize_model_for_claude_code("local-qwen") == "local-qwen3.8-27b"
         assert normalize_model_for_claude_code("local-custom[96k]") == "local-custom"
         assert parse_context_suffix("local-gemma4-31b") == ("local-gemma4-31b", 48_000)
-        assert parse_context_suffix("qwen") == ("local-qwen3.8-27b", 262_000)
+        assert parse_context_suffix("qwen-27b") == ("local-qwen3.8-27b", 262_000)
         assert parse_context_suffix("local-qwen") == ("local-qwen3.8-27b", 262_000)
         assert parse_context_suffix("local-qwen[262k]") == ("local-qwen3.8-27b", 262_000)
         assert parse_context_suffix("local-custom[96k]") == ("local-custom", 96_000)
 
-    @pytest.mark.parametrize("model", ["qwen", "local-qwen", "local-qwen3.8-27b"])
+    @pytest.mark.parametrize("model", ["qwen-27b", "local-qwen", "local-qwen3.8-27b"])
     def test_local_qwen_default_context_matches_documented_262k_contract(self, model):
         resolved = resolve_model_context(model)
         assert resolved.context_tokens == 262_000
@@ -200,7 +239,7 @@ class TestContextSuffixParsing:
 
     def test_claude_alias_uses_default_obs_context_window(self):
         clean, tokens = parse_context_suffix("claude")
-        assert clean == "claude-opus-5"
+        assert clean == "claude-opus-5-5"
         assert tokens == 1_000_000
 
     def test_uppercase_suffix(self):

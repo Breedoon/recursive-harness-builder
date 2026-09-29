@@ -46,7 +46,7 @@ def test_reject_invalid_effort(value):
     ("gpt", "medium"), ("astra", "medium"), ("sol[200k]", "medium"),
     ("terra", "medium"), ("luna", "medium"), ("claude", "high"),
     ("sonnet[1m]", "high"), ("claude-opus-4-7", "xhigh"),
-    ("qwen", "medium"), ("local-qwen", "medium"),
+    ("qwen-27b", "medium"), ("local-qwen", "medium"),
     ("haiku", "auto"), ("custom-model", "auto"),
 ])
 def test_defaults_resolve_model_aliases_independently_of_context(model, expected):
@@ -75,7 +75,7 @@ def test_config_env_supports_per_model_defaults(monkeypatch):
     monkeypatch.setenv("OBS_MODEL_EFFORT_LEVELS", '{"sol":"max","sonnet[200k]":"low"}')
     config = OBSConfig.from_env()
     assert config.effort_level == "high"
-    assert config.model_effort_levels == {"gpt-5.6-sol": "max", "claude-sonnet-5": "low"}
+    assert config.model_effort_levels == {"gpt-6.1-sol": "max", "claude-sonnet-5-5": "low"}
     manager = SessionManager(config=config)
     assert manager.effective_effort == "high"
     manager.effort_override = "auto"
@@ -112,7 +112,7 @@ def test_openai_wire_options_all_levels_with_context_and_no_global_mutation(conf
     assert settings_env[EFFORT_ENV] == level
     assert settings_env[EXTRA_BODY_ENV] == options.env[EXTRA_BODY_ENV]
     assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
-    assert options.model == "gpt-5.6-sol[200k]"
+    assert options.model == "gpt-6.1-sol[200k]"
     assert manager.sdk_env_overrides == original_env
     assert dict(os.environ) == before
 

@@ -389,6 +389,7 @@ class SessionManager:
         )
         from obs_agent.config import is_claude_model, resolve_model_context
         from obs_agent.hooks import COMPACT_POLICY_HANDOFF, effective_compact_policy
+        from obs_agent.spark import is_spark_model, spark_backend_env, spark_provider_window
 
         resolved_model = resolve_model_context(self.effective_model)
         clean_model = resolved_model.model
@@ -406,6 +407,15 @@ class SessionManager:
         effective_env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
         proxy_in_use = should_use_proxy(cache_proxy_enabled=self.config.cache_proxy_enabled)
 
+        # DGX Sparks: the backend follows the MODEL NAME (children and forks
+        # inherit names, not env overrides). Explicit env still wins; a session
+        # launched the old env-only way is unchanged. Injected before the 3090
+        # branch below so the 3090 gate credential never reaches the Sparks.
+        spark_env: dict[str, str] = {}
+        if is_spark_model(clean_model):
+            spark_env = spark_backend_env(clean_model, effective_env)
+            effective_env.update(spark_env)
+
         # Local models whose requests reach the upstream gate directly (proxy
         # disabled, or an explicit per-session ANTHROPIC_BASE_URL): the gate
         # routes on the model id literally. Claude Code 2.1.59 itself strips a
@@ -415,6 +425,8 @@ class SessionManager:
         # only a [200k] selector is replaced by the bare id, whose CLI capacity
         # is the same 200K, so the plan's percentage still holds.
         explicit_base_url = explicit_env.get("ANTHROPIC_BASE_URL")
+        if explicit_base_url is None:
+            explicit_base_url = spark_env.get("ANTHROPIC_BASE_URL")
         if explicit_base_url is not None:
             local_direct = is_local_provider and not _is_cache_proxy_url(
                 explicit_base_url, self.config.cache_proxy_port
@@ -468,6 +480,8 @@ class SessionManager:
             (explicit_disable and not wall) or self.compaction_handoff_active
         )
         provider_window = resolve_model_context(clean_model).context_tokens
+        if is_spark_model(clean_model):
+            provider_window = spark_provider_window(provider_window, context_tokens)
         context_plan = build_claude_context_plan(
             model=clean_model,
             context_tokens=context_tokens,

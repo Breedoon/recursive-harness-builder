@@ -141,9 +141,9 @@ class TestLocalUpstreamSelection:
         assert cache_proxy._resolve_upstream("local-qwen3.8-27b") == "http://gate:8080"
 
     def test_local_shorthand_routes_to_local_upstream(self, monkeypatch):
-        # "qwen" resolves to local-qwen3.8-27b via OBS model resolution.
+        # "qwen-27b" resolves to local-qwen3.8-27b via OBS model resolution.
         monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", "http://gate:8080")
-        assert cache_proxy._resolve_upstream("qwen") == "http://gate:8080"
+        assert cache_proxy._resolve_upstream("qwen-27b") == "http://gate:8080"
         assert cache_proxy._resolve_upstream("local-qwen") == "http://gate:8080"
 
     def test_local_with_context_suffix_routes_to_local_upstream(self, monkeypatch):
@@ -156,7 +156,7 @@ class TestLocalUpstreamSelection:
 
     def test_is_local_model(self, monkeypatch):
         assert cache_proxy._is_local_model("local-qwen3.8-27b") is True
-        assert cache_proxy._is_local_model("qwen") is True
+        assert cache_proxy._is_local_model("qwen-27b") is True
         assert cache_proxy._is_local_model("claude-opus-4-6") is False
         assert cache_proxy._is_local_model("gpt-5.5") is False
         assert cache_proxy._is_local_model("") is False
