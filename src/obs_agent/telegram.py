@@ -8101,8 +8101,15 @@ class TelegramBot:
             )
             _ctx_remaining = _ctx_snapshot.get("estimated_context_remaining_tokens", 0)
             _ctx_pct = _ctx_snapshot.get("estimated_context_remaining_pct", 0.0)
+            _ctx_window = _ctx_snapshot.get("estimated_context_window_tokens", 0)
             if state.hook_state.last_result_data is not None:
-                _ctx_line = f"\nContext: ~{_ctx_remaining:,} tokens remaining ({_ctx_pct:.0f}%)"
+                # Print the session's real context window next to the percentage so
+                # agents never read the CLI capacity-selector suffix (e.g. [1m]) as
+                # the served window.
+                _ctx_line = (
+                    f"\nContext: ~{_ctx_remaining:,} of {_ctx_window:,} "
+                    f"tokens remaining ({_ctx_pct:.0f}%)"
+                )
             else:
                 _ctx_line = "\nContext: first turn"
             run_user_text = f"<system-note>\nTime: {_now_str}{_ctx_line}\n</system-note>\n\n{run_user_text}"
