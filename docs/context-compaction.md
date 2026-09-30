@@ -263,22 +263,23 @@ The native probe on 2.1.59 confirms that an explicit disable removes the
 A launcher that copies a parent's resolved env into a child must not copy
 the plan-owned keys, or they now pin the child's budget.
 
-## PreCompact handoff policy (2026-09-25; default for local models 2026-09-26)
+## PreCompact handoff policy (2026-09-25; explicit-only default 2026-09-30)
 
 `OBS_COMPACT_POLICY=handoff` in a session's explicit env replaces automatic
 compaction with "stop and hand off from full context".
 
-**Default for local models (2026-09-26, vault-u3b.64).** When the effective
-model is local (`local-*`), the policy defaults to `handoff` even when the
-session's explicit env does not set it, so no local session compacts lossily
-or overflows whether or not it was launched through a level procedure. An
-explicit `OBS_COMPACT_POLICY` always wins; set any other non-empty value
-(e.g. `native`) to opt out. Because the default counts as the policy, a local
-session with only `DISABLE_AUTO_COMPACT=1` also gets the handoff wall above;
-add `OBS_COMPACT_POLICY=native` to keep compaction fully off. Hosted models
-are unchanged (opt-in only). Resolution: `hooks.effective_compact_policy`,
-used by both the PreCompact callback and `SessionManager.create_options`.
-Live after the next OBS restart following merge. The pinned 2.1.59
+**Explicit-only default (2026-09-30, Daniel).** Lossy native compaction is
+the default for **every** agent, local included; `handoff` activates only
+when the session's explicit env sets `OBS_COMPACT_POLICY=handoff` (the
+level-stack procedures pass it explicitly). This reverses the 2026-09-26
+local-model default (`fc45661`, vault-u3b.64) which made `handoff` the
+implicit default for `local-*` sessions. An explicit
+`OBS_COMPACT_POLICY` always wins; any other non-empty value (e.g. `native`)
+is a no-op opt-out. A session with only `DISABLE_AUTO_COMPACT=1` is again
+honoured fully off; the handoff wall above applies only when `handoff` is
+also set explicitly. Resolution: `hooks.effective_compact_policy`, used by
+both the PreCompact callback and `SessionManager.create_options`. Live after
+the next OBS restart following merge. The pinned 2.1.59
 ignores a PreCompact `block`, and it always appends "Please continue the
 conversation from where we left off" after an automatic compaction. Steering
 the summary through PreCompact `systemMessage` or SessionStart(compact) context

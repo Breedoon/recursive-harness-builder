@@ -469,10 +469,10 @@ class SessionManager:
         # at the end of the usable window ("wall") and lets the PreCompact
         # handoff intercept it: still no summary, but a handoff instead of an
         # HTTP 500. An explicit disable without the handoff policy is honoured.
-        # Local models default to the handoff policy unless the explicit env
-        # sets OBS_COMPACT_POLICY (which always wins, incl. an opt-out value).
+        # The handoff policy is explicit-only: native compaction is the
+        # default for every agent, local included (Daniel, 2026-09-30).
         handoff_policy = (
-            effective_compact_policy(explicit_env, clean_model) == COMPACT_POLICY_HANDOFF
+            effective_compact_policy(explicit_env) == COMPACT_POLICY_HANDOFF
         )
         explicit_disable = explicit_compaction_disabled(explicit_env)
         wall = explicit_disable and handoff_policy and not self.compaction_handoff_active
