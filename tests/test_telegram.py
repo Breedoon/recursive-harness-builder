@@ -136,6 +136,7 @@ class TestTimezoneAndSenderIdentity:
         record = _TopicScheduleRecord(
             schedule_id="tz", route=route, schedule_mode="interval", trigger_kind="interval",
             interval_seconds=60, prompt="run", reset_session=False, next_run_at=ts,
+            description="tz", cron_expr=None,
         )
         assert bot._format_schedule_timestamp(ts=ts, record=record, now_ts=ts) == "today at 14:00 CEST"
         assert bot._schedule_summary_payload(record)["next_run_at"] == "2026-09-30T14:00:00+02:00"
@@ -1225,9 +1226,10 @@ class TestPerChatLock:
             t2 = asyncio.create_task(bot._process_message("second", u2, ctx))
             await asyncio.sleep(0.01)
 
-            assert started == ["first"]
+            _tag = '<telegram_sender full_name="Unknown Telegram User" user_id="12345"/>'
+            assert started == [f"{_tag}\nfirst"]
             assert _state(bot).hook_state.message_queue.get_nowait() == QueuedMessage(
-                text="second",
+                text=f"{_tag}\nsecond",
                 telegram_message_id=2,
                 reply_to_message_id=None,
             )

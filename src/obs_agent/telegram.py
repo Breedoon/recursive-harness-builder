@@ -8581,7 +8581,6 @@ class TelegramBot:
         if update.effective_message is None or update.effective_user is None:
             return
 
-        user_text = self._annotate_telegram_user_text(user_text, update.effective_user)
         route = self._route_for_message(update.effective_message)
         message_id = update.effective_message.message_id
         last_seen = self._last_inbound_message_id_by_route.get(route)
@@ -8616,8 +8615,11 @@ class TelegramBot:
             # That is routing metadata, not an explicit user fork target.
             if not (route.thread_id is not None and candidate_reply_id == route.thread_id):
                 reply_to_message_id = candidate_reply_id
+        annotated_user_text = self._annotate_telegram_user_text(
+            user_text, update.effective_user
+        )
         incoming = QueuedMessage(
-            text=user_text,
+            text=annotated_user_text,
             telegram_message_id=update.effective_message.message_id,
             reply_to_message_id=reply_to_message_id,
         )
@@ -8671,7 +8673,7 @@ class TelegramBot:
                     state.hook_state.pause_queue_delivery = False
                 await self._run_and_send(
                     state=state,
-                    user_text=user_text,
+                    user_text=annotated_user_text,
                     bot=context.bot,
                     trigger_message=incoming,
                     trigger_status_message_ids=trigger_status_message_ids,
