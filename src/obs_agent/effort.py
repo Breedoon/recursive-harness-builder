@@ -105,20 +105,26 @@ def build_effort_env(
         # back to session_env. Respect an operator's raw provider configuration.
         return result
     clean_model = resolve_model_context(model).model.lower()
-    if clean_model.startswith("local-qwen"):
+    is_local_qwen = clean_model.startswith(("local-qwen", "local-sparks-qwen"))
+    if is_local_qwen:
         output_config = body.get("output_config", {})
         if not isinstance(output_config, dict):
             raise ValueError("CLAUDE_CODE_EXTRA_BODY.output_config must be an object")
         body["output_config"] = {
             **output_config, "effort": QWEN_EFFORT_MAPPING[effort]
         }
+        chat_template_kwargs = body.get("chat_template_kwargs", {})
+        if not isinstance(chat_template_kwargs, dict):
+            raise ValueError("CLAUDE_CODE_EXTRA_BODY.chat_template_kwargs must be an object")
         if effort == "low":
-            chat_template_kwargs = body.get("chat_template_kwargs", {})
-            if not isinstance(chat_template_kwargs, dict):
-                raise ValueError("CLAUDE_CODE_EXTRA_BODY.chat_template_kwargs must be an object")
             body["chat_template_kwargs"] = {
                 **chat_template_kwargs,
-                "enable_thinking": chat_template_kwargs.get("enable_thinking", False),
+                "enable_thinking": False,
+            }
+        elif clean_model.startswith("local-sparks-qwen"):
+            body["chat_template_kwargs"] = {
+                **chat_template_kwargs,
+                "enable_thinking": True,
             }
         result[EXTRA_BODY_ENV] = json.dumps(body, separators=(",", ":"))
         return result

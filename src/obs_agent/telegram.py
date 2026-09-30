@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     from croniter import croniter
@@ -671,6 +672,10 @@ class TelegramBot:
         super_task_monitor_tick_seconds: float = _SUPER_TASK_MONITOR_TICK_SECONDS,
     ) -> None:
         self._config = config
+        try:
+            self._user_timezone = ZoneInfo(config.user_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Invalid OBS user timezone: {config.user_timezone}") from exc
         if _path_is_within(config.telegram_state_db_path, config.telegram_temp_root):
             raise ValueError(
                 "Invalid Telegram state DB path: OBS_TELEGRAM_STATE_DB_PATH must be outside "
@@ -3385,14 +3390,16 @@ class TelegramBot:
     ) -> float:
         if croniter is None:
             raise ValueError("croniter is not installed")
-        anchor = datetime.fromtimestamp(base_ts, timezone.utc)
+        anchor = datetime.fromtimestamp(base_ts, timezone.utc).astimezone(self._user_timezone)
         try:
             itr = croniter(cron_expr, anchor)
             candidate = float(itr.get_next(float))
         except Exception as exc:
             raise ValueError(str(exc)) from exc
         if not_before_ts is not None and candidate < not_before_ts:
-            anchor_nb = datetime.fromtimestamp(not_before_ts - 1.0, timezone.utc)
+            anchor_nb = datetime.fromtimestamp(
+                not_before_ts - 1.0, timezone.utc
+            ).astimezone(self._user_timezone)
             try:
                 itr = croniter(cron_expr, anchor_nb)
                 candidate = float(itr.get_next(float))
@@ -3543,21 +3550,9 @@ class TelegramBot:
             "enabled": record.enabled,
             "run_count": record.run_count,
             "max_runs": record.max_runs,
-            "from": (
-                datetime.fromtimestamp(record.from_ts, timezone.utc).isoformat().replace("+00:00", "Z")
-                if record.from_ts is not None
-                else None
-            ),
-            "until": (
-                datetime.fromtimestamp(record.until_ts, timezone.utc).isoformat().replace("+00:00", "Z")
-                if record.until_ts is not None
-                else None
-            ),
-            "next_run_at": (
-                datetime.fromtimestamp(record.next_run_at, timezone.utc).isoformat().replace("+00:00", "Z")
-                if record.next_run_at is not None
-                else None
-            ),
+            "from": self._schedule_iso_timestamp(record.from_ts),
+            "until": self._schedule_iso_timestamp(record.until_ts),
+            "next_run_at": self._schedule_iso_timestamp(record.next_run_at),
             "inherit": record.inherit_mode,
         }
         if record.last_error:
@@ -5789,6 +5784,13 @@ class TelegramBot:
             return record.interval_seconds < 60
         return False
 
+    def _schedule_iso_timestamp(self, ts: float | None) -> str | None:
+        if ts is None:
+            return None
+        return datetime.fromtimestamp(ts, timezone.utc).astimezone(
+            self._user_timezone
+        ).isoformat()
+
     def _format_schedule_timestamp(
         self,
         *,
@@ -5799,8 +5801,8 @@ class TelegramBot:
         include_seconds = self._schedule_uses_second_precision(record)
         now_utc = datetime.fromtimestamp(now_ts if now_ts is not None else time.time(), timezone.utc)
         value_utc = datetime.fromtimestamp(ts, timezone.utc)
-        now_dt = now_utc.astimezone()
-        value_dt = value_utc.astimezone()
+        now_dt = now_utc.astimezone(self._user_timezone)
+        value_dt = value_utc.astimezone(self._user_timezone)
         tz_label = value_dt.tzname() or value_dt.strftime("%z") or "local"
         time_fmt = "%H:%M:%S" if include_seconds else "%H:%M"
         if value_dt.date() == now_dt.date():
@@ -8547,6 +8549,25 @@ class TelegramBot:
             error=error_text,
         )
 
+    @staticmethod
+    def _telegram_sender_label(user: Any) -> str:
+        full_name = getattr(user, "full_name", None)
+        if isinstance(full_name, str) and full_name.strip():
+            return full_name.strip()
+        parts = [
+            value.strip()
+            for value in (getattr(user, "first_name", None), getattr(user, "last_name", None))
+            if isinstance(value, str) and value.strip()
+        ]
+        return " ".join(parts) or "Unknown Telegram User"
+
+    def _annotate_telegram_user_text(self, user_text: str, user: Any) -> str:
+        user_id = getattr(user, "id", None)
+        return (
+            f'<telegram_sender full_name="{html.escape(self._telegram_sender_label(user), quote=True)}" '
+            f'user_id="{int(user_id)}"/>\n{user_text}'
+        )
+
     async def _process_message(
         self,
         user_text: str,
@@ -8557,7 +8578,7 @@ class TelegramBot:
         user_warnings: list[str] | None = None,
     ) -> None:
         """Process a complete (possibly reassembled) user message."""
-        if update.effective_message is None:
+        if update.effective_message is None or update.effective_user is None:
             return
 
         route = self._route_for_message(update.effective_message)
@@ -8594,8 +8615,11 @@ class TelegramBot:
             # That is routing metadata, not an explicit user fork target.
             if not (route.thread_id is not None and candidate_reply_id == route.thread_id):
                 reply_to_message_id = candidate_reply_id
+        annotated_user_text = self._annotate_telegram_user_text(
+            user_text, update.effective_user
+        )
         incoming = QueuedMessage(
-            text=user_text,
+            text=annotated_user_text,
             telegram_message_id=update.effective_message.message_id,
             reply_to_message_id=reply_to_message_id,
         )
@@ -8649,7 +8673,7 @@ class TelegramBot:
                     state.hook_state.pause_queue_delivery = False
                 await self._run_and_send(
                     state=state,
-                    user_text=user_text,
+                    user_text=annotated_user_text,
                     bot=context.bot,
                     trigger_message=incoming,
                     trigger_status_message_ids=trigger_status_message_ids,

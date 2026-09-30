@@ -46,7 +46,7 @@ def test_reject_invalid_effort(value):
     ("gpt", "medium"), ("astra", "medium"), ("sol[200k]", "medium"),
     ("terra", "medium"), ("luna", "medium"), ("claude", "high"),
     ("sonnet[1m]", "high"), ("claude-opus-4-7", "xhigh"),
-    ("qwen-27b", "medium"), ("local-qwen", "medium"),
+    ("qwen-27b", "medium"), ("local-qwen", "medium"), ("qwen", "max"),
     ("haiku", "auto"), ("custom-model", "auto"),
 ])
 def test_defaults_resolve_model_aliases_independently_of_context(model, expected):
@@ -175,11 +175,26 @@ def test_local_qwen_effort_maps_to_template_values(level, expected):
         assert "chat_template_kwargs" not in body
 
 
+@pytest.mark.parametrize("level,expected_effort,thinking", [
+    ("low", "low", False),
+    ("medium", "medium", True),
+    ("max", "medium", True),
+])
+def test_local_sparks_qwen_wire_thinking_policy(level, expected_effort, thinking):
+    env = build_effort_env("local-sparks-qwen3.8-flash-next-abliterated", level, {})
+    body = json.loads(env[EXTRA_BODY_ENV])
+    assert env[EFFORT_ENV] == level
+    assert body == {
+        "output_config": {"effort": expected_effort},
+        "chat_template_kwargs": {"enable_thinking": thinking},
+    }
+
+
 def test_local_non_qwen_does_not_receive_qwen_body_override():
     assert build_effort_env("local-llama", "high", {}) == {EFFORT_ENV: "high"}
 
 
-def test_local_qwen_deep_merges_operator_extra_body_and_preserves_explicit_thinking():
+def test_local_qwen_low_overrides_operator_thinking_but_preserves_other_body():
     env = build_effort_env("local-qwen3.8-27b", "low", {
         EXTRA_BODY_ENV: json.dumps({
             "metadata": {"user_id": "operator"},
@@ -190,7 +205,7 @@ def test_local_qwen_deep_merges_operator_extra_body_and_preserves_explicit_think
     body = json.loads(env[EXTRA_BODY_ENV])
     assert body["metadata"] == {"user_id": "operator"}
     assert body["output_config"] == {"format": {"type": "json"}, "effort": "low"}
-    assert body["chat_template_kwargs"] == {"enable_thinking": True, "other": "kept"}
+    assert body["chat_template_kwargs"] == {"enable_thinking": False, "other": "kept"}
 
 
 def test_shell_extra_body_is_merged(monkeypatch, config):
