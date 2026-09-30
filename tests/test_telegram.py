@@ -15,6 +15,7 @@ from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from telegram.error import BadRequest, Conflict, TelegramError
@@ -110,8 +111,9 @@ def _expected_local_schedule_time(
     now_ts: float,
     include_seconds: bool,
 ) -> str:
-    now_dt = datetime.fromtimestamp(now_ts, timezone.utc).astimezone()
-    value_dt = datetime.fromtimestamp(ts, timezone.utc).astimezone()
+    user_tz = ZoneInfo("Europe/Warsaw")
+    now_dt = datetime.fromtimestamp(now_ts, timezone.utc).astimezone(user_tz)
+    value_dt = datetime.fromtimestamp(ts, timezone.utc).astimezone(user_tz)
     tz_label = value_dt.tzname() or value_dt.strftime("%z") or "local"
     time_fmt = "%H:%M:%S" if include_seconds else "%H:%M"
     if value_dt.date() == now_dt.date():
@@ -124,6 +126,35 @@ def _expected_local_schedule_time(
 
 def _state(bot: TelegramBot, chat_id: int = 67890, thread_id: int | None = None):
     return bot._get_state(TelegramRoute(chat_id=chat_id, thread_id=thread_id))
+
+
+class TestTimezoneAndSenderIdentity:
+    def test_schedule_times_render_in_warsaw(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=42)
+        ts = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc).timestamp()
+        record = _TopicScheduleRecord(
+            schedule_id="tz", route=route, schedule_mode="interval", trigger_kind="interval",
+            interval_seconds=60, prompt="run", reset_session=False, next_run_at=ts,
+        )
+        assert bot._format_schedule_timestamp(ts=ts, record=record, now_ts=ts) == "today at 14:00 CEST"
+        assert bot._schedule_summary_payload(record)["next_run_at"] == "2026-09-30T14:00:00+02:00"
+
+    def test_cron_uses_warsaw_wall_clock(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        base = datetime(2026, 9, 30, 6, 30, tzinfo=timezone.utc).timestamp()
+        expected = datetime(2026, 9, 30, 7, 0, tzinfo=timezone.utc).timestamp()
+        assert bot._next_cron_fire_ts(cron_expr="0 9 * * *", base_ts=base) == expected
+
+    async def test_process_message_includes_sender_name_and_id(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        update = _make_update("hello", user_id=12345)
+        update.effective_user.full_name = "Alice Example"
+        ctx = _make_context()
+        with patch.object(bot, "_run_and_send", new=AsyncMock()) as run_mock:
+            await bot._process_message("hello", update, ctx, pre_sent_status_message_ids=[999])
+        delivered = run_mock.await_args.kwargs["user_text"]
+        assert delivered == '<telegram_sender full_name="Alice Example" user_id="12345"/>\nhello'
 
 
 class TestTelegramBotAuth:

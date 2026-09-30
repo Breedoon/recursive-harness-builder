@@ -89,6 +89,10 @@ OBS_TELEGRAM_NOTIFY_USERNAME=your_telegram_username
 
 This mode depends on Telethon and Telegram API credentials from my.telegram.org. `OBS_TELEGRAM_USERBOT_SESSION` is a Telethon `StringSession`, not a `.session` file path. The userbot may be the operator's main Telegram account, but a secondary Telegram account is safer if the user does not want group ownership and automation tied to their personal account. Folder placement is optional; omit `OBS_TELEGRAM_GROUP_FOLDER_TITLE` and `OBS_TELEGRAM_GROUP_ADDLIST_URL` for the simplest setup.
 
+## User timezone
+
+Schedule wall-clock evaluation and all user-visible schedule timestamps use `OBS_USER_TIMEZONE`, an IANA timezone name. The default is `Europe/Warsaw`. For example, `OBS_USER_TIMEZONE=America/New_York` makes cron expressions use New York wall time and renders `from`, `until`, and `next_run_at` with that timezone's UTC offset.
+
 ## Model and provider selection
 
 Use `OBS_DEFAULT_MODEL` for normal defaults and `OBS_AGENT_MODEL` only when you want to force every root session to a specific model.

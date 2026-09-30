@@ -122,6 +122,7 @@ MODEL_EFFORT_LEVELS: dict[str, str] = {
     "claude-opus-4-6": "high",
     "claude-sonnet-4-6": "high",
     "local-qwen3.8-27b": "medium",
+    SPARK_QWEN_MODEL: "max",
     "gpt-6-astra": "medium",
     "gpt-6.1-sol": "medium",
     "gpt-6-sol": "medium",
@@ -363,6 +364,7 @@ class OBSConfig:
     # Change this to e.g. "claude" to make root sessions default to Claude.
     default_model: str = "luna"
     effort_level: str | None = None
+    user_timezone: str = "Europe/Warsaw"
     model_effort_levels: dict[str, str] = field(default_factory=dict)
     claude_dir: str = ".claude"
     agent_entry_file: str = "CLAUDE.md"
@@ -433,6 +435,8 @@ class OBSConfig:
 
         if effort := os.environ.get("OBS_EFFORT_LEVEL"):
             kwargs["effort_level"] = normalize_effort(effort)
+        if user_timezone := os.environ.get("OBS_USER_TIMEZONE"):
+            kwargs["user_timezone"] = user_timezone.strip() or "Europe/Warsaw"
         if raw_defaults := os.environ.get("OBS_MODEL_EFFORT_LEVELS"):
             import json
 
