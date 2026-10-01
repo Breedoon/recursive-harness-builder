@@ -8031,13 +8031,8 @@ class TelegramBot:
         state.hook_state.stop_requested_at = None
         state.hook_state.pause_queue_delivery = False
         run_user_text = user_text
-        if state.hook_state.interrupt_notice_pending:
-            run_user_text = (
-                "(System: The user interrupted your previous response via /stop. "
-                "Any canceled work should remain canceled unless the user explicitly asks to resume it.)\n\n"
-                f"{user_text}"
-            )
-            state.hook_state.interrupt_notice_pending = False
+        # A stop ends the prior turn, not the task described by the next message.
+        state.hook_state.interrupt_notice_pending = False
         runner_events = None
         trigger_status_ids = list(trigger_status_message_ids or [])
         trigger_user_mapped = False

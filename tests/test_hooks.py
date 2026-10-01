@@ -697,14 +697,16 @@ class TestCheckInterrupt:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_returns_stop_when_set(self):
-        """Interrupt flag set -> continue_: False."""
+    @pytest.mark.parametrize("tool_name", ["Bash", "AgentTaskOutput", "AgentTaskStop"])
+    async def test_returns_stop_when_set(self, config, tool_name):
+        """Halt the turn without adding instructions to abandon the task."""
         state = HookState(interrupt_flag=True)
-        check = _make_interrupt_check(state)
-        result = await check(_make_pre_tool_use_input(), "tu-123", _EMPTY_CONTEXT)
-        assert result is not None
-        assert result["continue_"] is False
-        assert result["stopReason"] == "Interrupted by user"
+        check = create_hook_matchers(config, state)["PreToolUse"][0].hooks[0]
+        result = await check(
+            _make_pre_tool_use_input(tool_name=tool_name), "tu-123", _EMPTY_CONTEXT,
+        )
+        assert result == {"continue_": False, "stopReason": "Interrupted by user"}
+        assert state.interrupt_flag is False
 
     @pytest.mark.asyncio
     async def test_clears_flag_after_firing(self):

@@ -517,7 +517,7 @@ class HookPipeline:
 
 
 def _make_interrupt_check(state: HookState) -> CheckFn:
-    """Create a check that stops the agent if interrupt_flag is set."""
+    """Create a check that halts the current turn if interrupt_flag is set."""
 
     async def _check(
         hook_input: HookInput,
@@ -530,13 +530,6 @@ def _make_interrupt_check(state: HookState) -> CheckFn:
             return {
                 "continue_": False,
                 "stopReason": "Interrupted by user",
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": (
-                        "System: The user interrupted your previous response via /stop. "
-                        "Stop current work immediately and wait for the next user message."
-                    ),
-                },
             }
         return None
 

@@ -22,6 +22,7 @@ from telegram.error import BadRequest, Conflict, TelegramError
 
 from obs_agent.config import normalize_model_for_claude_code, resolve_model
 from obs_agent.events import StatusEvent
+from obs_agent.hooks import create_hook_matchers
 from obs_agent.lineage import (
     ObsBootstrap,
     agent_name_for_lineage,
@@ -1501,11 +1502,40 @@ class TestBackgroundPoller:
             )
         ]
 
-    async def test_run_and_send_injects_interrupt_notice_once(self, config):
+    @pytest.mark.parametrize(("command", "handler", "args"), [
+        ("/stop", "handle_stop", []),
+        ("/stop@obs_bot", "handle_stop", []),
+        ("/stop all", "handle_stop", ["all"]),
+        ("/stop all@obs_bot", "handle_stop", ["all@obs_bot"]),
+        ("/stop@obs_bot all", "handle_stop", ["all"]),
+        ("/stop_branch", "handle_stop_branch", []),
+        ("/stop_branch@obs_bot", "handle_stop_branch", []),
+        ("/stop_tree", "handle_stop_tree", []),
+        ("/stop_tree@obs_bot", "handle_stop_tree", []),
+    ])
+    @pytest.mark.parametrize("active", [False, True], ids=["idle", "active"])
+    async def test_run_and_send_does_not_inject_interrupt_notice(
+        self, config, monkeypatch, command, handler, args, active,
+    ):
+        monkeypatch.setenv("OBS_STOP_KILL_GRACE_SECONDS", "0")
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         state = _state(bot)
         assert state is not None
-        state.hook_state.interrupt_notice_pending = True
+        state.busy = active
+        state.hook_state.execution_active = active
+        client = MagicMock()
+        client.interrupt = AsyncMock()
+        state.session_manager._client = client
+        state.session_manager._connected = True
+        context = _make_context()
+        context.args = args
+        with patch.object(bot, "_tree_stop_snapshot", return_value=([state], 0, ("Root",))):
+            await getattr(bot, handler)(_make_update(command), context)
+        client.interrupt.assert_awaited_once()
+        assert state.hook_state.interrupt_flag is True
+        assert state.hook_state.interrupt_requested is active
+        assert (state.hook_state.stop_requested_at is not None) is active
+        assert state.hook_state.interrupt_notice_pending is True
         fake_bot = MagicMock()
         fake_bot.send_message = AsyncMock(return_value=MagicMock(message_id=777))
         captured_prompt: list[str] = []
@@ -1526,8 +1556,12 @@ class TestBackgroundPoller:
             )
 
         assert len(captured_prompt) == 1
-        assert "user interrupted your previous response via /stop" in captured_prompt[0]
+        assert "user interrupted your previous response" not in captured_prompt[0]
+        assert "canceled work" not in captured_prompt[0]
         assert captured_prompt[0].strip().endswith("hello")
+        assert state.hook_state.interrupt_flag is False
+        assert state.hook_state.interrupt_requested is False
+        assert state.hook_state.stop_requested_at is None
         assert state.hook_state.interrupt_notice_pending is False
 
     async def test_run_and_send_clears_stale_idle_interrupt_before_new_turn(self, config):
@@ -7689,6 +7723,10 @@ class TestForkTaskRuntime:
         assert child_state.hook_state.interrupt_flag is True
         fake_client.interrupt.assert_awaited_once()
         assert "Successfully stopped task: task-123" in result["content"][0]["text"]
+        hook = create_hook_matchers(config, child_state.hook_state)["PreToolUse"][0].hooks[0]
+        assert await hook({"hook_event_name": "PreToolUse"}, None, {}) == {
+            "continue_": False, "stopReason": "Interrupted by user",
+        }
 
     async def test_fork_task_stop_on_completed_handle_is_idempotent_and_non_destructive(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
