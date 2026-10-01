@@ -3,7 +3,7 @@ FROM node:22-bookworm-slim@sha256:4d676821dff059fd00d277ee4261ef34ea712317fed073
 ARG DESKTOP_COMMANDER_VERSION=0.2.50
 
 LABEL org.opencontainers.image.title="OBS operational ChatGPT toolbox" \
-      org.opencontainers.image.version="0.2.0-reliability" \
+      org.opencontainers.image.version="0.2.1-reliability" \
       org.opencontainers.image.base.name="node:22-bookworm-slim" \
       org.opencontainers.image.base.digest="sha256:4d676821dff059fd00d277ee4261ef34ea712317fed0737c03941481b5760c96" \
       io.obs.chatgpt-toolbox.desktop-commander.version="0.2.50"
@@ -40,16 +40,14 @@ RUN test "$(node -p "require('./package-lock.json').packages['node_modules/@wond
     && npm cache clean --force \
     && test "$(node -p "require('./node_modules/@wonderwhy-er/desktop-commander/package.json').version")" = "$DESKTOP_COMMANDER_VERSION"
 
-RUN groupadd --gid 10001 toolbox \
-    && useradd --uid 10001 --gid 10001 --home-dir /session/home --shell /bin/bash --no-create-home toolbox \
-    && mkdir -p \
+RUN mkdir -p \
         /opt/toolbox/bin \
         /session/home \
         /session/xdg/config \
         /session/xdg/cache \
         /session/xdg/data \
         /workspace \
-    && chown -R 10001:10001 /session /workspace \
+    && chown -R 1000:1000 /session /workspace \
     && chmod 0700 /session/home /session/xdg/config /session/xdg/cache /session/xdg/data \
     && chmod 0750 /workspace
 
@@ -59,7 +57,7 @@ COPY --chmod=0755 bin/self_test.py /opt/toolbox/bin/self-test
 COPY --chmod=0755 bin/boundary_probe.py /opt/toolbox/bin/boundary-probe
 
 VOLUME ["/workspace", "/session"]
-USER 10001:10001
+USER 1000:1000
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/toolbox-entrypoint"]
 CMD ["idle"]

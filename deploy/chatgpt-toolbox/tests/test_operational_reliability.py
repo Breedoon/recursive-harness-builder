@@ -94,6 +94,14 @@ console.log(JSON.stringify({rejected,unchanged:config.session.refresh_token==='i
 
 
 class EntryPointTests(unittest.TestCase):
+    def test_image_and_compose_use_same_operational_uid_for_fresh_volumes(self) -> None:
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        compose = (ROOT / "compose.yaml").read_text()
+        self.assertIn("USER 1000:1000", dockerfile)
+        self.assertIn("chown -R 1000:1000 /session /workspace", dockerfile)
+        self.assertIn('user: "1000:1000"', compose)
+        self.assertNotIn("10001", dockerfile)
+
     def test_bind_mounted_entrypoint_is_executable(self) -> None:
         self.assertTrue(os.access(ROOT / "bin/entrypoint.sh", os.X_OK))
 

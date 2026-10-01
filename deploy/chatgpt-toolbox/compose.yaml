@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
       args:
         DESKTOP_COMMANDER_VERSION: "0.2.50"
-    image: local/chatgpt-toolbox:0.2.0-reliability
+    image: local/chatgpt-toolbox:0.2.1-reliability
     pull_policy: never
     container_name: chatgpt-toolbox-p2-20260917
     hostname: chatgpt-toolbox-p2-20260917
