@@ -1,4 +1,4 @@
-name: chatgpt-toolbox
+name: chatgpt-toolbox-p2-20260917
 
 services:
   toolbox:
@@ -7,15 +7,15 @@ services:
       dockerfile: Dockerfile
       args:
         DESKTOP_COMMANDER_VERSION: "0.2.50"
-    image: local/chatgpt-toolbox:0.1.0
+    image: local/chatgpt-toolbox:0.2.0-reliability
     pull_policy: never
-    container_name: chatgpt-toolbox
-    hostname: chatgpt-toolbox
-    command: ["idle"]
-    restart: "no"
+    container_name: chatgpt-toolbox-p2-20260917
+    hostname: chatgpt-toolbox-p2-20260917
+    command: ["exec", "sh", "-c", "while :; do /usr/local/bin/toolbox-entrypoint remote; sleep 3; done"]
+    restart: unless-stopped
     init: true
     read_only: true
-    user: "10001:1000"
+    user: "1000:1000"
     privileged: false
     cap_drop:
       - ALL
@@ -28,24 +28,52 @@ services:
       XDG_CONFIG_HOME: /session/xdg/config
       XDG_CACHE_HOME: /session/xdg/cache
       XDG_DATA_HOME: /session/xdg/data
-      NPM_CONFIG_CACHE: /tmp/npm-cache
-      TOOLBOX_WORKSPACE: /workspace/runtime/git/obs-vault-active
-      TOOLBOX_ACTIVE_VAULT: /workspace/runtime/git/obs-vault-active
+      TMPDIR: /session/tmp
+      NPM_CONFIG_CACHE: /session/cache/npm
+      TOOLBOX_WORKSPACE: /workspace
       TOOLBOX_SESSION: /session
+      TOOLBOX_HOST_FS: "1"
+      PATH: /workspace/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      GIT_SSH_COMMAND: ssh -i /session/keys/vault_sync_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=/session/home/.ssh/known_hosts
+      BROWSER_USE_RDP_HOST: obs-browser
+      BROWSER_USE_RDP_PORT: "6081"
+      PYTHONPATH: /workspace/obs/.venv/lib/python3.12/site-packages
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
-      - /workspace/runtime/git/obs-vault-active/.git:rw,noexec,nosuid,nodev,size=1m,mode=0555
     volumes:
+      - type: bind
+        source: ./bin/entrypoint.sh
+        target: /usr/local/bin/toolbox-entrypoint
+        read_only: true
+      - type: bind
+        source: ./bin/persistent_remote.mjs
+        target: /opt/toolbox/bin/persistent_remote.mjs
+        read_only: true
       - type: volume
         source: session
         target: /session
       - type: bind
-        source: /data/scratch/obs-test/runtime/git/obs-vault-active
-        target: /workspace/runtime/git/obs-vault-active
-        bind:
-          create_host_path: false
+        source: /data/scratch/obs-test/toolbox-workspace
+        target: /workspace
+      - type: bind
+        source: /
+        target: /host
+        read_only: true
+      - type: bind
+        source: /data/scratch/obs-test/runtime
+        target: /workspace/runtime
+      - type: bind
+        source: /data/scratch/obs-test/obs
+        target: /workspace/obs
+      - type: bind
+        source: /data/scratch/obs-test/runtime/git/keys
+        target: /session/keys
+        read_only: true
     networks:
       - egress
+      - browser-rdp
     cpus: "1.0"
     mem_limit: 1g
     memswap_limit: 1g
@@ -55,24 +83,29 @@ services:
         soft: 1024
         hard: 2048
       nproc:
-        soft: 128
-        hard: 128
+        soft: 4096
+        hard: 8192
     stop_grace_period: 10s
     logging:
       driver: none
     labels:
-      io.obs.chatgpt-toolbox.boundary: "isolated-v1"
+      io.obs.chatgpt-toolbox.boundary: "operational-agent-v2"
       io.obs.chatgpt-toolbox.connector.endpoint: "https://mcp.desktopcommander.app/mcp"
       io.obs.chatgpt-toolbox.desktop-commander.version: "0.2.50"
-      io.obs.chatgpt-toolbox.remote.session-persistence: "disabled"
+      io.obs.chatgpt-toolbox.remote.session-persistence: "enabled-atomic-refresh"
 
 networks:
   egress:
-    name: chatgpt-toolbox-net
+    name: chatgpt-toolbox-p2-net-20260917
     driver: bridge
     driver_opts:
       com.docker.network.bridge.enable_icc: "false"
+  browser-rdp:
+    name: obs-browser-rdp
+    external: true
 
 volumes:
+  workspace:
+    name: chatgpt-toolbox-p2-workspace-20260917
   session:
-    name: chatgpt-toolbox-session
+    name: chatgpt-toolbox-p2-session-20260917

@@ -1,24 +1,18 @@
 #!/bin/sh
 set -eu
 
-umask 007
+umask 077
 
-: "${TOOLBOX_ACTIVE_VAULT:?TOOLBOX_ACTIVE_VAULT is required}"
-[ "$TOOLBOX_ACTIVE_VAULT" = "/workspace/runtime/git/obs-vault-active" ] || {
-  printf '%s\n' "unexpected active vault path" >&2
-  exit 64
-}
-[ -d "$TOOLBOX_ACTIVE_VAULT" ] || {
-  printf '%s\n' "active vault mount is unavailable" >&2
-  exit 64
-}
+: "${TMPDIR:=$TOOLBOX_SESSION/tmp}"
+export TMPDIR
 
 mkdir -p \
   "$HOME" \
   "$XDG_CONFIG_HOME" \
   "$XDG_CACHE_HOME" \
   "$XDG_DATA_HOME" \
-  "$TOOLBOX_WORKSPACE"
+  "$TOOLBOX_WORKSPACE" \
+  "$TMPDIR"
 
 case "${1:-idle}" in
   idle)
@@ -37,19 +31,17 @@ case "${1:-idle}" in
     ;;
   remote)
     shift
-    remote_dir="$HOME/.desktop-commander-device"
-    remote_config="$remote_dir/device.json"
     runtime_dir="$TOOLBOX_SESSION/runtime"
     pid_file="$runtime_dir/remote-adapter.pid"
     child_pid=""
 
     cleanup_remote() {
-      rm -f "$remote_config" "$pid_file"
-      rmdir "$remote_dir" 2>/dev/null || true
+      rm -f "$pid_file"
     }
     terminate_remote() {
       if [ -n "$child_pid" ]; then
         kill -TERM "$child_pid" 2>/dev/null || true
+        wait "$child_pid" 2>/dev/null || true
       fi
     }
 
@@ -59,8 +51,11 @@ case "${1:-idle}" in
     trap terminate_remote INT TERM HUP
     trap cleanup_remote EXIT
 
-    node /opt/toolbox/node_modules/@wonderwhy-er/desktop-commander/dist/index.js \
-      remote --no-persist-session "$@" &
+    if [ "$#" -eq 0 ]; then
+      node /opt/toolbox/bin/persistent_remote.mjs > "$runtime_dir/remote-private.log" 2>&1 &
+    else
+      node /opt/toolbox/node_modules/@wonderwhy-er/desktop-commander/dist/index.js remote "$@" &
+    fi
     child_pid="$!"
     set +e
     wait "$child_pid"
