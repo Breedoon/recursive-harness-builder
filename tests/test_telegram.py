@@ -7725,7 +7725,7 @@ class TestForkTaskRuntime:
         assert "Successfully stopped task: task-123" in result["content"][0]["text"]
         hook = create_hook_matchers(config, child_state.hook_state)["PreToolUse"][0].hooks[0]
         assert await hook({"hook_event_name": "PreToolUse"}, None, {}) == {
-            "continue_": False, "stopReason": "Interrupted by user",
+            "continue_": False, "stopReason": "Turn interrupted",
         }
 
     async def test_fork_task_stop_on_completed_handle_is_idempotent_and_non_destructive(self, config):

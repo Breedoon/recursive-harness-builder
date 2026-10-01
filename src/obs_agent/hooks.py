@@ -529,7 +529,7 @@ def _make_interrupt_check(state: HookState) -> CheckFn:
             state.interrupt_notice_pending = True
             return {
                 "continue_": False,
-                "stopReason": "Interrupted by user",
+                "stopReason": "Turn interrupted",
             }
         return None
 

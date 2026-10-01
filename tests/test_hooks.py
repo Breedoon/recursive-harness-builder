@@ -705,7 +705,7 @@ class TestCheckInterrupt:
         result = await check(
             _make_pre_tool_use_input(tool_name=tool_name), "tu-123", _EMPTY_CONTEXT,
         )
-        assert result == {"continue_": False, "stopReason": "Interrupted by user"}
+        assert result == {"continue_": False, "stopReason": "Turn interrupted"}
         assert state.interrupt_flag is False
 
     @pytest.mark.asyncio
