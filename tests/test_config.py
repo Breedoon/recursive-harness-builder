@@ -12,6 +12,20 @@ import obs_agent.config as config_module
 from obs_agent.config import OBSConfig
 
 
+@pytest.mark.parametrize("model", ["glm", "glm-flash", "glm-5.3-flash", config_module.SPARK_GLM_MODEL])
+def test_glm_default_native_context(model):
+    resolved = config_module.resolve_model_context(model)
+    assert resolved.model == config_module.SPARK_GLM_MODEL
+    assert resolved.context_tokens == 1_048_576
+    assert not resolved.explicit_context
+
+
+def test_glm_explicit_context_and_qwen_default_unchanged():
+    assert config_module.resolve_model_context("glm[200k]").context_tokens == 200_000
+    assert config_module.resolve_model_context("glm[1m]").context_tokens == 1_000_000
+    assert config_module.resolve_model_context("qwen").context_tokens == 262_000
+
+
 # --- Vault Path Resolution ---
 
 

@@ -89,10 +89,11 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5": 200_000,
     "local-qwen": 262_000,
     "local-qwen3.8-27b": 262_000,
-    # Sparks default profile serves 262,144 native; the qwen-1m profile serves
+    # Spark Qwen's default profile serves 262,144 native; qwen-1m serves
     # ~1M, selected explicitly with a [1m] suffix (obs_agent.spark checks it).
     SPARK_QWEN_MODEL: 262_000,
-    SPARK_GLM_MODEL: 262_000,
+    # TensorFold GLM serves its native 1,048,576-token window by default.
+    SPARK_GLM_MODEL: 1_048_576,
     "local-gemma4-31b": 48_000,
     "gpt-6-astra": 900_000,
     "gpt-6.1-sol": 900_000,
