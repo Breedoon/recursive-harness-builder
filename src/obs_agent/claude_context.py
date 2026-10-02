@@ -260,9 +260,12 @@ def build_claude_context_plan(
     percentage overrides are superseded by this per-session policy. Disable
     switches are rejected instead of being silently reversed.
     """
+    context_maximum = EXTENDED_CONTEXT_TOKENS
+    if model.lower().startswith("local-") and provider_window_tokens is not None:
+        context_maximum = max(context_maximum, provider_window_tokens)
     _require_integer(
         context_tokens, name="context window",
-        minimum=MIN_OBS_CONTEXT_TOKENS, maximum=EXTENDED_CONTEXT_TOKENS,
+        minimum=MIN_OBS_CONTEXT_TOKENS, maximum=context_maximum,
     )
     _require_integer(
         auto_compact_window_tokens, name="auto-compact cap",

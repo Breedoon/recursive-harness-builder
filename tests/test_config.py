@@ -18,6 +18,14 @@ def test_glm_default_native_context(model):
     assert resolved.model == config_module.SPARK_GLM_MODEL
     assert resolved.context_tokens == 1_048_576
     assert not resolved.explicit_context
+    assert resolved.model_with_context == config_module.SPARK_GLM_MODEL
+
+
+def test_glm_native_served_name_context():
+    model = "local-sparks-glm-5.3-flash-exl3-abliterated"
+    resolved = config_module.resolve_model_context(model)
+    assert resolved.context_tokens == 1_048_576
+    assert resolved.model_with_context == model
 
 
 def test_glm_explicit_context_and_qwen_default_unchanged():

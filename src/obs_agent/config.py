@@ -94,6 +94,7 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     SPARK_QWEN_MODEL: 262_000,
     # TensorFold GLM serves its native 1,048,576-token window by default.
     SPARK_GLM_MODEL: 1_048_576,
+    "local-sparks-glm-5.3-flash-exl3-abliterated": 1_048_576,
     "local-gemma4-31b": 48_000,
     "gpt-6-astra": 900_000,
     "gpt-6.1-sol": 900_000,
@@ -147,6 +148,8 @@ class ModelContext:
 
     @property
     def model_with_context(self) -> str:
+        if self.model.lower().startswith("local-") and self.context_tokens % 1_000:
+            return self.model
         return self.model + _context_suffix_for_tokens(self.context_tokens)
 
     @property

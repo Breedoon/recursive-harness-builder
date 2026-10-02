@@ -136,6 +136,12 @@ class TestSessionOptions:
             assert child_options.env[key] == parent_options.env[key]
         assert child_options.model == parent_options.model
 
+    def test_glm_native_default_builds_session_options(self, config, key_file):
+        manager, options = _options(config, GLM)
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1048576"
+        assert manager.hook_state.effective_model == GLM
+        assert options.env["ANTHROPIC_BASE_URL"] == DEFAULT_BASE_URL
+
     def test_glm_alias_uses_glm_served_name(self, config, key_file):
         _manager, options = _options(config, GLM + "[262k]")
         assert options.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == GLM
