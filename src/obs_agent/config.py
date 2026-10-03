@@ -95,6 +95,7 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # TensorFold GLM serves its native 1,048,576-token window by default.
     SPARK_GLM_MODEL: 1_048_576,
     "local-sparks-glm-5.3-flash-exl3-abliterated": 1_048_576,
+    "local-sparks-glm-5.3-flash-exl3-4bpw": 1_048_576,
     "local-gemma4-31b": 48_000,
     "gpt-6-astra": 900_000,
     "gpt-6.1-sol": 900_000,

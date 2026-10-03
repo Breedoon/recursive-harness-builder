@@ -142,6 +142,21 @@ class TestSessionOptions:
         assert manager.hook_state.effective_model == GLM
         assert options.env["ANTHROPIC_BASE_URL"] == DEFAULT_BASE_URL
 
+    def test_glm_4bpw_native_default_builds_session_options(self, config, key_file):
+        model = "local-sparks-glm-5.3-flash-exl3-4bpw"
+        manager, options = _options(config, model)
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "1048576"
+        assert manager.hook_state.effective_model == model
+        assert options.env["ANTHROPIC_BASE_URL"] == DEFAULT_BASE_URL
+        assert options.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == model
+
+    def test_glm_4bpw_explicit_context_override_is_preserved(self, config, key_file):
+        model = "local-sparks-glm-5.3-flash-exl3-4bpw"
+        manager, options = _options(config, model + "[200k]")
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
+        assert manager.hook_state.effective_model == model + "[200k]"
+        assert options.env["ANTHROPIC_BASE_URL"] == DEFAULT_BASE_URL
+
     def test_glm_alias_uses_glm_served_name(self, config, key_file):
         _manager, options = _options(config, GLM + "[262k]")
         assert options.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == GLM
