@@ -44,8 +44,8 @@ class TestModelResolution:
         assert resolve_model("fable") == "claude-fable-5-1"
 
     def test_claude_haiku_shorthand(self):
-        assert resolve_model("claude-haiku") == "claude-haiku-4-5"
-        assert resolve_model("haiku") == "claude-haiku-4-5"
+        assert resolve_model("claude-haiku") == "claude-haiku-5-5"
+        assert resolve_model("haiku") == "claude-haiku-5-5"
 
     def test_gpt_shorthand_resolves_to_latest(self):
         resolved = resolve_model("gpt")
@@ -144,7 +144,7 @@ class TestModelContextBoundary:
     def test_claude_code_boundary_adds_resolved_context_suffix(self):
         assert normalize_model_for_claude_code("gpt") == "gpt-6.1-sol[900k]"
         assert normalize_model_for_claude_code("claude") == "claude-opus-5-5[1m]"
-        assert normalize_model_for_claude_code("haiku") == "claude-haiku-4-5[200k]"
+        assert normalize_model_for_claude_code("haiku") == "claude-haiku-5-5[1m]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
 
     @pytest.mark.parametrize("model", [

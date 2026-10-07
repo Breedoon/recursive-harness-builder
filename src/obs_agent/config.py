@@ -46,8 +46,8 @@ MODEL_RESOLUTION: dict[str, str] = {
     "claude-sonnet": "claude-sonnet-5-5",
     "fable": "claude-fable-5-1",
     "claude-fable": "claude-fable-5-1",
-    "haiku": "claude-haiku-4-5",
-    "claude-haiku": "claude-haiku-4-5",
+    "haiku": "claude-haiku-5-5",
+    "claude-haiku": "claude-haiku-5-5",
     # OpenAI tiers – "gpt" resolves to main production model
     "gpt": "gpt-6.1-sol",
     "gpt-pro": "gpt-6.1-sol",
@@ -87,6 +87,7 @@ _DEFAULT_CONTEXT_TOKENS = 1_000_000
 _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS = 0
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-haiku-4-5": 200_000,
+    "claude-haiku-5-5": 1_000_000,
     "local-qwen": 262_000,
     "local-qwen3.8-27b": 262_000,
     # Spark Qwen's default profile serves 262,144 native; qwen-1m serves

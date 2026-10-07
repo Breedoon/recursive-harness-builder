@@ -231,7 +231,7 @@ class TestCreateOptions:
         config.model = "haiku"
         mgr = SessionManager(config=config)
         options = mgr.create_options()
-        assert options.model == "claude-haiku-4-5[200k]"
+        assert options.model == "claude-haiku-5-5[1m]"
 
     def test_exposes_effective_model_to_hook_state(self, config):
         state = HookState()

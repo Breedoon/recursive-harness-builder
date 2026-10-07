@@ -106,7 +106,7 @@ def test_library_bootstrap_test_profile_remains_available_without_launch(
     assert profile == "test"
     assert OBSConfig.from_env().vault_path == Path("/tmp/unit-fixture")
     assert OBSConfig.from_env().daemon_port == 29999
-    assert OBSConfig.from_env().model == "claude-haiku-4-5"
+    assert OBSConfig.from_env().model == "claude-haiku-5-5"
 
 
 def test_explicit_generic_env_wins_over_profile_mapping(

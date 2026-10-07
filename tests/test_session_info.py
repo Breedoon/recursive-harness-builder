@@ -76,7 +76,7 @@ def test_cold_session_is_unknown_not_an_invented_agent(config):
     manager.create_options.assert_not_called()
 
 
-@pytest.mark.parametrize("model,expected", [("gpt[200k]", 200_000), ("haiku", 200_000), ("local-qwen", 262_000)])
+@pytest.mark.parametrize("model,expected", [("gpt[200k]", 200_000), ("haiku", 1_000_000), ("local-qwen", 262_000)])
 def test_cold_override_uses_its_own_model_window(config, model, expected):
     manager = SessionManager(config=config)
     manager.model_override = model
@@ -346,7 +346,7 @@ async def test_daemon_get_session_is_read_only_even_during_a_turn(config):
             assert response.status_code == 200
             info = response.json()
             assert info["runtime"]["busy"]
-            assert info["model"]["context_window_tokens"] == 200_000
+            assert info["model"]["context_window_tokens"] == 1_000_000
             assert info["session"]["session_id"] is None
             assert "session" in {c["name"] for c in client.get("/commands").json()["commands"]}
     manager.get_client.assert_not_awaited()

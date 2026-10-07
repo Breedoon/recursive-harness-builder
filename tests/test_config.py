@@ -168,7 +168,7 @@ class TestSessionSettings:
         """OBS_AGENT_MODEL overrides the default session model identity."""
         monkeypatch.setenv("OBS_AGENT_MODEL", "haiku")
         cfg = OBSConfig.from_env()
-        assert cfg.model == "claude-haiku-4-5"
+        assert cfg.model == "claude-haiku-5-5"
 
     def test_model_from_env_preserves_explicit_context_suffix(self, monkeypatch):
         monkeypatch.setenv("OBS_AGENT_MODEL", "gpt[200k]")
