@@ -125,6 +125,7 @@ MODEL_EFFORT_LEVELS: dict[str, str] = {
     "claude-opus-4-7": "xhigh",
     "claude-opus-4-6": "high",
     "claude-sonnet-4-6": "high",
+    "claude-haiku-5-5": "max",
     "local-qwen3.8-27b": "medium",
     SPARK_QWEN_MODEL: "max",
     "gpt-6-astra": "medium",

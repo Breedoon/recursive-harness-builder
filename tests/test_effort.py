@@ -47,7 +47,7 @@ def test_reject_invalid_effort(value):
     ("terra", "medium"), ("luna", "medium"), ("claude", "high"),
     ("sonnet[1m]", "high"), ("claude-opus-4-7", "xhigh"),
     ("qwen-27b", "medium"), ("local-qwen", "medium"), ("qwen", "max"),
-    ("haiku", "auto"), ("custom-model", "auto"),
+    ("haiku", "max"), ("custom-model", "auto"),
 ])
 def test_defaults_resolve_model_aliases_independently_of_context(model, expected):
     assert resolve_effort(model) == expected
