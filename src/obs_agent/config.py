@@ -364,12 +364,12 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "gpt-6-luna"
+    model: str = "gpt-6.1-sol"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
     # Resolved via MODEL_RESOLUTION (e.g. "sol" → "gpt-6.1-sol");
     # full model names pass through unchanged.
     # Change this to e.g. "claude" to make root sessions default to Claude.
-    default_model: str = "luna"
+    default_model: str = "sol"
     effort_level: str | None = None
     user_timezone: str = "Europe/Warsaw"
     model_effort_levels: dict[str, str] = field(default_factory=dict)
@@ -436,7 +436,7 @@ class OBSConfig:
         if model := os.environ.get("OBS_AGENT_MODEL") or os.environ.get("OBS_MODEL"):
             kwargs["model"] = resolve_model(model.strip())
         else:
-            dm = kwargs.get("default_model", "luna")
+            dm = kwargs.get("default_model", "sol")
             kwargs["model"] = resolve_model(dm)
         from obs_agent.effort import normalize_effort
 
