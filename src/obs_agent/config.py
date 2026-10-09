@@ -37,6 +37,9 @@ DEFAULT_QWEN_MODEL = SPARK_QWEN_MODEL
 # or "gpt", we resolve it to the latest/best model in that tier.  More specific
 # strings (e.g. "gpt-5.4") pass through unchanged.  Maintained as a flat dict;
 # update when new models are released.
+# PREFIX-STABILITY WARNING: alias/provider/context changes can invalidate the
+# tools/system/history cache key. Resolve once per session and record route/model
+# in live receipts; never infer provider from the agent's conversational identity.
 MODEL_RESOLUTION: dict[str, str] = {
     # Anthropic tiers
     "claude": "claude-opus-5-5",

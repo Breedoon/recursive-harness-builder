@@ -87,7 +87,7 @@ CCH_PLACEHOLDER = "cch=" + "0" * 5
 
 # ── driving the CLI ─────────────────────────────────────────────────────
 
-def _options(args, *, session_id=None, resume=None, env_extra=None, hooks=None):
+def _options(args, *, session_id=None, resume=None, env_extra=None, hooks=None, system_append=None):
     # The driver may itself run inside an agent's CLI; the nested-session guard
     # keys on CLAUDECODE in the inherited environment.
     os.environ.pop("CLAUDECODE", None)
@@ -115,7 +115,8 @@ def _options(args, *, session_id=None, resume=None, env_extra=None, hooks=None):
         setting_sources=[],
         # the real Claude Code system prompt (what OBS agents run with); its
         # system[2] is where the GrowthBook-driven boundary marker lands
-        system_prompt={"type": "preset", "preset": "claude_code"},
+        system_prompt={"type": "preset", "preset": "claude_code",
+                       **({"append": system_append} if system_append is not None else {})},
         permission_mode="bypassPermissions",
         allowed_tools=["Bash", "Read"],
         hooks=hooks,
@@ -261,6 +262,18 @@ async def sc_cch_collision(args):
     return [sid], None
 
 
+async def sc_boundary_marker(args):
+    """Exact standalone marker changes, not a substitute auto-memory toggle."""
+    sid = str(uuid.uuid4())
+    plain = "M4 driver stable section.\n\nM4 driver dynamic section."
+    marked = plain.replace("\n\n", "\n\n__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__\n\n")
+    await _session(args, ["Reply with the single word: one.", "Reply with the single word: two."],
+                   session_id=sid, system_append=plain)
+    await _session(args, ["Reply with the single word: three."], resume=sid, system_append=marked)
+    await _session(args, ["Reply with the single word: four."], resume=sid, system_append=plain)
+    return [sid], {"marker": "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"}
+
+
 async def sc_boundary_flip(args):
     sid = str(uuid.uuid4())
     await _session(args, ["Reply with the single word: one.", "Reply with the single word: two."],
@@ -387,7 +400,8 @@ SCENARIOS = {
     "reminder_block": (sc_reminder_block, "class A; expect FAIL on unfixed proxy"),
     "queued_midturn": (sc_queued_midturn, "notification splice"),
     "cch_collision": (sc_cch_collision, "billing placeholder collision; expect FAIL on unfixed proxy"),
-    "boundary_flip": (sc_boundary_flip, "class B flip-flop; expect FAIL on unfixed proxy"),
+    "boundary_flip": (sc_boundary_flip, "class B split-system flip-flop; expect FAIL on unfixed proxy"),
+    "boundary_marker": (sc_boundary_marker, "exact standalone dynamic marker; expect FAIL on unfixed proxy"),
     "resume_new_proc": (sc_resume_new_proc, "wake/new-process resume (--gap for >5 min)"),
     "recovery": (sc_recovery, "real fork recovery, kill during the first tool call"),
     "recovery_multi": (sc_recovery_multi, "real fork recovery after several tool rounds; expect FAIL"),
@@ -411,8 +425,11 @@ def run(args, name):
             pairs.append((rows_p[-1], rows_c[0]))  # the recovery boundary
         pairs += list(zip(rows_c, rows_c[1:]))
     rows, verdicts = evaluate(args.log_dir, sids, since, args.threshold, pairs=pairs)
-    ok = bool(verdicts) and all(v["ok"] for v in verdicts)
+    route_ok = all(r.get("route") == "cli-proxy" and r.get("model") == args.model for r in rows) if args.provider == "codex" else True
+    ok = bool(verdicts) and route_ok and all(v["ok"] for v in verdicts)
     return {"scenario": name, "note": note, "sessions": sids, "meta": meta,
+            "provider": args.provider, "model": args.model, "route_ok": route_ok,
+            "routes": sorted({r.get("route", "") for r in rows}),
             "requests": [r["req_id"] for r in rows], "pairs": verdicts, "ok": ok}
 
 
@@ -420,7 +437,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("scenarios", nargs="*")
     ap.add_argument("--list", action="store_true")
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--provider", choices=("anthropic", "codex"), default="anthropic",
+                    help="explicit codex route uses Sol; legacy Anthropic route stays available")
+    ap.add_argument("--model", default=None)
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL)
     ap.add_argument("--log-dir", default=pd.DEFAULT_LOG_DIR)
     ap.add_argument("--gap", type=int, default=0, help="idle seconds before resume_new_proc's resume")
@@ -431,6 +450,10 @@ def main(argv=None):
         for k, (_, note) in SCENARIOS.items():
             print(f"{k:16s} {note}")
         return 0
+    from obs_agent.config import resolve_model
+    args.model = resolve_model(args.model or ("sol" if args.provider == "codex" else DEFAULT_MODEL))
+    if args.provider == "codex" and not args.model.startswith("gpt-"):
+        ap.error("--provider codex requires an explicit GPT model, not a Claude/local fallback")
     names = list(SCENARIOS) if args.scenarios == ["all"] else args.scenarios
     results = []
     for n in names:

@@ -4474,6 +4474,9 @@ class TelegramBot:
             )
         return target.target_uuid, target.health
 
+    # PREFIX-STABILITY WARNING: restart/idle recovery must use a complete
+    # JSONL-visible prefix; bootstraps, inbox/task notices and resume notes append.
+    # Live guards: --provider codex queued_resume recovery_multi resume_new_proc.
     async def _recover_route_session_if_needed(
         self,
         *,

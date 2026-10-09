@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+# PREFIX-STABILITY WARNING: environment/bootstrap controls model routes and CLI
+# feature flags. A new process must replay stable history with the same request
+# semantics; never log credentials while diagnosing configuration divergence.
+
 import os
 import sys
 from pathlib import Path

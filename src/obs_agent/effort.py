@@ -6,6 +6,10 @@ levels. Provider capabilities remain authoritative; xhigh and max are distinct.
 
 from __future__ import annotations
 
+# PREFIX-STABILITY WARNING: effort changes can change the complete cache key.
+# Preserve per-session request history and provider-specific semantics; never
+# mutate process-global effort while concurrent sessions have distinct levels.
+
 import json
 from collections.abc import Mapping
 

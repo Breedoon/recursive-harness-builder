@@ -9,6 +9,10 @@ See daemon.py for the original inline implementation.
 
 from __future__ import annotations
 
+# PREFIX-STABILITY WARNING: queued notifications/continuations must append to
+# the same JSONL-visible history, not splice runtime-only content into its past.
+# Live guard: prefix_repro.py --provider codex queued_midturn queued_resume.
+
 import asyncio
 import logging
 from dataclasses import dataclass

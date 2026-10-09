@@ -83,6 +83,10 @@ try:
 except ValueError:
     PROD_PORT = 28925
 _CODEBASE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Capture at module load, never read a potentially newer on-disk file at health time.
+with open(__file__, "rb") as _source_file:
+    _LOADED_SOURCE_SHA256 = hashlib.sha256(_source_file.read()).hexdigest()
+_LOADED_AT = time.time()
 LOG_DIR = os.environ.get(
     "CACHE_PROXY_LOG_DIR",
     os.path.join(_CODEBASE_ROOT, ".obs-agent", "cache-proxy-log"),
@@ -899,6 +903,39 @@ def restore_cch_placeholder(raw: bytes) -> tuple[bytes, int]:
     return raw[:m.start()] + _CCH_PLACEHOLDER + raw[m.end():], 1
 
 
+# PREFIX-STABILITY WARNING (M4): CLI global-cache rollout inserts this exact
+# standalone system line between existing prompt sections. Strip only that
+# scaffolding and its added separator, not user/tool text or other whitespace.
+_DYNAMIC_BOUNDARY_LINE = re.compile(r"(?m)^__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__\n(?:\n)?")
+
+
+def normalize_dynamic_boundary(body: dict) -> int:
+    system = body.get("system")
+    if not isinstance(system, list):
+        return 0
+    count = 0
+    # CLI 2.1.59 can consume the marker itself, splitting the same prompt into
+    # stable/dynamic blocks. Rejoin only its exact SDK/auto-memory shape.
+    if (len(system) == 4 and all(isinstance(b, dict) and b.get("type") == "text" for b in system)
+            and str(system[0].get("text", "")).startswith("x-anthropic-billing-header:")
+            and system[1].get("text") == "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+            and str(system[2].get("text", "")).startswith("\nYou are an interactive agent")
+            and str(system[3].get("text", "")).startswith("# auto memory\n")
+            and set(system[3]).issubset({"type", "text", "cache_control"})):
+        system[2]["text"] += "\n\n" + system[3]["text"]
+        if "cache_control" in system[3]:
+            system[2].setdefault("cache_control", system[3]["cache_control"])
+        del system[3]
+        count += 1
+    for block in system:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                block["text"], n = _DYNAMIC_BOUNDARY_LINE.subn("", text)
+                count += n
+    return count
+
+
 def normalize_request(body: dict) -> tuple[dict, dict]:
     """Apply all normalizations to a request body in spec order.
 
@@ -919,6 +956,7 @@ def normalize_request(body: dict) -> tuple[dict, dict]:
 
     # 1. Normalize billing header (first — start of token stream)
     info["billing"] = normalize_billing_header(body)
+    info["dynamic_boundary"] = normalize_dynamic_boundary(body)
 
     # 2. Convert bare string content to list format (before skill listing move)
     info["strings"] = normalize_user_content_structure(body)
@@ -941,7 +979,7 @@ def normalize_request(body: dict) -> tuple[dict, dict]:
     # Determine overall action label
     actions_taken = [
         info["billing"], info["strings"], info["reminders"],
-        info["git_status"], info["tools"], info["metadata"],
+        info["git_status"], info["tools"], info["metadata"], info["dynamic_boundary"],
     ]
     if any(actions_taken):
         info["action"] = "normalized"
@@ -1472,7 +1510,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_health(self):
         """Respond to /health with a simple status check."""
-        body = json.dumps({"status": "ok"}).encode()
+        body = json.dumps({"status": "ok", "pid": os.getpid(),
+                           "loaded_at": _LOADED_AT,
+                           "source_sha256": _LOADED_SOURCE_SHA256}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

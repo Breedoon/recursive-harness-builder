@@ -9,6 +9,11 @@ See decisions D014 (SDK cache for continuity) and D022 (no compaction).
 
 from __future__ import annotations
 
+# PREFIX-STABILITY WARNING: model/effort/env and tool configuration participate
+# in the request prefix. Reconnect/eviction must replay identical old content,
+# not regenerate historical bootstrap/context with current runtime values.
+# Live guard: prefix_repro.py --provider codex resume_new_proc boundary_flip.
+
 import asyncio
 from contextlib import contextmanager
 import json

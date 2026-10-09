@@ -14,6 +14,10 @@ See decisions D018, D022.
 
 from __future__ import annotations
 
+# PREFIX-STABILITY WARNING: hook additionalContext/reminder output must not
+# silently alter historical API content. Stripped reminders retain their existing
+# message breakpoint in the proxy. Live guard: --provider codex reminder_block.
+
 import asyncio
 import importlib.util
 import inspect

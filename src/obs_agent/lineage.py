@@ -10,6 +10,10 @@ Naming convention (two-tier):
 
 from __future__ import annotations
 
+# PREFIX-STABILITY WARNING: lineage/bootstrap payloads belong in append-only
+# JSONL-visible context, not regenerated historical messages on fork/resume.
+# Stable identity must survive new-process replay; transient values append.
+
 import hashlib
 import json
 import re
