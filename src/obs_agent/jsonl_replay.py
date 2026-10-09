@@ -165,11 +165,64 @@ def prepare_session_replay(
                 uid = json.loads(raw).get("uuid")
                 effective_lines[uid] = index
                 first_originals.setdefault(uid, (index, raw))
-        selected = select_replay_entries(entries, target_uuid)
+        legacy_boundary = -1
+        repair_limit = None
+        legacy_error = None
+        try:
+            selected = select_replay_entries(entries, target_uuid)
+        except ValueError as exc:
+            if target_uuid is not None or str(exc) not in (
+                "Selected replay contains an incomplete tool round",
+                "Selected replay contains a synthetic API-error row",
+            ):
+                raise
+            from obs_agent.jsonl_health import analyze_jsonl_path
+
+            health = analyze_jsonl_path(path=path, session_id=session_id)
+            if health.needs_recovery:
+                raise
+            selected = select_replay_entries(entries, require_complete=False)
+            result_ids = {block.get("tool_use_id") for entry, _raw in selected
+                          for block in entry.get("message", {}).get("content", [])
+                          if isinstance(block, dict) and block.get("type") == "tool_result"}
+            invalid_groups = {
+                entry.get("message", {}).get("id") or entry["uuid"]
+                for entry, _raw in selected
+                if entry.get("isApiErrorMessage") or entry.get("message", {}).get("model") == "<synthetic>"
+                or any(isinstance(block, dict) and block.get("type") == "tool_use"
+                       and block.get("id") not in result_ids
+                       for block in entry.get("message", {}).get("content", []))
+            }
+            legacy_boundary = max(index for index, (entry, _raw) in enumerate(selected)
+                                  if (entry.get("message", {}).get("id") or entry["uuid"]) in invalid_groups)
+            # Already-inherited legacy damage is opaque: do not relink, remove or
+            # fabricate it. Only a later healthy, complete suffix may be repaired.
+            # Unknown terminal text is preserved by health, not certified complete.
+            # Leave that entire tail opaque rather than reparent any of its rows.
+            repair_limit = next((index for index, (entry, _raw) in enumerate(selected)
+                                 if index > legacy_boundary and entry.get("type") == "assistant"
+                                 and entry["uuid"] not in health.complete_message_targets), len(selected))
+            suffix = selected[legacy_boundary + 1:repair_limit]
+            if suffix and not any(entry["uuid"] in health.complete_message_targets for entry, _raw in suffix):
+                raise
+            suffix_results = {block.get("tool_use_id") for entry, _raw in suffix
+                              for block in entry.get("message", {}).get("content", [])
+                              if isinstance(block, dict) and block.get("type") == "tool_result"}
+            if any(entry.get("isApiErrorMessage") or entry.get("message", {}).get("model") == "<synthetic>"
+                   or any(isinstance(block, dict) and block.get("type") == "tool_use"
+                          and block.get("id") not in suffix_results
+                          for block in entry.get("message", {}).get("content", []))
+                   for entry, _raw in suffix):
+                raise
+            legacy_error = str(exc)
         overlays = []
         manifest = []
         parent = None
-        for entry, raw in selected:
+        for index, (entry, raw) in enumerate(selected):
+            if index <= legacy_boundary or (repair_limit is not None and index >= repair_limit):
+                continue
+            if legacy_boundary >= 0 and index == legacy_boundary + 1:
+                parent = entry.get("parentUuid")
             if entry.get("parentUuid") != parent:
                 patched = dict(entry)
                 patched["parentUuid"] = parent
@@ -192,7 +245,14 @@ def prepare_session_replay(
                   "loaded_sources": loaded_sources,
                   "path": str(path), "prefix_bytes": len(original),
                   "prefix_sha256": prefix_sha, "selected_uuids": [e["uuid"] for e, _raw in selected],
-                  "overlays": manifest, "overlay_count": len(overlays)}
+                  "overlays": manifest, "overlay_count": len(overlays),
+                  "legacy_prefix": None if legacy_boundary < 0 else {
+                      "boundary_uuid": selected[legacy_boundary][0]["uuid"],
+                      "selected_entries_preserved": legacy_boundary + 1,
+                      "unconfirmed_tail_entries_preserved": len(selected) - repair_limit,
+                      "validation_error": legacy_error,
+                      "policy": "opaque_original_ancestry_preserved_complete_suffix_only",
+                  }}
         if not overlays:
             return result
         provenance = Path(os.environ.get("OBS_SESSION_REPLAY_PROVENANCE_DIR", "/workspace/runtime/state/session-replay")) / session_id
