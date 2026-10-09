@@ -164,6 +164,7 @@ stats = {
     "skill_stripped": 0, "skill_missing": 0,
     "billing_normalized": 0, "strings_converted": 0,
     "reminders_stripped": 0, "messages_placeholdered": 0,
+    "cch_restored": 0,
     "git_status_normalized": 0,
     "tools_sorted": 0, "metadata_normalized": 0,
     "errors": 0,
@@ -438,15 +439,37 @@ def strip_all_system_reminders(body: dict) -> int:
         if not isinstance(content, list):
             continue
         kept: list = []
+        # PREFIX-STABILITY WARNING (M1): the request must stay an
+        # append-extension of the previous request of the same session, and a
+        # cache breakpoint may never be dropped (or added: the API limit is 4).
+        # When a reminder-only block is dropped and it carries cache_control,
+        # that marker MOVES to the nearest surviving earlier block of the same
+        # message (or the next surviving block / the placeholder if none is
+        # earlier). Dropping it silently leaves the request with no message
+        # breakpoint, which reads only system+tools and writes nothing.
+        # Live guard: scripts/prefix_repro.py reminder_block. Incident:
+        # 2026-10-08/09, mission vault-mief.
+        pending_cc = None
         for block in content:
             removed, now_empty = _strip_reminders_in_block(block)
             count += removed
             if now_empty:
+                cc = block.get("cache_control") if isinstance(block, dict) else None
+                if cc is not None:
+                    if kept and isinstance(kept[-1], dict):
+                        kept[-1].setdefault("cache_control", cc)
+                    else:
+                        pending_cc = cc
                 continue
+            if pending_cc is not None and isinstance(block, dict):
+                block.setdefault("cache_control", pending_cc)
+                pending_cc = None
             kept.append(block)
         if content and not kept:
             kept = [{"type": "text", "text": REMINDER_PLACEHOLDER}]
             placeholdered += 1
+            if pending_cc is not None:
+                kept[0]["cache_control"] = pending_cc
         msg["content"] = kept
     stats["reminders_stripped"] += count
     stats["messages_placeholdered"] += placeholdered
@@ -833,6 +856,44 @@ def _add_beta(headers: dict, beta: str) -> None:
                 headers[k] = ",".join(parts + [beta])
             return
     headers["anthropic-beta"] = beta
+
+
+# PREFIX-STABILITY WARNING (M3): the request must stay an append-extension of
+# the previous request of the same session; never let the Claude Code billing
+# placeholder (the "cch=" key followed by five zero characters) appear in
+# message content. The CLI rewrites the FIRST occurrence of that placeholder in
+# the serialized body with a random hash on every request. `messages` serialize
+# before `system`, so a message that contains the placeholder gets a new random
+# value each call and the whole conversation stops caching, while the system
+# header keeps the placeholder. restore_cch_placeholder() is the exact inverse:
+# when the system billing header still carries the placeholder and an earlier
+# "cch=<5 hex>" occurrence exists, that first occurrence is put back. Everything
+# else stays byte-identical. Runs on the raw bytes BEFORE normalize_request().
+# Live guard: scripts/prefix_repro.py cch_collision. Incident: 2026-10-08/09,
+# mission vault-mief. Do not write the placeholder literal in prompts, notes,
+# logs or source comments that agents may read.
+_CCH_PLACEHOLDER = b"cch=" + b"0" * 5
+_CCH_HASH_RE = re.compile(rb"cch=[0-9a-f]{5}")
+_BILLING_HEADER_MARK = b"x-anthropic-billing-header:"
+
+
+def restore_cch_placeholder(raw: bytes) -> tuple[bytes, int]:
+    """Undo the CLI's billing-hash mutation of an earlier message occurrence.
+
+    The system billing header is the LAST billing-header marker in the body
+    (`system` serializes after `messages`). If it still carries the placeholder,
+    the CLI's single replacement landed on an earlier occurrence. Placeholders
+    further down in messages (echoed in tool input/output) are irrelevant: only
+    the first occurrence of the whole body was ever rewritten.
+    """
+    h = raw.rfind(_BILLING_HEADER_MARK)
+    if h < 0 or raw.find(_CCH_PLACEHOLDER, h, h + 1000) < 0:
+        return raw, 0  # header already carries a hash: nothing was displaced
+    m = _CCH_HASH_RE.search(raw, 0, h)
+    if m is None:
+        return raw, 0
+    stats["cch_restored"] += 1
+    return raw[:m.start()] + _CCH_PLACEHOLDER + raw[m.end():], 1
 
 
 def normalize_request(body: dict) -> tuple[dict, dict]:
@@ -1486,7 +1547,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         post_bytes = None
         info = {}
         try:
-            data = json.loads(raw_body)
+            # M3: undo the CLI's billing-hash mutation of an earlier message
+            # (see restore_cch_placeholder). raw_body itself stays untouched so
+            # the request log keeps the exact bytes the CLI sent.
+            parse_bytes, cch_fixed = restore_cch_placeholder(raw_body)
+            data = json.loads(parse_bytes)
+            if cch_fixed:
+                log("restored CLI billing-hash mutation in an earlier message")
             is_streaming = data.get("stream", False)
             try:
                 self._rl["session_id"] = extract_session_id(data)

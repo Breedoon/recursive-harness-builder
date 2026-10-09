@@ -137,6 +137,8 @@ async def _session(args, prompts, **kw):
     async with ClaudeSDKClient(options=_options(args, **kw)) as client:
         for p in prompts:
             await _turn(client, p)
+        # let the CLI flush its JSONL before the process is torn down
+        await asyncio.sleep(float(os.environ.get("PREFIX_REPRO_SETTLE", "0")))
 
 
 # ── reading the proxy log ───────────────────────────────────────────────
@@ -245,6 +247,7 @@ async def sc_queued_midturn(args):
             except asyncio.TimeoutError:
                 break
         await _turn(client, "Reply with the single word: after.")
+        await asyncio.sleep(float(os.environ.get("PREFIX_REPRO_SETTLE", "0")))
     return [sid], None
 
 
