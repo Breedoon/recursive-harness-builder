@@ -209,9 +209,20 @@ def diff_requests(a: dict, b: dict, a_beta: str | None = None, b_beta: str | Non
 
     ma, mb = a.get("messages") or [], b.get("messages") or []
     msg_div = None
+    tail_block_append = False
     for i in range(min(len(ma), len(mb))):
         ca, cb = canon(ma[i]), canon(mb[i])
         if ca != cb:
+            ba, bb = _as_blocks(ma[i].get("content")), _as_blocks(mb[i].get("content"))
+            # The CLI merges an appended continuation into a trailing user tool-
+            # result message. Distinguish exact old-block prefix from mutation.
+            if (i == len(ma) - 1 and len(mb) >= len(ma)
+                    and ma[i].get("role") == "user" and len(bb) > len(ba)
+                    and canon({k: v for k, v in ma[i].items() if k != "content"})
+                    == canon({k: v for k, v in mb[i].items() if k != "content"})
+                    and all(canon(x) == canon(y) for x, y in zip(ba, bb))):
+                tail_block_append = True
+                continue
             msg_div = _divergence("messages", f"messages[{i}]", ca, cb)
             # Narrow to the block inside the message.
             ba, bb = _as_blocks(ma[i].get("content")), _as_blocks(mb[i].get("content"))
@@ -251,11 +262,14 @@ def diff_requests(a: dict, b: dict, a_beta: str | None = None, b_beta: str | Non
         result["classification"] = "shrunk"
     elif result["config_diffs"]:
         result["classification"] = "config-changed"
+    elif tail_block_append:
+        result["classification"] = "tail-block-append"
+        result["tail_block_append"] = True
     elif len(mb) == len(ma):
         result["classification"] = "identical"
     else:
         result["classification"] = "append"
-    if result["config_diffs"] and result["classification"] in ("append", "identical"):
+    if result["config_diffs"] and result["classification"] in ("append", "tail-block-append", "identical"):
         result["classification"] = "config-changed"
 
     a_bp = _last_message_bp(result["a_breakpoints"])

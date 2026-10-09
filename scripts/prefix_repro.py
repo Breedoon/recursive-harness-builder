@@ -93,8 +93,12 @@ def _options(args, *, session_id=None, resume=None, env_extra=None, hooks=None, 
     os.environ.pop("CLAUDECODE", None)
     cwd = WORK_ROOT / "cwd"
     cwd.mkdir(parents=True, exist_ok=True)
+    if resume:
+        from obs_agent.jsonl_replay import prepare_session_replay
+        prepare_session_replay(session_id=resume, cwd=cwd)
     env = {
         "ANTHROPIC_BASE_URL": args.base_url,
+        "CLAUDE_CODE_EAGER_FLUSH": "1",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "ENABLE_TOOL_SEARCH": "false",
         "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
@@ -124,12 +128,21 @@ def _options(args, *, session_id=None, resume=None, env_extra=None, hooks=None, 
 
 
 async def _turn(client, prompt, *, stop_on_tool_use=False):
+    from obs_agent._sdk_patch import ensure_raw_uuid_patch
+    ensure_raw_uuid_patch()
     await client.query(prompt)
+    last_assistant_uuid = None
     async for msg in client.receive_response():
+        if isinstance(msg, AssistantMessage):
+            last_assistant_uuid = getattr(msg, "_raw_uuid", None) or last_assistant_uuid
         if stop_on_tool_use and isinstance(msg, AssistantMessage):
             if any(isinstance(b, ToolUseBlock) for b in msg.content):
                 return "tool_use_seen"
         if isinstance(msg, ResultMessage):
+            if msg.subtype == "success" and not msg.is_error:
+                from obs_agent.jsonl_replay import record_terminal_completion
+                record_terminal_completion(session_id=msg.session_id, cwd=WORK_ROOT / "cwd",
+                                           target_uuid=last_assistant_uuid)
             return "done"
     return "eof"
 
@@ -189,10 +202,24 @@ def evaluate(log_dir, session_ids, since, threshold, *, settle=3.0, pairs=None):
         prior = _prompt_total(a.get("usage"))
         cr = (b.get("usage") or {}).get("cache_read") or 0
         ratio = cr / prior if prior else 0.0
-        ok = cls in ("append", "identical") and not no_bp and ratio >= threshold
+        def tool_blocks(request):
+            blocks = {}
+            for message in request.get("messages", []):
+                content = message.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"):
+                        key = (block["type"], block.get("id", block.get("tool_use_id")))
+                        blocks.setdefault(key, []).append(pd.canon(block))
+            return blocks
+        old_tools, new_tools = tool_blocks(A), tool_blocks(B)
+        tool_fidelity = all(new_tools.get(key) == value for key, value in old_tools.items())
+        ok = cls in ("append", "tail-block-append", "identical") and not no_bp and ratio >= threshold and tool_fidelity
         verdicts.append({
             "a": a["req_id"], "b": b["req_id"], "class": cls, "no_breakpoint": no_bp,
             "cache_read": cr, "prior_prompt": prior, "ratio": round(ratio, 4),
+            "original_tool_blocks_exactly_once": tool_fidelity,
             "ok": ok, "diff": text if not ok else "",
         })
     return rows, verdicts
@@ -336,9 +363,35 @@ async def sc_parallel_resume(args):
         "Reply with the single word: ready.",
         "In ONE message call the Read tool three times in parallel on a.txt, b.txt and c.txt "
         "(relative to the current directory), then reply with the single word: read.",
-    ], session_id=sid)
+    ] + [f"Reply with the single word: warm{i}." for i in range(args.warm_turns)], session_id=sid)
     await _session(args, ["Reply with the single word: woke."], resume=sid)
     return [sid], None
+
+
+async def sc_parallel_fork(args):
+    import hashlib
+    from obs_agent.context_jsonl import find_session_jsonl
+    from obs_agent.jsonl_fork import fork_session_jsonl
+    from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+    sids, _ = await sc_parallel_resume(args)
+    sid = sids[0]
+    cwd = WORK_ROOT / "cwd"
+    source = find_session_jsonl(session_id=sid, cwd=cwd)
+    before = hashlib.sha256(source.read_bytes()).hexdigest()
+    target = resolve_safe_jsonl_target(session_id=sid, cwd=cwd)
+    final_uuid = target.health.last_real_assistant_uuid
+    if target.health.complete_message_targets.get(final_uuid) != target.target_uuid:
+        raise RuntimeError("parallel_fork: observed terminal response lacks confirmed completion")
+    original_map = {e["uuid"]: e for e in (json.loads(line) for line in source.read_text().splitlines()) if e.get("uuid")}
+    new_sid = fork_session_jsonl(session_id=sid, target_uuid=target.target_uuid, cwd=cwd)
+    fork_path = source.parent / f"{new_sid}.jsonl"
+    copied_map = {e["uuid"]: e for e in (json.loads(line) for line in fork_path.read_text().splitlines()) if e.get("uuid")}
+    final_response_preserved = copied_map.get(final_uuid, {}).get("message") == original_map[final_uuid]["message"]
+    source_unchanged = hashlib.sha256(source.read_bytes()).hexdigest() == before
+    await _session(args, ["Reply with the single word: forked."], resume=new_sid)
+    return [sid, new_sid], {"parent": sid, "child": new_sid, "final_response_preserved": final_response_preserved,
+                            "original_source_sha256": before, "source_unchanged": source_unchanged}
 
 
 async def sc_recovery_multi(args):
@@ -348,8 +401,12 @@ async def sc_recovery_multi(args):
     from obs_agent.jsonl_fork import fork_session_jsonl
     from obs_agent.jsonl_health import resolve_safe_jsonl_target
 
+    import hashlib
+    from obs_agent.context_jsonl import find_session_jsonl
+
     sid = str(uuid.uuid4())
     cwd = WORK_ROOT / "cwd"
+    effect_path = cwd / f"effects-{sid}.txt"
     for name in ("a.txt", "b.txt", "c.txt"):
         (cwd / name).parent.mkdir(parents=True, exist_ok=True)
         (cwd / name).write_text(name + "\n")
@@ -359,8 +416,8 @@ async def sc_recovery_multi(args):
         await _turn(client, "Reply with the single word: ready.")
         await client.query(
             "Do these steps in order without pausing: (1) say 'working', (2) in ONE message call the "
-            "Read tool on a.txt and b.txt in parallel, (3) run Bash `echo step3`, (4) run Bash `echo step4`, "
-            "(5) run Bash `sleep 60`.")
+            f"Read tool on a.txt and b.txt in parallel, (3) run Bash `echo step3 >> {effect_path.name}`, "
+            f"(4) run Bash `echo step4 >> {effect_path.name}`, (5) run Bash `sleep 60`.")
         seen = 0
         async for msg in client.receive_messages():
             if isinstance(msg, AssistantMessage):
@@ -377,12 +434,20 @@ async def sc_recovery_multi(args):
     target = resolve_safe_jsonl_target(session_id=sid, cwd=cwd)
     if target is None or not target.target_uuid:
         raise RuntimeError("recovery_multi: no safe target")
+    effects_before = effect_path.read_text().splitlines() if effect_path.exists() else []
+    source = find_session_jsonl(session_id=sid, cwd=cwd)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
     new_sid = fork_session_jsonl(session_id=sid, target_uuid=target.target_uuid, cwd=cwd,
                                  new_session_id=str(uuid.uuid4()))
-    await _session(args, ["(recovered) Reply with the single word: back."], resume=new_sid)
+    await _session(args, ["(recovered) Do not rerun prior tools. Reply with the single word: back."], resume=new_sid)
+    effects_after = effect_path.read_text().splitlines() if effect_path.exists() else []
     return [sid, new_sid], {"parent": sid, "child": new_sid,
                             "needs_recovery": target.health.needs_recovery,
-                            "reason": target.health.unsafe_tail_reason}
+                            "reason": target.health.unsafe_tail_reason,
+                            "effects_before": effects_before, "effects_after": effects_after,
+                            "effects_unchanged": effects_before == effects_after == ["step3", "step4"],
+                            "original_source_sha256": source_hash,
+                            "source_unchanged": hashlib.sha256(source.read_bytes()).hexdigest() == source_hash}
 
 
 async def sc_queued_resume(args):
@@ -393,6 +458,32 @@ async def sc_queued_resume(args):
     sids, _ = await sc_queued_midturn(args)
     await _session(args, ["Reply with the single word: woke."], resume=sids[0])
     return sids, None
+
+
+async def sc_poisoned_recovery(args):
+    import hashlib
+    from datetime import datetime, timezone
+    from obs_agent.context_jsonl import find_session_jsonl
+    from obs_agent.jsonl_fork import fork_session_jsonl
+    from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+    sid = str(uuid.uuid4())
+    cwd = WORK_ROOT / "cwd"
+    await _session(args, ["Reply with the single word: ready.", "Reply with the single word: two."], session_id=sid)
+    path = find_session_jsonl(session_id=sid, cwd=cwd)
+    target = resolve_safe_jsonl_target(session_id=sid, cwd=cwd)
+    poison = {"type": "assistant", "uuid": str(uuid.uuid4()), "parentUuid": target.target_uuid,
+              "sessionId": sid, "timestamp": datetime.now(timezone.utc).isoformat(), "isApiErrorMessage": True,
+              "message": {"role": "assistant", "model": "<synthetic>", "content": [{"type": "text", "text": "Prompt is too long"}]}}
+    with path.open("a") as handle:
+        handle.write(json.dumps(poison) + "\n")
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    target = resolve_safe_jsonl_target(session_id=sid, cwd=cwd)
+    child = fork_session_jsonl(session_id=sid, target_uuid=target.target_uuid, cwd=cwd)
+    await _session(args, ["Reply with the single word: recovered."], resume=child)
+    return [sid, child], {"parent": sid, "child": child, "reason": target.health.unsafe_tail_reason,
+                         "source_unchanged": hashlib.sha256(path.read_bytes()).hexdigest() == before,
+                         "original_source_sha256": before, "synthetic_row_is_test_injection": True}
 
 
 SCENARIOS = {
@@ -407,6 +498,8 @@ SCENARIOS = {
     "recovery_multi": (sc_recovery_multi, "real fork recovery after several tool rounds; expect FAIL"),
     "queued_resume": (sc_queued_resume, "mid-turn queued message then new-process resume"),
     "parallel_resume": (sc_parallel_resume, "parallel tool calls then new-process resume; expect FAIL"),
+    "parallel_fork": (sc_parallel_fork, "parallel same-ID resume then verbatim-source fork"),
+    "poisoned_recovery": (sc_poisoned_recovery, "test-injected synthetic API-error tail excluded on recovery"),
 }
 
 
@@ -415,7 +508,7 @@ def run(args, name):
     since = time.time() - 1
     sids, meta = asyncio.run(fn(args))
     pairs = None
-    if name in ("recovery", "recovery_multi"):
+    if name in ("recovery", "recovery_multi", "parallel_fork", "poisoned_recovery"):
         rows_p = _rows(args.log_dir, [meta["parent"]], since)
         time.sleep(3)
         rows_c = _rows(args.log_dir, [meta["child"]], since)
@@ -426,7 +519,9 @@ def run(args, name):
         pairs += list(zip(rows_c, rows_c[1:]))
     rows, verdicts = evaluate(args.log_dir, sids, since, args.threshold, pairs=pairs)
     route_ok = all(r.get("route") == "cli-proxy" and r.get("model") == args.model for r in rows) if args.provider == "codex" else True
-    ok = bool(verdicts) and route_ok and all(v["ok"] for v in verdicts)
+    meta_ok = not meta or (meta.get("effects_unchanged", True) and meta.get("source_unchanged", True)
+                           and meta.get("final_response_preserved", True))
+    ok = bool(verdicts) and route_ok and meta_ok and all(v["ok"] for v in verdicts)
     return {"scenario": name, "note": note, "sessions": sids, "meta": meta,
             "provider": args.provider, "model": args.model, "route_ok": route_ok,
             "routes": sorted({r.get("route", "") for r in rows}),
@@ -443,6 +538,7 @@ def main(argv=None):
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL)
     ap.add_argument("--log-dir", default=pd.DEFAULT_LOG_DIR)
     ap.add_argument("--gap", type=int, default=0, help="idle seconds before resume_new_proc's resume")
+    ap.add_argument("--warm-turns", type=int, default=0, help="turns after parallel tools to put divergence beyond lookback")
     ap.add_argument("--threshold", type=float, default=0.95)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)

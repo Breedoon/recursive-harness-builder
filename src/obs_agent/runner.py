@@ -14,6 +14,8 @@ from __future__ import annotations
 # Live guard: prefix_repro.py --provider codex queued_midturn queued_resume.
 
 import asyncio
+import hashlib
+from pathlib import Path
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, AsyncIterator
@@ -37,6 +39,7 @@ from obs_agent.session import SessionManager
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
 
+LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 logger = logging.getLogger("obs_agent.runner")
 
 _RECOVERY_PROMPT = (
@@ -284,6 +287,7 @@ class ConversationRunner:
         self._last_message = None  # tracks last SDK message for metrics
         self._last_result_message = None  # latest ResultMessage-like payload
         self._last_assistant_usage: dict | None = None  # latest assistant step usage
+        self._last_assistant_uuid: str | None = None
 
     def _refresh_last_result_data(self) -> None:
         """Refresh hook_state.last_result_data from the latest SDK result-like message."""
@@ -339,6 +343,15 @@ class ConversationRunner:
                 self._last_result_message = message
             if hasattr(message, "session_id") and message.session_id:
                 self._session_mgr.set_session_id(message.session_id)
+            if message_role == "assistant" and isinstance(raw_uuid, str) and raw_uuid:
+                self._last_assistant_uuid = raw_uuid
+            if (_is_result_message(message) and getattr(message, "subtype", None) == "success"
+                    and not getattr(message, "is_error", False) and self._session_mgr.session_id):
+                from obs_agent.jsonl_replay import record_terminal_completion
+                record_terminal_completion(session_id=self._session_mgr.session_id,
+                                           cwd=self._config.vault_path,
+                                           target_uuid=self._last_assistant_uuid,
+                                           observer="obs_runner", observer_source_sha256=LOADED_SOURCE_SHA256)
             if hasattr(message, "content") and isinstance(message.content, list):
                 usage = getattr(message, "usage", None)
                 if message.content and isinstance(usage, dict):

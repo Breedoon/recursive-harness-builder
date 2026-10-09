@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import hashlib
+import os
 import uuid
 from pathlib import Path
 from typing import Any, Literal
 
 from obs_agent.context_jsonl import find_session_jsonl
+
+LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class SessionSourceError(ValueError):
@@ -133,16 +137,14 @@ def resolve_session_source(
     )
 
 
-def _read_jsonl(path: Path) -> list[tuple[dict[str, Any], str]]:
+def _read_jsonl(source: bytes) -> list[tuple[dict[str, Any], str]]:
     entries: list[tuple[dict[str, Any], str]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            raw = line.rstrip("\n")
-            if not raw.strip():
-                continue
-            obj = json.loads(raw)
-            if isinstance(obj, dict):
-                entries.append((obj, raw))
+    for raw in source.decode("utf-8").split("\n"):
+        if not raw.strip():
+            continue
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            entries.append((obj, raw))
     return entries
 
 
@@ -174,13 +176,12 @@ def fork_session_jsonl(
     source_path: Path | None = None,
     new_session_id: str | None = None,
 ) -> str:
-    """Copy the active parent chain ending at ``target_uuid`` into a new session file.
+    """Copy complete active history verbatim, then append parent-only replay overlays.
 
-    CRITICAL: entries must be written verbatim — no transformation, no stripping fields.
-    The forked JSONL must be byte-identical to the parent's subset so that the Anthropic
-    API prompt cache prefix matches exactly. Any modification (including stripping thinking
-    block signatures) breaks the cache hit AND causes API 400 errors. Cross-model forking
-    is prevented upstream at the schema level (tools.py rejects fork=true with model!=inherit).
+    Source rows, payloads, IDs, signatures and timestamps stay unchanged. The
+    CLI's chain-only reader needs provenance-tracked same-UUID ancestry overlays
+    to retain parallel siblings; those copies change parentUuid only. Cross-model
+    forking remains prohibited upstream by tools.py.
     """
 
     if source_path is None:
@@ -194,44 +195,28 @@ def fork_session_jsonl(
     if source_path is None:
         raise FileNotFoundError(f"Session JSONL not found for {session_id}")
 
-    entries = _read_jsonl(source_path)
+    from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+    resolved = resolve_safe_jsonl_target(session_id=session_id, cwd=cwd, source_path=source_path,
+                                        preferred_uuid=target_uuid)
+    if resolved is None or resolved.target_uuid is None:
+        raise ValueError("Fork has no confirmed complete history boundary")
+    requested_target_uuid = target_uuid
+    target_uuid = resolved.target_uuid
+    source_bytes = source_path.read_bytes()
+    entries = _read_jsonl(source_bytes)
     if not entries:
         raise ValueError(f"Session JSONL is empty for {session_id}")
 
-    by_uuid = {
-        entry["uuid"]: (entry, raw)
-        for entry, raw in entries
-        if isinstance(entry.get("uuid"), str) and entry["uuid"]
-    }
-    if target_uuid not in by_uuid:
-        raise KeyError(f"UUID not found in session JSONL: {target_uuid}")
+    from obs_agent.jsonl_replay import prepare_session_replay, select_replay_entries
 
-    seen: set[str] = set()
-    chain: list[tuple[dict[str, Any], str]] = []
-    cursor = target_uuid
-    while cursor:
-        if cursor in seen:
-            raise ValueError(f"Cycle detected while traversing parentUuid chain at {cursor}")
-        seen.add(cursor)
-
-        item = by_uuid.get(cursor)
-        if item is None:
-            raise KeyError(f"Missing ancestor UUID in parentUuid chain: {cursor}")
-        entry, _raw = item
-        chain.append(item)
-
-        parent_uuid = entry.get("parentUuid")
-        if not isinstance(parent_uuid, str) or not parent_uuid:
-            break
-        cursor = parent_uuid
-
-    chain.reverse()
-    first_chain_uuid = chain[0][0].get("uuid")
-    first_chain_index = next(
-        index for index, (entry, _raw) in enumerate(entries)
-        if entry.get("uuid") == first_chain_uuid
-    )
-    output_entries = _adjacent_metadata(entries, first_chain_index) + chain
+    selected = select_replay_entries(entries, target_uuid)
+    selected_uuids = {entry["uuid"] for entry, _raw in selected}
+    first_chain_index = next(index for index, (entry, _raw) in enumerate(entries)
+                             if entry.get("uuid") in selected_uuids)
+    output_entries = _adjacent_metadata(entries, first_chain_index) + [
+        item for item in entries if item[0].get("uuid") in selected_uuids
+    ]
 
     fork_session_id = new_session_id or str(uuid.uuid4())
     dest_path = source_path.parent / f"{fork_session_id}.jsonl"
@@ -239,4 +224,17 @@ def fork_session_jsonl(
         for _entry, raw in output_entries:
             handle.write(raw + "\n")
 
+    replay = prepare_session_replay(session_id=fork_session_id, cwd=cwd, source_path=dest_path,
+                                    target_uuid=target_uuid)
+    with source_path.open("rb") as handle:
+        source_prefix_unchanged = handle.read(len(source_bytes)) == source_bytes
+    provenance = Path(os.environ.get("OBS_SESSION_REPLAY_PROVENANCE_DIR", "/workspace/runtime/state/session-replay")) / "forks"
+    provenance.mkdir(parents=True, exist_ok=True)
+    (provenance / f"{fork_session_id}.json").write_text(json.dumps({
+        "fork_session_id": fork_session_id, "source_path": str(source_path),
+        "requested_target_uuid": requested_target_uuid, "target_uuid": target_uuid,
+        "source_prefix_bytes": len(source_bytes), "source_prefix_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "source_prefix_unchanged": source_prefix_unchanged, "replay": replay,
+        "loaded_fork_source_sha256": LOADED_SOURCE_SHA256,
+    }, indent=2) + "\n")
     return fork_session_id

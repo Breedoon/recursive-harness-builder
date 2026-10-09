@@ -188,10 +188,11 @@ def load_jsonl_usage_snapshot(
     usage_totals: list[tuple[int, int, int, int, int]] = []
     # tuples: (input, output, cache_creation, cache_read, triplet_total)
     text_char_count = 0
+    events: dict[str, tuple[str, int, tuple[int, int, int, int, int] | None]] = {}
 
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
+            for line_no, line in enumerate(handle, 1):
                 raw = line.strip()
                 if not raw:
                     continue
@@ -211,14 +212,15 @@ def load_jsonl_usage_snapshot(
                 if not isinstance(message, dict):
                     continue
                 try:
-                    text_char_count += _content_char_count(message.get("content"))
+                    chars = _content_char_count(message.get("content"))
                 except RecursionError:
-                    # A decoder may accept deeper nesting than the estimator.
-                    # Keep independent usage counters even without this estimate.
-                    pass
+                    chars = 0
+                entry_uuid = obj.get("uuid")
+                key = entry_uuid if isinstance(entry_uuid, str) and entry_uuid else f"line:{line_no}"
+                # Last UUID payload wins without moving its original event order.
+                events[key] = (event_type, chars, None)
                 if event_type != "assistant":
                     continue
-                assistant_entries += 1
 
                 usage = message.get("usage")
                 if not isinstance(usage, dict):
@@ -229,18 +231,13 @@ def load_jsonl_usage_snapshot(
                 cache_creation = _as_int(usage.get("cache_creation_input_tokens"))
                 cache_read = _as_int(usage.get("cache_read_input_tokens"))
                 triplet_total = input_tokens + cache_creation + cache_read
-                usage_totals.append(
-                    (
-                        input_tokens,
-                        output_tokens,
-                        cache_creation,
-                        cache_read,
-                        triplet_total,
-                    )
-                )
+                events[key] = (event_type, chars, (input_tokens, output_tokens, cache_creation, cache_read, triplet_total))
     except OSError:
         return None
 
+    assistant_entries = sum(kind == "assistant" for kind, _chars, _usage in events.values())
+    text_char_count = sum(chars for _kind, chars, _usage in events.values())
+    usage_totals = [usage for _kind, _chars, usage in events.values() if usage is not None]
     text_estimate_tokens = _estimate_tokens_from_chars(text_char_count)
     informative_usage_totals = [total for total in usage_totals if total[4] > 0]
     if informative_usage_totals:

@@ -4412,6 +4412,7 @@ class TelegramBot:
     def _persisted_jsonl_uuids(self, path: Path | str) -> list[str]:
         jsonl_path = Path(path).expanduser()
         uuids: list[str] = []
+        seen: set[str] = set()
         try:
             with jsonl_path.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -4425,7 +4426,8 @@ class TelegramBot:
                     if not isinstance(entry, dict):
                         continue
                     entry_uuid = entry.get("uuid")
-                    if isinstance(entry_uuid, str) and entry_uuid:
+                    if isinstance(entry_uuid, str) and entry_uuid and entry_uuid not in seen:
+                        seen.add(entry_uuid)
                         uuids.append(entry_uuid)
         except OSError:
             return []

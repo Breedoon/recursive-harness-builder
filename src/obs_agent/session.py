@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 import json
+import hashlib
+from pathlib import Path
 import logging
 import os
 import time
@@ -36,6 +38,7 @@ from obs_agent.tools import create_obs_tools
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
 
+LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 logger = logging.getLogger("obs_agent.session")
 
 ensure_raw_uuid_patch()
@@ -48,6 +51,9 @@ _ANTHROPIC_AUTH_ENV_KEYS = (
 
 
 _DEFAULT_SDK_ENV: dict[str, str] = {
+    # PREFIX-STABILITY: terminal ResultMessage must follow the JSONL writer flush,
+    # so immediate idle eviction/new-process resume cannot lose the final answer.
+    "CLAUDE_CODE_EAGER_FLUSH": "1",
     # Disable background tasks (skill auto-improvement, magic docs, plugin autoupdate).
     # The skill_improvement_apply feature crashes headless SDK sessions.
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
@@ -621,6 +627,17 @@ class SessionManager:
         """Create and connect a new SDK client with bounded retries."""
         from obs_agent.config import is_claude_model
 
+        if options.resume:
+            from obs_agent.jsonl_health import analyze_session_jsonl
+            from obs_agent.jsonl_replay import prepare_session_replay
+
+            health = analyze_session_jsonl(session_id=options.resume, cwd=self.config.vault_path)
+            if health is not None and not health.needs_recovery:
+                receipt = prepare_session_replay(session_id=options.resume, cwd=self.config.vault_path)
+                if receipt:
+                    logger.info("Prepared complete replay session=%s overlays=%s manifest=%s session_source=%s loaded=%s",
+                                options.resume, receipt["overlay_count"], receipt.get("manifest_path"),
+                                LOADED_SOURCE_SHA256, receipt["loaded_sources"])
         scrub_auth_env = is_claude_model(options.model)
         last_error: Exception | None = None
         for attempt in range(1, _CLIENT_CONNECT_MAX_ATTEMPTS + 1):
