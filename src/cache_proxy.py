@@ -872,6 +872,9 @@ def _add_beta(headers: dict, beta: str) -> None:
 # Live guard: scripts/prefix_repro.py cch_collision. Incident: 2026-10-08/09,
 # mission vault-mief. Do not write the placeholder literal in prompts, notes,
 # logs or source comments that agents may read.
+# Working on the proxy safely: read this file and the proxy logs only through a
+# redacting filter (sed -E on the placeholder regex) and describe the placeholder by
+# regex only. 2026-10-09 self-poisoning cost the mission ~30-35 weekly points.
 _CCH_PLACEHOLDER = b"cch=" + b"0" * 5
 _CCH_HASH_RE = re.compile(rb"cch=[0-9a-f]{5}")
 _BILLING_HEADER_MARK = b"x-anthropic-billing-header:"
