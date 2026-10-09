@@ -369,6 +369,16 @@ async def sc_recovery_multi(args):
                             "reason": target.health.unsafe_tail_reason}
 
 
+async def sc_queued_resume(args):
+    """queued_midturn, then the same session resumed by a NEW CLI process (the
+    wake path under OBS idle eviction, and every restart/crash resume). Tests
+    whether the live rendering of a mid-turn queued message equals the JSONL
+    rendering the resumed process rebuilds."""
+    sids, _ = await sc_queued_midturn(args)
+    await _session(args, ["Reply with the single word: woke."], resume=sids[0])
+    return sids, None
+
+
 SCENARIOS = {
     "baseline": (sc_baseline, "control; must pass"),
     "reminder_block": (sc_reminder_block, "class A; expect FAIL on unfixed proxy"),
@@ -378,6 +388,7 @@ SCENARIOS = {
     "resume_new_proc": (sc_resume_new_proc, "wake/new-process resume (--gap for >5 min)"),
     "recovery": (sc_recovery, "real fork recovery, kill during the first tool call"),
     "recovery_multi": (sc_recovery_multi, "real fork recovery after several tool rounds; expect FAIL"),
+    "queued_resume": (sc_queued_resume, "mid-turn queued message then new-process resume"),
     "parallel_resume": (sc_parallel_resume, "parallel tool calls then new-process resume; expect FAIL"),
 }
 
