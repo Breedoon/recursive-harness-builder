@@ -412,6 +412,12 @@ class SessionManager:
             **_DEFAULT_SDK_ENV,
             **explicit_env,
         }
+        # CLI file-path extraction and other utility calls otherwise default to
+        # Haiku even in a GPT session. Keep that work on its selected provider;
+        # explicit per-session utility choices and Claude sessions stay unchanged.
+        if clean_model.startswith("gpt-"):
+            for key in ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"):
+                effective_env.setdefault(key, clean_model)
         # This is a uniform OBS tool policy, not a per-route override: allowing
         # a child to re-enable these schemas would silently invalidate all
         # shared parent/fork cache entries before the first conversation turn.

@@ -103,6 +103,9 @@ def _options(args, *, session_id=None, resume=None, env_extra=None, hooks=None, 
         "ENABLE_TOOL_SEARCH": "false",
         "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
     }
+    if args.provider == "codex":
+        for key in ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"):
+            env[key] = args.model
     # Keep the GrowthBook-driven system marker deterministic unless a scenario
     # flips it on purpose (see boundary_flip).
     env["CLAUDE_CODE_FORCE_GLOBAL_CACHE"] = "0"
@@ -170,7 +173,8 @@ def _rows(log_dir, session_ids, since):
     out.sort(key=lambda r: r["ts"])
     # drop CLI side calls (title/topic helpers: no tools, tiny body) — they are
     # separate cache lines, not part of the conversation prefix
-    out = [r for r in out if ((r.get("sizes") or {}).get("pre") or 0) >= 20000]
+    out = [r for r in out if ((r.get("sizes") or {}).get("pre") or 0) >= 20000
+           and pd.load_request(r["req_id"], "wire", log_dir).get("tools")]
     # keep the scenario's main model only
     by = {}
     for r in out:
@@ -486,8 +490,20 @@ async def sc_poisoned_recovery(args):
                          "original_source_sha256": before, "synthetic_row_is_test_injection": True}
 
 
+async def sc_utility_route(args):
+    sid = str(uuid.uuid4())
+    cwd = WORK_ROOT / "cwd"
+    cwd.mkdir(parents=True, exist_ok=True)
+    (cwd / "utility.txt").write_text("public utility-route fixture\n")
+    await _session(args, ["Reply with the single word: ready.",
+                         "Run Bash exactly: pwd && python3 -c \"from pathlib import Path; print(Path('utility.txt').read_text())\". Then reply shown.",
+                         "Reply with the single word: after."], session_id=sid)
+    return [sid], None
+
+
 SCENARIOS = {
     "baseline": (sc_baseline, "control; must pass"),
+    "utility_route": (sc_utility_route, "Bash file-path utility remains on the explicit provider"),
     "reminder_block": (sc_reminder_block, "class A; expect FAIL on unfixed proxy"),
     "queued_midturn": (sc_queued_midturn, "notification splice"),
     "cch_collision": (sc_cch_collision, "billing placeholder collision; expect FAIL on unfixed proxy"),
@@ -518,14 +534,26 @@ def run(args, name):
             pairs.append((rows_p[-1], rows_c[0]))  # the recovery boundary
         pairs += list(zip(rows_c, rows_c[1:]))
     rows, verdicts = evaluate(args.log_dir, sids, since, args.threshold, pairs=pairs)
-    route_ok = all(r.get("route") == "cli-proxy" and r.get("model") == args.model for r in rows) if args.provider == "codex" else True
+    scoped_rows = [r for r in pd.read_index(args.log_dir) if r.get("session_id") in set(sids)
+                   and r.get("ts", 0) >= since and str(r.get("path", "")).startswith("/v1/messages")
+                   and "count_tokens" not in str(r.get("path", ""))]
+    route_ok = all(r.get("route") == "cli-proxy" and r.get("model") == args.model for r in scoped_rows) if args.provider == "codex" else True
+    utility_ids = []
+    if name == "utility_route":
+        for row in scoped_rows:
+            wire = pd.load_request(row["req_id"], "wire", args.log_dir)
+            if "Extract any file paths" in str(wire.get("system")):
+                utility_ids.append(row["req_id"])
+        route_ok = route_ok and bool(utility_ids)
     meta_ok = not meta or (meta.get("effects_unchanged", True) and meta.get("source_unchanged", True)
                            and meta.get("final_response_preserved", True))
     ok = bool(verdicts) and route_ok and meta_ok and all(v["ok"] for v in verdicts)
     return {"scenario": name, "note": note, "sessions": sids, "meta": meta,
             "provider": args.provider, "model": args.model, "route_ok": route_ok,
             "routes": sorted({r.get("route", "") for r in rows}),
-            "requests": [r["req_id"] for r in rows], "pairs": verdicts, "ok": ok}
+            "requests": [r["req_id"] for r in rows], "pairs": verdicts, "ok": ok,
+            "all_scoped_requests": [{"req_id": r["req_id"], "model": r.get("model"), "route": r.get("route"), "http_status": r.get("http_status")} for r in scoped_rows],
+            "utility_requests": utility_ids}
 
 
 def main(argv=None):
