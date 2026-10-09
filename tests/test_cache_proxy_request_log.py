@@ -364,3 +364,139 @@ def test_request_log_default_on_only_for_prod_port(monkeypatch):
     assert cache_proxy.request_log_enabled(12345) is True
     monkeypatch.setattr(cache_proxy, "_REQUEST_LOG_ENV", "0")
     assert cache_proxy.request_log_enabled(cache_proxy.PROD_PORT) is False
+
+
+# ── standing pool: ~1 GB ring buffer + secret redaction (Daniel 2026-10-08 23:55Z) ──
+
+BOT = "1234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw0"
+OAUTH = "sk-ant-oat01-" + "Q" * 20 + "abcdefgh12345678"
+SESSION_STR = "1" + "BVtsOHgBu7Zx9KqLm3Pd" * 18  # telethon-like, 361 chars
+
+
+def test_default_cap_is_one_gigabyte():
+    import importlib
+    old = os.environ.pop("CACHE_PROXY_REQUEST_LOG_MAX_GB", None)
+    try:
+        mod = importlib.reload(cache_proxy)
+        assert mod.REQUEST_LOG_MAX_BYTES == 10**9
+    finally:
+        if old is not None:
+            os.environ["CACHE_PROXY_REQUEST_LOG_MAX_GB"] = old
+        importlib.reload(cache_proxy)
+
+
+def test_redaction_scrubs_body_secrets_keeps_json_and_equality():
+    text = (f"env: TELEGRAM_BOT_TOKEN={BOT} OAUTH={OAUTH} "
+            f"session_string={SESSION_STR} Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123 "
+            f"ghp_{'a1B2' * 9} plain words stay, input_tokens 12345678")
+    body = {"messages": [{"role": "user", "content": [{"type": "text", "text": text}]}],
+            "api_key": "abcd1234efgh5678", "max_tokens": 32000}
+    raw = json.dumps(body).encode()
+    red = cache_proxy.redact_secrets(raw)
+    for secret in (BOT, OAUTH, SESSION_STR, "abcdefghijklmnopqrstuvwxyz0123", "ghp_", "abcd1234efgh5678"):
+        assert secret.encode() not in red, secret
+    parsed = json.loads(red)                       # still valid JSON
+    assert parsed["max_tokens"] == 32000
+    assert "plain words stay" in parsed["messages"][0]["content"][0]["text"]
+    assert cache_proxy.redact_secrets(red) == red  # idempotent
+    # same secret -> same placeholder; different secret -> different placeholder
+    a = cache_proxy.redact_secrets(f"x {OAUTH} y".encode())
+    b = cache_proxy.redact_secrets(f"x {OAUTH} y".encode())
+    c = cache_proxy.redact_secrets(f"x {OAUTH[:-1]}Z y".encode())
+    assert a == b and a != c
+
+
+def test_redaction_leaves_paths_and_ordinary_json_alone():
+    path = "/workspace/runtime/git/obs-artifacts/Drafts/Artifacts/" + "a-b-c/" * 80
+    raw = json.dumps({"p": path, "usage": {"input_tokens": 123456789,
+                                           "cache_read_input_tokens": 5}}).encode()
+    assert cache_proxy.redact_secrets(raw) == raw
+
+
+def test_captured_files_and_index_are_redacted(proxy, monkeypatch):
+    url, logger, tmp = proxy
+    rec = _Rec()
+    up, stop = _stub(rec)
+    monkeypatch.setattr(cache_proxy, "ANTHROPIC_UPSTREAM", up)
+    body = _body()
+    body["messages"].append({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
+    body["messages"].append({"role": "user", "content": [
+        {"type": "text", "text": f"my bot token is {BOT} and {OAUTH}", "cache_control": {"type": "ephemeral"}}]})
+    try:
+        _, r = _send(url, body)
+    finally:
+        stop()
+    assert r.status_code == 200
+    assert BOT.encode() in rec.bodies[0]           # upstream got the real bytes
+    logger.flush()
+    disk = _all_files_text(tmp / "requests")
+    assert BOT not in disk and OAUTH not in disk and SECRET not in disk
+    assert "[REDACTED:telegram-bot:" in disk
+    row = _index(tmp)[0]
+    day_dir = tmp / "requests" / f"{row['req_id'][0:4]}-{row['req_id'][4:6]}-{row['req_id'][6:8]}"
+    wire = json.loads(gzip.decompress((day_dir / f"{row['req_id']}.wire.json.gz").read_bytes()))
+    assert len(wire["messages"]) == 3               # structure intact for prefix_diff
+
+
+def test_prefix_diff_append_across_redacted_captures(tmp_path):
+    logger = cache_proxy.RequestLogger(str(tmp_path))
+    m1 = [_u(f"token={BOT}", bp=True)]
+    m2 = [_u(f"token={BOT}"), _a("r1"), _u("q2", bp=True)]
+    ids = []
+    for i, msgs in enumerate((m1, m2)):
+        rid = f"20261008T0000{i:02d}.000000Z-1-{i:06d}-{SID[:8]}"
+        wire = json.dumps(_req(msgs)).encode()
+        logger.submit_bodies(rid, wire, None, wire)
+        ids.append(rid)
+    logger.flush()
+    a = prefix_diff.load_request(ids[0], "wire", str(tmp_path))
+    b = prefix_diff.load_request(ids[1], "wire", str(tmp_path))
+    assert prefix_diff.diff_requests(a, b)["classification"] == "append"
+
+
+def test_ring_buffer_evicts_old_days_including_index(tmp_path):
+    logger = cache_proxy.RequestLogger(str(tmp_path), max_bytes=30_000)
+    big = os.urandom(6000)
+    for day in ("20261006", "20261007"):
+        for i in range(3):
+            rid = f"{day}T0000{i:02d}.000000Z-1-{i:06d}-sess"
+            logger.submit_bodies(rid, big, None, big)
+            logger.submit_index({"req_id": rid, "pad": "x" * 500})
+    logger.flush()
+    for i in range(3):
+        rid = f"20261008T0000{i:02d}.000000Z-1-{i:06d}-sess"
+        logger.submit_bodies(rid, big, None, big)
+        logger.submit_index({"req_id": rid})
+    logger.flush()
+    total = sum(p.stat().st_size for p in tmp_path.rglob("*") if p.is_file())
+    assert total <= 30_000
+    assert not (tmp_path / "2026-10-06").exists()   # whole oldest day evicted, index too
+    assert (tmp_path / "2026-10-08" / "index.jsonl").exists()
+
+
+def _a_think(text, sig="sigA"):
+    return {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "hmm", "signature": sig},
+        {"type": "text", "text": text}]}
+
+
+def test_prefix_diff_flags_dropped_thinking_blocks():
+    a = _req([_u("q1"), _a_think("r1"), _u("q2", bp=True)])
+    b = _req([_u("q1"), _a("r1"), _u("q2"), _a("r2"), _u("q3", bp=True)])
+    r = prefix_diff.diff_requests(a, b)
+    assert r["classification"] == "thinking-changed"
+    assert r["thinking_count_changed_at"] == [1]
+    assert r["first_divergence"]["thinking"] == {"a": 1, "b": 0}
+    assert "thinking-block count differs" in prefix_diff.format_result(r)
+
+
+def test_obs_fork_context_extracted_from_last_user_message():
+    boot = ("<obs-bootstrap version=\"2\"><fork_context><origin>session_recovery</origin>"
+            "<is_fork>true</is_fork><session_id>839b1149-238e-431b-bcae-2df3475981d4</session_id>"
+            "<parent_session_id>9f495d93-ca57-419e-9425-80d0501cd299</parent_session_id>"
+            "</fork_context></obs-bootstrap>")
+    body = {"messages": [_u("old"), _a("x"), _u(boot + " continue")]}
+    assert cache_proxy.extract_obs_fork_context(body) == {
+        "origin": "session_recovery",
+        "parent_session_id": "9f495d93-ca57-419e-9425-80d0501cd299"}
+    assert cache_proxy.extract_obs_fork_context({"messages": [_u("plain")]}) == {}

@@ -108,8 +108,15 @@ SAVE_BODIES = os.environ.get("CACHE_PROXY_SAVE_BODIES", "").lower() in ("1", "tr
 # This is the instrument for finding prefix breakage: diff consecutive requests
 # of one session with scripts/prefix_diff.py. Capture runs on a background
 # thread and NEVER alters, delays or fails the proxied request. Bodies contain
-# conversation content: the directory is outside the vault and auth headers are
-# never written. Size-capped (oldest files pruned first).
+# conversation content: the directory is outside the vault, auth headers are
+# never written, and secret-looking values inside bodies and index lines are
+# replaced by hashed placeholders (redact_secrets).
+# Standing pool (Daniel 2026-10-08 23:55Z: "ideally we should have like ongoing
+# some like gigabyte of pool for all ongoing requests to be saved from all
+# chats"): a ring buffer of ~1 GB total (bodies + index), oldest-first eviction.
+# At 2026-10-09 volume (~580 MB/h of gzip) that is roughly 1–2 hours of history;
+# raise CACHE_PROXY_REQUEST_LOG_MAX_GB for a longer window during an
+# investigation.
 # Default: ON for the production port, OFF for test/private instances (agents'
 # shells inherit CACHE_PROXY_LOG_DIR from the daemon, so a test proxy would
 # otherwise write into the production log). CACHE_PROXY_REQUEST_LOG=1/0 forces.
@@ -126,9 +133,9 @@ def request_log_enabled(port: int) -> bool:
 
 REQUEST_LOG_DIR = os.environ.get("CACHE_PROXY_REQUEST_LOG_DIR") or os.path.join(LOG_DIR, "requests")
 try:
-    REQUEST_LOG_MAX_BYTES = int(float(os.environ.get("CACHE_PROXY_REQUEST_LOG_MAX_GB", "60")) * 1e9)
+    REQUEST_LOG_MAX_BYTES = int(float(os.environ.get("CACHE_PROXY_REQUEST_LOG_MAX_GB", "1")) * 1e9)
 except ValueError:
-    REQUEST_LOG_MAX_BYTES = int(60e9)
+    REQUEST_LOG_MAX_BYTES = int(1e9)
 
 # Fixed billing header to replace the per-process/per-turn one.
 #
@@ -950,6 +957,96 @@ def extract_session_id(body: dict) -> str:
     return m.group(1) if m else ""
 
 
+# Secret-looking values inside captured bodies/index lines. Each match becomes
+# ``[REDACTED:<kind>:<sha256-12>]`` (kind names deliberately avoid the words
+# key/token/secret so a placeholder never re-matches; redaction is idempotent): same value → same placeholder, so two
+# captures still compare equal/unequal exactly where the originals did (the
+# property scripts/prefix_diff.py relies on); offsets shift by the length
+# difference. Placeholders contain no quote or backslash, so JSON stays valid.
+# The generic long-run rule also replaces image base64, thinking signatures and
+# Telegram/Telethon session strings (all >= 300 base64 chars) — equality is
+# preserved, the payload is not. The pattern for key=value pairs keeps the key.
+_REDACT_PATTERNS: list[tuple[str, "re.Pattern[bytes]", int]] = [
+    ("privkey", re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), 0),
+    ("anthropic", re.compile(rb"sk-ant-[A-Za-z0-9_\-]{20,}"), 0),
+    ("sk", re.compile(rb"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}"), 0),
+    ("github", re.compile(rb"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})"), 0),
+    ("slack", re.compile(rb"\bxox[abposr]-[A-Za-z0-9\-]{10,}"), 0),
+    ("aws", re.compile(rb"\bAKIA[0-9A-Z]{16}\b"), 0),
+    ("google", re.compile(rb"\b(?:AIza[0-9A-Za-z_\-]{35}|ya29\.[0-9A-Za-z_\-]{20,})"), 0),
+    ("telegram-bot", re.compile(rb"\b\d{8,10}:[A-Za-z0-9_\-]{35}\b"), 0),
+    ("jwt", re.compile(rb"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), 0),
+    ("bearer", re.compile(rb"(?i)(\bbearer\s+)([A-Za-z0-9._\-~+/]{20,}=*)"), 2),
+    ("assigned", re.compile(
+        rb"(?i)((?:api_?key|access_?key|token|secret|password|passwd|api_hash|"
+        rb"session_?string|string_?session)[\"']?\s*[:=]\s*[\"']?)([^\s\"'\\,;}{\]\[]{8,})"), 2),
+    # Run-start lookbehind + possessive quantifier keep this linear.
+    ("b64", re.compile(rb"(?<![A-Za-z0-9+/_\-])[A-Za-z0-9+/_\-]{300,}+={0,2}"), 0),
+]
+
+
+def _looks_random(value: bytes) -> bool:
+    """Base64 key material mixes cases and digits densely; paths do not."""
+    n = len(value)
+    upper = sum(1 for c in value if 65 <= c <= 90)
+    lower = sum(1 for c in value if 97 <= c <= 122)
+    digit = sum(1 for c in value if 48 <= c <= 57)
+    return upper > n * 0.15 and lower > n * 0.15 and digit > n * 0.03
+
+
+def redact_secrets(data: bytes) -> bytes:
+    """Replace secret-looking values with hashed placeholders (see above)."""
+    for kind, pattern, group in _REDACT_PATTERNS:
+        def _sub(m, kind=kind, group=group):
+            value = m.group(group)
+            if value.startswith(b"[REDACTED:"):
+                return m.group(0)
+            if kind == "b64" and not _looks_random(value):
+                return m.group(0)  # long path/identifier, not key material
+            tag = b"[REDACTED:" + kind.encode() + b":" + \
+                hashlib.sha256(value).hexdigest()[:12].encode() + b"]"
+            if group == 0:
+                return tag
+            return m.group(0)[: m.start(group) - m.start(0)] + tag + \
+                m.group(0)[m.end(group) - m.start(0):]
+        data = pattern.sub(_sub, data)
+    return data
+
+
+_OBS_ORIGIN_RE = re.compile(r"<fork_context><origin>([a-z_]+)</origin>")
+_OBS_PARENT_RE = re.compile(r"<parent_session_id>([0-9a-fA-F-]{8,})</parent_session_id>")
+
+
+def extract_obs_fork_context(body: dict) -> dict:
+    """origin / parent_session_id from the LAST user message's obs-bootstrap.
+
+    OBS prepends ``<obs-bootstrap>…<fork_context><origin>X</origin>…
+    <parent_session_id>Y</parent_session_id>`` to the first user message of
+    a new session (fresh task, fork, session_recovery). Returns {} otherwise.
+    """
+    try:
+        msgs = body.get("messages") or []
+        last = next((m for m in reversed(msgs) if m.get("role") == "user"), None)
+        if not last:
+            return {}
+        content = last.get("content")
+        texts = [content] if isinstance(content, str) else [
+            b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
+        out = {}
+        for t in texts:
+            if "<obs-bootstrap" not in t:
+                continue
+            m = _OBS_ORIGIN_RE.search(t)
+            if m:
+                out["origin"] = m.group(1)
+            m = _OBS_PARENT_RE.search(t)
+            if m:
+                out["parent_session_id"] = m.group(1)
+        return out
+    except Exception:
+        return {}
+
+
 def sanitize_headers(headers) -> dict:
     """Request headers safe to persist: credentials are dropped entirely."""
     out = {}
@@ -968,14 +1065,18 @@ class RequestLogger:
       root/YYYY-MM-DD/index.jsonl                 one line per completed request
       root/YYYY-MM-DD/<req_id>.<part>.json.gz     part ∈ pre | post | wire
     ``req_id`` = ``<UTC yyyymmddTHHMMSS.ffffff>Z-<pid>-<seq>-<session8>`` — unique
-    across restarts (time + pid) and sortable by time. ``pre`` is the exact
-    byte string the CLI sent; ``wire`` the exact bytes sent upstream; ``post``
-    the body right after normalize_request() (before route-specific effort
-    handling), written only when it differs from ``wire``.
+    across restarts (time + pid) and sortable by time. ``pre`` is the byte
+    string the CLI sent; ``wire`` the bytes sent upstream; ``post`` the body
+    right after normalize_request() (before route-specific effort handling),
+    written only when it differs from ``wire``. All three — and every index
+    line — pass through redact_secrets() first, so they are exact except that
+    secret-looking values are replaced by hashed placeholders (equality kept);
+    ``wire_sha256`` in the index is of the unredacted wire bytes.
 
     All work happens on one daemon thread fed by a bounded queue. If the queue
     is full the record is dropped and counted — traffic is never slowed or
-    failed by logging. Oldest files are pruned once ``max_bytes`` is exceeded.
+    failed by logging. The whole tree (bodies + index) is a ring buffer:
+    oldest files are evicted once ``max_bytes`` is exceeded (see _prune).
     """
 
     def __init__(self, root: str, max_bytes: int = REQUEST_LOG_MAX_BYTES,
@@ -1011,6 +1112,8 @@ class RequestLogger:
             self._q.put_nowait(item)
         except queue.Full:
             self.dropped += 1
+            if self.dropped in (1, 10, 100) or self.dropped % 1000 == 0:
+                log(f"request-log queue full: {self.dropped} record(s) dropped so far")
         except Exception:
             self.errors += 1
 
@@ -1049,9 +1152,10 @@ class RequestLogger:
         os.makedirs(day_dir, exist_ok=True)
         added = 0
         parts = [("pre", pre), ("wire", wire)]
-        if post is not None and post != wire:
+        if post is not None and post != wire:   # compare BEFORE redaction
             parts.append(("post", post))
         for part, data in parts:
+            data = redact_secrets(data)
             path = os.path.join(day_dir, f"{req_id}.{part}.json.gz")
             with gzip.open(path, "wb", compresslevel=6) as f:
                 f.write(data)
@@ -1063,8 +1167,8 @@ class RequestLogger:
         req_id = record.get("req_id", "")
         day_dir = os.path.join(self.root, self._day_of(req_id))
         os.makedirs(day_dir, exist_ok=True)
-        line = json.dumps(record, separators=(",", ":")) + "\n"
-        with open(os.path.join(day_dir, "index.jsonl"), "a") as f:
+        line = redact_secrets(json.dumps(record, separators=(",", ":")).encode()) + b"\n"
+        with open(os.path.join(day_dir, "index.jsonl"), "ab") as f:
             f.write(line)
         self._account(len(line))
 
@@ -1087,16 +1191,20 @@ class RequestLogger:
             self._prune()
 
     def _prune(self):
-        """Delete oldest body files (then empty old day dirs) to 90% of cap.
+        """Ring-buffer eviction: oldest first, down to 90% of the cap.
 
-        Index files are kept unless their whole day directory has no bodies
-        left, so status/usage history outlives the bodies.
+        The cap covers everything under ``root`` (bodies AND index files).
+        Days are visited oldest first; within a day body files go oldest first
+        (names sort by time). A day whose bodies are all gone loses its
+        index.jsonl too, unless it is the newest day (still being written).
+        Index rows whose bodies were evicted stay readable; prefix_diff
+        reports them as missing.
         """
         target = int(self.max_bytes * 0.9)
         days = sorted(d for d in os.listdir(self.root)
                       if os.path.isdir(os.path.join(self.root, d)))
         total = self._measure()
-        for day in days:
+        for n, day in enumerate(days):
             if total <= target:
                 break
             day_dir = os.path.join(self.root, day)
@@ -1110,6 +1218,20 @@ class RequestLogger:
                     size = os.path.getsize(path)
                     os.remove(path)
                     total -= size
+                except OSError:
+                    pass
+            is_newest = n == len(days) - 1
+            if total > target and not is_newest:
+                for name in os.listdir(day_dir):
+                    path = os.path.join(day_dir, name)
+                    try:
+                        size = os.path.getsize(path)
+                        os.remove(path)
+                        total -= size
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(day_dir)
                 except OSError:
                     pass
         self._bytes = total
@@ -1366,6 +1488,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             is_streaming = data.get("stream", False)
             try:
                 self._rl["session_id"] = extract_session_id(data)
+                self._rl["obs"] = extract_obs_fork_context(data)
                 if rlog is not None:
                     self._rl["req_id"] = rlog.new_request_id(self._rl["session_id"])
             except Exception:
@@ -1510,6 +1633,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(rl["t0"])) + "Z",
             "duration_ms": int((t1 - rl["t0"]) * 1000),
             "session_id": rl.get("session_id", ""),
+            # OBS fork context from the newest user message's obs-bootstrap
+            # block (only present on an agent's first turn in a session):
+            # tells a session_recovery fork (new id + parent) from a
+            # same-id restart resume (no block).
+            "obs_origin": (rl.get("obs") or {}).get("origin"),
+            "obs_parent_session_id": (rl.get("obs") or {}).get("parent_session_id"),
             "model": model,
             "route": route,
             "path": self.path,
@@ -1715,7 +1844,8 @@ def main():
         try:
             REQUEST_LOGGER = RequestLogger(REQUEST_LOG_DIR, REQUEST_LOG_MAX_BYTES)
             log(f"request_log: ON dir={REQUEST_LOG_DIR} "
-                f"cap={REQUEST_LOG_MAX_BYTES / 1e9:.0f}GB (pre/post/wire bodies + index.jsonl)")
+                f"cap={REQUEST_LOG_MAX_BYTES / 1e9:g}GB ring buffer (pre/post/wire bodies + "
+                f"index.jsonl, secrets redacted)")
         except Exception as e:
             REQUEST_LOGGER = None
             log(f"request_log: FAILED to start ({e}) — proxying without capture")

@@ -148,32 +148,55 @@ Use `OBS_SKIP_CACHE_PROXY=1` for debugging or if the proxy fails to start. When 
 
 ### Request log (prompt-cache diagnosis)
 
-Since 2026-10-08 the proxy keeps a durable, session-keyed log of every
-`/v1/messages` request (mission cache-proxy-prefix-fix, bead `vault-mief.2`).
-It is the instrument for finding prompt-cache prefix breakage: when a turn
-re-writes the conversation instead of reading it, diff that request against the
-previous request of the same session.
+Since 2026-10-08 the proxy keeps a standing, session-keyed pool of recent
+`/v1/messages` requests from all chats and routes (mission
+cache-proxy-prefix-fix, beads `vault-mief.2`/`.8`; Daniel 2026-10-08 23:55Z:
+"ideally we should have like ongoing some like gigabyte of pool for all ongoing
+requests to be saved from all chats. So like if things like this happen there
+at least there are logs"). It is the instrument for finding prompt-cache prefix
+breakage: when a turn re-writes the conversation instead of reading it, diff
+that request against the previous request of the same session.
 
 ```bash
 CACHE_PROXY_LOG_DIR=/workspace/runtime/logs/cache-proxy     # usage.jsonl lives here
 CACHE_PROXY_REQUEST_LOG=            # unset: ON on the production port (28925), OFF elsewhere; 1/0 forces
 CACHE_PROXY_REQUEST_LOG_DIR=        # default: $CACHE_PROXY_LOG_DIR/requests
-CACHE_PROXY_REQUEST_LOG_MAX_GB=60   # oldest body files pruned past this cap
+CACHE_PROXY_REQUEST_LOG_MAX_GB=1    # ring-buffer cap for everything under the dir
 ```
 
 Layout: `requests/YYYY-MM-DD/index.jsonl` (one line per request: `req_id`,
 `session_id`, `model`, `route`, `http_status`, `error`, `usage`, normalization
 counts, sizes, `wire_sha256`, credential-free client headers) and
-`requests/YYYY-MM-DD/<req_id>.{pre,post,wire}.json.gz` — `pre` is exactly what
-the CLI sent, `wire` exactly what went upstream, `post` the body right after
+`requests/YYYY-MM-DD/<req_id>.{pre,post,wire}.json.gz` — `pre` is what the CLI
+sent, `wire` what went upstream, `post` the body right after
 `normalize_request()` (stored only when it differs from `wire`, i.e. when the
-effort pin/strip changed something). `usage.jsonl` lines now carry `req_id`,
+effort pin/strip changed something). `usage.jsonl` lines carry `req_id`,
 `session_id` and `http_status`. Capture runs on a background thread: a full
-queue drops the record, it never delays or fails a request. Credentials
-(`authorization`, `x-api-key`, any header containing key/token/secret/cookie)
-are never written. Bodies contain conversation content and stay outside the
-vault. Volume at 2026-10 traffic (up to ~13k requests/day, ~200k tokens avg) is
-roughly 4–7 GB/day gzip-compressed, so the 60 GB default holds about 9–15 days.
+queue drops the record (logged at 1/10/100/every 1000 drops), it never delays
+or fails a request.
+
+Ring buffer: the cap covers bodies AND index files. When exceeded, the writer
+evicts oldest first down to 90%: body files of the oldest day first, then that
+day's index once it holds no bodies (the current day's index is kept). At
+2026-10-09 night-time volume (~1,900 requests/h, ~580 MB/h gzip) **1 GB holds
+roughly 1–2 hours** of full bodies; busier hours shorten it. That short window
+is the stated tradeoff — for an investigation needing longer history, raise
+`CACHE_PROXY_REQUEST_LOG_MAX_GB` (needs a proxy restart). Index lines are
+~1.5 KB each, so they are a small part of the cap.
+
+Redaction: credentials never reach disk. Headers containing
+auth/key/cookie/token/secret are dropped. Bodies and index lines pass through
+`redact_secrets()`, which replaces secret-looking values with
+`[REDACTED:<kind>:<sha256-12>]`: Anthropic/OpenAI-style `sk-` keys (incl.
+OAuth `sk-ant-oat…`), GitHub/Slack/AWS/Google tokens, Telegram bot tokens, JWTs,
+Bearer values, private-key blocks, `KEY=value`/`"api_key": "…"` assignments for
+key/token/secret/password/api_hash/session-string names, and any ≥300-char
+random-looking base64 run (this covers Telegram/Telethon session strings, image
+data and thinking-block `signature`s). Same value → same placeholder, so two
+captures compare equal/unequal exactly where the originals did; JSON stays
+valid; `prefix_diff.py` works unchanged on redacted files (byte offsets refer to
+the redacted text). `wire_sha256` is of the unredacted wire bytes. Redaction
+costs ~150 ms per 1.2 MB body on the writer thread.
 
 Diff tool: `scripts/prefix_diff.py` — `prefix_diff.py A B` (two `req_id`s or
 files), `--session <id-prefix>` (every adjacent pair of one session, with the

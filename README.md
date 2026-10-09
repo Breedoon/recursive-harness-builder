@@ -105,6 +105,11 @@ with actual fork **and** resume requests. Run the real protocol tests in
 `tests/test_cache_proxy_reminder_span.py`; notification visibility alone does not
 establish cache safety. Preserve this invariant even when other tests pass.
 
+To diagnose a prompt-cache miss, use the proxy's standing request pool
+(`/workspace/runtime/logs/cache-proxy/requests`, ~1 GB ring buffer, secrets
+redacted) and `scripts/prefix_diff.py --session <id>` — see
+docs/configuration.md "Request log".
+
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE).

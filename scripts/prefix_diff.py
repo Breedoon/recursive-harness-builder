@@ -19,6 +19,8 @@ Classification of B relative to A:
   tools-changed     tools differ (whole cache invalidated)
   system-changed    system blocks differ
   history-changed   an EARLIER message (index < len(A.messages)) differs
+  thinking-changed  ...and that message's thinking-block count differs
+                    (blocks dropped/added — compare thinking config too)
   shrunk            B has fewer messages than A and they agree up to len(B)
 
 It also lists cache_control breakpoints of both requests and says whether
@@ -28,10 +30,14 @@ no message breakpoint can only read the system/tools cache).
 Usage:
   prefix_diff.py A B                     # files (.json/.json.gz) or req_ids
   prefix_diff.py --session SID           # every adjacent pair of one session
+                                         #   (same model; count_tokens skipped)
   prefix_diff.py --prev-any REQ_ID       # REQ vs the earlier logged request
                                          #   (any session, within --window min)
                                          #   sharing the longest message prefix
                                          #   — for recoveries / new session ids
+Use --part pre to compare what the CLI itself sent (catches harness-injected
+content the proxy strips only sometimes), --part wire for what Anthropic saw.
+Files are secret-redacted with hashed placeholders; equality is preserved.
 Options: --part pre|post|wire (default wire), --log-dir DIR, --json,
          --since/--until ISO (for --session), --window MINUTES (default 90)
 """
@@ -115,6 +121,13 @@ def _as_blocks(content):
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
     return content if isinstance(content, list) else [content]
+
+
+def thinking_counts(req: dict) -> list[int]:
+    """Number of thinking/redacted_thinking blocks per message."""
+    return [sum(1 for b in _as_blocks(m.get("content"))
+                if isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))
+            for m in req.get("messages") or []]
 
 
 def breakpoints(req: dict) -> list[str]:
@@ -216,12 +229,24 @@ def diff_requests(a: dict, b: dict, a_beta: str | None = None, b_beta: str | Non
             msg_div["a_role"] = ma[i].get("role")
             break
 
+    ta, tb = thinking_counts(a), thinking_counts(b)
+    shared = min(len(ta), len(tb))
+    result["a_thinking_blocks"] = sum(ta)
+    result["b_thinking_blocks"] = sum(tb[:len(ta)]) if len(tb) >= len(ta) else sum(tb)
+    thinking_moved = [i for i in range(shared) if ta[i] != tb[i]]
+    result["thinking_count_changed_at"] = thinking_moved[:20]
+    if msg_div is not None and msg_div["message_index"] in thinking_moved:
+        msg_div["thinking"] = {"a": ta[msg_div["message_index"]], "b": tb[msg_div["message_index"]]}
+
     if tools_div:
         result["classification"], result["first_divergence"] = "tools-changed", tools_div
     elif sys_div:
         result["classification"], result["first_divergence"] = "system-changed", sys_div
     elif msg_div:
-        result["classification"], result["first_divergence"] = "history-changed", msg_div
+        # Thinking blocks dropped/added in an earlier message is its own class
+        # (E1 hypothesis: class-B shrinks track accumulated thinking).
+        cls = "thinking-changed" if "thinking" in msg_div else "history-changed"
+        result["classification"], result["first_divergence"] = cls, msg_div
     elif len(mb) < len(ma):
         result["classification"] = "shrunk"
     elif result["config_diffs"]:
@@ -250,6 +275,9 @@ def format_result(r: dict, label: str = "") -> str:
     if not r["b_has_message_breakpoint"]:
         head += "  !! B HAS NO MESSAGE BREAKPOINT (reads system/tools cache only)"
     lines.append(head)
+    if r.get("thinking_count_changed_at"):
+        lines.append(f"  thinking-block count differs at messages {r['thinking_count_changed_at']} "
+                     f"(A total {r['a_thinking_blocks']}, B over A's span {r['b_thinking_blocks']})")
     for c in r["config_diffs"]:
         lines.append(f"  config {c['key']}: {json.dumps(c['a'])[:200]} → {json.dumps(c['b'])[:200]}")
     d = r["first_divergence"]
@@ -273,8 +301,20 @@ def session_pairs(log_dir: str, session: str, part: str, since=None, until=None)
         rows = [r for r in rows if r.get("ts_iso", "") >= since]
     if until:
         rows = [r for r in rows if r.get("ts_iso", "") <= until]
+    # Pair each request with the previous one of the same model and path:
+    # the CLI interleaves side requests (e.g. a small model for titles/topic
+    # checks, count_tokens) that share the session id but not the prefix.
+    lanes: dict = {}
+    pairs = []
+    for r in rows:
+        if "count_tokens" in (r.get("path") or ""):
+            continue
+        key = r.get("model")
+        if key in lanes:
+            pairs.append((lanes[key], r))
+        lanes[key] = r
     out = []
-    for ra, rb in zip(rows, rows[1:]):
+    for ra, rb in pairs:
         try:
             a = load_request(ra["req_id"], part, log_dir)
             b = load_request(rb["req_id"], part, log_dir)
