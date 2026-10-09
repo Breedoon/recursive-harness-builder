@@ -113,10 +113,12 @@ SAVE_BODIES = os.environ.get("CACHE_PROXY_SAVE_BODIES", "").lower() in ("1", "tr
 # replaced by hashed placeholders (redact_secrets).
 # Standing pool (Daniel 2026-10-08 23:55Z: "ideally we should have like ongoing
 # some like gigabyte of pool for all ongoing requests to be saved from all
-# chats"): a ring buffer of ~1 GB total (bodies + index), oldest-first eviction.
-# At 2026-10-09 volume (~580 MB/h of gzip) that is roughly 1–2 hours of history;
-# raise CACHE_PROXY_REQUEST_LOG_MAX_GB for a longer window during an
-# investigation.
+# chats. So like if things like this happen there at least there are logs"):
+# a ring buffer over bodies + index, oldest-first eviction, default 60 GB.
+# 1 GB holds only ~1–2 h at 2026-10-09 volume (~580 MB/h gzip), which would
+# defeat "so there are logs"; Daniel 2026-10-09 00:21Z: "60 is fine. I don't
+# mind that." 60 GB ≈ 30–60 h+ of history. Override: CACHE_PROXY_REQUEST_LOG_MAX_GB
+# (takes effect at the next proxy start).
 # Default: ON for the production port, OFF for test/private instances (agents'
 # shells inherit CACHE_PROXY_LOG_DIR from the daemon, so a test proxy would
 # otherwise write into the production log). CACHE_PROXY_REQUEST_LOG=1/0 forces.
@@ -133,9 +135,9 @@ def request_log_enabled(port: int) -> bool:
 
 REQUEST_LOG_DIR = os.environ.get("CACHE_PROXY_REQUEST_LOG_DIR") or os.path.join(LOG_DIR, "requests")
 try:
-    REQUEST_LOG_MAX_BYTES = int(float(os.environ.get("CACHE_PROXY_REQUEST_LOG_MAX_GB", "1")) * 1e9)
+    REQUEST_LOG_MAX_BYTES = int(float(os.environ.get("CACHE_PROXY_REQUEST_LOG_MAX_GB", "60")) * 1e9)
 except ValueError:
-    REQUEST_LOG_MAX_BYTES = int(1e9)
+    REQUEST_LOG_MAX_BYTES = int(60e9)
 
 # Fixed billing header to replace the per-process/per-turn one.
 #
@@ -978,7 +980,7 @@ _REDACT_PATTERNS: list[tuple[str, "re.Pattern[bytes]", int]] = [
     ("jwt", re.compile(rb"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), 0),
     ("bearer", re.compile(rb"(?i)(\bbearer\s+)([A-Za-z0-9._\-~+/]{20,}=*)"), 2),
     ("assigned", re.compile(
-        rb"(?i)((?:api_?key|access_?key|token|secret|password|passwd|api_hash|"
+        rb"(?i)((?:api_?key|access_?key|_key|token|secret[A-Za-z0-9_]*|password|passwd|api_hash|"
         rb"session_?string|string_?session)[\"']?\s*[:=]\s*[\"']?)([^\s\"'\\,;}{\]\[]{8,})"), 2),
     # Run-start lookbehind + possessive quantifier keep this linear.
     ("b64", re.compile(rb"(?<![A-Za-z0-9+/_\-])[A-Za-z0-9+/_\-]{300,}+={0,2}"), 0),

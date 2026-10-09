@@ -161,7 +161,7 @@ that request against the previous request of the same session.
 CACHE_PROXY_LOG_DIR=/workspace/runtime/logs/cache-proxy     # usage.jsonl lives here
 CACHE_PROXY_REQUEST_LOG=            # unset: ON on the production port (28925), OFF elsewhere; 1/0 forces
 CACHE_PROXY_REQUEST_LOG_DIR=        # default: $CACHE_PROXY_LOG_DIR/requests
-CACHE_PROXY_REQUEST_LOG_MAX_GB=1    # ring-buffer cap for everything under the dir
+CACHE_PROXY_REQUEST_LOG_MAX_GB=60   # ring-buffer cap for everything under the dir
 ```
 
 Layout: `requests/YYYY-MM-DD/index.jsonl` (one line per request: `req_id`,
@@ -178,24 +178,28 @@ or fails a request.
 Ring buffer: the cap covers bodies AND index files. When exceeded, the writer
 evicts oldest first down to 90%: body files of the oldest day first, then that
 day's index once it holds no bodies (the current day's index is kept). At
-2026-10-09 night-time volume (~1,900 requests/h, ~580 MB/h gzip) **1 GB holds
-roughly 1–2 hours** of full bodies; busier hours shorten it. That short window
-is the stated tradeoff — for an investigation needing longer history, raise
-`CACHE_PROXY_REQUEST_LOG_MAX_GB` (needs a proxy restart). Index lines are
-~1.5 KB each, so they are a small part of the cap.
+2026-10-09 night-time volume (~1,900 requests/h, ~580 MB/h gzip) each GB holds
+roughly 1–2 hours of full bodies, so the **60 GB default ≈ 30–60+ hours**
+(quieter hours stretch it, busier ones shorten it). Rationale: Daniel asked for
+a standing pool "so there are logs" when a miss happens; 1 GB (~1–2 h) would
+usually be evicted before anyone looks, and Daniel confirmed 2026-10-09 00:21Z
+"60 is fine. I don't mind that." Override with `CACHE_PROXY_REQUEST_LOG_MAX_GB`
+(takes effect at the next proxy start). Index lines are ~1.5 KB each, a small
+part of the cap.
 
 Redaction: credentials never reach disk. Headers containing
 auth/key/cookie/token/secret are dropped. Bodies and index lines pass through
 `redact_secrets()`, which replaces secret-looking values with
-`[REDACTED:<kind>:<sha256-12>]`: Anthropic/OpenAI-style `sk-` keys (incl.
+`[REDACTED:<kind>:<sha256-12>]` in the STORED copies only (the bytes sent
+upstream are never modified): Anthropic/OpenAI-style `sk-` keys (incl.
 OAuth `sk-ant-oat…`), GitHub/Slack/AWS/Google tokens, Telegram bot tokens, JWTs,
 Bearer values, private-key blocks, `KEY=value`/`"api_key": "…"` assignments for
 key/token/secret/password/api_hash/session-string names, and any ≥300-char
 random-looking base64 run (this covers Telegram/Telethon session strings, image
 data and thinking-block `signature`s). Same value → same placeholder, so two
 captures compare equal/unequal exactly where the originals did; JSON stays
-valid; `prefix_diff.py` works unchanged on redacted files (byte offsets refer to
-the redacted text). `wire_sha256` is of the unredacted wire bytes. Redaction
+valid; `prefix_diff.py` works unchanged on redacted files — diffs operate on the
+redacted copies (byte offsets refer to the redacted text). `wire_sha256` is of the unredacted wire bytes. Redaction
 costs ~150 ms per 1.2 MB body on the writer thread.
 
 Diff tool: `scripts/prefix_diff.py` — `prefix_diff.py A B` (two `req_id`s or

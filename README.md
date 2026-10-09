@@ -106,8 +106,8 @@ with actual fork **and** resume requests. Run the real protocol tests in
 establish cache safety. Preserve this invariant even when other tests pass.
 
 To diagnose a prompt-cache miss, use the proxy's standing request pool
-(`/workspace/runtime/logs/cache-proxy/requests`, ~1 GB ring buffer, secrets
-redacted) and `scripts/prefix_diff.py --session <id>` — see
+(`/workspace/runtime/logs/cache-proxy/requests`, 60 GB ring buffer ≈ 30–60 h,
+secrets redacted in stored copies) and `scripts/prefix_diff.py --session <id>` — see
 docs/configuration.md "Request log".
 
 ## License

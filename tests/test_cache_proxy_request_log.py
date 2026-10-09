@@ -373,12 +373,12 @@ OAUTH = "sk-ant-oat01-" + "Q" * 20 + "abcdefgh12345678"
 SESSION_STR = "1" + "BVtsOHgBu7Zx9KqLm3Pd" * 18  # telethon-like, 361 chars
 
 
-def test_default_cap_is_one_gigabyte():
+def test_default_cap_is_sixty_gigabytes():
     import importlib
     old = os.environ.pop("CACHE_PROXY_REQUEST_LOG_MAX_GB", None)
     try:
         mod = importlib.reload(cache_proxy)
-        assert mod.REQUEST_LOG_MAX_BYTES == 10**9
+        assert mod.REQUEST_LOG_MAX_BYTES == 60 * 10**9
     finally:
         if old is not None:
             os.environ["CACHE_PROXY_REQUEST_LOG_MAX_GB"] = old
@@ -500,3 +500,11 @@ def test_obs_fork_context_extracted_from_last_user_message():
         "origin": "session_recovery",
         "parent_session_id": "9f495d93-ca57-419e-9425-80d0501cd299"}
     assert cache_proxy.extract_obs_fork_context({"messages": [_u("plain")]}) == {}
+
+
+def test_redaction_env_style_names():
+    raw = b'STRIPE_KEY=abcd1234wxyz MY_SECRET_VALUE=zz99yy88xx77 OBS_LOCAL_LLM_AUTH_TOKEN=tok123456789'
+    red = cache_proxy.redact_secrets(raw)
+    for v in (b"abcd1234wxyz", b"zz99yy88xx77", b"tok123456789"):
+        assert v not in red
+    assert b"STRIPE_KEY=" in red and b"MY_SECRET_VALUE=" in red
