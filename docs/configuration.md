@@ -146,6 +146,52 @@ OBS_CACHE_PROXY_PORT=18923
 
 Use `OBS_SKIP_CACHE_PROXY=1` for debugging or if the proxy fails to start. When disabled or unhealthy, sessions route directly to Anthropic for Claude models.
 
+### Request log (prompt-cache diagnosis)
+
+Since 2026-10-08 the proxy keeps a durable, session-keyed log of every
+`/v1/messages` request (mission cache-proxy-prefix-fix, bead `vault-mief.2`).
+It is the instrument for finding prompt-cache prefix breakage: when a turn
+re-writes the conversation instead of reading it, diff that request against the
+previous request of the same session.
+
+```bash
+CACHE_PROXY_LOG_DIR=/workspace/runtime/logs/cache-proxy     # usage.jsonl lives here
+CACHE_PROXY_REQUEST_LOG=            # unset: ON on the production port (28925), OFF elsewhere; 1/0 forces
+CACHE_PROXY_REQUEST_LOG_DIR=        # default: $CACHE_PROXY_LOG_DIR/requests
+CACHE_PROXY_REQUEST_LOG_MAX_GB=60   # oldest body files pruned past this cap
+```
+
+Layout: `requests/YYYY-MM-DD/index.jsonl` (one line per request: `req_id`,
+`session_id`, `model`, `route`, `http_status`, `error`, `usage`, normalization
+counts, sizes, `wire_sha256`, credential-free client headers) and
+`requests/YYYY-MM-DD/<req_id>.{pre,post,wire}.json.gz` — `pre` is exactly what
+the CLI sent, `wire` exactly what went upstream, `post` the body right after
+`normalize_request()` (stored only when it differs from `wire`, i.e. when the
+effort pin/strip changed something). `usage.jsonl` lines now carry `req_id`,
+`session_id` and `http_status`. Capture runs on a background thread: a full
+queue drops the record, it never delays or fails a request. Credentials
+(`authorization`, `x-api-key`, any header containing key/token/secret/cookie)
+are never written. Bodies contain conversation content and stay outside the
+vault. Volume at 2026-10 traffic (up to ~13k requests/day, ~200k tokens avg) is
+roughly 4–7 GB/day gzip-compressed, so the 60 GB default holds about 9–15 days.
+
+Diff tool: `scripts/prefix_diff.py` — `prefix_diff.py A B` (two `req_id`s or
+files), `--session <id-prefix>` (every adjacent pair of one session, with the
+usage of the later request), `--prev-any <req_id>` (pairs a request with the
+earlier request of any session sharing the longest message prefix — use it for
+recoveries, which continue a conversation under a new session id). It compares
+tools → system → request config (model, thinking, output_config,
+context_management, betas) → messages in prompt-cache order, ignoring only
+`cache_control`, and reports the first divergence with byte offset and
+snippets, plus whether the later request still carries a message-level cache
+breakpoint.
+
+Test runs: agents' shells inherit `CACHE_PROXY_LOG_DIR` from the daemon, so a
+test proxy subprocess writes `usage.jsonl` (and, with `CACHE_PROXY_SAVE_BODIES=1`,
+legacy `bodies/`) into the production directory unless you unset it:
+`env -u CACHE_PROXY_LOG_DIR -u CACHE_PROXY_SAVE_BODIES pytest ...`. The request
+log itself stays off on non-production ports unless forced.
+
 ## Voice transcription
 
 Current runtime expects an executable transcription script:

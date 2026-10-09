@@ -40,10 +40,15 @@ Client:
     ANTHROPIC_BASE_URL=http://localhost:18923
 
 """
+import gzip
+import hashlib
+import itertools
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -88,7 +93,42 @@ USAGE_LOG = os.path.join(LOG_DIR, "usage.jsonl")
 SKILL_MARKER = "The following skills are available for use with the Skill tool:"
 CLAUDEMD_MARKER = "As you answer the user's questions, you can use the following context:"
 
+# Legacy debug capture: req{NNN}_pre/post.json keyed by a per-process counter,
+# overwritten on every restart. Kept for the existing test fixtures. For
+# production diagnosis use the durable request log below.
 SAVE_BODIES = os.environ.get("CACHE_PROXY_SAVE_BODIES", "").lower() in ("1", "true")
+
+# Durable, session-keyed request log (2026-10-08, mission cache-proxy-prefix-fix,
+# bead vault-mief.2; Daniel: "They can enable logging requests and go off of
+# their own logs to find errors"). ON by default on the production port (see
+# request_log_enabled). One record per /v1/messages
+# request: the exact bytes the CLI sent (pre), the body after normalize_request()
+# (post — stored only when it differs from wire), the exact bytes forwarded
+# upstream (wire), and one index line with session id, HTTP status and usage.
+# This is the instrument for finding prefix breakage: diff consecutive requests
+# of one session with scripts/prefix_diff.py. Capture runs on a background
+# thread and NEVER alters, delays or fails the proxied request. Bodies contain
+# conversation content: the directory is outside the vault and auth headers are
+# never written. Size-capped (oldest files pruned first).
+# Default: ON for the production port, OFF for test/private instances (agents'
+# shells inherit CACHE_PROXY_LOG_DIR from the daemon, so a test proxy would
+# otherwise write into the production log). CACHE_PROXY_REQUEST_LOG=1/0 forces.
+_REQUEST_LOG_ENV = os.environ.get("CACHE_PROXY_REQUEST_LOG", "").strip().lower()
+
+
+def request_log_enabled(port: int) -> bool:
+    if _REQUEST_LOG_ENV in ("1", "true", "on"):
+        return True
+    if _REQUEST_LOG_ENV in ("0", "false", "off"):
+        return False
+    return port == PROD_PORT
+
+
+REQUEST_LOG_DIR = os.environ.get("CACHE_PROXY_REQUEST_LOG_DIR") or os.path.join(LOG_DIR, "requests")
+try:
+    REQUEST_LOG_MAX_BYTES = int(float(os.environ.get("CACHE_PROXY_REQUEST_LOG_MAX_GB", "60")) * 1e9)
+except ValueError:
+    REQUEST_LOG_MAX_BYTES = int(60e9)
 
 # Fixed billing header to replace the per-process/per-turn one.
 #
@@ -846,11 +886,14 @@ def log(msg: str):
     sys.stderr.flush()
 
 
-def log_usage_entry(norm_action: str, usage: dict, model: str = "", route: str = ""):
+def log_usage_entry(norm_action: str, usage: dict, model: str = "", route: str = "",
+                    req_id: str = "", session_id: str = "", http_status: int | None = None):
     """Append a usage entry to the structured JSONL log.
 
     ``model`` and ``route`` let a reader tell local turns apart from hosted
-    ones. Both are additive keys; existing readers do keyed lookups.
+    ones. ``req_id``/``session_id``/``http_status`` (added 2026-10-08) join a
+    usage line to its request-log record and its Claude session. All are
+    additive keys; existing readers do keyed lookups.
     """
     entry = {
         "ts": time.time(),
@@ -864,6 +907,12 @@ def log_usage_entry(norm_action: str, usage: dict, model: str = "", route: str =
     entry["total"] = entry["cache_read"] + entry["cache_creation"] + entry["input_tokens"]
     entry["cache_rate"] = (entry["cache_read"] / entry["total"]
                            if entry["total"] > 0 else 0.0)
+    if req_id:
+        entry["req_id"] = req_id
+    if session_id:
+        entry["session_id"] = session_id
+    if http_status is not None:
+        entry["http_status"] = http_status
     try:
         with open(USAGE_LOG, "a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -875,8 +924,198 @@ def log_usage_entry(norm_action: str, usage: dict, model: str = "", route: str =
     tot = entry["total"]
     rate = entry["cache_rate"]
     suffix = f" route={route}" if route else ""
+    if session_id:
+        suffix += f" session={session_id[:8]} req={req_id}"
     log(f"USAGE: tot={tot:,} cr={cr:,} cc={cc:,} ip={ip} ({rate:.0%} cached) "
         f"[{norm_action}]{suffix}")
+
+
+# ── Durable request log ──────────────────────────────────────────────────
+
+_SESSION_IN_USER_ID_RE = re.compile(r"_session_([0-9a-fA-F-]{8,})$")
+# Header names whose values are never written (substring match, lowercase).
+_SECRET_HEADER_PARTS = ("auth", "key", "cookie", "token", "secret", "session-token")
+
+
+def extract_session_id(body: dict) -> str:
+    """Claude session id from metadata.user_id (``..._session_<uuid>``).
+
+    Must be read BEFORE normalize_metadata() replaces it with ``_session_0``.
+    """
+    try:
+        user_id = (body.get("metadata") or {}).get("user_id") or ""
+    except AttributeError:
+        return ""
+    m = _SESSION_IN_USER_ID_RE.search(user_id) if isinstance(user_id, str) else None
+    return m.group(1) if m else ""
+
+
+def sanitize_headers(headers) -> dict:
+    """Request headers safe to persist: credentials are dropped entirely."""
+    out = {}
+    for k, v in headers.items():
+        lk = k.lower()
+        if any(p in lk for p in _SECRET_HEADER_PARTS):
+            continue
+        out[lk] = v
+    return out
+
+
+class RequestLogger:
+    """Durable per-request capture for prefix-breakage diagnosis.
+
+    Layout (``root`` = CACHE_PROXY_REQUEST_LOG_DIR):
+      root/YYYY-MM-DD/index.jsonl                 one line per completed request
+      root/YYYY-MM-DD/<req_id>.<part>.json.gz     part ∈ pre | post | wire
+    ``req_id`` = ``<UTC yyyymmddTHHMMSS.ffffff>Z-<pid>-<seq>-<session8>`` — unique
+    across restarts (time + pid) and sortable by time. ``pre`` is the exact
+    byte string the CLI sent; ``wire`` the exact bytes sent upstream; ``post``
+    the body right after normalize_request() (before route-specific effort
+    handling), written only when it differs from ``wire``.
+
+    All work happens on one daemon thread fed by a bounded queue. If the queue
+    is full the record is dropped and counted — traffic is never slowed or
+    failed by logging. Oldest files are pruned once ``max_bytes`` is exceeded.
+    """
+
+    def __init__(self, root: str, max_bytes: int = REQUEST_LOG_MAX_BYTES,
+                 queue_size: int = 32):
+        self.root = root
+        self.max_bytes = max_bytes
+        self._seq = itertools.count(1)
+        self._q: queue.Queue = queue.Queue(maxsize=queue_size)
+        self.dropped = 0
+        self.errors = 0
+        self.written = 0
+        self._bytes = None  # lazily measured on first write
+        os.makedirs(root, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, name="request-log", daemon=True)
+        self._thread.start()
+
+    # -- request-path API (cheap, never raises) --
+
+    def new_request_id(self, session_id: str = "") -> str:
+        now = time.time()
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now)) + f".{int((now % 1) * 1e6):06d}Z"
+        sid = (session_id or "nosession")[:8]
+        return f"{stamp}-{os.getpid()}-{next(self._seq):06d}-{sid}"
+
+    def submit_bodies(self, req_id: str, pre: bytes, post: bytes | None, wire: bytes):
+        self._put(("bodies", req_id, pre, post, wire))
+
+    def submit_index(self, record: dict):
+        self._put(("index", record))
+
+    def _put(self, item):
+        try:
+            self._q.put_nowait(item)
+        except queue.Full:
+            self.dropped += 1
+        except Exception:
+            self.errors += 1
+
+    def flush(self, timeout: float = 10.0):
+        """Block until queued items are written (tests/shutdown only)."""
+        done = threading.Event()
+        self._put(("barrier", done))
+        done.wait(timeout)
+
+    # -- writer thread --
+
+    @staticmethod
+    def _day_of(req_id: str) -> str:
+        return f"{req_id[0:4]}-{req_id[4:6]}-{req_id[6:8]}"
+
+    def _run(self):
+        while True:
+            item = self._q.get()
+            try:
+                kind = item[0]
+                if kind == "barrier":
+                    item[1].set()
+                elif kind == "bodies":
+                    self._write_bodies(*item[1:])
+                elif kind == "index":
+                    self._write_index(item[1])
+            except Exception as e:  # never let the writer die
+                self.errors += 1
+                try:
+                    log(f"request-log write error: {e}")
+                except Exception:
+                    pass
+
+    def _write_bodies(self, req_id: str, pre: bytes, post: bytes | None, wire: bytes):
+        day_dir = os.path.join(self.root, self._day_of(req_id))
+        os.makedirs(day_dir, exist_ok=True)
+        added = 0
+        parts = [("pre", pre), ("wire", wire)]
+        if post is not None and post != wire:
+            parts.append(("post", post))
+        for part, data in parts:
+            path = os.path.join(day_dir, f"{req_id}.{part}.json.gz")
+            with gzip.open(path, "wb", compresslevel=6) as f:
+                f.write(data)
+            added += os.path.getsize(path)
+        self.written += 1
+        self._account(added)
+
+    def _write_index(self, record: dict):
+        req_id = record.get("req_id", "")
+        day_dir = os.path.join(self.root, self._day_of(req_id))
+        os.makedirs(day_dir, exist_ok=True)
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+        with open(os.path.join(day_dir, "index.jsonl"), "a") as f:
+            f.write(line)
+        self._account(len(line))
+
+    def _measure(self) -> int:
+        total = 0
+        for dirpath, _dirs, files in os.walk(self.root):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, name))
+                except OSError:
+                    pass
+        return total
+
+    def _account(self, added: int):
+        if self._bytes is None:
+            self._bytes = self._measure()
+        else:
+            self._bytes += added
+        if self._bytes > self.max_bytes:
+            self._prune()
+
+    def _prune(self):
+        """Delete oldest body files (then empty old day dirs) to 90% of cap.
+
+        Index files are kept unless their whole day directory has no bodies
+        left, so status/usage history outlives the bodies.
+        """
+        target = int(self.max_bytes * 0.9)
+        days = sorted(d for d in os.listdir(self.root)
+                      if os.path.isdir(os.path.join(self.root, d)))
+        total = self._measure()
+        for day in days:
+            if total <= target:
+                break
+            day_dir = os.path.join(self.root, day)
+            for name in sorted(os.listdir(day_dir)):
+                if total <= target:
+                    break
+                if not name.endswith(".json.gz"):
+                    continue
+                path = os.path.join(day_dir, name)
+                try:
+                    size = os.path.getsize(path)
+                    os.remove(path)
+                    total -= size
+                except OSError:
+                    pass
+        self._bytes = total
+
+
+REQUEST_LOGGER: RequestLogger | None = None
 
 
 def parse_sse_usage(sse_chunks: list[bytes]) -> dict:
@@ -1116,9 +1355,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
         log_model = ""
         route_label = "anthropic"
         pin_beta = False
+        rlog = REQUEST_LOGGER
+        # Per-request capture context. Filled best-effort; never affects forwarding.
+        self._rl = {"t0": time.time(), "session_id": "", "req_id": "",
+                    "status": None, "usage": None, "error": None}
+        post_bytes = None
+        info = {}
         try:
             data = json.loads(raw_body)
             is_streaming = data.get("stream", False)
+            try:
+                self._rl["session_id"] = extract_session_id(data)
+                if rlog is not None:
+                    self._rl["req_id"] = rlog.new_request_id(self._rl["session_id"])
+            except Exception:
+                pass
 
             # Determine upstream based on model
             raw_model = data.get("model") or ""
@@ -1158,6 +1409,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             # Apply all normalizations
             data, info = normalize_request(data)
+            if rlog is not None:
+                try:
+                    post_bytes = json.dumps(data, separators=(",", ":")).encode()
+                except Exception:
+                    post_bytes = None
 
             # Sanitize tool schemas for CLIProxyAPI-routed models (OpenAI compat).
             # Deliberately NOT applied to local-* upstreams: those spoke the
@@ -1222,6 +1478,68 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _add_beta(headers, MID_EFFORT_BETA)
         url = upstream + self.path
 
+        if rlog is not None:
+            try:
+                if not self._rl["req_id"]:
+                    self._rl["req_id"] = rlog.new_request_id("")
+                rlog.submit_bodies(self._rl["req_id"], raw_body, post_bytes, body)
+            except Exception:
+                pass
+
+        try:
+            self._forward_messages_upstream(url, body, headers, is_streaming,
+                                            norm_action, log_model, route_label)
+        finally:
+            if rlog is not None:
+                try:
+                    self._submit_request_index(rlog, raw_body, post_bytes, body,
+                                               headers, info, log_model,
+                                               route_label, is_streaming)
+                except Exception:
+                    pass
+
+    def _submit_request_index(self, rlog, raw_body, post_bytes, body, headers,
+                              info, model, route, is_streaming):
+        rl = self._rl
+        usage = rl.get("usage") or {}
+        t1 = time.time()
+        effort_pin = info.get("effort_pin") if isinstance(info, dict) else None
+        record = {
+            "req_id": rl["req_id"],
+            "ts": rl["t0"],
+            "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(rl["t0"])) + "Z",
+            "duration_ms": int((t1 - rl["t0"]) * 1000),
+            "session_id": rl.get("session_id", ""),
+            "model": model,
+            "route": route,
+            "path": self.path,
+            "stream": bool(is_streaming),
+            "http_status": rl.get("status"),
+            "error": rl.get("error"),
+            "usage": {
+                "cache_read": usage.get("cache_read_input_tokens", 0),
+                "cache_creation": usage.get("cache_creation_input_tokens", 0),
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "cache_creation_detail": usage.get("cache_creation"),
+            } if usage else None,
+            "norm": {k: info.get(k) for k in
+                     ("action", "billing", "strings", "reminders", "git_status",
+                      "tools", "metadata", "effort_stripped", "schema_sanitized")
+                     if isinstance(info, dict) and k in info},
+            "effort_pin": effort_pin if isinstance(effort_pin, dict) else None,
+            "sizes": {"pre": len(raw_body), "wire": len(body),
+                      "post": len(post_bytes) if post_bytes is not None else None},
+            "post_equals_wire": (post_bytes == body) if post_bytes is not None else None,
+            "wire_sha256": hashlib.sha256(body).hexdigest(),
+            "client_headers": sanitize_headers(self.headers),
+            "upstream_beta": headers.get("anthropic-beta"),
+        }
+        rlog.submit_index(record)
+
+    def _forward_messages_upstream(self, url, body, headers, is_streaming,
+                                   norm_action, log_model, route_label):
+        rl = getattr(self, "_rl", None) or {}
         timeout = httpx.Timeout(connect=30, read=600, write=30, pool=30)
         try:
             with httpx.Client(timeout=timeout) as client:
@@ -1230,6 +1548,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                           model=log_model, route=route_label)
                 else:
                     resp = client.post(url, content=body, headers=headers)
+                    rl["status"] = resp.status_code
+                    if resp.status_code >= 400:
+                        rl["error"] = resp.content[:500].decode("utf-8", errors="replace")
                     if route_label == "local" and self._send_translated_overflow(
                         resp.status_code, resp.content
                     ):
@@ -1246,14 +1567,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         resp_data = resp.json()
                         usage = resp_data.get("usage", {})
                         if usage:
+                            rl["usage"] = usage
                             log_usage_entry(norm_action, usage,
-                                            model=log_model, route=route_label)
+                                            model=log_model, route=route_label,
+                                            req_id=rl.get("req_id", ""),
+                                            session_id=rl.get("session_id", ""),
+                                            http_status=resp.status_code)
                         else:
                             log(f"NON-STREAM: no usage in response (status={resp.status_code})")
                     except Exception as e:
                         log(f"NON-STREAM: response parse error: {e}")
         except Exception as e:
             log(f"upstream error: {e}")
+            rl["status"] = rl.get("status") or 502
+            rl["error"] = f"proxy upstream error: {e}"[:500]
             try:
                 self.send_error(502, str(e))
             except Exception:
@@ -1276,9 +1603,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _stream_upstream(self, client: httpx.Client, url: str,
                          body: bytes, headers: dict, norm_action: str,
                          model: str = "", route: str = ""):
+        rl = getattr(self, "_rl", None)
+        if rl is None:
+            rl = self._rl = {}
         with client.stream("POST", url, content=body, headers=headers) as resp:
+            rl["status"] = resp.status_code
             if route == "local" and resp.status_code >= 400:
                 error_body = resp.read()
+                rl["error"] = error_body[:500].decode("utf-8", errors="replace")
                 if self._send_translated_overflow(resp.status_code, error_body):
                     return
                 self.send_response(resp.status_code)
@@ -1320,13 +1652,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             usage = parse_sse_usage(chunks)
             if usage:
-                log_usage_entry(norm_action, usage, model=model, route=route)
+                rl["usage"] = usage
+                log_usage_entry(norm_action, usage, model=model, route=route,
+                                req_id=rl.get("req_id", ""),
+                                session_id=rl.get("session_id", ""),
+                                http_status=resp.status_code)
             else:
                 # Log chunk sizes for debugging
                 chunk_info = [len(c) for c in chunks]
                 total_bytes = sum(chunk_info)
                 # Show first 500 bytes of raw response for debugging
                 raw_preview = b"".join(chunks)[:500].decode("utf-8", errors="replace")
+                rl["error"] = raw_preview
                 log(f"STREAM: no usage in {len(chunks)} chunks ({total_bytes} bytes). Preview: {raw_preview[:200]}")
 
     def do_POST(self):
@@ -1373,6 +1710,18 @@ def main():
             f"and bodies go to {LOG_DIR} — set CACHE_PROXY_LOG_DIR to a private "
             f"directory so this instance does not mix into production data")
     log(f"save_bodies: {SAVE_BODIES}")
+    global REQUEST_LOGGER
+    if request_log_enabled(port):
+        try:
+            REQUEST_LOGGER = RequestLogger(REQUEST_LOG_DIR, REQUEST_LOG_MAX_BYTES)
+            log(f"request_log: ON dir={REQUEST_LOG_DIR} "
+                f"cap={REQUEST_LOG_MAX_BYTES / 1e9:.0f}GB (pre/post/wire bodies + index.jsonl)")
+        except Exception as e:
+            REQUEST_LOGGER = None
+            log(f"request_log: FAILED to start ({e}) — proxying without capture")
+    else:
+        log("request_log: OFF (non-production port or CACHE_PROXY_REQUEST_LOG=0; "
+            "set CACHE_PROXY_REQUEST_LOG=1 to force)")
     log(f"normalizations: billing, string→list, strip all system reminders, "
         f"git status, tool sort, metadata (cache_control: passthrough)")
     log(f"Set ANTHROPIC_BASE_URL=http://localhost:{port}")
