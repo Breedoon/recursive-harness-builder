@@ -158,8 +158,9 @@ def consume(root: pathlib.Path, *, now: float | None = None):
                 source.seek(row['source_offset'])
                 raw = source.readline()
                 source_ok = raw.endswith(b'\n') and sha(raw) == row['usage_line_sha256']
-                # Legacy unjoined retained rows can lack a supported current source binding.
-                if not source_ok and row.get('index_join', 'unjoined') == 'unjoined':
+                # Only legacy rows without request/session provenance may lack a source binding.
+                legacy_unbound = not row.get('req_id') and not row.get('session_id')
+                if not source_ok and legacy_unbound and row.get('index_join', 'unjoined') == 'unjoined':
                     usage_unknown += 1
                     continue
                 require(source_ok, field, 'SOURCE_JOIN_REFUSED', {'req_id': row['req_id'], 'offset': row['source_offset'], 'expected_line_sha256': row['usage_line_sha256'], 'observed_line_sha256': sha(raw)})

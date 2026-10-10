@@ -148,3 +148,85 @@ def test_forged_projection_metadata(feed):
                     row['prefix_sample']['tools_system_redacted_sha256']='0'*64
         alter(feed,name,edit)
     assert consume(feed,now=NOW)['decision']=='STORED_BODY_REFUSED'
+
+
+@pytest.fixture
+def unjoined_feed(feed):
+    index = feed / 'index.jsonl'
+    raw = b''.join(line for line in index.read_bytes().splitlines(keepends=True) if json.loads(line)['req_id'] != 'req-1')
+    index.write_bytes(raw)
+    alter(feed, 'latest.json', lambda v: v.update(joins=dict(exact_id_identity_tokens=2, unjoined=1), index_sources=[dict(path=str(index), lines=2, sha256_read_bytes=sha(raw))]))
+    for name in ('latest.json', 'samples.json'):
+        alter(feed, name, lambda v: v.update(samples=[r for r in v['samples'] if r['req_id'] != 'req-1']))
+    with sqlite3.connect(feed / 'records.sqlite3') as db:
+        row = json.loads(db.execute("SELECT data FROM records WHERE key='req-1'").fetchone()[0])
+        row['index_join'] = 'unjoined'
+        db.execute("UPDATE records SET data=? WHERE key='req-1'", (json.dumps(row),))
+    return feed
+
+
+def test_current_unjoined_valid_source_is_observational(unjoined_feed):
+    result = consume(unjoined_feed, now=NOW)
+    assert result['allow_observational_assessment']
+    assert result['unknowns'][0]['unsupported_old_source_bindings'] == 0
+    assert not result['qualified95'] and not result['new_burner_attribution']
+
+
+@pytest.mark.parametrize('field', ['source_offset', 'usage_line_sha256'])
+def test_current_unjoined_corrupt_source_refuses(unjoined_feed, field):
+    with sqlite3.connect(unjoined_feed / 'records.sqlite3') as db:
+        row = json.loads(db.execute("SELECT data FROM records WHERE key='req-1'").fetchone()[0])
+        row[field] = row[field] + 1 if field == 'source_offset' else '0' * 64
+        db.execute("UPDATE records SET data=? WHERE key='req-1'", (json.dumps(row),))
+    result = consume(unjoined_feed, now=NOW)
+    assert result['decision'] == 'SOURCE_JOIN_REFUSED'
+    assert result['field'] == 'usage.source_offset/LF_sha256'
+    assert not result['allow_observational_assessment']
+
+
+@pytest.mark.parametrize('field,value,decision', [('session_id', '00000000-0000-0000-0000-000000000000', 'IDENTITY_JOIN_REFUSED'), ('input_tokens', 11, 'TOKEN_JOIN_REFUSED')])
+def test_current_unjoined_bound_source_identity_tokens_refuse(unjoined_feed, field, value, decision):
+    source = unjoined_feed / 'usage.jsonl'
+    lines = source.read_bytes().splitlines(keepends=True)
+    item = json.loads(lines[1]); item[field] = value
+    raw = (json.dumps(item) + '\n').encode()
+    assert len(raw) == len(lines[1])
+    lines[1] = raw; source.write_bytes(b''.join(lines))
+    with sqlite3.connect(unjoined_feed / 'records.sqlite3') as db:
+        row = json.loads(db.execute("SELECT data FROM records WHERE key='req-1'").fetchone()[0])
+        row['usage_line_sha256'] = sha(raw)
+        db.execute("UPDATE records SET data=? WHERE key='req-1'", (json.dumps(row),))
+    result = consume(unjoined_feed, now=NOW)
+    assert result['decision'] == decision
+    assert not result['allow_observational_assessment']
+
+
+def test_legacy_source_schema_unavailable_remains_unknown(feed):
+    source = feed / 'usage.jsonl'
+    items = [json.loads(line) for line in source.read_bytes().splitlines()]
+    rows = []
+    with source.open('wb') as stream:
+        for item in items:
+            item.pop('req_id'); item.pop('session_id')
+            raw = (json.dumps(item) + '\n').encode()
+            rows.append(dict(item, req_id='', session_id='', source_offset=stream.tell(), usage_line_sha256=sha(raw), prompt_total=20, index_join='unjoined'))
+            stream.write(raw)
+    with sqlite3.connect(feed / 'records.sqlite3') as db:
+        for i, row in enumerate(rows):
+            db.execute('UPDATE records SET data=? WHERE key=?', (json.dumps(row), f'req-{i}'))
+        db.execute('UPDATE cursor SET offset=? WHERE id=1', (source.stat().st_size,))
+    alter(feed, 'latest.json', lambda v: v.update(source_offset_end=source.stat().st_size, classes_observational=dict(HIT=0,MISS=0,EDGE=0,SKIP=3), joins=dict(unjoined=3), index_sources=[], samples=[], prefix_samples=[]))
+    alter(feed, 'receipts.jsonl', lambda v: v.update(source_offset_end=source.stat().st_size))
+    alter(feed, 'samples.json', lambda v: v.update(samples=[], prefix_samples=[]))
+    for name in ('hourly-summary.json', 'session-summary.json'):
+        def edit(v):
+            row = v['rows'][0]
+            row.update(HIT=0,MISS=0,EDGE=0,SKIP=3)
+            if name.startswith('session'): row['session_id'] = 'unknown'
+        alter(feed, name, edit)
+    assert consume(feed, now=NOW)['allow_observational_assessment']
+    source.write_bytes(b'')
+    result = consume(feed, now=NOW)
+    assert result['allow_observational_assessment']
+    assert result['unknowns'][0]['unsupported_old_source_bindings'] == 3
+    assert not result['qualified95'] and not result['new_burner_attribution']
