@@ -501,9 +501,21 @@ async def sc_utility_route(args):
     return [sid], None
 
 
+async def sc_empty_result_resume(args):
+    sid = str(uuid.uuid4())
+    cwd = WORK_ROOT / "cwd"
+    cwd.mkdir(parents=True, exist_ok=True)
+    await _session(args, ["Reply with the single word: ready.",
+                         "Run Bash exactly: python3 -c 'pass'. Then reply with the single word: done."]
+                   + [f"Reply with the single word: warm{i}." for i in range(args.warm_turns)], session_id=sid)
+    await _session(args, ["Reply with the single word: resumed."], resume=sid)
+    return [sid], None
+
+
 SCENARIOS = {
     "baseline": (sc_baseline, "control; must pass"),
     "utility_route": (sc_utility_route, "Bash file-path utility remains on the explicit provider"),
+    "empty_result_resume": (sc_empty_result_resume, "no-output Bash tool result then new-process replay"),
     "reminder_block": (sc_reminder_block, "class A; expect FAIL on unfixed proxy"),
     "queued_midturn": (sc_queued_midturn, "notification splice"),
     "cch_collision": (sc_cch_collision, "billing placeholder collision; expect FAIL on unfixed proxy"),

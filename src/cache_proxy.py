@@ -392,7 +392,10 @@ def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
         content = block.get("content")
         if isinstance(content, str):
             new_text, removed = strip_reminder_spans(content)
-            if removed:
+            # PREFIX-STABILITY M7: live reminder-only results replay from JSONL
+            # as empty strings. Canonicalize absence identically, not whitespace
+            # or meaningful output, preserving the result ID/error/cache fields.
+            if removed or content == "":
                 block["content"] = new_text or REMINDER_PLACEHOLDER
             return removed, False
         if isinstance(content, list):
@@ -407,7 +410,7 @@ def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
                         if not new_text.strip():
                             continue
                 kept.append(sub)
-            if removed:
+            if removed or content == []:
                 block["content"] = kept or [
                     {"type": "text", "text": REMINDER_PLACEHOLDER}
                 ]
