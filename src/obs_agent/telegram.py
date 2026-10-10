@@ -12,6 +12,7 @@ and sends chronological per-turn updates. Key behavior:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -676,6 +677,12 @@ class TelegramBot:
             self._user_timezone = ZoneInfo(config.user_timezone)
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"Invalid OBS user timezone: {config.user_timezone}") from exc
+        logger.info(
+            "schedule_evaluator_loaded code_sha256=%s per_schedule_utc=%s default_timezone=%s",
+            hashlib.sha256(self._next_cron_fire_ts.__code__.co_code).hexdigest(),
+            "CRON_TZ=UTC " in self._next_cron_fire_ts.__code__.co_consts,
+            config.user_timezone,
+        )
         if _path_is_within(config.telegram_state_db_path, config.telegram_temp_root):
             raise ValueError(
                 "Invalid Telegram state DB path: OBS_TELEGRAM_STATE_DB_PATH must be outside "
@@ -3390,7 +3397,13 @@ class TelegramBot:
     ) -> float:
         if croniter is None:
             raise ValueError("croniter is not installed")
-        anchor = datetime.fromtimestamp(base_ts, timezone.utc).astimezone(self._user_timezone)
+        # Explicit per-schedule UTC survives persistence and fresh-context repairs.
+        # Plain expressions retain the ordinary user-timezone behavior.
+        schedule_timezone = self._user_timezone
+        if cron_expr.startswith("CRON_TZ=UTC "):
+            cron_expr = cron_expr[len("CRON_TZ=UTC "):].strip()
+            schedule_timezone = timezone.utc
+        anchor = datetime.fromtimestamp(base_ts, timezone.utc).astimezone(schedule_timezone)
         try:
             itr = croniter(cron_expr, anchor)
             candidate = float(itr.get_next(float))
@@ -3399,7 +3412,7 @@ class TelegramBot:
         if not_before_ts is not None and candidate < not_before_ts:
             anchor_nb = datetime.fromtimestamp(
                 not_before_ts - 1.0, timezone.utc
-            ).astimezone(self._user_timezone)
+            ).astimezone(schedule_timezone)
             try:
                 itr = croniter(cron_expr, anchor_nb)
                 candidate = float(itr.get_next(float))
