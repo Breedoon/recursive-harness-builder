@@ -452,11 +452,13 @@ def strip_all_system_reminders(body: dict) -> int:
         # When a reminder-only block is dropped and it carries cache_control,
         # that marker MOVES to the nearest surviving earlier block of the same
         # message (or the next surviving block / the placeholder if none is
-        # earlier). Dropping it silently leaves the request with no message
+        # earlier). An occupied destination retains both markers by keeping a
+        # fixed placeholder for the removed block, never coalescing TTL objects.
+        # Dropping it silently leaves the request with no message
         # breakpoint, which reads only system+tools and writes nothing.
         # Live guard: scripts/prefix_repro.py reminder_block. Incident:
         # 2026-10-08/09, mission vault-mief.
-        pending_cc = None
+        pending_markers = []
         for block in content:
             removed, now_empty = _strip_reminders_in_block(block)
             count += removed
@@ -464,19 +466,29 @@ def strip_all_system_reminders(body: dict) -> int:
                 cc = block.get("cache_control") if isinstance(block, dict) else None
                 if cc is not None:
                     if kept and isinstance(kept[-1], dict):
-                        kept[-1].setdefault("cache_control", cc)
+                        if "cache_control" not in kept[-1]:
+                            kept[-1]["cache_control"] = cc
+                        else:
+                            kept.append({"type": "text", "text": REMINDER_PLACEHOLDER,
+                                         "cache_control": cc})
                     else:
-                        pending_cc = cc
+                        pending_markers.append(cc)
                 continue
-            if pending_cc is not None and isinstance(block, dict):
-                block.setdefault("cache_control", pending_cc)
-                pending_cc = None
+            if pending_markers and isinstance(block, dict):
+                if "cache_control" not in block:
+                    block["cache_control"] = pending_markers.pop(0)
+                kept.extend({"type": "text", "text": REMINDER_PLACEHOLDER,
+                             "cache_control": cc} for cc in pending_markers)
+                pending_markers = []
             kept.append(block)
+        if pending_markers:
+            if not kept:
+                placeholdered += 1
+            kept.extend({"type": "text", "text": REMINDER_PLACEHOLDER,
+                         "cache_control": cc} for cc in pending_markers)
         if content and not kept:
             kept = [{"type": "text", "text": REMINDER_PLACEHOLDER}]
             placeholdered += 1
-            if pending_cc is not None:
-                kept[0]["cache_control"] = pending_cc
         msg["content"] = kept
     stats["reminders_stripped"] += count
     stats["messages_placeholdered"] += placeholdered
@@ -883,7 +895,7 @@ def _add_beta(headers: dict, beta: str) -> None:
 # redacting filter (sed -E on the placeholder regex) and describe the placeholder by
 # regex only. 2026-10-09 self-poisoning cost the mission ~30-35 weekly points.
 _CCH_PLACEHOLDER = b"cch=" + b"0" * 5
-_CCH_HASH_RE = re.compile(rb"cch=[0-9a-f]{5}")
+_CCH_HASH_RE = re.compile(rb"cch=[0-9a-f]{5}(?![0-9a-fA-F])")
 _BILLING_HEADER_MARK = b"x-anthropic-billing-header:"
 
 
