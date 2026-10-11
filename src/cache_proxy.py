@@ -367,6 +367,16 @@ def strip_reminder_spans(text: str) -> tuple[str, int]:
     return new_text, removed
 
 
+def _contains_cache_control(value) -> bool:
+    if isinstance(value, dict):
+        return "cache_control" in value or any(
+            _contains_cache_control(child) for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(_contains_cache_control(child) for child in value)
+    return False
+
+
 def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
     """Strip reminder spans inside one content block, recursively.
 
@@ -385,6 +395,12 @@ def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
         new_text, removed = strip_reminder_spans(block.get("text", ""))
         if removed:
             block["text"] = new_text
+            if not new_text.strip() and any(
+                _contains_cache_control(value)
+                for key, value in block.items() if key != "cache_control"
+            ):
+                block["text"] = REMINDER_PLACEHOLDER
+                return removed, False
             return removed, not new_text.strip()
         return 0, False
 
@@ -402,13 +418,15 @@ def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
             removed = 0
             kept: list = []
             for sub in content:
-                if isinstance(sub, dict) and sub.get("type") == "text":
-                    new_text, sub_removed = strip_reminder_spans(sub.get("text", ""))
-                    removed += sub_removed
-                    if sub_removed:
-                        sub["text"] = new_text
-                        if not new_text.strip():
-                            continue
+                sub_removed, sub_empty = _strip_reminders_in_block(sub)
+                removed += sub_removed
+                if sub_empty:
+                    # PREFIX-STABILITY M1: keep every nested marker on its
+                    # original block, including identical and distinct TTLs.
+                    if _contains_cache_control(sub):
+                        sub["text"] = REMINDER_PLACEHOLDER
+                    else:
+                        continue
                 kept.append(sub)
             if removed or content == []:
                 block["content"] = kept or [
