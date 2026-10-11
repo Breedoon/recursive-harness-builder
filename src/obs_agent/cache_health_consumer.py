@@ -16,7 +16,7 @@ CLASSES = ('HIT', 'MISS', 'EDGE', 'SKIP')
 TOKENS = ('cache_read', 'cache_creation', 'input_tokens')
 ROUTE = {
     'principal': '6b3cac918e-caching-solidification-successor-supervisor',
-    'wait_resume_owner': '6febe8b574-caching-whole-amended-content-takeover-depth3',
+    'wait_resume_owner': '2fd507c2bf-caching-whole-amended-proof-ready-takeover-depth4',
     'implementation_conduit': 'fe06d8430d-caching-solidification-flat-router',
     'registry': '2026-10-08-23-33-topic-16234',
     'team_name': '2026-10-08-23-33-topic-16234',

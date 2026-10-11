@@ -72,7 +72,13 @@ def test_all_summary_fields_refuse(feed,name,key):
     result = consume(feed,now=NOW)
     assert not result['allow_observational_assessment']
     assert result['field'] == name+'.'+key
-    assert result['route']['wait_resume_owner'].endswith('takeover-depth3')
+    assert result['route'] == {
+        'principal': '6b3cac918e-caching-solidification-successor-supervisor',
+        'wait_resume_owner': '2fd507c2bf-caching-whole-amended-proof-ready-takeover-depth4',
+        'implementation_conduit': 'fe06d8430d-caching-solidification-flat-router',
+        'registry': '2026-10-08-23-33-topic-16234',
+        'team_name': '2026-10-08-23-33-topic-16234',
+    }
 
 
 @pytest.mark.parametrize('cls', ['HIT','MISS','EDGE','SKIP'])
