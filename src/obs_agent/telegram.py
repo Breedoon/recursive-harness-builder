@@ -6016,6 +6016,14 @@ class TelegramBot:
         self._persist_state_for_route(state.route)
 
     async def _reset_route_state(self, state: TelegramSessionState) -> None:
+        logger.info(
+            "[route_reset] route=%s old_session_id=%s model_override=%s effort_override=%s pending=%d",
+            state.route,
+            state.session_id,
+            state.session_manager.model_override,
+            state.session_manager.effort_override,
+            len(state.pending_messages),
+        )
         self._last_inbound_message_id_by_route.pop(state.route, None)
         self._unbind_route_sessions(state.route)
         await state.session_manager.async_reset()
@@ -8045,6 +8053,15 @@ class TelegramBot:
         if not proceed:
             state.pending_messages = []
             return _RunOutcome(assistant_text="")
+        logger.info(
+            "[run_and_send] preflight route=%s session_id=%s trigger_message_id=%s schedule_id=%s pending=%d msg=%.80s",
+            state.route,
+            state.session_id,
+            trigger_message.telegram_message_id if trigger_message else None,
+            triggered_schedule_id,
+            len(pending_messages),
+            user_text,
+        )
         await self._recover_route_session_if_needed(
             state=state,
             source="run_start",
