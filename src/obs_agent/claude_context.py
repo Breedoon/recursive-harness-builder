@@ -238,6 +238,14 @@ class ClaudeContextPlan:
         }
 
 
+# CACHE-PREFIX WARNING (judged 2026-10-12, not measured): these controls are set
+# per CLI process. A resumed or forked process that receives a DIFFERENT 200K/1M
+# selector than its parent may send different request settings (model selector /
+# betas), which would re-bill the conversation; keep them a pure function of the
+# session's stored model/context. Compaction itself rewrites history on purpose
+# (one deliberate full miss); changing the threshold only moves when it happens.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py resume_new_proc parallel_fork (docs/cache-proxy-safety.md).
 def build_claude_context_plan(
     *,
     model: str,

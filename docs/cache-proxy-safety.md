@@ -78,11 +78,31 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
 
 ## The checklist
 
-0. **Do not poison your own session.** Never put the billing placeholder
-   (`cch=` followed by five zeros) into your context, a file, a prompt or a
-   commit message. Read proxy source, logs and reports through
-   `sed -E 's/cch=0{5}/cch=<PH>/g'`. If it shows up unredacted in your context,
-   start a fresh session.
+0. **Do not poison your own session, and do not leak secrets.**
+   - Never put the billing placeholder (`cch=` followed by five zeros) into your
+     context, a file, a prompt or a commit message. If it shows up unredacted
+     in your context, start a fresh session.
+   - Proxy work means reading logs and process environments that also hold
+     real credentials: Telegram bot tokens, the userbot session string, API
+     keys, OAuth tokens. Never print them into your context or copy them
+     anywhere.
+   - Pipe everything you read through the ready-made filter, which hides both:
+     ```text
+     <command> | scripts/redact.sh
+     tr '\0' '\n' < /proc/<pid>/environ | scripts/redact.sh    # process env
+     ```
+     It replaces the placeholder, `KEY=value` pairs whose name looks secret
+     (`*TOKEN*`, `*KEY*`, `*SECRET*`, `*SESSION*`, `*AUTH*`, `*PASSWORD*`, ...),
+     `Bearer` tokens, secret-named JSON fields, known token shapes and long
+     opaque strings. It is best-effort: prefer printing only variable *names*
+     (`... | cut -d= -f1`) when names are all you need.
+   - What the tools themselves output: the stored request log keeps
+     secret-redacted copies (hashed placeholders), so `prefix_diff.py` and the
+     runner's diff snippets come from redacted bodies. `cache_regression.py`
+     prints and saves request ids, session ids, statuses, cache ratios and diff
+     snippets; it never prints the OAuth token the direct-probe scenarios send.
+     Its per-scenario `.txt` files also keep the harness's stderr, which is not
+     filtered, so run them through `scripts/redact.sh` before quoting them.
 1. **Know the mechanism from real bytes.** If you are fixing a miss, find it in
    the request log (`/workspace/runtime/logs/cache-proxy/requests`) and run
    `.venv/bin/python scripts/prefix_diff.py <earlier req id> <later req id>`
@@ -146,7 +166,10 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
   returned 5xx errors. Usually provider overload, not our code. It is not a
   pass: rerun that route later.
 - `SKIPPED` — after two provider errors in a row on one route the runner stops
-  that route instead of wasting time (`--max-provider-errors`).
+  that route instead of wasting time (`--max-provider-errors`). Tested on
+  2026-10-12 against a scratch proxy whose GPT upstream was a stub that always
+  returned 502: two scenarios came back `PROVIDER-ERROR`, the next two
+  `SKIPPED`, and the runner exited with 2.
 - Exit code 0 = all PASS, 1 = some FAIL, 2 = inconclusive (provider errors or
   skips, no FAIL).
 
@@ -162,15 +185,55 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
   `volatile_flip` scenario.
 - **Claude Code CLI upgrade:** run the full checklist from step 3; CLI changes
   caused two of the mechanisms above.
-- **The wake test with a long gap** (`resume_new_proc --gap 330`) cannot pass on
-  Haiku, whose cache entries last 5 minutes; use a 1-hour model
-  (`--model claude-opus-5-5`) or judge the pair class (append) instead of the
-  ratio.
+- **The wake test with a long gap** (`scripts/prefix_repro.py resume_new_proc
+  --gap 330`, not part of the default runner because it takes 6 minutes) needs
+  1-hour cache entries. The CLI writes them only when its feature-flag service
+  (GrowthBook) is on, because the 1-hour setting is a server flag
+  (`tengu_prompt_cache_1h_config`); `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
+  turns that service off and leaves only 5-minute entries. Since commit
+  86a1672 the wake scenario turns it back on; check that the first requests'
+  usage shows `ephemeral_1h_input_tokens > 0`. If only 5-minute entries were
+  written, a zero read after the gap is expiry, not a prefix break. The same
+  applies to the fleet: never set that variable for production agents.
 - **Every request is logged** with what the proxy did to it (`norm.*` fields in
   the request index: `ws_trimmed`, `volatile_pin`, `cache_key`,
   `dynamic_boundary`, plus `proxy_source`, the hash of the loaded code). The
   request log is capped at 60 GB, about 20 days of fleet traffic at the
   2026-10-12 rate of about 3 GB a day.
+
+## Accepted side effects of the 2026-10-12 design
+
+These are deliberate tradeoffs. Re-decide them if they start to hurt.
+
+- **Two conversations with the same first message are treated as one.** The
+  variant pin (`pin_volatile_config`) and the GPT cache key
+  (`assign_conversation_cache_key`) are keyed on the model plus the first
+  message. This is what lets resumes, wakes, restarts and forks share them.
+  The cost: separate conversations that start with an identical first
+  message share one pin and one GPT key. Examples are a recurring scheduled
+  prompt or identical helper prompts.
+  - Sharing a GPT key is harmless: they would share a cache prefix anyway.
+  - Sharing a pin means a recurring prompt keeps the system-prompt variant it
+    was first seen with for as long as it keeps running. The pin expires only
+    after 2 days without use, so a prompt that runs every day may never pick
+    up a newer variant.
+  - Accepted because the pinned section ("# Output efficiency") only changes
+    the model's answer style, while a flip re-bills the whole conversation.
+- **A newly appearing `context_management` setting is removed for pinned
+  conversations.** If the server starts sending it (a "clear old thinking"
+  edit) in the middle of a conversation that began without it, the proxy
+  removes it for the rest of that conversation. Old thinking blocks are then
+  kept rather than cleared, so long conversations may grow a little faster
+  toward compaction. If it disappears, it is restored, but only when thinking
+  is enabled.
+- **Only one system section is pinned.** That is `"# Output efficiency"`, the
+  only one seen flipping. Any other flag-driven section that starts flipping
+  is not covered until it is added to `VOLATILE_SYSTEM_SECTIONS`.
+- **Why these sections flip is a hypothesis.** It comes from reading the
+  bundled CLI, not from observing the mechanism end to end. The guess: a
+  server feature flag (`tengu_swann_brevity`) is cached in the fleet's shared
+  `~/.claude.json` and refreshed every few hours, so one process's refresh
+  changes it for every running agent. The pin works whatever the cause.
 
 ## More detail
 

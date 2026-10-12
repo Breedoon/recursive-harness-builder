@@ -136,7 +136,8 @@ literal (the key `cch=` followed by five zeros; describe it only by the regex
 `cch=0{5}`) into an agent's context: the CLI rewrites its first occurrence in the
 request body with a random hash, so a session that read proxy source, logs or
 reports containing it stops caching on every later call. Read the proxy source,
-request logs and reports through a redacting filter (`sed -E 's/cch=0{5}/cch=<PH>/g'`),
+request logs and reports through a redacting filter (`scripts/redact.sh`, which
+also hides tokens, API keys and session strings; minimal form `sed -E 's/cch=0{5}/cch=<PH>/g'`),
 never write the literal in prompts, notes or messages, and abandon a poisoned
 session for a fresh one. On 2026-10-08/09 this self-poisoning cost the cache-prefix
 mission roughly 30-35 points of the Claude weekly pool (vault-mief). The regression

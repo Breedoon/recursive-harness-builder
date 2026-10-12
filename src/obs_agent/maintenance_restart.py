@@ -321,6 +321,13 @@ def split_resume_order(entries: list[ResumeEntry]) -> tuple[list[ResumeEntry], l
     return hosted, local
 
 
+# CACHE-PREFIX WARNING: every resumed route replays its JSONL in a NEW CLI process,
+# so a restart is a full resume test for every mid-turn agent at once. The resume
+# note built here must be sent as a NEW appended user message, never merged into
+# or replacing earlier history; the variant pins and GPT cache keys in the proxy
+# survive a restart only because they live in effort-pins.json and are derived
+# from the conversation itself. A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py resume_new_proc queued_resume ws_resume (docs/cache-proxy-safety.md).
 def build_resume_prompt(
     *,
     requested_at: float,

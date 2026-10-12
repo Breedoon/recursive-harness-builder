@@ -90,8 +90,25 @@ _SPIKE_PROXY = _PROJECT_ROOT / "spikes" / "cache_normalizing_proxy.py"
 _MAIN_SPIKE_PROXY = Path.home() / "Documents" / "obs" / "spikes" / "cache_normalizing_proxy.py"
 _PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
-# Log directory: matches the production default in src/cache_proxy.py
+# Log directory for test proxies (NOT the production default).
 TEST_LOG_DIR = str(_PROJECT_ROOT / ".obs-agent" / "cache-proxy-log")
+
+
+def isolated_proxy_env() -> dict[str, str]:
+    """Environment for a test proxy subprocess that cannot touch production state.
+
+    CACHE-PREFIX: agents' shells inherit CACHE_PROXY_LOG_DIR from the OBS daemon
+    (= the production dir). Before 2026-10-12 every test proxy therefore wrote
+    its usage rows into the production usage.jsonl (polluting fleet cache
+    tallies: 311 rows on 2026-10-12 alone) and its pins into the production
+    effort-pins.json, while the tests themselves read TEST_LOG_DIR and found
+    nothing. Pin every log/state path to TEST_LOG_DIR and keep the request log off.
+    """
+    env = os.environ.copy()
+    env["CACHE_PROXY_LOG_DIR"] = TEST_LOG_DIR
+    env["CACHE_PROXY_REQUEST_LOG_DIR"] = os.path.join(TEST_LOG_DIR, "requests")
+    env["CACHE_PROXY_REQUEST_LOG"] = "0"
+    return env
 
 # Proxy port range: pick something unlikely to collide
 _PROXY_PORT_MIN = 18200
@@ -522,6 +539,7 @@ def proxy(proxy_port: int, proxy_script: Path) -> Generator[int, None, None]:
         [sys.executable, str(proxy_script), str(proxy_port)],
         stderr=subprocess.PIPE,
         stdout=subprocess.PIPE,
+        env=isolated_proxy_env(),
     )
 
     # Health check: wait for TCP port to accept connections
@@ -575,7 +593,7 @@ def proxy_with_bodies(proxy_port: int, proxy_script: Path) -> Generator[int, Non
             except Exception:
                 pass
 
-    env = os.environ.copy()
+    env = isolated_proxy_env()
     env["CACHE_PROXY_SAVE_BODIES"] = "1"
 
     proc = subprocess.Popen(

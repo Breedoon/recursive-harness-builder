@@ -26,9 +26,23 @@ check only; they are not evidence that caching still works.
 
 **Never put the Claude Code billing placeholder** (`cch=` followed by five
 zeros; refer to it only by the regex `cch=0{5}`) into your context, files,
-prompts or commit messages. Read proxy source and logs through
-`sed -E 's/cch=0{5}/cch=<PH>/g'`. A session that has it in context stops
-caching; start a fresh one.
+prompts or commit messages. A session that has it in context stops caching;
+start a fresh one.
+
+**Never print secrets either.** Proxy logs and the daemon's environment also
+hold Telegram bot tokens, the userbot session string, API keys and OAuth
+tokens. Read source, logs, reports and process environments through the
+ready-made filter, which hides both the placeholder and secrets:
+
+```text
+<command> | scripts/redact.sh
+tr '\0' '\n' < /proc/<pid>/environ | scripts/redact.sh
+```
+
+It is best-effort; when you only need variable names, print names only
+(`cut -d= -f1`). The stored request log and `scripts/cache_regression.py`
+results do not contain credentials by design, but the runner's per-scenario
+`.txt` files keep unfiltered harness stderr — filter them before quoting.
 
 ## Other
 

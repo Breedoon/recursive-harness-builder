@@ -962,6 +962,11 @@ class TelegramStateStore:
             (_route_key(chat_id, thread_id),),
         )
 
+    # CACHE-PREFIX WARNING: session_head is the JSONL point forks and recoveries copy
+    # from (decided in telegram.py, which carries the main warning). A stale or
+    # wrong head makes a child start from different history than the parent's last
+    # request. A break is silent: no error, the API just re-bills the whole conversation.
+    # Live check: scripts/cache_regression.py parallel_fork recovery (docs/cache-proxy-safety.md).
     def upsert_session_head(self, *, session_id: str, jsonl_uuid: str) -> None:
         conn = self._require_conn()
         now = time.time()

@@ -34,6 +34,7 @@ from conftest_cache_proxy import (  # noqa: E402
     ClaudeSDKClient,
     _free_port,
     _resolve_proxy_script,
+    isolated_proxy_env,
     _wait_for_port,
     assert_cache_hit,
     compute_baseline,
@@ -61,6 +62,7 @@ def _start_proxy(port: int) -> subprocess.Popen:
         [sys.executable, str(script), str(port)],
         stderr=subprocess.PIPE,
         stdout=subprocess.PIPE,
+        env=isolated_proxy_env(),
     )
     if not _wait_for_port("127.0.0.1", port, timeout=10.0):
         stderr_out = ""

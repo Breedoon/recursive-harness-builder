@@ -672,8 +672,9 @@ async def sc_ws_resume(args):
 async def sc_volatile_flip(args):
     """Server-driven prompt variant flip inside one conversation (2026-10-09
     09:28Z and 2026-10-12 15:21Z episodes): the "# Output efficiency" system
-    section (GrowthBook flag tengu_swann_brevity, cached in the fleet's shared
-    ~/.claude.json) and the context_management field appear/disappear between
+    section (probably GrowthBook flag tengu_swann_brevity, cached in the fleet's
+    shared ~/.claude.json -- a hypothesis from reading the bundled CLI, not
+    observed end-to-end) and the context_management field appear/disappear between
     two requests of the same conversation. The CLI cannot be flipped on demand
     without touching the fleet's shared config, so this probe sends three
     variants of one real CLI request (A: section + context_management; B: both
