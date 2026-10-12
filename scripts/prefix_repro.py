@@ -173,16 +173,47 @@ def _rows(log_dir, session_ids, since):
     out.sort(key=lambda r: r["ts"])
     # drop CLI side calls (title/topic helpers: no tools, tiny body) — they are
     # separate cache lines, not part of the conversation prefix
-    out = [r for r in out if ((r.get("sizes") or {}).get("pre") or 0) >= 20000
-           and pd.load_request(r["req_id"], "wire", log_dir).get("tools")]
+    kept = []
+    for r in out:
+        if ((r.get("sizes") or {}).get("pre") or 0) < 20000:
+            continue
+        wire = pd.load_request(r["req_id"], "wire", log_dir)
+        if not wire.get("tools"):
+            continue
+        msgs = wire.get("messages") or []
+        r["_first"] = json.dumps(pd.canon(msgs[0]), sort_keys=True) if msgs else ""
+        r["_n_msgs"] = len(msgs)
+        kept.append(r)
     # keep the scenario's main model only
     by = {}
-    for r in out:
+    for r in kept:
         by.setdefault(r["model"], []).append(r)
     if not by:
         return []
     main = max(by, key=lambda m: len(by[m]))
-    return by[main]
+    # Drop utility side calls of the same model (on the GPT route the CLI's
+    # "extract file paths"-style helpers share the session id AND the model since
+    # acee2c4). Every request of one conversation starts with the same first
+    # message; a helper call starts with its own prompt and is SHORT. A request
+    # is dropped only if both hold (first message differs from the session's
+    # most common one AND it has no more messages than the conversation already
+    # had), so a real break of the first message on resume (which always adds
+    # messages) is never hidden.
+    # Without this filter the harness paired side calls with the conversation
+    # and reported false config-changed FAILs (E1 fixer round F4, 2026-10-12).
+    from collections import Counter
+    per_session = {}
+    for r in by[main]:
+        per_session.setdefault(r.get("session_id"), Counter())[r["_first"]] += 1
+    major = {sid: c.most_common(1)[0][0] for sid, c in per_session.items()}
+    result, max_n = [], {}
+    for r in by[main]:
+        sid = r.get("session_id")
+        if r["_first"] != major[sid] and r["_n_msgs"] <= max_n.get(sid, 0):
+            continue
+        max_n[sid] = max(max_n.get(sid, 0), r["_n_msgs"])
+        result.append(r)
+    return result
 
 
 def _prompt_total(u):
@@ -512,6 +543,158 @@ async def sc_empty_result_resume(args):
     return [sid], None
 
 
+REMINDER_TAG = "system" + "-reminder"  # built at runtime: agents reading this file see it intact
+
+
+def _direct_probe(args, sid, since, variants):
+    """Send hand-built variants of one real CLI request through the proxy under test.
+
+    The CLI cannot be made to produce some live shapes on demand (a reminder
+    spliced INTO a tool result; a server-side flag flip). So the scenario first
+    drives the real CLI through the proxy, takes the exact body the CLI sent
+    (the proxy's "pre" log), and then sends variants of that body directly with
+    the CLI's own OAuth token. Every variant goes through the proxy exactly like
+    CLI traffic. Verdict per later variant vs the first: the bytes the proxy sent
+    upstream must be identical/append (prefix_diff) and the cache read must be
+    >= threshold of the first variant's prompt.
+    """
+    import urllib.request
+    time.sleep(3)
+    rows = [r for r in pd.read_index(args.log_dir) if r.get("session_id") == sid
+            and r.get("ts", 0) >= since and r.get("http_status") == 200
+            and str(r.get("path", "")).startswith("/v1/messages")
+            and ((r.get("sizes") or {}).get("pre") or 0) >= 20000]
+    if not rows:
+        raise RuntimeError("no captured CLI request to build variants from")
+    base_row = rows[-1]
+    base = pd.load_request(base_row["req_id"], "pre", args.log_dir)
+    headers = {k: v for k, v in (base_row.get("client_headers") or {}).items()
+               if k.lower() in ("anthropic-beta", "anthropic-version", "user-agent", "x-app")}
+    creds = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
+    headers["authorization"] = "Bearer " + creds["claudeAiOauth"]["accessToken"]
+    headers["content-type"] = "application/json"
+    if "context-management-2025-06-27" not in headers.get("anthropic-beta", ""):
+        headers["anthropic-beta"] = ",".join(
+            [p for p in [headers.get("anthropic-beta", ""), "context-management-2025-06-27"] if p])
+    nonce = f"direct probe {uuid.uuid4()}"
+    t_start = time.time()
+    usages = []
+    for name, build in variants:
+        b = json.loads(json.dumps(base))
+        b["stream"] = False
+        b.pop("temperature", None)
+        b["messages"][0]["content"].insert(0, {"type": "text", "text": nonce})
+        # earlier thinking blocks carry signatures bound to the original
+        # context; the nonce invalidates them, and they are not under test
+        for m in b["messages"]:
+            if m.get("role") == "assistant" and isinstance(m.get("content"), list):
+                m["content"] = [c for c in m["content"]
+                                if c.get("type") not in ("thinking", "redacted_thinking")] or m["content"]
+        build(b)
+        req = urllib.request.Request(args.base_url + "/v1/messages",
+                                     data=json.dumps(b).encode(), headers=headers)
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            usages.append((name, json.loads(resp.read()).get("usage") or {}))
+        time.sleep(2)
+    time.sleep(3)
+    sent = sorted([r for r in pd.read_index(args.log_dir) if r.get("session_id") == sid
+                   and r.get("ts", 0) >= t_start], key=lambda r: r["ts"])
+    if len(sent) < len(variants):
+        raise RuntimeError(f"only {len(sent)} of {len(variants)} probe requests in the proxy log")
+    first = sent[0]
+    A = pd.load_request(first["req_id"], "wire", args.log_dir)
+    total_a = sum(usages[0][1].get(k) or 0 for k in
+                  ("cache_read_input_tokens", "cache_creation_input_tokens", "input_tokens"))
+    verdicts = []
+    for (name, usage), row in zip(usages[1:], sent[1:]):
+        B = pd.load_request(row["req_id"], "wire", args.log_dir)
+        res = pd.diff_requests(A, B, pd._beta(first), pd._beta(row))
+        text = pd.format_result(res)
+        cls = text.split()[0]
+        cr = usage.get("cache_read_input_tokens") or 0
+        ratio = cr / total_a if total_a else 0.0
+        ok = cls in ("identical", "append", "tail-block-append") and ratio >= args.threshold
+        verdicts.append({"a": f"{usages[0][0]} {first['req_id']}", "b": f"{name} {row['req_id']}",
+                         "class": cls, "no_breakpoint": False, "cache_read": cr,
+                         "prior_prompt": total_a, "ratio": round(ratio, 4), "ok": ok,
+                         "diff": text if not ok else ""})
+    return {"direct_usage": dict(usages), "direct_verdicts": verdicts}
+
+
+async def sc_ws_resume(args):
+    """Whitespace-edged tool output that carried a reminder in the live request,
+    replayed from JSONL on resume (the 2026-10-12 break, requests 598bb917 and
+    e5f25ac9). Live, the CLI trims a tool output and splices a reminder into
+    it (its periodic task reminder does this); the JSONL replay has the
+    untrimmed output and no reminder. A real CLI session produces a tool result
+    with leading spaces, then the probe sends the live form (trimmed + spliced
+    reminder) and the replay form (untrimmed) of that exact request. The proxy
+    must make them byte-identical."""
+    sid = str(uuid.uuid4())
+    since = time.time() - 1
+    await _session(args, [
+        "Reply with the single word: ready.",
+        "Run the Bash command `printf '      indented output\\nsecond line\\n'` "
+        "and then reply with the single word: shown.",
+        "Reply with the single word: after.",
+    ], session_id=sid)
+
+    def tool_results(b):
+        return [blk for m in b["messages"] if m["role"] == "user" and isinstance(m["content"], list)
+                for blk in m["content"] if blk.get("type") == "tool_result"
+                and isinstance(blk.get("content"), str) and blk["content"].startswith(" ")]
+
+    def live(b):
+        blocks = tool_results(b)
+        if not blocks:
+            raise RuntimeError("ws_resume: no whitespace-led tool result captured")
+        for blk in blocks:
+            blk["content"] = (blk["content"].strip() + f"\n\n<{REMINDER_TAG}>\nprefix_repro "
+                              f"ws_resume periodic reminder\n</{REMINDER_TAG}>")
+
+    def replay(b):
+        if not tool_results(b):
+            raise RuntimeError("ws_resume: no whitespace-led tool result captured")
+
+    meta = _direct_probe(args, sid, since, [("live", live), ("replay", replay)])
+    return [sid], meta
+
+
+async def sc_volatile_flip(args):
+    """Server-driven prompt variant flip inside one conversation (2026-10-09
+    09:28Z and 2026-10-12 15:21Z episodes): the "# Output efficiency" system
+    section (GrowthBook flag tengu_swann_brevity, cached in the fleet's shared
+    ~/.claude.json) and the context_management field appear/disappear between
+    two requests of the same conversation. The CLI cannot be flipped on demand
+    without touching the fleet's shared config, so this probe sends three
+    variants of one real CLI request (A: section + context_management; B: both
+    removed; C: both back). The proxy must send B and C upstream exactly as A."""
+    if args.provider != "anthropic":
+        raise RuntimeError("volatile_flip is an Anthropic-route scenario")
+    sid = str(uuid.uuid4())
+    since = time.time() - 1
+    await _session(args, ["Reply with the single word: ready."], session_id=sid)
+    oe = ("# Output efficiency\n\nIMPORTANT: Go straight to the point. Be extra concise.\n\n"
+          "Keep your text output brief and direct.\n\n")
+
+    def with_section(on):
+        def build(b):
+            b["max_tokens"] = 2048
+            b["thinking"] = {"type": "enabled", "budget_tokens": 1024}
+            sys2 = b["system"][2]
+            t = sys2["text"]
+            cut = t.rfind("\n# ")  # insert before the last top-level heading
+            if on:
+                sys2["text"] = t[:cut + 1] + oe + t[cut + 1:] if cut >= 0 else t + "\n\n" + oe
+                b["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
+        return build
+
+    meta = _direct_probe(args, sid, since, [("A-section-on", with_section(True)),
+                                           ("B-section-off", with_section(False)),
+                                           ("C-section-on", with_section(True))])
+    return [sid], meta
+
+
 SCENARIOS = {
     "baseline": (sc_baseline, "control; must pass"),
     "utility_route": (sc_utility_route, "Bash file-path utility remains on the explicit provider"),
@@ -528,13 +711,34 @@ SCENARIOS = {
     "parallel_resume": (sc_parallel_resume, "parallel tool calls then new-process resume; expect FAIL"),
     "parallel_fork": (sc_parallel_fork, "parallel same-ID resume then verbatim-source fork"),
     "poisoned_recovery": (sc_poisoned_recovery, "test-injected synthetic API-error tail excluded on recovery"),
+    "ws_resume": (sc_ws_resume, "whitespace-edged tool output + spliced reminder, then new-process resume"),
+    "volatile_flip": (sc_volatile_flip, "server flag flips system section/context_management mid-conversation (Anthropic)"),
 }
+
+
+def _provider_errors(log_dir, since):
+    """5xx responses the proxy logged since *since* (any session)."""
+    return [{"req_id": r["req_id"], "http_status": r.get("http_status"), "route": r.get("route")}
+            for r in pd.read_index(log_dir)
+            if r.get("ts", 0) >= since and (r.get("http_status") or 0) >= 500]
+
+
+ANTHROPIC_ONLY = {"volatile_flip", "ws_resume"}
 
 
 def run(args, name):
     fn, note = SCENARIOS[name]
     since = time.time() - 1
-    sids, meta = asyncio.run(fn(args))
+    try:
+        sids, meta = asyncio.run(asyncio.wait_for(fn(args), timeout=args.scenario_timeout))
+    except BaseException as e:  # timeout or driver error: say whether the provider failed
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        errs = _provider_errors(args.log_dir, since)
+        return {"scenario": name, "note": note, "ok": False, "pairs": [],
+                "status": "PROVIDER-ERROR" if errs else "ERROR",
+                "error": f"{type(e).__name__}: {e}",
+                "provider_errors": errs[:20]}
     pairs = None
     if name in ("recovery", "recovery_multi", "parallel_fork", "poisoned_recovery"):
         rows_p = _rows(args.log_dir, [meta["parent"]], since)
@@ -545,7 +749,10 @@ def run(args, name):
         if rows_p and rows_c:
             pairs.append((rows_p[-1], rows_c[0]))  # the recovery boundary
         pairs += list(zip(rows_c, rows_c[1:]))
-    rows, verdicts = evaluate(args.log_dir, sids, since, args.threshold, pairs=pairs)
+    if meta and "direct_verdicts" in meta:  # volatile_flip: verdicts come from direct calls
+        rows, verdicts = _rows(args.log_dir, sids, since), meta["direct_verdicts"]
+    else:
+        rows, verdicts = evaluate(args.log_dir, sids, since, args.threshold, pairs=pairs)
     scoped_rows = [r for r in pd.read_index(args.log_dir) if r.get("session_id") in set(sids)
                    and r.get("ts", 0) >= since and str(r.get("path", "")).startswith("/v1/messages")
                    and "count_tokens" not in str(r.get("path", ""))]
@@ -560,7 +767,13 @@ def run(args, name):
     meta_ok = not meta or (meta.get("effects_unchanged", True) and meta.get("source_unchanged", True)
                            and meta.get("final_response_preserved", True))
     ok = bool(verdicts) and route_ok and meta_ok and all(v["ok"] for v in verdicts)
-    return {"scenario": name, "note": note, "sessions": sids, "meta": meta,
+    errs = [{"req_id": r["req_id"], "http_status": r.get("http_status")} for r in scoped_rows
+            if (r.get("http_status") or 0) >= 500]
+    # A FAIL whose sessions also hit 5xx upstream errors is reported separately:
+    # it may be provider overload, not a cache-prefix regression. Read the pairs.
+    status = "PASS" if ok else ("PROVIDER-ERROR" if errs else "FAIL")
+    return {"scenario": name, "note": note, "sessions": sids, "meta": meta, "status": status,
+            "provider_errors": errs,
             "provider": args.provider, "model": args.model, "route_ok": route_ok,
             "routes": sorted({r.get("route", "") for r in rows}),
             "requests": [r["req_id"] for r in rows], "pairs": verdicts, "ok": ok,
@@ -581,6 +794,12 @@ def main(argv=None):
     ap.add_argument("--warm-turns", type=int, default=0, help="turns after parallel tools to put divergence beyond lookback")
     ap.add_argument("--threshold", type=float, default=0.95)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--json-out", default=None,
+                    help="also write the results list to this file after EVERY scenario "
+                         "(a killed run keeps what finished)")
+    ap.add_argument("--scenario-timeout", type=int, default=900,
+                    help="seconds per scenario before it is stopped and reported "
+                         "(PROVIDER-ERROR if the proxy logged 5xx upstream errors meanwhile)")
     args = ap.parse_args(argv)
     if args.list or not args.scenarios:
         for k, (_, note) in SCENARIOS.items():
@@ -590,7 +809,15 @@ def main(argv=None):
     args.model = resolve_model(args.model or ("sol" if args.provider == "codex" else DEFAULT_MODEL))
     if args.provider == "codex" and not args.model.startswith("gpt-"):
         ap.error("--provider codex requires an explicit GPT model, not a Claude/local fallback")
-    names = list(SCENARIOS) if args.scenarios == ["all"] else args.scenarios
+    if args.scenarios == ["all"]:
+        names = [k for k in SCENARIOS if args.provider == "anthropic" or k not in ANTHROPIC_ONLY]
+    else:
+        names = args.scenarios
+    if args.gap > 290 and "haiku" in args.model:
+        print("WARNING: Haiku requests write 5-minute cache entries; with --gap > 300 the resume "
+              "reads 0 even when bytes are identical. Use --model claude-opus-5-5 (1-hour entries, "
+              "like the fleet) for the wake test, or read the pair class (append) instead of the ratio.",
+              file=sys.stderr)
     results = []
     for n in names:
         try:
@@ -598,9 +825,15 @@ def main(argv=None):
         except Exception as e:  # report and continue with the next scenario
             res = {"scenario": n, "ok": False, "error": f"{type(e).__name__}: {e}", "pairs": []}
         results.append(res)
+        if args.json_out:
+            Path(args.json_out).write_text(json.dumps(results, indent=1))
         if args.json:
             continue
-        print(f"== {n}: {'PASS' if res['ok'] else 'FAIL'}  sessions={res.get('sessions')}")
+        label = res.get("status") or ("PASS" if res["ok"] else "FAIL")
+        print(f"== {n}: {label}  sessions={res.get('sessions')}", flush=True)
+        if res.get("provider_errors"):
+            print(f"   provider 5xx during scenario: {len(res['provider_errors'])} "
+                  f"(e.g. {res['provider_errors'][0]['req_id']})")
         if res.get("error"):
             print("   error:", res["error"])
         for v in res.get("pairs", []):

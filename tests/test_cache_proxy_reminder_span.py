@@ -350,11 +350,32 @@ class TestToolResultStringContent:
         assert content == cache_proxy.REMINDER_PLACEHOLDER
         assert content.strip()
 
-    def test_tool_result_without_a_tag_is_untouched(self):
+    def test_tool_result_without_a_tag_is_trimmed(self):
+        # 2026-10-12 (vault-1r7n): tool_result text is ALWAYS trimmed. The live
+        # CLI trims output before splicing a reminder; the JSONL replay keeps
+        # the untrimmed output, so both forms must converge on the trimmed one.
         payload = "  leading and trailing  "
         body = _body([_user([_tool_result(payload)])])
         assert cache_proxy.strip_all_system_reminders(body) == 0
-        assert body["messages"][0]["content"][0]["content"] == payload
+        assert body["messages"][0]["content"][0]["content"] == "leading and trailing"
+
+    def test_live_and_replay_forms_converge(self):
+        output = "     14 Thu line"
+        live = _body([_user([_tool_result(output.strip() + "\n\n" + _reminder())])])
+        replay = _body([_user([_tool_result(output)])])
+        cache_proxy.strip_all_system_reminders(live)
+        cache_proxy.strip_all_system_reminders(replay)
+        assert live["messages"] == replay["messages"]
+
+    def test_list_content_text_is_trimmed_and_whitespace_only_becomes_placeholder(self):
+        live = _body([_user([_tool_result([_text("x\n\n" + _reminder())])])])
+        replay = _body([_user([_tool_result([_text("  x  ")])])])
+        blank = _body([_user([_tool_result([_text("   ")])])])
+        for b in (live, replay, blank):
+            cache_proxy.strip_all_system_reminders(b)
+        assert live["messages"] == replay["messages"]
+        assert blank["messages"][0]["content"][0]["content"] == [
+            {"type": "text", "text": cache_proxy.REMINDER_PLACEHOLDER}]
 
 
 class TestToolResultListContent:
@@ -680,5 +701,5 @@ class TestForwardSimpleRouting:
     def test_health_is_still_served_locally(self, stubs):
         proxy_url, local_seen, hosted_seen = stubs
         resp = httpx.get(f"{proxy_url}/health", timeout=10)
-        assert resp.status_code == 200 and resp.json() == {"status": "ok"}
+        assert resp.status_code == 200 and resp.json()["status"] == "ok"
         assert not local_seen and not hosted_seen

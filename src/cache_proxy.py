@@ -28,10 +28,19 @@ Normalizations (applied in order):
 2. String→list: bare-string user content converted to list format
 3. Claude Code system-reminders: every reminder span stripped from all user
    messages, including spans nested inside tool_result content
+   (tool_result text is always whitespace-trimmed: the live CLI trims it, the
+   JSONL replay does not)
 4. Git status: normalized in system prompt to fixed placeholder
+   (also: the CLI's dynamic-boundary marker line is removed from the system)
 5. Tool sorting: tools[] sorted alphabetically by name
 6. Metadata: session-specific IDs normalized
 7. Tool schema sanitization: array types get ``items`` added (non-Claude only)
+After normalization:
+8. Variant pin: the "# Output efficiency" system section and the
+   context_management field stay as first seen for each conversation
+   (pin_volatile_config) — server-side flag refreshes otherwise flip them.
+9. GPT route only: per-conversation provider cache key (assign_conversation_cache_key).
+10. Anthropic route only: Haiku effort strip and mid-session effort pin.
 
 Usage:
     python cache_proxy.py [port]  # default: 18923
@@ -169,6 +178,8 @@ stats = {
     "billing_normalized": 0, "strings_converted": 0,
     "reminders_stripped": 0, "messages_placeholdered": 0,
     "cch_restored": 0,
+    "tool_results_trimmed": 0,
+    "volatile_pins_applied": 0,
     "git_status_normalized": 0,
     "tools_sorted": 0, "metadata_normalized": 0,
     "errors": 0,
@@ -377,6 +388,15 @@ def _contains_cache_control(value) -> bool:
     return False
 
 
+_norm_local = threading.local()
+
+
+def _count_trim() -> None:
+    """Count a tool_result whose text changed only by whitespace trimming."""
+    stats["tool_results_trimmed"] += 1
+    _norm_local.trimmed = getattr(_norm_local, "trimmed", 0) + 1
+
+
 def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
     """Strip reminder spans inside one content block, recursively.
 
@@ -405,21 +425,43 @@ def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
         return 0, False
 
     if btype == "tool_result":
+        # CACHE-PREFIX WARNING (whitespace, 2026-10-12 mission vault-1r7n):
+        # tool_result text is ALWAYS trimmed, whether or not a reminder span was
+        # removed. The live CLI trims a tool output before splicing a reminder
+        # into it; the JSONL keeps the untrimmed output with no reminder. If we
+        # trimmed only when a span was removed, the live and the resumed/forked
+        # history differed by leading spaces and every wake, resume or restart
+        # re-billed the whole conversation (byte-verified: requests 598bb917
+        # and e5f25ac9 on 2026-10-12). Live guard: prefix_repro.py ws_resume.
         content = block.get("content")
         if isinstance(content, str):
             new_text, removed = strip_reminder_spans(content)
-            # PREFIX-STABILITY M7: live reminder-only results replay from JSONL
-            # as empty strings. Canonicalize absence identically, not whitespace
-            # or meaningful output, preserving the result ID/error/cache fields.
-            if removed or content == "":
-                block["content"] = new_text or REMINDER_PLACEHOLDER
+            # Live reminder-only results replay from JSONL as empty strings, and
+            # whitespace-only output trims to empty: both become the same fixed
+            # placeholder, preserving the result ID/error/cache fields.
+            final = new_text.strip() or REMINDER_PLACEHOLDER
+            if final != content:
+                block["content"] = final
+                if not removed:
+                    _count_trim()
             return removed, False
         if isinstance(content, list):
             removed = 0
+            trimmed = 0
             kept: list = []
             for sub in content:
                 sub_removed, sub_empty = _strip_reminders_in_block(sub)
                 removed += sub_removed
+                if (not sub_empty and isinstance(sub, dict) and sub.get("type") == "text"
+                        and isinstance(sub.get("text"), str)
+                        and sub["text"] != REMINDER_PLACEHOLDER):
+                    stripped = sub["text"].strip()
+                    if stripped != sub["text"]:
+                        sub["text"] = stripped
+                        trimmed += 1
+                        if not sub_removed:
+                            _count_trim()
+                        sub_empty = not stripped
                 if sub_empty:
                     # PREFIX-STABILITY M1: keep every nested marker on its
                     # original block, including identical and distinct TTLs.
@@ -428,7 +470,7 @@ def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
                     else:
                         continue
                 kept.append(sub)
-            if removed or content == []:
+            if removed or trimmed or content == [] or len(kept) != len(content):
                 block["content"] = kept or [
                     {"type": "text", "text": REMINDER_PLACEHOLDER}
                 ]
@@ -735,6 +777,9 @@ class EffortPinStore:
         self.lock = threading.Lock()
         self.bases: dict[str, list] = {}    # key -> [effort, last_used]
         self.anchors: dict[str, list] = {}  # key -> [effort, last_used]
+        # key -> [{"sections": {...}, "cm": ...}, last_used]; see pin_volatile_config
+        self.variants: dict[str, list] = {}
+        self.texts: dict[str, str] = {}  # sha256 -> pinned section text (dedup)
         self._load()
 
     def _load(self):
@@ -745,6 +790,8 @@ class EffortPinStore:
                 data = json.load(f)
             self.bases = data.get("bases", {})
             self.anchors = data.get("anchors", {})
+            self.variants = data.get("variants", {})
+            self.texts = data.get("texts", {})
         except Exception as e:
             log(f"effort pins unreadable, starting empty: {e}")
 
@@ -752,8 +799,9 @@ class EffortPinStore:
         if not self.path:
             return
         now = time.time()
-        for table in (self.bases, self.anchors):
-            stale = [k for k, v in table.items() if now - v[1] > EFFORT_PIN_TTL]
+        for table, ttl in ((self.bases, EFFORT_PIN_TTL), (self.anchors, EFFORT_PIN_TTL),
+                           (self.variants, VARIANT_PIN_TTL)):
+            stale = [k for k, v in table.items() if now - v[1] > ttl]
             for k in stale:
                 del table[k]
             if len(table) > EFFORT_PIN_MAX:
@@ -763,7 +811,11 @@ class EffortPinStore:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"bases": self.bases, "anchors": self.anchors}, f)
+            live_texts = {h for v in self.variants.values()
+                          for h in (v[0].get("s") or {}).values() if h}
+            self.texts = {h: t for h, t in self.texts.items() if h in live_texts}
+            json.dump({"bases": self.bases, "anchors": self.anchors,
+                       "variants": self.variants, "texts": self.texts}, f)
         os.replace(tmp, self.path)
 
 
@@ -885,6 +937,175 @@ def pin_effort(body: dict, store: EffortPinStore | None = None) -> dict:
     return result
 
 
+# ── Per-conversation pinning of server-driven prompt variants ────────────
+#
+# CACHE-PREFIX WARNING (2026-10-12, mission vault-1r7n): Claude Code receives
+# feature values from Anthropic's servers. Occasionally a fleet-wide refresh
+# (observed 2026-10-09 09:28Z and 2026-10-12 15:21Z; cause unknown) flips them
+# between two requests of the SAME conversation:
+#   * the "# Output efficiency" section of the system prompt appears/disappears;
+#   * the top-level ``context_management`` field (a clear_thinking edit)
+#     appears/disappears.
+# Either flip changes the cached prefix and re-bills the whole conversation
+# (one request re-billed 391k tokens on 2026-10-12). We cannot stop the flip,
+# so each conversation is kept on the variant it was FIRST seen with. The key
+# is model + first message (like the effort pins), so resumes, wakes, restarts
+# and forks of that conversation share the pin. New conversations record
+# whatever the server sends at that time. Only the listed section and that one
+# field are ever touched. Live guard: scripts/prefix_repro.py volatile_flip.
+VOLATILE_SYSTEM_SECTIONS = ("# Output efficiency",)
+# A pin only matters while the conversation's cache can still be read (1 hour
+# after its last request); 2 days of inactivity is ample and keeps the file small.
+VARIANT_PIN_TTL = 2 * 86400
+CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
+
+
+def _volatile_section_re(heading: str) -> re.Pattern:
+    # The section runs from its heading line up to the next top-level heading
+    # (or the end of the block); the separating blank line belongs to it, so
+    # removing it yields exactly the CLI's own "section absent" form.
+    return re.compile(r"(?ms)^" + re.escape(heading) + r"\n.*?(?:\n\n(?=# )|\Z)")
+
+
+def _find_volatile_section(system: list, heading: str):
+    """Return (block_index, start, end, text, following_heading) or None."""
+    rx = _volatile_section_re(heading)
+    for i, block in enumerate(system):
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            continue
+        m = rx.search(text)
+        if m:
+            rest = text[m.end():]
+            following = rest.split("\n", 1)[0] if rest.startswith("# ") else None
+            return i, m.start(), m.end(), m.group(0), following
+    return None
+
+
+def pin_volatile_config(body: dict, store: "EffortPinStore | None" = None) -> dict:
+    """Keep server-driven prompt variants stable within one conversation.
+
+    Returns {"recorded": bool, "applied": [...], "beta": bool}. Mutates body.
+    Must run after normalize_request so the key covers normalized history.
+    """
+    result = {"recorded": False, "applied": [], "beta": False}
+    msgs = body.get("messages")
+    system = body.get("system")
+    if not isinstance(msgs, list) or not msgs or not isinstance(system, list):
+        return result
+    if not body.get("tools"):
+        return result  # tool-less side calls (titles, summaries): nothing worth pinning
+    store = store or _get_effort_pins()
+    model = str(body.get("model", ""))
+    key = hashlib.sha256(model.encode() + b"\0" + _msg_bytes(msgs[0]) + b"\0").hexdigest()
+    found = {h: _find_volatile_section(system, h) for h in VOLATILE_SYSTEM_SECTIONS}
+    cm = body.get("context_management")
+    # original key order is kept so a restored field is byte-identical
+    cm_json = json.dumps(cm, separators=(",", ":")) if cm is not None else None
+    now = time.time()
+    dirty = False
+    with store.lock:
+        entry = store.variants.get(key)
+        if entry is None:
+            sections, anchors = {}, {}
+            for h, f in found.items():
+                if f:
+                    digest = hashlib.sha256(f[3].encode()).hexdigest()
+                    store.texts[digest] = f[3]
+                    sections[h] = digest
+                    anchors[h] = [f[0], f[4]]
+                else:
+                    sections[h] = None
+            store.variants[key] = [{"s": sections, "a": anchors, "cm": cm_json}, now]
+            result["recorded"] = True
+            dirty = True
+        else:
+            entry[1] = now
+            pinned = entry[0]
+            for h, f in found.items():
+                if h not in (pinned.get("s") or {}):
+                    continue
+                want = pinned["s"][h]
+                have = hashlib.sha256(f[3].encode()).hexdigest() if f else None
+                if want == have:
+                    continue
+                if want is None and f:  # section appeared: remove it
+                    i, start, end = f[0], f[1], f[2]
+                    t = system[i]["text"]
+                    system[i]["text"] = t[:start] + t[end:]
+                    result["applied"].append(f"removed:{h}")
+                elif want is not None:
+                    text = store.texts.get(want)
+                    anchor = (pinned.get("a") or {}).get(h) or [None, None]
+                    i, following = anchor
+                    if text is None or i is None or i >= len(system):
+                        continue
+                    blk = system[i]
+                    if not isinstance(blk, dict) or not isinstance(blk.get("text"), str):
+                        continue
+                    t = blk["text"]
+                    if f:  # different text in place: drop the new one first
+                        t = t[:f[1]] + t[f[2]:]
+                    if following is None:
+                        if t and not t.endswith("\n\n"):
+                            continue
+                        blk["text"] = t + text
+                    else:
+                        m = re.search(r"(?m)^" + re.escape(following) + r"$", t)
+                        if not m:
+                            continue
+                        blk["text"] = t[:m.start()] + text + t[m.start():]
+                    result["applied"].append(f"restored:{h}")
+            want_cm = pinned.get("cm", cm_json)
+            if (json.loads(want_cm) if want_cm is not None else None) != cm:
+                if want_cm is None:
+                    body.pop("context_management", None)
+                    result["applied"].append("removed:context_management")
+                else:
+                    thinking = body.get("thinking")
+                    if isinstance(thinking, dict) and thinking.get("type") in ("enabled", "adaptive"):
+                        body["context_management"] = json.loads(want_cm)
+                        result["applied"].append("restored:context_management")
+                        result["beta"] = True
+        if dirty:
+            try:
+                store._save()
+            except Exception as e:
+                log(f"variant pins save failed: {e}")
+    if result["applied"]:
+        stats["volatile_pins_applied"] += 1
+    return result
+
+
+def assign_conversation_cache_key(body: dict) -> str | None:
+    """GPT route only: give each conversation its own provider cache key.
+
+    CACHE-PREFIX WARNING (2026-10-12, mission vault-1r7n): CLIProxyAPI derives
+    the Codex ``prompt_cache_key`` from the session part of metadata.user_id
+    (verified by direct probe: same session -> same key, different session ->
+    different key). normalize_metadata() rewrites that part to a constant, so
+    before this fix EVERY GPT conversation of the fleet shared one key, and the
+    provider's per-key routing overflowed: many byte-identical prefixes got no
+    cache hit. Here the session part becomes an id derived from model + first
+    message, so a conversation, its resumes and its forks share one key while
+    different conversations get different keys. Never applied to Anthropic.
+    """
+    msgs = body.get("messages")
+    md = body.get("metadata")
+    if not isinstance(msgs, list) or not msgs or not isinstance(md, dict):
+        return None
+    uid = md.get("user_id")
+    if not isinstance(uid, str) or not uid.endswith("_session_0"):
+        return None
+    digest = hashlib.sha256(str(body.get("model", "")).encode() + b"\0"
+                            + _msg_bytes(msgs[0])).hexdigest()
+    conv = f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+    md["user_id"] = uid[: -len("0")] + conv
+    return conv
+
+
 def _add_beta(headers: dict, beta: str) -> None:
     for k in list(headers):
         if k.lower() == "anthropic-beta":
@@ -949,20 +1170,23 @@ def normalize_dynamic_boundary(body: dict) -> int:
     count = 0
     # CLI 2.1.59 can consume the marker itself, splitting the same prompt into
     # stable/dynamic blocks. Rejoin only its exact SDK/auto-memory shape.
+    # CACHE-PREFIX WARNING (2026-10-12, mission vault-1r7n): when BOTH halves
+    # carry a cache breakpoint the request is left as the CLI sent it. The
+    # previous attempt (commit 09636e3) kept an empty text block holding the
+    # second breakpoint, and the Anthropic API rejects that with HTTP 400
+    # ("cache_control cannot be set for empty text blocks"). That shape has
+    # never been seen in real CLI traffic; do not reintroduce empty carriers.
     if (len(system) == 4 and all(isinstance(b, dict) and b.get("type") == "text" for b in system)
             and str(system[0].get("text", "")).startswith("x-anthropic-billing-header:")
             and system[1].get("text") == "You are a Claude agent, built on Anthropic's Claude Agent SDK."
             and str(system[2].get("text", "")).startswith("\nYou are an interactive agent")
             and str(system[3].get("text", "")).startswith("# auto memory\n")
-            and set(system[3]).issubset({"type", "text", "cache_control"})):
+            and set(system[3]).issubset({"type", "text", "cache_control"})
+            and not ("cache_control" in system[3] and "cache_control" in system[2])):
         system[2]["text"] += "\n\n" + system[3]["text"]
-        if "cache_control" in system[3] and "cache_control" in system[2]:
-            # Keep the second original breakpoint without duplicating its text.
-            system[3]["text"] = ""
-        else:
-            if "cache_control" in system[3]:
-                system[2]["cache_control"] = system[3]["cache_control"]
-            del system[3]
+        if "cache_control" in system[3]:
+            system[2]["cache_control"] = system[3]["cache_control"]
+        del system[3]
         count += 1
     for block in system:
         if isinstance(block, dict) and block.get("type") == "text":
@@ -1002,7 +1226,10 @@ def normalize_request(body: dict) -> tuple[dict, dict]:
     # CLAUDE.md project-context reminders. OBS-owned project context is injected
     # into JSONL separately.
     info["skill"] = {"action": "merged_into_reminders"}
+    _norm_local.trimmed = 0
     info["reminders"] = strip_all_system_reminders(body)
+    # tool_result texts changed by whitespace trimming alone (no reminder)
+    info["ws_trimmed"] = getattr(_norm_local, "trimmed", 0)
 
     # 4. Normalize git status in system prompt
     info["git_status"] = normalize_git_status(body)
@@ -1017,6 +1244,7 @@ def normalize_request(body: dict) -> tuple[dict, dict]:
     actions_taken = [
         info["billing"], info["strings"], info["reminders"],
         info["git_status"], info["tools"], info["metadata"], info["dynamic_boundary"],
+        info["ws_trimmed"],
     ]
     if any(actions_taken):
         info["action"] = "normalized"
@@ -1681,6 +1909,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             # Apply all normalizations
             data, info = normalize_request(data)
+            if not is_local:
+                try:
+                    info["volatile_pin"] = pin_volatile_config(data)
+                except Exception as e:
+                    log(f"variant pin error, sending as-is: {e}")
+            if upstream == CLI_PROXY_UPSTREAM:
+                try:
+                    info["cache_key"] = assign_conversation_cache_key(data)
+                except Exception as e:
+                    log(f"cache key error, sending as-is: {e}")
             if rlog is not None:
                 try:
                     post_bytes = json.dumps(data, separators=(",", ":")).encode()
@@ -1748,6 +1986,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         headers["content-length"] = str(len(body))
         if pin_beta:
             _add_beta(headers, MID_EFFORT_BETA)
+        if (upstream == ANTHROPIC_UPSTREAM and isinstance(info, dict)
+                and (info.get("volatile_pin") or {}).get("beta")):
+            _add_beta(headers, CONTEXT_MANAGEMENT_BETA)
         url = upstream + self.path
 
         if rlog is not None:
@@ -1803,8 +2044,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             } if usage else None,
             "norm": {k: info.get(k) for k in
                      ("action", "billing", "strings", "reminders", "git_status",
-                      "tools", "metadata", "effort_stripped", "schema_sanitized")
+                      "tools", "metadata", "effort_stripped", "schema_sanitized",
+                      "dynamic_boundary", "ws_trimmed", "volatile_pin", "cache_key")
                      if isinstance(info, dict) and k in info},
+            # which proxy code produced these bytes (load-time hash, short)
+            "proxy_source": _LOADED_SOURCE_SHA256[:12],
+            # real CLI traffic vs synthetic probes (urllib/curl/tests): fleet
+            # metrics should exclude non-CLI rows
+            "client_kind": ("claude-cli" if "claude-cli" in str(self.headers.get("User-Agent", ""))
+                            else "other"),
             "effort_pin": effort_pin if isinstance(effort_pin, dict) else None,
             "sizes": {"pre": len(raw_body), "wire": len(body),
                       "post": len(post_bytes) if post_bytes is not None else None},
