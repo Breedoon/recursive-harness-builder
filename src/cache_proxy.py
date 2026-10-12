@@ -956,9 +956,13 @@ def normalize_dynamic_boundary(body: dict) -> int:
             and str(system[3].get("text", "")).startswith("# auto memory\n")
             and set(system[3]).issubset({"type", "text", "cache_control"})):
         system[2]["text"] += "\n\n" + system[3]["text"]
-        if "cache_control" in system[3]:
-            system[2].setdefault("cache_control", system[3]["cache_control"])
-        del system[3]
+        if "cache_control" in system[3] and "cache_control" in system[2]:
+            # Keep the second original breakpoint without duplicating its text.
+            system[3]["text"] = ""
+        else:
+            if "cache_control" in system[3]:
+                system[2]["cache_control"] = system[3]["cache_control"]
+            del system[3]
         count += 1
     for block in system:
         if isinstance(block, dict) and block.get("type") == "text":
