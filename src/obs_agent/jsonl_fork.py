@@ -209,9 +209,21 @@ def fork_session_jsonl(
     if not entries:
         raise ValueError(f"Session JSONL is empty for {session_id}")
 
-    from obs_agent.jsonl_replay import prepare_session_replay, select_replay_entries
+    from obs_agent.jsonl_replay import LEGACY_REPLAY_ERRORS, prepare_session_replay, select_replay_entries
 
-    selected = select_replay_entries(entries, target_uuid)
+    try:
+        selected = select_replay_entries(entries, target_uuid)
+    except ValueError as exc:
+        # Dead-topic fix (2026-10-12): inherited damage behind a resolver-confirmed
+        # complete boundary (an old unanswered tool_use or <synthetic> error row)
+        # was already part of the history the CLI resumed and cached. Copy it
+        # verbatim, same rows as the strict path would select, and never drop or
+        # rewrite it: removing it would change the API prefix and break the cache.
+        if str(exc) not in LEGACY_REPLAY_ERRORS or target_uuid not in set(
+            resolved.health.complete_message_targets.values()
+        ):
+            raise
+        selected = select_replay_entries(entries, target_uuid, require_complete=False)
     selected_uuids = {entry["uuid"] for entry, _raw in selected}
     first_chain_index = next(index for index, (entry, _raw) in enumerate(entries)
                              if entry.get("uuid") in selected_uuids)

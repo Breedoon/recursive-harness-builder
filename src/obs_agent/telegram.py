@@ -704,6 +704,8 @@ class TelegramBot:
         self._route_by_session_id: dict[str, TelegramRoute] = {}
         self._message_map: dict[tuple[int, int], _TelegramMessageBinding] = {}
         self._session_heads: dict[str, str] = {}
+        # route -> (session_id, error) already reported, so retries do not spam the topic.
+        self._recovery_failure_notified: dict[TelegramRoute, tuple[str | None, str]] = {}
         self._fork_tasks_by_id: dict[str, _ForkTaskRecord] = {}
         self._fork_task_by_child_route: dict[TelegramRoute, str] = {}
         self._fork_task_tasks: dict[str, asyncio.Task] = {}
@@ -8080,10 +8082,33 @@ class TelegramBot:
             len(pending_messages),
             user_text,
         )
-        await self._recover_route_session_if_needed(
-            state=state,
-            source="run_start",
-        )
+        try:
+            await self._recover_route_session_if_needed(
+                state=state,
+                source="run_start",
+            )
+        except Exception as exc:
+            # Dead-topic fix (2026-10-12): never drop the turn silently. Tell the
+            # topic once per (session, error); queued work stays owned by the route.
+            error = f"{type(exc).__name__}: {exc}"
+            key = (state.session_id, error)
+            if self._recovery_failure_notified.get(state.route) != key:
+                self._recovery_failure_notified[state.route] = key
+                try:
+                    await self._send_system_message(
+                        route=state.route,
+                        bot=bot,
+                        text=(
+                            f"Session recovery failed for {state.session_id}, so this turn could not run "
+                            f"({error}). Send /clear to start a fresh session in this topic."
+                        ),
+                        disable_notification=False,
+                        reply_to_message_id=trigger_message.telegram_message_id if trigger_message else None,
+                    )
+                except Exception:
+                    logger.exception("[jsonl_recovery_failed] could not notify route=%s", state.route)
+            raise
+        self._recovery_failure_notified.pop(state.route, None)
 
         # Keep queued work owned by the route until session preflight succeeds.
         # A cancelled/failed detached delivery can then retry without losing it.

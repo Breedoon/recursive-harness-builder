@@ -198,3 +198,70 @@ def test_fork_session_jsonl_uses_explicit_source_path(tmp_path: Path) -> None:
     assert (tmp_path / "seeded-child.jsonl").exists()
     forked_entries = _read_lines(tmp_path / "seeded-child.jsonl")
     assert [entry.get("uuid") for entry in forked_entries] == ["u1", "a1"]
+
+
+# Dead-topic regression (2026-10-12): a recovery fork must not reject inherited
+# damage behind a confirmed complete boundary, and must copy it byte-for-byte.
+def _dead_topic_session(tmp_path: Path, middle: dict) -> tuple[Path, list[str]]:
+    def user(uid, parent, text, ts):
+        return {"type": "user", "uuid": uid, "parentUuid": parent, "sessionId": "s", "timestamp": ts,
+                "message": {"role": "user", "content": text}}
+
+    def assistant(uid, parent, mid, content, ts, **extra):
+        return {"type": "assistant", "uuid": uid, "parentUuid": parent, "sessionId": "s", "timestamp": ts,
+                "message": {"id": mid, "role": "assistant", "model": extra.pop("model", "claude"),
+                            "content": content, "stop_reason": "end_turn"}, **extra}
+
+    entries = [
+        user("u1", None, "start", "2026-10-08T00:00:01Z"),
+        middle,
+        user("u2", "a1", "next", "2026-10-08T00:00:03Z"),
+        assistant("a2", "u2", "m2", [{"type": "text", "text": "ok"}], "2026-10-08T00:00:04Z"),
+        user("u3", "a2", "again", "2026-10-12T00:00:05Z"),
+        assistant("a3", "u3", "m3", [{"type": "text", "text": "API Error: 401 OAuth token revoked"}],
+                  "2026-10-12T00:00:06Z", model="<synthetic>", isApiErrorMessage=True),
+    ]
+    entries[1].update({"uuid": "a1", "parentUuid": "u1", "sessionId": "s", "timestamp": "2026-10-08T00:00:02Z"})
+    raw = [json.dumps(entry, separators=(",", ":")) for entry in entries]
+    path = tmp_path / "projects" / "p" / "s.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text("\n".join(raw) + "\n", encoding="utf-8")
+    return path, raw
+
+
+@pytest.mark.parametrize("middle", [
+    pytest.param({"type": "assistant", "message": {"id": "m1", "role": "assistant", "model": "claude",
+                  "content": [{"type": "tool_use", "id": "T1", "name": "context_info", "input": {}}],
+                  "stop_reason": "tool_use"}}, id="unanswered-tool-use"),
+    pytest.param({"type": "assistant",
+                  "message": {"id": "m1", "role": "assistant", "model": "<synthetic>",
+                              "content": [{"type": "text", "text": "No response requested."}]}},
+                 id="synthetic-row"),
+])
+def test_recovery_fork_keeps_inherited_damage_verbatim(tmp_path: Path, monkeypatch, middle: dict) -> None:
+    from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+    monkeypatch.setenv("OBS_SESSION_REPLAY_PROVENANCE_DIR", str(tmp_path / "prov"))
+    source, raw = _dead_topic_session(tmp_path, middle)
+    target = resolve_safe_jsonl_target(session_id="s", cwd=tmp_path, source_path=source)
+    assert target.health.needs_recovery and target.target_uuid == "u3"
+
+    fork_session_jsonl(session_id="s", target_uuid=target.target_uuid, cwd=tmp_path,
+                       source_path=source, new_session_id="f")
+
+    # Byte-identical prefix: every original row up to the boundary, unchanged, no overlays.
+    assert (source.parent / "f.jsonl").read_text(encoding="utf-8").splitlines() == raw[:5]
+    receipt = json.loads((tmp_path / "prov" / "forks" / "f.json").read_text())
+    assert receipt["replay"]["legacy_prefix"]["policy"] == "opaque_original_ancestry_preserved_complete_suffix_only"
+
+
+def test_replay_explicit_target_must_be_complete_boundary(tmp_path: Path, monkeypatch) -> None:
+    from obs_agent.jsonl_replay import prepare_session_replay
+
+    monkeypatch.setenv("OBS_SESSION_REPLAY_PROVENANCE_DIR", str(tmp_path / "prov"))
+    middle = {"type": "assistant", "message": {"id": "m1", "role": "assistant", "model": "claude",
+              "content": [{"type": "tool_use", "id": "T1", "name": "x", "input": {}}], "stop_reason": "tool_use"}}
+    source, _raw = _dead_topic_session(tmp_path, middle)
+    source.write_text("\n".join(_raw[:2]) + "\n", encoding="utf-8")  # target's own round is incomplete
+    with pytest.raises(ValueError, match="incomplete tool round"):
+        prepare_session_replay(session_id="s", cwd=tmp_path, source_path=source, target_uuid="a1")

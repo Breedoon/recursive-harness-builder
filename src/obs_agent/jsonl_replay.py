@@ -83,6 +83,12 @@ def record_terminal_completion(
     return receipt
 
 
+LEGACY_REPLAY_ERRORS = (
+    "Selected replay contains an incomplete tool round",
+    "Selected replay contains a synthetic API-error row",
+)
+
+
 def select_replay_entries(
     entries: list[tuple[dict[str, Any], str]], target_uuid: str | None = None,
     *, require_complete: bool = True,
@@ -177,17 +183,18 @@ def prepare_session_replay(
         try:
             selected = select_replay_entries(entries, target_uuid)
         except ValueError as exc:
-            if target_uuid is not None or str(exc) not in (
-                "Selected replay contains an incomplete tool round",
-                "Selected replay contains a synthetic API-error row",
-            ):
+            if str(exc) not in LEGACY_REPLAY_ERRORS:
                 raise
             from obs_agent.jsonl_health import analyze_jsonl_path
 
             health = analyze_jsonl_path(path=path, session_id=session_id)
             if health.needs_recovery:
                 raise
-            selected = select_replay_entries(entries, require_complete=False)
+            # An explicit target (recovery fork) must itself be a health-confirmed
+            # complete boundary; inherited damage behind it stays opaque.
+            if target_uuid is not None and target_uuid not in set(health.complete_message_targets.values()):
+                raise
+            selected = select_replay_entries(entries, target_uuid, require_complete=False)
             result_ids = {block.get("tool_use_id") for entry, _raw in selected
                           for block in entry.get("message", {}).get("content", [])
                           if isinstance(block, dict) and block.get("type") == "tool_result"}

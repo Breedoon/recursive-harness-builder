@@ -616,3 +616,22 @@ def test_marker_with_inflight_task_ids_is_readable_by_rollback_readers(tmp_path:
         assert reason == "ok" and marker.entries[0].thread_id == 2
     finally:
         sys.modules.pop(name, None)
+
+
+@pytest.mark.asyncio
+async def test_recovery_failure_is_reported_to_topic_once(config):
+    bot = _bot(config)
+    route = TelegramRoute(chat_id=67890, thread_id=526)
+    state = bot._get_state(route, topic_title="Dead")
+    state.session_manager.set_session_id("sid-526")
+    notice = AsyncMock()
+    with (
+        patch.object(bot, "_resolve_session_for_trigger", AsyncMock(return_value=(True, None))),
+        patch.object(bot, "_recover_route_session_if_needed", AsyncMock(side_effect=ValueError("boom"))),
+        patch.object(bot, "_send_system_message", notice),
+    ):
+        for _ in range(3):
+            with pytest.raises(ValueError):
+                await bot._run_and_send(state=state, user_text="hello", bot=AsyncMock())
+    assert notice.await_count == 1
+    assert "/clear" in notice.await_args.kwargs["text"] and "sid-526" in notice.await_args.kwargs["text"]
