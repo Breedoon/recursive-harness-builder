@@ -4181,7 +4181,7 @@ class TelegramBot:
     ) -> dict[str, str]:
         """Build team identity env, not route-dependent tool configuration.
 
-        Forked JSONL replays the parent's messages. Tool schemas precede those
+        CACHE-PREFIX WARNING: forked JSONL replays the parent's messages. Tool schemas precede those
         messages in the cache prefix, so child-only defaults would invalidate
         the entire shared prefix. Global CLI defaults belong in SessionManager.
         """
@@ -4489,9 +4489,10 @@ class TelegramBot:
             )
         return target.target_uuid, target.health
 
-    # PREFIX-STABILITY WARNING: restart/idle recovery must use a complete
+    # CACHE-PREFIX WARNING: restart/idle recovery must use a complete
     # JSONL-visible prefix; bootstraps, inbox/task notices and resume notes append.
-    # Live guards: --provider codex queued_resume recovery_multi resume_new_proc.
+    # A break is silent: no error, the API just re-bills the whole conversation.
+    # Live check: scripts/cache_regression.py queued_resume recovery_multi resume_new_proc (docs/cache-proxy-safety.md).
     async def _recover_route_session_if_needed(
         self,
         *,
@@ -4593,6 +4594,9 @@ class TelegramBot:
         self._persist_state_for_route(state.route)
         return recovery_session_id
 
+    # CACHE-PREFIX WARNING: same as _resolve_fork_source for persisted fork records.
+    # A break is silent: no error, the API just re-bills the whole conversation.
+    # Live check: scripts/cache_regression.py recovery parallel_fork (docs/cache-proxy-safety.md).
     def _resolve_persisted_fork_source(
         self,
         *,
@@ -5492,6 +5496,10 @@ class TelegramBot:
         parsed = int(value)
         return parsed if parsed > 0 else None
 
+    # CACHE-PREFIX WARNING: picks the JSONL point a fork/recovery copies from; a
+    # mid-message or in-flight target makes the forked history differ (M5).
+    # A break is silent: no error, the API just re-bills the whole conversation.
+    # Live check: scripts/cache_regression.py recovery recovery_multi parallel_fork (docs/cache-proxy-safety.md).
     def _resolve_fork_source(
         self,
         *,
@@ -6340,6 +6348,10 @@ class TelegramBot:
             jsonl_uuid=jsonl_uuid,
         )
 
+    # CACHE-PREFIX WARNING: scheduled/inbox wakes resume or fork an idle session from
+    # its JSONL in a new process; the replayed history must equal what the API saw.
+    # A break is silent: no error, the API just re-bills the whole conversation.
+    # Live check: scripts/cache_regression.py resume_new_proc ws_resume queued_resume (docs/cache-proxy-safety.md).
     async def _resolve_session_for_trigger(
         self,
         *,
@@ -9239,6 +9251,12 @@ class TelegramBot:
         finally:
             state.hook_state.reset()
 
+    # CACHE-PREFIX WARNING: AgentTask fork=true children start from a byte copy of the
+    # parent's JSONL (fork_session_jsonl). The child's first request must be an
+    # append of the parent's last request; child-only tools/env/system differences
+    # invalidate the whole shared prefix.
+    # A break is silent: no error, the API just re-bills the whole conversation.
+    # Live check: scripts/cache_regression.py parallel_fork recovery (docs/cache-proxy-safety.md).
     async def _create_child_fork_topic(
         self,
         *,

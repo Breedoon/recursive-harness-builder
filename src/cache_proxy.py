@@ -8,7 +8,20 @@ All other requests are forwarded unmodified. CC's native cache_control
 placement is left untouched — cache_control is not part of the cache key
 (it's a breakpoint hint only), so normalizing it is unnecessary.
 
-WARNING — FORK/RESUME CACHE CORRECTNESS, NOT OPTIONAL TEXT CLEANUP
+CACHE-PREFIX WARNING — THIS FILE IS EASY TO BREAK AND BREAKS SILENTLY
+Every request of the whole agent fleet passes through here. Prompt caching
+only works when a request starts with exactly the same bytes as an earlier
+one; change one byte of old history, the system prompt, the tool list or a
+request setting and the API quietly re-bills the whole conversation (no error,
+just cost: one changed system section re-billed 391k tokens on 2026-10-12).
+Six such break mechanisms were found in October 2026; unit tests caught none.
+Before committing ANY change here (or in jsonl_fork/jsonl_health/jsonl_replay,
+session resume, telegram recovery/fork code) run the live check
+    .venv/bin/python scripts/cache_regression.py
+on a scratch proxy and again on production after a maintenance restart, and
+follow docs/cache-proxy-safety.md.
+
+FORK/RESUME CACHE CORRECTNESS, NOT OPTIONAL TEXT CLEANUP
 The live CLI adds context that it never persists to JSONL. Forks and resumes
 rebuild history from JSONL, so those additions MUST NOT survive normalization:
 one differing historical block breaks the shared prefix from that point on.
@@ -18,9 +31,10 @@ message delivery. Do not rewrite historical JSONL to imitate live-only context.
 
 Before changing normalization, capture the actual bundled CLI's live request,
 its JSONL, and actual fork AND resume requests; compare normalized shared history
-(not just notification visibility or synthetic request fixtures). Run the real
-protocol regressions in tests/test_cache_proxy_reminder_span.py. Unit success
-alone does not prove provider cache-hit behavior. See README.md's critical
+(not just notification visibility or synthetic request fixtures). Run
+scripts/cache_regression.py; tests/test_cache_proxy_reminder_span.py is a quick
+unit regression only -- unit success alone does not prove provider cache-hit
+behavior. See README.md's critical
 maintainer warning and docs/inflight-message-delivery.md for the delivery boundary.
 
 Normalizations (applied in order):
@@ -254,6 +268,9 @@ def _resolve_upstream(model: str) -> str:
 def normalize_billing_header(body: dict) -> int:
     """Rule 1: Replace per-process billing header in system[0] with fixed value.
 
+    CACHE-PREFIX WARNING: must give byte-identical output for the same conversation
+    in every process (live, resume, fork). Live check: scripts/cache_regression.py.
+
     The billing header contains cc_version (git hash) and cch (content hash)
     that change per-process and per-turn. The Anthropic API normalizes this
     for cache matching, but we fix it for clean diffs.
@@ -275,6 +292,9 @@ def normalize_billing_header(body: dict) -> int:
 
 def normalize_user_content_structure(body: dict) -> int:
     """Rule 2: Convert bare-string user message content to list format.
+
+    CACHE-PREFIX WARNING: must give byte-identical output for the same conversation
+    in every process (live, resume, fork). Live check: scripts/cache_regression.py.
 
     CC sometimes demotes older user message content from
     [{type: "text", text: "..."}] to "..." between turns.
@@ -356,7 +376,7 @@ REMINDER_PLACEHOLDER = "[reminder stripped]"
 def strip_reminder_spans(text: str) -> tuple[str, int]:
     """Remove every reminder span from *text*.
 
-    WARNING: do not preserve ``hook additional context:`` (or other live-only
+    CACHE-PREFIX WARNING: do not preserve ``hook additional context:`` (or other live-only
     exceptions) here. The CLI omits it from JSONL; keeping it makes the parent
     diverge from the fork/resume history. Fix delivery at the persisted-query
     boundary and prove actual live/fork/resume prefix equality instead.
@@ -432,7 +452,7 @@ def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
         # trimmed only when a span was removed, the live and the resumed/forked
         # history differed by leading spaces and every wake, resume or restart
         # re-billed the whole conversation (byte-verified: requests 598bb917
-        # and e5f25ac9 on 2026-10-12). Live guard: prefix_repro.py ws_resume.
+        # and e5f25ac9 on 2026-10-12). Live check: scripts/cache_regression.py ws_resume (docs/cache-proxy-safety.md).
         content = block.get("content")
         if isinstance(content, str):
             new_text, removed = strip_reminder_spans(content)
@@ -463,7 +483,7 @@ def _strip_reminders_in_block(block: dict) -> tuple[int, bool]:
                             _count_trim()
                         sub_empty = not stripped
                 if sub_empty:
-                    # PREFIX-STABILITY M1: keep every nested marker on its
+                    # CACHE-PREFIX M1: keep every nested marker on its
                     # original block, including identical and distinct TTLs.
                     if _contains_cache_control(sub):
                         sub["text"] = REMINDER_PLACEHOLDER
@@ -506,7 +526,7 @@ def strip_all_system_reminders(body: dict) -> int:
         if not isinstance(content, list):
             continue
         kept: list = []
-        # PREFIX-STABILITY WARNING (M1): the request must stay an
+        # CACHE-PREFIX WARNING (M1): the request must stay an
         # append-extension of the previous request of the same session, and a
         # cache breakpoint may never be dropped (or added: the API limit is 4).
         # When a reminder-only block is dropped and it carries cache_control,
@@ -516,7 +536,7 @@ def strip_all_system_reminders(body: dict) -> int:
         # fixed placeholder for the removed block, never coalescing TTL objects.
         # Dropping it silently leaves the request with no message
         # breakpoint, which reads only system+tools and writes nothing.
-        # Live guard: scripts/prefix_repro.py reminder_block. Incident:
+        # Live check: scripts/cache_regression.py reminder_block. Incident:
         # 2026-10-08/09, mission vault-mief.
         pending_markers = []
         for block in content:
@@ -566,6 +586,9 @@ def strip_dynamic_reminders(body: dict) -> int:
 def normalize_git_status(body: dict) -> int:
     """Rule 4: Normalize git status section in system prompt.
 
+    CACHE-PREFIX WARNING: must give byte-identical output for the same conversation
+    in every process (live, resume, fork). Live check: scripts/cache_regression.py.
+
     The gitStatus section in sys[2] contains a snapshot of the working tree
     at the time the CC process started. Sessions started at different times
     see different untracked/modified files, creating byte-level divergence
@@ -592,6 +615,9 @@ def normalize_git_status(body: dict) -> int:
 def normalize_tool_order(body: dict) -> int:
     """Rule 5: Sort tool definitions alphabetically by name.
 
+    CACHE-PREFIX WARNING: must give byte-identical output for the same conversation
+    in every process (live, resume, fork). Live check: scripts/cache_regression.py.
+
     Tool definitions arrive in filesystem readdir order, which is
     non-deterministic across process restarts and platforms. Different
     order = different bytes = cache miss on the tools section.
@@ -614,6 +640,14 @@ def normalize_metadata(body: dict) -> int:
     metadata.user_id contains the session UUID which differs between
     parent and fork. Normalizing it eliminates a potential divergence
     source and produces cleaner request diffs.
+
+    CACHE-PREFIX WARNING: this field is not only cosmetic on the GPT route.
+    CLIProxyAPI derives the provider cache key from it, so this rewrite made
+    the whole GPT fleet share ONE cache key until 2026-10-12;
+    assign_conversation_cache_key() now replaces it per conversation. Any change
+    here must keep that working. Live check: scripts/cache_regression.py
+    --providers codex and scripts/cliproxy_cache_key_probe.py
+    (docs/cache-proxy-safety.md).
     """
     metadata = body.get("metadata")
     if not metadata or not isinstance(metadata, dict):
@@ -667,6 +701,9 @@ def _fix_array_items_recursive(schema: dict) -> int:
 
 def sanitize_tool_schemas_for_openai(body: dict) -> int:
     """Sanitize tool schemas for OpenAI API compatibility.
+
+    CACHE-PREFIX WARNING: must give byte-identical output for the same conversation
+    in every process (live, resume, fork). Live check: scripts/cache_regression.py --providers codex.
 
     OpenAI rejects array schemas without ``items``.  Anthropic accepts them.
     Walk all tool input_schemas recursively and fix missing ``items``.
@@ -848,6 +885,10 @@ def _msg_bytes(msg: dict) -> bytes:
 def pin_effort(body: dict, store: EffortPinStore | None = None) -> dict:
     """Pin top-level effort; express changes as per-message effort.
 
+    CACHE-PREFIX WARNING: a top-level effort change mid-conversation changes the
+    request settings and re-bills the conversation; this pin exists to prevent
+    that. Live check: scripts/cache_regression.py resume_new_proc.
+
     Returns {"inserted": n, "changed": bool, "beta": bool}. Mutates body.
     Must run after normalize_request so hashes cover normalized history.
     """
@@ -952,7 +993,11 @@ def pin_effort(body: dict, store: EffortPinStore | None = None) -> dict:
 # is model + first message (like the effort pins), so resumes, wakes, restarts
 # and forks of that conversation share the pin. New conversations record
 # whatever the server sends at that time. Only the listed section and that one
-# field are ever touched. Live guard: scripts/prefix_repro.py volatile_flip.
+# field are ever touched.
+# Live check: scripts/cache_regression.py volatile_flip (docs/cache-proxy-safety.md).
+# CACHE-PREFIX WARNING: if another server-flag-driven system section starts
+# flipping mid-conversation (watch system-changed breaks in cache_tally.py
+# --breaks-out + prefix_diff.py), add its heading here and extend volatile_flip.
 VOLATILE_SYSTEM_SECTIONS = ("# Output efficiency",)
 # A pin only matters while the conversation's cache can still be read (1 hour
 # after its last request); 2 days of inactivity is ample and keeps the file small.
@@ -1086,11 +1131,15 @@ def assign_conversation_cache_key(body: dict) -> str | None:
     the Codex ``prompt_cache_key`` from the session part of metadata.user_id
     (verified by direct probe: same session -> same key, different session ->
     different key). normalize_metadata() rewrites that part to a constant, so
-    before this fix EVERY GPT conversation of the fleet shared one key, and the
-    provider's per-key routing overflowed: many byte-identical prefixes got no
-    cache hit. Here the session part becomes an id derived from model + first
-    message, so a conversation, its resumes and its forks share one key while
-    different conversations get different keys. Never applied to Anthropic.
+    before this fix EVERY GPT conversation of the fleet shared one key, and many
+    byte-identical prefixes got no cache hit (the provider-side reason -- e.g.
+    per-key routing overflow -- is a hypothesis, not proven). Here the session
+    part becomes an id derived from model + first message, so a conversation,
+    its resumes and its forks share one key while different conversations get
+    different keys. Never applied to Anthropic.
+    If CLIProxyAPI is upgraded this can silently stop helping. Live check:
+    scripts/cliproxy_cache_key_probe.py, then scripts/cache_regression.py
+    --providers codex (docs/cache-proxy-safety.md).
     """
     msgs = body.get("messages")
     md = body.get("metadata")
@@ -1116,7 +1165,7 @@ def _add_beta(headers: dict, beta: str) -> None:
     headers["anthropic-beta"] = beta
 
 
-# PREFIX-STABILITY WARNING (M3): the request must stay an append-extension of
+# CACHE-PREFIX WARNING (M3): the request must stay an append-extension of
 # the previous request of the same session; never let the Claude Code billing
 # placeholder (the "cch=" key followed by five zero characters) appear in
 # message content. The CLI rewrites the FIRST occurrence of that placeholder in
@@ -1127,7 +1176,7 @@ def _add_beta(headers: dict, beta: str) -> None:
 # when the system billing header still carries the placeholder and an earlier
 # "cch=<5 hex>" occurrence exists, that first occurrence is put back. Everything
 # else stays byte-identical. Runs on the raw bytes BEFORE normalize_request().
-# Live guard: scripts/prefix_repro.py cch_collision. Incident: 2026-10-08/09,
+# Live check: scripts/cache_regression.py cch_collision. Incident: 2026-10-08/09,
 # mission vault-mief. Do not write the placeholder literal in prompts, notes,
 # logs or source comments that agents may read.
 # Working on the proxy safely: read this file and the proxy logs only through a
@@ -1157,9 +1206,11 @@ def restore_cch_placeholder(raw: bytes) -> tuple[bytes, int]:
     return raw[:m.start()] + _CCH_PLACEHOLDER + raw[m.end():], 1
 
 
-# PREFIX-STABILITY WARNING (M4): CLI global-cache rollout inserts this exact
+# CACHE-PREFIX WARNING (M4): CLI global-cache rollout inserts this exact
 # standalone system line between existing prompt sections. Strip only that
 # scaffolding and its added separator, not user/tool text or other whitespace.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py boundary_flip boundary_marker (docs/cache-proxy-safety.md).
 _DYNAMIC_BOUNDARY_LINE = re.compile(r"(?m)^__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__\n(?:\n)?")
 
 
@@ -1200,10 +1251,13 @@ def normalize_dynamic_boundary(body: dict) -> int:
 def normalize_request(body: dict) -> tuple[dict, dict]:
     """Apply all normalizations to a request body in spec order.
 
-    WARNING: this is the shared-history contract for forking, not merely a
-    performance filter. Never allow non-JSONL runtime additions through to fix
-    a transport/hook bug. Any change requires actual parent/fork/resume
-    normalized-prefix equivalence tests; preserving a notice alone is not proof.
+    CACHE-PREFIX WARNING: this is the shared-history contract for forking, not
+    merely a performance filter. Never allow non-JSONL runtime additions through
+    to fix a transport/hook bug. A break is silent: no error, the API just
+    re-bills the whole conversation. Any change requires actual
+    parent/fork/resume normalized-prefix equivalence; preserving a notice alone
+    is not proof. Live check: scripts/cache_regression.py (all scenarios, both
+    routes) -- see docs/cache-proxy-safety.md.
 
     Order: billing → strings → strip all system reminders → git status →
            tool sorting → metadata
@@ -1907,7 +1961,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 with open(pre_path, "w") as f:
                     json.dump(data, f, indent=2)
 
-            # Apply all normalizations
+            # CACHE-PREFIX WARNING: from here to the json.dumps() below is the
+            # whole request-byte pipeline (normalize -> variant pin -> GPT cache
+            # key -> route-specific schema/effort edits -> one compact
+            # re-serialization). Order, the compact separators and every step
+            # must be deterministic for the same conversation, or each request
+            # silently re-bills the conversation. Each new step needs a
+            # norm.* field in the request index and a prefix_repro scenario.
+            # Live check: scripts/cache_regression.py (docs/cache-proxy-safety.md).
             data, info = normalize_request(data)
             if not is_local:
                 try:

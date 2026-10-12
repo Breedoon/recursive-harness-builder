@@ -68,6 +68,10 @@ request_resuming_restart() {
   done
 }
 
+# CACHE-PREFIX WARNING: this watchdog restarts the cache proxy that every agent
+# request goes through. A proxy restart reloads src/cache_proxy.py; check
+# curl 127.0.0.1:28925/health (source_sha256) and run scripts/cache_regression.py
+# after any proxy change (docs/cache-proxy-safety.md).
 watch_cache_proxy() {
   local healthy=0
   local failures=0

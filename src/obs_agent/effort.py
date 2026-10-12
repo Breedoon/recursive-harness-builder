@@ -6,9 +6,11 @@ levels. Provider capabilities remain authoritative; xhigh and max are distinct.
 
 from __future__ import annotations
 
-# PREFIX-STABILITY WARNING: effort changes can change the complete cache key.
+# CACHE-PREFIX WARNING: effort changes can change the complete cache key.
 # Preserve per-session request history and provider-specific semantics; never
 # mutate process-global effort while concurrent sessions have distinct levels.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py resume_new_proc (docs/cache-proxy-safety.md).
 
 import json
 from collections.abc import Mapping

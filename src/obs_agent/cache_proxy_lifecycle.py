@@ -27,6 +27,11 @@ _proxy_proc: subprocess.Popen | None = None
 _proxy_healthy: bool = False
 
 
+# CACHE-PREFIX WARNING: this starts the proxy every agent request goes through. After
+# a restart confirm the loaded code: curl 127.0.0.1:<port>/health -> source_sha256
+# must equal sha256 of src/cache_proxy.py at the deployed commit.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py (docs/cache-proxy-safety.md).
 def start_cache_proxy(port: int) -> subprocess.Popen | None:
     """Launch the cache proxy subprocess and wait for it to become healthy.
 

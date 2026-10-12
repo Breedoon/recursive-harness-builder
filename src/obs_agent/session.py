@@ -9,10 +9,11 @@ See decisions D014 (SDK cache for continuity) and D022 (no compaction).
 
 from __future__ import annotations
 
-# PREFIX-STABILITY WARNING: model/effort/env and tool configuration participate
+# CACHE-PREFIX WARNING: model/effort/env and tool configuration participate
 # in the request prefix. Reconnect/eviction must replay identical old content,
 # not regenerate historical bootstrap/context with current runtime values.
-# Live guard: prefix_repro.py --provider codex resume_new_proc boundary_flip.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py resume_new_proc boundary_flip ws_resume (docs/cache-proxy-safety.md).
 
 import asyncio
 from contextlib import contextmanager
@@ -51,7 +52,7 @@ _ANTHROPIC_AUTH_ENV_KEYS = (
 
 
 _DEFAULT_SDK_ENV: dict[str, str] = {
-    # PREFIX-STABILITY: terminal ResultMessage must follow the JSONL writer flush,
+    # CACHE-PREFIX: terminal ResultMessage must follow the JSONL writer flush,
     # so immediate idle eviction/new-process resume cannot lose the final answer.
     "CLAUDE_CODE_EAGER_FLUSH": "1",
     # Disable background tasks (skill auto-improvement, magic docs, plugin autoupdate).
@@ -625,6 +626,10 @@ class SessionManager:
 
         return options
 
+    # CACHE-PREFIX WARNING: every reconnect/wake resumes from JSONL (prepare_session_replay
+    # may append parent overlays). Replayed bytes must equal the live history.
+    # A break is silent: no error, the API just re-bills the whole conversation.
+    # Live check: scripts/cache_regression.py resume_new_proc ws_resume parallel_resume (docs/cache-proxy-safety.md).
     async def _connect_client_with_retry(
         self,
         *,
@@ -805,6 +810,10 @@ class SessionManager:
             options = self._build_options()
             return await self._connect_client_with_retry(options=options)
 
+    # CACHE-PREFIX WARNING: forks away from a synthetic API-error tail; the new
+    # session's first request must still be an append of the last good request.
+    # A break is silent: no error, the API just re-bills the whole conversation.
+    # Live check: scripts/cache_regression.py poisoned_recovery (docs/cache-proxy-safety.md).
     async def recover_poisoned_session_if_needed(self) -> tuple[str, str, str] | None:
         """Fork away from a synthetic API-error JSONL tail before resuming.
 

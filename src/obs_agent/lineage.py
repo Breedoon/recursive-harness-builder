@@ -10,9 +10,11 @@ Naming convention (two-tier):
 
 from __future__ import annotations
 
-# PREFIX-STABILITY WARNING: lineage/bootstrap payloads belong in append-only
+# CACHE-PREFIX WARNING: lineage/bootstrap payloads belong in append-only
 # JSONL-visible context, not regenerated historical messages on fork/resume.
 # Stable identity must survive new-process replay; transient values append.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py resume_new_proc parallel_fork (docs/cache-proxy-safety.md).
 
 import hashlib
 import json

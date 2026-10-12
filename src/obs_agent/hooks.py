@@ -14,9 +14,10 @@ See decisions D018, D022.
 
 from __future__ import annotations
 
-# PREFIX-STABILITY WARNING: hook additionalContext/reminder output must not
+# CACHE-PREFIX WARNING: hook additionalContext/reminder output must not
 # silently alter historical API content. Stripped reminders retain their existing
-# message breakpoint in the proxy. Live guard: --provider codex reminder_block.
+# message breakpoint in the proxy. A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py reminder_block ws_resume (docs/cache-proxy-safety.md).
 
 import asyncio
 import importlib.util

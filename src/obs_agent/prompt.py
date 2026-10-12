@@ -25,9 +25,10 @@ def _read_file(path: Path) -> str:
         return ""
 
 
-# PREFIX-STABILITY WARNING: entry-file updates belong in a new append-only user
+# CACHE-PREFIX WARNING: entry-file updates belong in a new append-only user
 # context message, never in an existing session's historical system prefix.
-# Real CLI guard: prefix_repro.py --provider codex queued_resume boundary_flip.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py queued_resume boundary_flip (docs/cache-proxy-safety.md).
 def build_system_prompt(config: OBSConfig) -> str:
     """Build the system prompt by reading the configured agent entry file."""
     content = _read_file(config.context_path)

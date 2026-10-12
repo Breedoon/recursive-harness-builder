@@ -91,7 +91,15 @@ model, ownership/persistence map, child inheritance rules and architecture revie
 Related policies: [configuration](docs/configuration.md),
 [effort](docs/effort.md), and [context/compaction](docs/context-compaction.md).
 
-## Critical maintainer warning: fork-cache fidelity
+## Critical maintainer warning: the cache proxy is easy to break
+
+**Changing the cache proxy, or any code that saves, picks, copies or replays
+conversation history, can silently multiply the cost of every agent.** A break
+raises no error: the API just stops reusing its prompt cache and re-bills the
+whole conversation on every request (one changed system-prompt section re-billed
+391k tokens in a single request on 2026-10-12). Read
+[docs/cache-proxy-safety.md](docs/cache-proxy-safety.md) before such a change and
+pass its checklist after it.
 
 `src/cache_proxy.py` is part of the fork/resume correctness contract. Live CLI
 attachments absent from JSONL must be stripped: preserving even useful transient
@@ -101,13 +109,26 @@ canonical persisted queries instead, as described in
 [in-flight message delivery](docs/inflight-message-delivery.md).
 
 Before changing normalization, compare actual bundled CLI live requests and JSONL
-with actual fork **and** resume requests. Run the real protocol tests in
-`tests/test_cache_proxy_reminder_span.py`; notification visibility alone does not
-establish cache safety. Preserve this invariant even when other tests pass.
+with actual fork **and** resume requests. Notification visibility alone does not
+establish cache safety, and unit tests (`tests/test_cache_proxy_*.py`) are only a
+quick first check: none of the real break mechanisms found in October 2026 was
+caught by them. The required check is the live runner:
+
+```text
+.venv/bin/python scripts/cache_regression.py     # both routes, all scenarios
+```
+
+Follow the full checklist in
+**[docs/cache-proxy-safety.md](docs/cache-proxy-safety.md)** (scratch proxy
+first, maintenance restart, production run, 1-2 h of real-traffic tally with
+`scripts/cache_tally.py`). Every sensitive code site carries a
+`CACHE-PREFIX WARNING` comment; `grep -rn "CACHE-PREFIX" src scripts deploy`
+lists them.
 
 To diagnose a prompt-cache miss, use the proxy's standing request pool
-(`/workspace/runtime/logs/cache-proxy/requests`, 60 GB ring buffer ≈ 30–60 h,
-secrets redacted in stored copies) and `scripts/prefix_diff.py --session <id>` — see
+(`/workspace/runtime/logs/cache-proxy/requests`, capped at 60 GB — about 20 days
+of fleet traffic at the 2026-10-12 rate of ~3 GB/day; secrets redacted in stored
+copies) and `scripts/prefix_diff.py --session <id>` — see
 docs/configuration.md "Request log".
 
 **Working on the proxy safely.** Never load the Claude Code billing placeholder
@@ -119,8 +140,8 @@ request logs and reports through a redacting filter (`sed -E 's/cch=0{5}/cch=<PH
 never write the literal in prompts, notes or messages, and abandon a poisoned
 session for a fresh one. On 2026-10-08/09 this self-poisoning cost the cache-prefix
 mission roughly 30-35 points of the Claude weekly pool (vault-mief). The regression
-check is the live Haiku drivers in `scripts/prefix_repro.py` (baseline,
-reminder_block, cch_collision, ...), not unit tests, which are not evidence here.
+check is `scripts/cache_regression.py` (it runs the live drivers in
+`scripts/prefix_repro.py`), not unit tests, which are not evidence here.
 
 ## License
 

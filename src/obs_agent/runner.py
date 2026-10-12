@@ -9,9 +9,10 @@ See daemon.py for the original inline implementation.
 
 from __future__ import annotations
 
-# PREFIX-STABILITY WARNING: queued notifications/continuations must append to
+# CACHE-PREFIX WARNING: queued notifications/continuations must append to
 # the same JSONL-visible history, not splice runtime-only content into its past.
-# Live guard: prefix_repro.py --provider codex queued_midturn queued_resume.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py queued_midturn queued_resume (docs/cache-proxy-safety.md).
 
 import asyncio
 import hashlib

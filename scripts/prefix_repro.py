@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live prompt-cache prefix reproduction drivers (one scenario per miss class).
 
-PREFIX-STABILITY: these drivers exist because unit tests "have utterly failed at
+CACHE-PREFIX: these drivers exist because unit tests "have utterly failed at
 preventing these issues" (Daniel, 2026-10-09 00:21Z). Each scenario drives a REAL
 bundled Claude Code CLI (cheap Haiku model) through the PRODUCTION cache proxy
 (default http://127.0.0.1:28925), then reads the proxy's own request log

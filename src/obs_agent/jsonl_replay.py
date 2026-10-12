@@ -2,6 +2,12 @@
 
 Call preparation only after disconnect, under the session owner's lock. Original
 rows remain untouched; CLI last-UUID-wins overlays change only parentUuid.
+
+CACHE-PREFIX WARNING: this decides which JSONL rows a resumed process replays.
+The replayed messages must be byte-identical (after proxy normalization) to
+what the live session sent, or every wake/resume silently re-bills the whole
+conversation. Live check: scripts/cache_regression.py resume_new_proc
+parallel_resume ws_resume (docs/cache-proxy-safety.md).
 """
 from __future__ import annotations
 

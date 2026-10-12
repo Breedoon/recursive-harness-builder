@@ -409,10 +409,11 @@ def analyze_jsonl_path(*, path: Path, session_id: str | None = None) -> JsonlSes
     )
 
 
-# PREFIX-STABILITY WARNING (M5): safe recovery means a complete API message,
+# CACHE-PREFIX WARNING (M5): safe recovery means a complete API message,
 # not merely its text row. Grouped tools/results must remain replay-equivalent,
 # with side effects reconciled before any retry. Original histories stay intact.
-# Live guard: prefix_repro.py --provider codex recovery recovery_multi.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py recovery recovery_multi poisoned_recovery (docs/cache-proxy-safety.md).
 def resolve_safe_jsonl_target(
     *,
     session_id: str,

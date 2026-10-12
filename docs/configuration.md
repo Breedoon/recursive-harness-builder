@@ -180,7 +180,9 @@ evicts oldest first down to 90%: body files of the oldest day first, then that
 day's index once it holds no bodies (the current day's index is kept). At
 2026-10-09 night-time volume (~1,900 requests/h, ~580 MB/h gzip) each GB holds
 roughly 1–2 hours of full bodies, so the **60 GB default ≈ 30–60+ hours**
-(quieter hours stretch it, busier ones shorten it). Rationale: Daniel asked for
+(quieter hours stretch it, busier ones shorten it). That estimate proved far too
+low: measured on 2026-10-12 the pool held 11 GB for everything since 2026-10-09
+(about 3 GB/day), so 60 GB is roughly 20 days at that rate. Rationale: Daniel asked for
 a standing pool "so there are logs" when a miss happens; 1 GB (~1–2 h) would
 usually be evicted before anyone looks, and Daniel confirmed 2026-10-09 00:21Z
 "60 is fine. I don't mind that." Override with `CACHE_PROXY_REQUEST_LOG_MAX_GB`

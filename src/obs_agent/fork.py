@@ -26,6 +26,11 @@ class ForkRunner:
         self.config = config
         self.session_id = session_id
 
+    # CACHE-PREFIX WARNING: SDK-native fork (resume + fork_session). Passing a different
+    # system_prompt here changes the system bytes and the child cannot reuse the
+    # parent's cache at all; keep it None when cache reuse matters.
+    # A break is silent: no error, the API just re-bills the whole conversation.
+    # Live check: scripts/cache_regression.py parallel_fork (docs/cache-proxy-safety.md).
     async def run(
         self,
         prompt: str,

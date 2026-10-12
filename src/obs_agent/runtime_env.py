@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-# PREFIX-STABILITY WARNING: environment/bootstrap controls model routes and CLI
+# CACHE-PREFIX WARNING: environment/bootstrap controls model routes and CLI
 # feature flags. A new process must replay stable history with the same request
 # semantics; never log credentials while diagnosing configuration divergence.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py resume_new_proc boundary_flip volatile_flip (docs/cache-proxy-safety.md).
 
 import os
 import sys

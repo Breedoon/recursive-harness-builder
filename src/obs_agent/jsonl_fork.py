@@ -163,10 +163,11 @@ def _adjacent_metadata(
     return metadata
 
 
-# PREFIX-STABILITY WARNING (M5/M6): parentUuid traversal alone can lose sibling
+# CACHE-PREFIX WARNING (M5/M6): parentUuid traversal alone can lose sibling
 # tool results from a parallel batch. Recovery/fork must retain complete API
 # messages and tool rounds verbatim; never select an in-flight text-only row.
-# Live guard: prefix_repro.py --provider codex parallel_resume recovery_multi.
+# A break is silent: no error, the API just re-bills the whole conversation.
+# Live check: scripts/cache_regression.py parallel_resume parallel_fork recovery_multi (docs/cache-proxy-safety.md).
 def fork_session_jsonl(
     *,
     session_id: str,
