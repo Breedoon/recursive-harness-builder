@@ -20,7 +20,7 @@ Metrics, per route ("anthropic" = Claude, "cli-proxy" = GPT via CLIProxyAPI):
 
 Usage:
   cache_tally.py --since 2026-10-12T18:00:00 [--until ...] [--gap 3600]
-                 [--breaks-out breaks.jsonl]
+                 [--breaks-out breaks.jsonl] [--exclude-sessions harness_sessions.txt]
 Session ids exist in the usage log only from 2026-10-08 23:53Z.
 """
 from __future__ import annotations
@@ -47,7 +47,13 @@ def main(argv=None) -> int:
     ap.add_argument("--gap", type=int, default=3600)
     ap.add_argument("--log", default=LOG)
     ap.add_argument("--breaks-out", default=None, help="write every break pair as JSONL")
+    ap.add_argument("--exclude-sessions", default=None,
+                    help="file of session ids (one per line, prefixes ok) to leave out, e.g. "
+                         "prefix_repro harness sessions run during the window")
     args = ap.parse_args(argv)
+    excluded = []
+    if args.exclude_sessions:
+        excluded = [x.strip() for x in open(args.exclude_sessions) if x.strip()]
     since, until = ts(args.since), ts(args.until) or 1e12
 
     agg = collections.defaultdict(lambda: [0, 0, 0, 0])
@@ -62,6 +68,9 @@ def main(argv=None) -> int:
                 continue
             t = d.get("ts", 0)
             if not (since <= t < until):
+                continue
+            sid0 = d.get("session_id") or ""
+            if excluded and any(sid0.startswith(x) for x in excluded):
                 continue
             route = d.get("route") or "unknown"
             r, c, i = d.get("cache_read", 0), d.get("cache_creation", 0), d.get("input_tokens", 0)
