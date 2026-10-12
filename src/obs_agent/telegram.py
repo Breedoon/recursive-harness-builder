@@ -4522,12 +4522,34 @@ class TelegramBot:
         old_lineage = self._ensure_state_lineage(state, session_id=session_id)
         old_projection = self._state_inbox_projection(state)
 
-        recovery_session_id = fork_session_jsonl(
-            session_id=session_id,
-            target_uuid=target.target_uuid,
-            cwd=self._config.vault_path,
-            new_session_id=str(uuid.uuid4()),
-        )
+        try:
+            recovery_session_id = fork_session_jsonl(
+                session_id=session_id,
+                target_uuid=target.target_uuid,
+                cwd=self._config.vault_path,
+                new_session_id=str(uuid.uuid4()),
+            )
+        except Exception as exc:
+            # Dead-topic diagnostics (2026-10-12): a failed recovery fork aborts
+            # every run on this route, so record the full recovery context.
+            logger.error(
+                "[jsonl_recovery_failed] route=%s source=%s session_id=%s "
+                "preferred_uuid=%s recovery_uuid=%s target_reason=%s reason=%s "
+                "first_unsafe=%s first_poison=%s safe_line=%s error=%s: %s",
+                state.route,
+                source,
+                session_id,
+                preferred_uuid,
+                target.target_uuid,
+                target.reason,
+                target.health.unsafe_tail_reason,
+                target.health.first_unsafe_tail_uuid,
+                target.health.first_poison_uuid,
+                target.health.safe_recovery_line,
+                type(exc).__name__,
+                exc,
+            )
+            raise
         logger.warning(
             "[jsonl_recovery] route=%s source=%s old_session_id=%s "
             "new_session_id=%s recovery_uuid=%s reason=%s first_unsafe=%s first_poison=%s",
@@ -7562,6 +7584,27 @@ class TelegramBot:
                     disable_notification=True,
                 )
 
+    async def log_command_update(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Log every slash command before its handler runs (observer only)."""
+        message = update.effective_message
+        if message is None:
+            return
+        try:
+            route = self._route_for_message(message)
+        except Exception:
+            route = None
+        state = self._get_state(route, create=False) if route is not None else None
+        logger.info(
+            "[command] route=%s user_id=%s message_id=%s session_id=%s text=%r",
+            route,
+            update.effective_user.id if update.effective_user else None,
+            message.message_id,
+            state.session_id if state is not None else None,
+            (message.text or "")[:300],
+        )
+
     async def handle_session(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -7956,10 +7999,11 @@ class TelegramBot:
         session_id = state.session_id
         if not jsonl_uuid:
             logger.info(
-                "[flush_turn] not mapping turn jsonl_uuid=%s session_id=%s turn_items=%d",
+                "[flush_turn] not mapping turn jsonl_uuid=%s session_id=%s turn_items=%d text=%r",
                 jsonl_uuid,
                 session_id,
                 len(turn_items),
+                html_text[:500],
             )
             return
         for sent in sent_messages:
@@ -11578,6 +11622,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
         .build()
     )
     app.bot_data["obs_telegram_bot"] = bot
+    app.add_handler(MessageHandler(filters.COMMAND, bot.log_command_update), group=-1)
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"^/(?:tree-|tree-(?:ancestors|descendants|children))(?:@[A-Za-z0-9_]+)?(?:\s|$)"),
