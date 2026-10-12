@@ -44,7 +44,10 @@ real break mechanisms in live traffic; none was caught by a unit test:
 5. Parallel tool results lost when forking (fixed in `jsonl_fork`).
 6. On resume, a tool result with leading spaces differed from the live form,
    because the CLI trims it live but the JSONL keeps the spaces (fixed
-   2026-10-12: always trim).
+   2026-10-12: always trim). Lesson: the old code trimmed only when it had
+   also removed a reminder, and reminders exist only in the live form. Any
+   rewrite that happens only when live-only content is present makes the live
+   and replayed forms differ; make every canonicalization unconditional.
 7. A server-side feature refresh flips one system-prompt section and the
    `context_management` setting in the middle of conversations (fixed
    2026-10-12: kept as first seen per conversation, `pin_volatile_config`).
@@ -96,9 +99,23 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
      `Bearer` tokens, secret-named JSON fields, known token shapes and long
      opaque strings. It is best-effort: prefer printing only variable *names*
      (`... | cut -d= -f1`) when names are all you need.
-   - What the tools themselves output: the stored request log keeps
-     secret-redacted copies (hashed placeholders), so `prefix_diff.py` and the
-     runner's diff snippets come from redacted bodies. `cache_regression.py`
+   - **Stored request bodies are NOT free of the billing placeholder.** The
+     request log redacts secrets, but a stored `.pre`/`.wire` body keeps the
+     placeholder exactly as sent whenever the conversation contained it: every
+     `cch_collision` test session does (that is what it tests), and so does any
+     agent session that read it unfiltered. So `zcat` a stored body, or quote
+     `prefix_diff.py` output, only through `scripts/redact.sh`.
+   - **Redact what you read, never the log itself.** Never edit, rewrite or
+     "clean" files under `/workspace/runtime/logs/cache-proxy/requests`: they are
+     the raw evidence `prefix_diff.py` compares, and an edited body shows a
+     break that never happened. Redaction happens only on the way to your
+     screen. (On 2026-10-12 the 26 stored files of 13 requests of session
+     `2cd7c4a3` in `requests/2026-10-12/` were edited after capture; they no
+     longer match what was sent, so do not `prefix_diff` them. The request ids
+     are listed in bead `vault-1r7n.14`.)
+   - What the tools themselves output: apart from the placeholder case above,
+     the stored request log keeps secret-redacted copies, so `prefix_diff.py`
+     and the runner's diff snippets come from secret-redacted bodies. `cache_regression.py`
      prints and saves request ids, session ids, statuses, cache ratios and diff
      snippets; it never prints the OAuth token the direct-probe scenarios send.
      Its per-scenario `.txt` files also keep the harness's stderr, which is not
@@ -120,7 +137,14 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
        --log-dir /workspace/runtime/cache-proxy-scratch/new/requests
    ```
    (`--log-dir` must be the `requests` subdirectory, or the runner finds no
-   rows.) To compare with the old code, start the committed version on another
+   rows.) Always give a scratch or test proxy its own `CACHE_PROXY_LOG_DIR`:
+   agent shells inherit the production value from the OBS daemon, and on
+   2026-10-12 test proxies that did not override it wrote about 320 rows into
+   the production `usage.jsonl` and the production `effort-pins.json` (unit
+   tests now use `isolated_proxy_env()` in `tests/conftest_cache_proxy.py`).
+   Stop scratch proxies by their PID, not with `pkill -f <pattern>` or a
+   `pgrep -f` wait loop: the pattern also matches your own shell command, which
+   then kills itself or waits forever. To compare with the old code, start the committed version on another
    port: `git show HEAD:src/cache_proxy.py > /workspace/runtime/cache-proxy-scratch/old.py`.
    Required result: `RESULT: PASS` on both routes, and your new scenario FAILs
    on the old code and PASSes on the new.
@@ -128,7 +152,10 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
    `/workspace/obs/.venv/bin/python -m obs_agent.maintenance_restart`
    (running agents resume by themselves). Then confirm the live proxy loaded
    your code: `curl -s 127.0.0.1:28925/health` → `source_sha256` must equal
-   `git show HEAD:src/cache_proxy.py | sha256sum`.
+   `git show HEAD:src/cache_proxy.py | sha256sum`. A comment-only commit to
+   `cache_proxy.py` also changes that hash, so do a maintenance restart after it
+   too, or the identity check (and the runner's first line) will report a
+   mismatch.
 5. **Run the live check on production:** `.venv/bin/python scripts/cache_regression.py`.
    It must say `RESULT: PASS`. Write down the output directory (it keeps every
    request id).

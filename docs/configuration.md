@@ -202,7 +202,11 @@ data and thinking-block `signature`s). Same value → same placeholder, so two
 captures compare equal/unequal exactly where the originals did; JSON stays
 valid; `prefix_diff.py` works unchanged on redacted files — diffs operate on the
 redacted copies (byte offsets refer to the redacted text). `wire_sha256` is of the unredacted wire bytes. Redaction
-costs ~150 ms per 1.2 MB body on the writer thread.
+costs ~150 ms per 1.2 MB body on the writer thread. Not redacted: the Claude
+Code billing placeholder (regex `cch=0{5}`) is stored as sent, so read stored
+bodies only through `scripts/redact.sh`; and never edit the stored files to
+clean them — they are the raw evidence `prefix_diff.py` compares (see
+`docs/cache-proxy-safety.md` step 0).
 
 Diff tool: `scripts/prefix_diff.py` — `prefix_diff.py A B` (two `req_id`s or
 files), `--session <id-prefix>` (every adjacent pair of one session, with the

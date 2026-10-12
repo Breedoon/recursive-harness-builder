@@ -127,8 +127,10 @@ lists them.
 
 To diagnose a prompt-cache miss, use the proxy's standing request pool
 (`/workspace/runtime/logs/cache-proxy/requests`, capped at 60 GB — about 20 days
-of fleet traffic at the 2026-10-12 rate of ~3 GB/day; secrets redacted in stored
-copies) and `scripts/prefix_diff.py --session <id>` — see
+of fleet traffic at the 2026-10-12 rate of ~3 GB/day; secrets are redacted in
+stored copies, but the billing placeholder is kept as sent, so read stored bodies
+only through `scripts/redact.sh`, and never edit the stored files themselves —
+they are the raw evidence) and `scripts/prefix_diff.py --session <id>` — see
 docs/configuration.md "Request log".
 
 **Working on the proxy safely.** Never load the Claude Code billing placeholder
