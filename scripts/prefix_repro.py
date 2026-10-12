@@ -349,10 +349,19 @@ async def sc_boundary_flip(args):
 
 async def sc_resume_new_proc(args):
     sid = str(uuid.uuid4())
-    await _session(args, ["Reply with the single word: one.", "Reply with the single word: two."], session_id=sid)
+    # The fleet's cache entries live 1 hour, the harness's only 5 minutes: the
+    # CLI asks for a 1-hour TTL only on a subscription login AND when the
+    # GrowthBook allowlist tengu_prompt_cache_1h_config matches, and
+    # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC (set by _options) turns GrowthBook
+    # off. So for a real wake test (--gap > 300) the CLI runs like the fleet:
+    # GrowthBook on. Verified 2026-10-12: with it off, even Opus wrote only
+    # ephemeral_5m and a 330 s wake read 0 despite byte-identical history.
+    env = {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": ""} if args.gap > 290 else None
+    await _session(args, ["Reply with the single word: one.", "Reply with the single word: two."],
+                   session_id=sid, env_extra=env)
     if args.gap:
         await asyncio.sleep(args.gap)
-    await _session(args, ["Reply with the single word: woke."], resume=sid)
+    await _session(args, ["Reply with the single word: woke."], resume=sid, env_extra=env)
     return [sid], None
 
 
@@ -813,11 +822,11 @@ def main(argv=None):
         names = [k for k in SCENARIOS if args.provider == "anthropic" or k not in ANTHROPIC_ONLY]
     else:
         names = args.scenarios
-    if args.gap > 290 and "haiku" in args.model:
-        print("WARNING: Haiku requests write 5-minute cache entries; with --gap > 300 the resume "
-              "reads 0 even when bytes are identical. Use --model claude-opus-5-5 (1-hour entries, "
-              "like the fleet) for the wake test, or read the pair class (append) instead of the ratio.",
-              file=sys.stderr)
+    if args.gap > 290:
+        print("NOTE: --gap > 300 needs 1-hour cache entries. resume_new_proc then runs the CLI with "
+              "GrowthBook on (like the fleet); check that the first requests' usage shows "
+              "ephemeral_1h_input_tokens > 0 — if only ephemeral_5m is written, a zero read after the "
+              "gap is cache expiry, not a prefix break (read the pair class instead).", file=sys.stderr)
     results = []
     for n in names:
         try:
