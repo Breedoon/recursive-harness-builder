@@ -131,6 +131,17 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
 - `PASS` — every request pair was a pure append with at least 95% cache read.
 - `FAIL` — a cache regression (or a scenario crashed without any provider
   error). The line shows the bad pairs; run `prefix_diff.py` on them.
+  Two known FAIL shapes are not caused by a proxy change and are usually
+  intermittent, so rerun that one scenario before concluding:
+  - class `append` with ratio 0 on the GPT route: our bytes were a perfect
+    prefix but the provider read nothing from cache (seen on production
+    2026-10-12 for `codex boundary_marker`; it passed on rerun).
+  - class `tail-block-append` around 0.93 in `recovery_multi`: the open
+    "Continue from where you left off." mechanism (bead `vault-1r7n.9`); it
+    passes on some runs and fails on others.
+  Any other class (`history-changed`, `system-changed`, `config-changed`,
+  `tools-changed`, missing breakpoint) is a real regression until proven
+  otherwise.
 - `PROVIDER-ERROR` — the scenario failed or timed out while the upstream API
   returned 5xx errors. Usually provider overload, not our code. It is not a
   pass: rerun that route later.
