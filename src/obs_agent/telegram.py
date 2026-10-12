@@ -7994,9 +7994,15 @@ class TelegramBot:
             return
         await self._flush_observability_buffer(route=state.route, bot=bot)
         logger.info(
-            "[flush_turn] sending %d chars (%d items) route=%s",
-            len(html_text), len(turn_items), state.route,
+            "[flush_turn] sending %d chars (%d items) route=%s preview=%r",
+            len(html_text), len(turn_items), state.route, html_text[:160],
         )
+        if "<tool_call>" in html_text or "&lt;tool_call&gt;" in html_text:
+            logger.warning(
+                "[flush_turn] textual tool call in assistant text (unparsed model tool call) "
+                "route=%s session_id=%s model=%s",
+                state.route, state.session_id, state.session_manager.effective_model,
+            )
         sent_messages = await self._send_html(
             route=state.route,
             bot=bot,
