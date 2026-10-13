@@ -771,6 +771,9 @@ class TelegramBot:
         self._background_task: asyncio.Task | None = None
         self._schedule_poller_task: asyncio.Task | None = None
         self._idle_evict_task: asyncio.Task | None = None
+        self._cli_hang_task: asyncio.Task | None = None
+        self._cli_hang_samples: dict[tuple[TelegramRoute, int], dict[str, float | None]] = {}
+        self._cli_hang_kills: dict[TelegramRoute, list[float]] = {}
         self._transport_queue: asyncio.PriorityQueue[_TransportEnvelope] = asyncio.PriorityQueue()
         self._transport_sequence = 0
         self._transport_worker_task: asyncio.Task | None = None
@@ -5577,6 +5580,8 @@ class TelegramBot:
             and (self._idle_evict_task is None or self._idle_evict_task.done())
         ):
             self._idle_evict_task = asyncio.create_task(self._idle_evict_loop())
+        if _cli_hang_watchdog_seconds() > 0 and (self._cli_hang_task is None or self._cli_hang_task.done()):
+            self._cli_hang_task = asyncio.create_task(self._cli_hang_watchdog_loop())
 
     async def _idle_evict_loop(self, interval: float = 60.0) -> None:
         """Periodic idle-CLI sweep so eviction does not wait for a fork completion."""
@@ -5587,9 +5592,130 @@ class TelegramBot:
             except Exception:
                 logger.warning("Claude idle process eviction sweep failed", exc_info=True)
 
+    async def _cli_hang_watchdog_loop(self, interval: float = 60.0) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._cli_hang_sweep()
+            except Exception:
+                logger.warning("[cli_hang_watchdog] sweep failed", exc_info=True)
+
+    async def _cli_hang_sweep(self, *, now: float | None = None, read_cpu=None) -> int:
+        """Kill a running turn's Claude CLI that spins without making progress.
+
+        Seen 2026-10-12/13: a CLI stopped emitting output mid-turn while burning
+        a full core (21 h on topic 83366, holding the route busy so every later
+        message queued forever). A CLI that waits on the API, a tool subprocess
+        or a hook uses almost no CPU itself, so "own CPU >= 80% of a core and the
+        session JSONL unchanged for the whole window" only matches a hang.
+
+        The kill goes through the normal CLI-exit path: the runner reconnects
+        with ``resume`` and asks the model to continue. A second hang of the
+        same route within 3 h ends the turn instead and says so in the topic.
+        Long no-output stretches are also logged as ``[cli_stall]`` (no action)
+        so stalls that are not CPU spins are visible next time.
+        """
+        threshold = _cli_hang_watchdog_seconds()
+        if threshold <= 0:
+            return 0
+        now = time.time() if now is None else now
+        read_cpu = read_cpu or _read_proc_cpu_seconds
+        live: set[tuple[TelegramRoute, int]] = set()
+        killed = 0
+        for route, state in list(self._states_by_route.items()):
+            if not (state.busy or state.hook_state.execution_active):
+                continue
+            client = state.session_manager._client
+            process = getattr(getattr(client, "_transport", None), "_process", None)
+            pid = getattr(process, "pid", None)
+            if not isinstance(pid, int) or getattr(process, "returncode", None) is not None:
+                continue
+            cpu = read_cpu(pid)
+            if cpu is None:
+                continue
+            key = (route, pid)
+            live.add(key)
+            mtime = self._session_jsonl_mtime(state.session_id)
+            sample = self._cli_hang_samples.get(key)
+            if sample is None or sample.get("mtime") != mtime:
+                self._cli_hang_samples[key] = {"since": now, "cpu0": cpu, "mtime": mtime, "last_log": now}
+                continue
+            stalled = now - float(sample["since"] or now)
+            busy = (cpu - float(sample["cpu0"] or 0.0)) / max(stalled, 1.0)
+            if stalled >= 600 and now - float(sample["last_log"] or now) >= 600:
+                sample["last_log"] = now
+                logger.warning(
+                    "[cli_stall] route=%s session_id=%s pid=%s no JSONL progress for %.0fs cpu=%.0f%%",
+                    route, state.session_id, pid, stalled, busy * 100,
+                )
+            if stalled >= threshold and busy >= 0.8:
+                self._cli_hang_samples.pop(key, None)
+                await self._kill_hung_cli(state, pid=pid, stalled=stalled, busy=busy, now=now)
+                killed += 1
+        for key in list(self._cli_hang_samples):
+            if key not in live:
+                self._cli_hang_samples.pop(key, None)
+        return killed
+
+    def _session_jsonl_mtime(self, session_id: str | None) -> float | None:
+        if not session_id:
+            return None
+        try:
+            path = find_session_jsonl(session_id=session_id, cwd=self._config.vault_path)
+            return path.stat().st_mtime if path is not None else None
+        except OSError:
+            return None
+
+    async def _kill_hung_cli(
+        self, state: TelegramSessionState, *, pid: int, stalled: float, busy: float, now: float,
+    ) -> None:
+        recent = [t for t in self._cli_hang_kills.get(state.route, []) if now - t < 3 * 3600]
+        recent.append(now)
+        self._cli_hang_kills[state.route] = recent
+        give_up = len(recent) >= 2
+        logger.warning(
+            "[cli_hang_watchdog] killing hung Claude CLI route=%s session_id=%s pid=%s "
+            "no_progress=%.0fs cpu=%.0f%% action=%s",
+            state.route, state.session_id, pid, stalled, busy * 100,
+            "end_turn" if give_up else "resume",
+        )
+        if give_up:
+            # Same effect as /stop: the CLI exit ends the turn, no auto-resume.
+            state.hook_state.stop_requested_at = time.time()
+        try:
+            await asyncio.to_thread(_maint.kill_process_tree, int(pid))
+        except Exception:
+            logger.warning("[cli_hang_watchdog] process-tree kill failed pid=%s", pid, exc_info=True)
+        session_mgr = state.session_manager
+        try:
+            await asyncio.wait_for(session_mgr.disconnect_idle_client(direct_kill=True), timeout=10.0)
+        except Exception:
+            logger.warning("[cli_hang_watchdog] locked kill failed; killing without the session lock", exc_info=True)
+            try:
+                await session_mgr._direct_kill_client_process_unlocked()
+            except Exception:
+                logger.warning("[cli_hang_watchdog] direct kill failed route=%s", state.route, exc_info=True)
+        bot = state.last_bot or self._primary_bot
+        if bot is None:
+            return
+        minutes = int(stalled // 60)
+        text = (
+            f"The Claude CLI for this topic hung again (no progress for {minutes} min at full CPU) "
+            "and was stopped. Send a message to continue; use /clear if it keeps hanging."
+            if give_up
+            else f"The Claude CLI for this topic hung (no progress for {minutes} min at full CPU); "
+            "restarted it and resumed the turn."
+        )
+        try:
+            await self._send_system_message(
+                route=state.route, bot=bot, text=text, disable_notification=True, max_attempts=1,
+            )
+        except Exception:
+            logger.debug("[cli_hang_watchdog] notice failed route=%s", state.route, exc_info=True)
+
     async def shutdown(self) -> None:
         """Stop background tasks owned by this adapter."""
-        for task in [self._crash_snapshot_task, self._idle_evict_task, *self._stop_escalation_tasks]:
+        for task in [self._crash_snapshot_task, self._idle_evict_task, self._cli_hang_task, *self._stop_escalation_tasks]:
             if task is not None and not task.done():
                 task.cancel()
                 try:
@@ -11867,6 +11993,25 @@ async def _run_telegram_bot_once(config: OBSConfig, *, first_start: bool = True)
                 )
     finally:
         await _shutdown_telegram_runtime(app=app, tg_bot=tg_bot)
+
+
+def _cli_hang_watchdog_seconds() -> float:
+    """Seconds a turn's CLI may spin at full CPU without JSONL progress (0 = off)."""
+    raw = (os.environ.get("OBS_CLI_HANG_WATCHDOG_SECONDS") or "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else 900.0
+    except ValueError:
+        return 900.0
+
+
+def _read_proc_cpu_seconds(pid: int) -> float | None:
+    """User+system CPU seconds of one process (not its children), or None."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        fields = raw[raw.rindex(")") + 2:].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _stop_kill_grace_seconds() -> float:

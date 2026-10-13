@@ -31,3 +31,91 @@ def ensure_raw_uuid_patch() -> None:
 
     message_parser.parse_message = _parse_with_uuid
     _PATCHED = True
+
+
+_QUERY_CLOSE_PATCHED = False
+QUERY_CLOSED_ERROR = "Claude SDK query closed while a response was pending"
+
+
+def ensure_query_close_patch() -> None:
+    """Make ``Query.close()`` safe when called from a task other than the starter.
+
+    OBS starts each client in a detached task (``session.py`` runs
+    ``asyncio.create_task(client.connect())``), so the SDK's anyio task group is
+    entered in a task that finishes right away, and every later ``close()`` runs
+    in a different task. The stock ``close()`` then:
+
+    - raises RuntimeError from the task group's ``__aexit__`` (a cancel scope
+      cannot be exited from another task), which skips ``transport.close()``;
+    - leaves the cancelled scope rescheduling ``_deliver_cancellation`` on every
+      event-loop iteration forever, because its finished host task stays in
+      ``scope._tasks`` (one leaked spinner per disconnect; 350 of them pegged
+      the prod loop at 100% CPU on 2026-10-13);
+    - cancels the reader before it can send its ``end`` sentinel, so a turn
+      waiting in ``receive_messages()`` never wakes. After a stop escalation
+      killed a stuck CLI, that held the route lock forever (dead topics 16234
+      and 83366, 2026-10-13).
+
+    The patched ``close()`` first wakes any waiting consumer with an error item
+    (the SDK raises it as an ``Exception``, which the runner treats like a CLI
+    exit), cancels the group, exits it normally when it can, and otherwise waits
+    briefly for the group's own child tasks to finish cancelling and then drops
+    the finished host task so anyio stops re-delivering. It always closes the
+    transport.
+    """
+
+    global _QUERY_CLOSE_PATCHED
+    if _QUERY_CLOSE_PATCHED:
+        return
+
+    import asyncio
+    from contextlib import suppress
+
+    import anyio
+    from claude_agent_sdk._internal.query import Query
+
+    original_close = Query.close
+
+    def _wake_receivers(query) -> None:
+        send = query._message_send
+        with suppress(Exception):
+            send.send_nowait({"type": "error", "error": QUERY_CLOSED_ERROR})
+        with suppress(Exception):
+            send.close()
+
+    async def _release_orphaned_scope(scope, host) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 1.0
+        while loop.time() < deadline:
+            if not any(t is not host and not t.done() for t in list(scope._tasks)):
+                break
+            await asyncio.sleep(0.01)
+        scope._tasks.discard(host)
+        handle = getattr(scope, "_cancel_handle", None)
+        if handle is not None and not any(not t.done() for t in scope._tasks):
+            handle.cancel()
+            scope._cancel_handle = None
+
+    async def _close(self) -> None:
+        self._closed = True
+        _wake_receivers(self)
+        tg = self._tg
+        try:
+            if tg is not None:
+                scope = tg.cancel_scope
+                scope.cancel()
+                host = getattr(scope, "_host_task", None)
+                if host is None or host is asyncio.current_task():
+                    with suppress(anyio.get_cancelled_exc_class()):
+                        await tg.__aexit__(None, None, None)
+                elif host.done():
+                    await _release_orphaned_scope(scope, host)
+                else:
+                    with suppress(anyio.get_cancelled_exc_class(), RuntimeError):
+                        await tg.__aexit__(None, None, None)
+        finally:
+            await self.transport.close()
+
+    _close._obs_original = original_close  # type: ignore[attr-defined]
+    Query.close = _close
+    _QUERY_CLOSE_PATCHED = True
