@@ -1,6 +1,6 @@
 """Maintenance restart and crash resume: snapshot running agents, resume them.
 
-Three ways OBS can go down, and what comes back:
+OBS shutdown/restart paths and what comes back:
 
 * **Maintenance restart (the default for planned restarts).** Telegram
   ``/restart`` (alias ``/maintenance_restart``), SIGUSR1 to ``telegram_main``,
@@ -15,7 +15,12 @@ Three ways OBS can go down, and what comes back:
   start the routes in it resume with a "restarted unexpectedly" note. A
   SIGTERM (supervisord stop, plain restart) discards that snapshot first, and
   the supervisord wrapper leaves a kill-switch sentinel as a second guard, so
-  the kill switch never resumes anything.
+  ordinary kill-switch stops do not resume the crash snapshot.
+* **Intentional shutdown.** ``/shutdown`` leaves OBS stopped with no resume;
+  ``/shutdown_autoresume`` saves a durable ``shutdown-resume.json`` checkpoint
+  before stopping. Only that explicitly staged checkpoint has no age limit.
+  The host recovery timer respects the shutdown latch until the wrapper clears
+  it on the next explicit start or boot autostart.
 
 For a maintenance restart the running daemon:
 
@@ -27,8 +32,8 @@ For a maintenance restart the running daemon:
    OBS back, with the same effect as a plain restart for the CLI children.
 
 On startup the new daemon renames the marker to ``*.consumed`` *before* acting
-on it, so a crash loop can never resurrect agents twice. It ignores markers
-and crash snapshots whose last write is older than
+on it and fsyncs the directory, so a crash loop cannot replay the same marker.
+It ignores ordinary maintenance markers and crash snapshots whose last write is older than
 :data:`DEFAULT_MAX_AGE_SECONDS` (5 minutes): a quick crash plus supervisord
 autorestart resumes, while a server that stayed down longer (unplugged,
 stopped) resumes nothing. It then resumes each recorded
@@ -44,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess
@@ -54,6 +60,9 @@ from pathlib import Path
 
 MARKER_FILENAME = "maintenance-resume.json"
 CRASH_SNAPSHOT_FILENAME = "crash-resume.json"
+SHUTDOWN_MARKER_FILENAME = "shutdown-resume.json"
+SHUTDOWN_SENTINEL_ENV = "OBS_SHUTDOWN_SENTINEL"
+SHUTDOWN_SENTINEL_FILENAME = "obs-telegram-prod.shutdown"
 CONSUMED_SUFFIX = ".consumed"
 KILLSWITCH_SUFFIX = ".killswitch"
 KILLSWITCH_SENTINEL_ENV = "OBS_KILLSWITCH_SENTINEL"
@@ -116,6 +125,23 @@ def crash_snapshot_path(state_dir: Path) -> Path:
     return Path(state_dir) / CRASH_SNAPSHOT_FILENAME
 
 
+def shutdown_marker_path(state_dir: Path) -> Path:
+    return Path(state_dir) / SHUTDOWN_MARKER_FILENAME
+
+
+def shutdown_sentinel_path(state_dir: Path) -> Path:
+    return Path(os.environ.get(SHUTDOWN_SENTINEL_ENV) or Path(state_dir) / SHUTDOWN_SENTINEL_FILENAME)
+
+
+def discard_resume_markers(state_dir: Path) -> None:
+    """A plain stop must also cancel any previously staged maintenance resume."""
+    for path in (marker_path(state_dir), shutdown_marker_path(state_dir)):
+        try:
+            os.replace(path, path.with_name(path.name + KILLSWITCH_SUFFIX))
+        except FileNotFoundError:
+            pass
+
+
 def discard_crash_snapshot(state_dir: Path) -> bool:
     """Kill switch: move the crash snapshot aside so the next start resumes nothing.
 
@@ -173,23 +199,10 @@ def _write_age_seconds(path: Path, requested_at: float, now: float) -> float:
     return age
 
 
-def peek_requested_at(path: Path, *, now: float | None = None, max_age_seconds: float) -> float | None:
-    """Read a marker's ``requested_at`` without consuming it (None if absent/stale)."""
-    try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return None
-    if not isinstance(raw, dict) or int(raw.get("version", 0) or 0) != MARKER_VERSION:
-        return None
-    try:
-        requested_at = float(raw.get("requested_at") or 0.0)
-    except (TypeError, ValueError):
-        return None
-    current = time.time() if now is None else now
-    age = _write_age_seconds(Path(path), requested_at, current)
-    if age < 0 or age > max_age_seconds:
-        return None
-    return requested_at
+def peek_requested_at(path: Path, *, now: float | None = None, max_age_seconds: float | None) -> float | None:
+    """Read a marker's original ``requested_at`` without consuming it."""
+    marker = peek_marker(path, now=now, max_age_seconds=max_age_seconds)
+    return marker.requested_at if marker is not None else None
 
 
 def is_local_model(model: str | None) -> bool:
@@ -198,12 +211,20 @@ def is_local_model(model: str | None) -> bool:
 
 
 def write_marker(path: Path, marker: ResumeMarker) -> Path:
-    """Write the marker atomically (tmp file + rename)."""
+    """Write the marker atomically and durably before shutdown."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(asdict(marker), ensure_ascii=True, indent=2), encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as stream:
+        json.dump(asdict(marker), stream, ensure_ascii=True, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(tmp, path)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
     return path
 
 
@@ -238,7 +259,7 @@ def consume_marker(
     path: Path,
     *,
     now: float | None = None,
-    max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS,
+    max_age_seconds: float | None = DEFAULT_MAX_AGE_SECONDS,
 ) -> tuple[ResumeMarker | None, str]:
     """Rename the marker to ``*.consumed`` first, then parse it.
 
@@ -253,6 +274,11 @@ def consume_marker(
     consumed = path.with_name(path.name + CONSUMED_SUFFIX)
     try:
         os.replace(path, consumed)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except OSError as exc:
         return None, f"rename_failed:{exc}"
     try:
@@ -267,17 +293,24 @@ def _marker_from_raw(
     *,
     path: Path,
     now: float | None,
-    max_age_seconds: float,
+    max_age_seconds: float | None,
 ) -> tuple[ResumeMarker | None, str]:
-    if not isinstance(raw, dict) or int(raw.get("version", 0) or 0) != MARKER_VERSION:
+    if not isinstance(raw, dict):
+        return None, "unsupported_version"
+    try:
+        if int(raw.get("version", 0) or 0) != MARKER_VERSION:
+            return None, "unsupported_version"
+    except (TypeError, ValueError):
         return None, "unsupported_version"
     try:
         requested_at = float(raw.get("requested_at") or 0.0)
     except (TypeError, ValueError):
         return None, "unreadable:requested_at"
+    if not math.isfinite(requested_at):
+        return None, "unreadable:requested_at"
     current = time.time() if now is None else now
     age = _write_age_seconds(path, requested_at, current)
-    if age < 0 or age > max_age_seconds:
+    if age < 0 or (max_age_seconds is not None and age > max_age_seconds):
         return None, f"stale:{int(age)}s"
     entries: list[ResumeEntry] = []
     for item in raw.get("entries") or []:
@@ -304,7 +337,7 @@ def _marker_from_raw(
     )
 
 
-def peek_marker(path: Path, *, now: float | None = None, max_age_seconds: float) -> ResumeMarker | None:
+def peek_marker(path: Path, *, now: float | None = None, max_age_seconds: float | None) -> ResumeMarker | None:
     """Parse a fresh marker without consuming it (None if absent, stale or unreadable)."""
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -345,6 +378,8 @@ def build_resume_prompt(
         cause = (
             f"OBS restarted unexpectedly (a crash, e.g. out of memory) shortly after {stamp}"
             if kind == "crash"
+            else f"OBS was shut down with auto-resume staged at {stamp} and has now started again"
+            if kind == "shutdown"
             else f"OBS was restarted for maintenance at {stamp}"
         )
         lines = [
@@ -364,6 +399,11 @@ def build_resume_prompt(
         lines = [
             f"(System: OBS restarted unexpectedly (a crash, e.g. out of memory) shortly after "
             f"{stamp}. Your turn was most likely still in progress and was cut off mid-way.)",
+        ]
+    elif kind == "shutdown":
+        lines = [
+            f"(System: OBS was shut down with auto-resume staged at {stamp} while your turn was "
+            "in progress and has now started again; the turn was cut off mid-way.)",
         ]
     else:
         lines = [
@@ -628,6 +668,25 @@ def find_daemon_pids(
     return matches
 
 
+def stop_daemon(*, run=subprocess.run) -> None:
+    """Stop via Supervisor without autorestart, raising if the stop fails.
+
+    Deliberately synchronous: no new daemon turn is admitted between its final
+    checkpoint and the stop. On success this process is terminated by Supervisor;
+    on failure the caller remains alive and can unstage the checkpoint/latch.
+    The control client has its own session so the group stop cannot kill it.
+    """
+    run(
+        ["supervisorctl", "stop", DAEMON_SUPERVISOR_PROCESS],
+        check=True,
+        timeout=15,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def plain_restart(*, popen=subprocess.Popen) -> int:
     """Kill-switch restart: ``supervisorctl restart obs-telegram-prod``, resuming nothing.
 
@@ -672,7 +731,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.status:
         found = False
-        for base in (marker_path(Path(args.status)), crash_snapshot_path(Path(args.status))):
+        for base in (shutdown_marker_path(Path(args.status)), marker_path(Path(args.status)), crash_snapshot_path(Path(args.status))):
             for candidate in (
                 base,
                 base.with_name(base.name + CONSUMED_SUFFIX),

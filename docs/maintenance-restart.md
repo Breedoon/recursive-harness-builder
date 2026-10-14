@@ -1,4 +1,4 @@
-# Restarting OBS: maintenance restart (default), plain restart (kill switch), crash resume
+# OBS restart and shutdown: maintenance, kill switch, durable shutdown resume, crash recovery
 
 History: the opt-in maintenance restart was added 2026-09-25 on Daniel's request
 (OBS `0c85907`, `4c84f0e`, `5e8a93a`). On 2026-09-26 Daniel asked to make it the
@@ -6,7 +6,62 @@ default for planned restarts, with a flag for the plain restart, and to cover
 crashes too ("crashes do randomly kill agents like that sometimes"). That is
 this version (vault-u3b.70).
 
-## The three ways OBS goes down
+## Planned shutdown for computer maintenance
+
+- **`/shutdown`** stops OBS only. The computer and container stay on. No interrupted
+  agents auto-resume when OBS next starts.
+- **`/shutdown_autoresume`** stops OBS only after saving all active, non-stopped
+  agents to a durable one-shot `shutdown-resume.json` checkpoint. At the next OBS
+  startup they resume, **without a time limit**, even if the computer was off for
+  days. Idle agents are not started just because they exist.
+- Both commands are global (not topic/tree scoped), use the existing authorized
+  user allowlist, and take no arguments. They do not power off the host.
+- For computer maintenance: send `/shutdown_autoresume`, wait for the staged
+  confirmation, then shut down the computer gracefully by its normal controls.
+  Docker/container boot startup and Supervisor autostart launch OBS when the
+  computer returns. Do not explicitly Docker-stop the `unless-stopped` container
+  as a substitute for host shutdown, because that prevents its boot autostart.
+- If the computer is staying on, explicitly start OBS with
+  `supervisorctl start obs-telegram-prod` inside the container. OBS cannot receive
+  Telegram commands while it is stopped.
+- Resume is continuation from saved conversation state, not process suspension.
+  An in-flight command may have completed its side effect; the appended resume
+  note tells each agent to verify before repeating it.
+
+The daemon writes and fsyncs its checkpoint and shutdown latch before launching
+`supervisorctl stop obs-telegram-prod` in a detached session. Supervisor leaves the
+program `STOPPED`, rather than autorestarting it. The host's 20-second recovery
+timer checks the latch and must not undo that intentional stop. The wrapper
+clears the latch only when a new OBS launch actually occurs; it does not delete
+the resume checkpoint. On startup the daemon consumes the checkpoint before
+acting, retaining its original shutdown timestamp for outage inbox handling and
+late-parent-callback attribution. `/shutdown` and `/restart plain` discard any
+pending shutdown or ordinary maintenance checkpoint.
+
+The checkpoint is refreshed after the confirmation send and delay, immediately
+before the stop, so agents that completed or were explicitly stopped during that
+wait are excluded, and newly active turns/queued messages are included. The final
+snapshot-to-stop section is synchronous (no event-loop admission gap). The
+Supervisor client survives in its own process session and its exit status is
+checked; a preparation/control failure while OBS is still alive removes the
+staged checkpoint/latch, re-enables normal operation and reports the failure.
+
+Deployment must include both companion scripts, installed atomically (never edit
+a running wrapper in place):
+
+- `deploy/obs-telegram-prod-wrapper.sh` →
+  `/workspace/runtime/bin/obs-telegram-prod-wrapper.sh` in the container.
+- `deploy/ensure-obs-test-running.sh` →
+  `/home/breedoon/infrastructure/obs-test/ensure-obs-test-running.sh` on the host.
+
+The container latch defaults to `/workspace/runtime/state/obs-telegram-prod.shutdown`
+(`OBS_SHUTDOWN_SENTINEL`). Its bind-mounted host path defaults to
+`/data/scratch/obs-test/runtime/state/obs-telegram-prod.shutdown`
+(`OBS_TELEGRAM_PROD_SHUTDOWN_FILE` in the host recovery script). These must name the
+same file if the runtime mount or configuration changes. The existing independent
+host/container recovery-disable files retain their previous behavior.
+
+## Restart and crash paths (unchanged five-minute window)
 
 - **Maintenance restart — the default for planned restarts.** Agents that are
   mid-turn are snapshotted and resumed automatically after the restart.
@@ -26,10 +81,10 @@ this version (vault-u3b.70).
     obs-telegram-prod` themselves.
   - `/stop`, `/stop_branch` and `/stop_tree` still stop agents, and **stopped
     agents are never resumed** by any restart or crash.
-  - **Keep OBS down for more than 5 minutes** (unplug the server, stop the
-    container, `supervisorctl stop obs-telegram-prod` and wait): nothing
-    resumes, whatever kind of snapshot was left behind. See the 5-minute
-    window below.
+  - **Keep OBS down for more than 5 minutes:** ordinary maintenance and crash
+    snapshots do not resume. The explicitly staged `/shutdown_autoresume`
+    checkpoint is the sole no-expiry exception; ordinary graceful shutdown still
+    clears crash recovery and does not automatically stage a durable checkpoint.
 - **Crash** (out-of-memory kill, the cache-proxy watchdog, an unhandled exit):
   agents that were mid-turn resume automatically, like a maintenance restart,
   with a note saying OBS restarted unexpectedly.
@@ -66,9 +121,9 @@ this version (vault-u3b.70).
 
 1. The kill-switch sentinel is consumed; if it was present, the crash snapshot
    is discarded.
-2. `maintenance-resume.json` and `crash-resume.json` are each **renamed to
-   `*.consumed` before anything acts on them**, so a crash loop can never
-   replay them.
+2. `shutdown-resume.json`, `maintenance-resume.json` and `crash-resume.json`
+   are each **renamed to `*.consumed` and directory-fsynced before anything acts
+   on them**, so a crash loop cannot replay the same checkpoint.
 3. **5-minute window (Daniel, 2026-09-26 11:02Z):** a maintenance marker or
    crash snapshot resumes only if its **last write is at most 5 minutes old**
    when the new daemon starts (`OBS_MAINTENANCE_RESUME_MAX_AGE_SECONDS`,
@@ -78,7 +133,9 @@ this version (vault-u3b.70).
    Age = time since the older of the file's `requested_at` stamp and its
    mtime. Files outside the window,
    corrupt files and unknown versions are ignored.
-4. A maintenance marker wins; otherwise the crash snapshot is used.
+4. An explicit durable shutdown checkpoint wins regardless of outage length;
+   otherwise a fresh maintenance marker wins, then a fresh crash snapshot.
+   Corrupt, unsupported-version, non-finite or future-dated markers are ignored.
 5. Each recorded route gets a new turn in its own topic:
    - A note comes first: "restarted for maintenance" or "restarted
      unexpectedly (a crash…)". It tells the agent that a tool call in flight
@@ -222,6 +279,7 @@ times on 2026-09-24/25 (vault-u3b.73).
 - Daemon, in `src/obs_agent/telegram.py`: `TelegramBot.start_maintenance_resume`,
   `write_crash_snapshot`, `start_crash_snapshot_writer`,
   `request_maintenance_restart`, `request_plain_restart`, `handle_restart`,
+  `request_shutdown`, `handle_shutdown`, `handle_shutdown_autoresume`,
   `_mark_stop_requested` / `_escalate_stop`, `_compute_outage_inbox_floor`,
   `_restored_record_owes_callback` / `_owed_callback_deliverable` (late
   callbacks, applied in `_restore_state_from_store` and
@@ -233,5 +291,6 @@ times on 2026-09-24/25 (vault-u3b.73).
 - Tests: `tests/test_maintenance_restart.py`, `tests/test_crash_resume.py`,
   `tests/test_restore_late_callbacks.py` (late callbacks and session-id
   coverage),
-  `tests/test_prod_wrapper.py` (fake daemon; never touches port 28925), and
+  `tests/test_prod_wrapper.py` (fake daemon; never touches port 28925),
+  `tests/test_shutdown.py` (mocked process control, durable restore, fake host recovery), and
   the fixture `tests/fixtures/maintenance-resume-19ddec9.json`.

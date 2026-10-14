@@ -138,6 +138,8 @@ _TELEGRAM_HELP_TEXT = """Usage:
 /stop_tree — interrupt the entire agent tree, including its trunk
 /restart — restart OBS and auto-resume agents that were mid-turn (alias /maintenance_restart)
 /restart plain — kill-switch restart: nothing is resumed
+/shutdown — stop OBS only; no agents auto-resume at the next startup
+/shutdown_autoresume — stop OBS only; save running agents for one-time resume at the next startup, with no expiry
 /fork [name] — create a new topic from this head or a replied message
 /new [name] — reset this topic into a new trunk agent
 /clear — clear this topic but keep its agent identity
@@ -1963,7 +1965,10 @@ class TelegramBot:
         previous files), so the set cannot reach back to an older outage.
         """
         max_age = _maint.max_age_from_env()
-        markers = [_maint.peek_marker(self._maintenance_marker_path(), max_age_seconds=max_age)]
+        markers = [
+            _maint.peek_marker(self._shutdown_marker_path(), max_age_seconds=None),
+            _maint.peek_marker(self._maintenance_marker_path(), max_age_seconds=max_age),
+        ]
         sentinel = os.environ.get(_maint.KILLSWITCH_SENTINEL_ENV)
         if not (sentinel and Path(sentinel).exists()):
             markers.append(_maint.peek_marker(self._crash_snapshot_path(), max_age_seconds=max_age))
@@ -2030,6 +2035,9 @@ class TelegramBot:
 
     def _maintenance_marker_path(self) -> Path:
         return _maint.marker_path(Path(self._config.telegram_state_db_path).parent)
+
+    def _shutdown_marker_path(self) -> Path:
+        return _maint.shutdown_marker_path(self._state_dir())
 
     def _state_model_name(self, state: TelegramSessionState) -> str:
         return str(state.session_manager.model_override or self._config.model or "")
@@ -2161,7 +2169,8 @@ class TelegramBot:
         """Last-alive time of the previous daemon when its restart was not a kill switch."""
         max_age = _maint.max_age_from_env()
         candidates = [
-            _maint.peek_requested_at(self._maintenance_marker_path(), max_age_seconds=max_age)
+            _maint.peek_requested_at(self._shutdown_marker_path(), max_age_seconds=None),
+            _maint.peek_requested_at(self._maintenance_marker_path(), max_age_seconds=max_age),
         ]
         sentinel = os.environ.get(_maint.KILLSWITCH_SENTINEL_ENV)
         if not (sentinel and Path(sentinel).exists()):
@@ -2219,12 +2228,19 @@ class TelegramBot:
         killswitch = _maint.consume_killswitch_sentinel(
             os.environ.get(_maint.KILLSWITCH_SENTINEL_ENV)
         )
+        shutdown, shutdown_reason = _maint.consume_marker(
+            self._shutdown_marker_path(), max_age_seconds=None,
+        )
+        if shutdown is None and shutdown_reason != "no_marker":
+            logger.warning("[shutdown_resume] marker ignored reason=%s", shutdown_reason)
         marker, reason = _maint.consume_marker(
             self._maintenance_marker_path(),
             max_age_seconds=max_age,
         )
         if marker is None and reason != "no_marker":
             logger.warning("[maintenance_restart] marker ignored reason=%s", reason)
+        if shutdown is not None:
+            marker = shutdown
         crash: _maint.ResumeMarker | None = None
         if include_crash:
             if killswitch and _maint.discard_crash_snapshot(self._state_dir()):
@@ -2238,7 +2254,7 @@ class TelegramBot:
                     "[crash_resume] maintenance marker present; crash snapshot not used routes=%d",
                     len(crash.entries),
                 )
-            kind = "maintenance"
+            kind = "shutdown" if shutdown is not None else "maintenance"
         elif crash is not None:
             limit = _maint.crash_max_consecutive_from_env()
             kept: list[_maint.ResumeEntry] = []
@@ -2262,7 +2278,7 @@ class TelegramBot:
             return None
         logger.warning(
             "[%s] resuming routes=%d source=%s requested_at=%.0f",
-            "maintenance_restart" if kind == "maintenance" else "crash_resume",
+            "shutdown_resume" if kind == "shutdown" else "maintenance_restart" if kind == "maintenance" else "crash_resume",
             len(marker.entries),
             marker.source,
             marker.requested_at,
@@ -2360,6 +2376,8 @@ class TelegramBot:
                 html_text=(
                     "crash recovery: OBS restarted unexpectedly; resuming the turn that was cut off"
                     if kind == "crash"
+                    else "shutdown recovery: OBS started again; resuming the saved turn"
+                    if kind == "shutdown"
                     else "maintenance restart: resuming the turn that was cut off"
                 ),
                 disable_notification=True,
@@ -2489,11 +2507,109 @@ class TelegramBot:
             source=f"telegram:/restart plain user={update.effective_user.id}",
         )
 
+    async def handle_shutdown(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._handle_shutdown(update, context, autoresume=False)
+
+    async def handle_shutdown_autoresume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._handle_shutdown(update, context, autoresume=True)
+
+    async def _handle_shutdown(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, *, autoresume: bool,
+    ) -> None:
+        if update.effective_user is None or update.effective_message is None:
+            return
+        if not self._is_authorized(update.effective_user.id):
+            return
+        command = "shutdown_autoresume" if autoresume else "shutdown"
+        route = self._route_for_message(update.effective_message)
+        if context.args:
+            await self._send_system_message(
+                route=route, bot=context.bot, text=f"usage: /{command}", disable_notification=True,
+            )
+            return
+        await self.request_shutdown(
+            route=route, bot=context.bot, autoresume=autoresume,
+            source=f"telegram:/{command} user={update.effective_user.id}",
+        )
+
+    def _stage_shutdown(self, *, autoresume: bool, source: str, requested_at: float) -> list[_maint.ResumeEntry]:
+        entries: list[_maint.ResumeEntry] = []
+        if autoresume:
+            entries = self._collect_maintenance_entries()
+            for entry in entries:
+                self._persist_state_for_route(TelegramRoute(entry.chat_id, entry.thread_id))
+            marker = _maint.ResumeMarker(
+                requested_at=requested_at, source=source, entries=entries,
+                inflight_task_ids=self._collect_inflight_task_ids(),
+            )
+            # Replace in place: the previous checkpoint remains durable until
+            # the refreshed checkpoint is successfully written and renamed.
+            _maint.write_marker(self._shutdown_marker_path(), marker)
+            self._maintenance_marker_path().unlink(missing_ok=True)
+        else:
+            _maint.discard_resume_markers(self._state_dir())
+        self.discard_crash_snapshot_for_kill_switch()
+        # The host recovery timer respects this latch. The wrapper clears it
+        # on its next explicit start or boot autostart, not on stop.
+        _maint.write_marker(
+            _maint.shutdown_sentinel_path(self._state_dir()),
+            _maint.ResumeMarker(requested_at, source, []),
+        )
+        return entries
+
+    async def request_shutdown(
+        self, *, route: TelegramRoute, bot: Any, autoresume: bool, source: str,
+        delay_seconds: float = 1.0,
+    ) -> int:
+        """Stage an optional durable checkpoint, then leave Supervisor STOPPED."""
+        if self._maintenance_restart_requested:
+            return 0
+        self._maintenance_restart_requested = True
+        requested_at = time.time()
+        try:
+            self._stage_shutdown(autoresume=autoresume, source=source, requested_at=requested_at)
+            try:
+                await self._send_system_message(
+                    route=route, bot=bot,
+                    text=(
+                        "shutdown: auto-resume staged. Stopping OBS only; the computer stays on. "
+                        "Agents still running at shutdown will resume once at the next OBS startup, "
+                        "even after a long outage."
+                        if autoresume else
+                        "shutdown: stopping OBS only; the computer stays on. No running agents will auto-resume."
+                    ),
+                    disable_notification=True,
+                )
+            except Exception:
+                logger.debug("shutdown notice failed", exc_info=True)
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+            # The notice/delay yielded to running agents and /stop commands.
+            # Refresh after all awaits, then synchronously stop: no new turn,
+            # completion or explicit stop can slip between checkpoint and stop.
+            entries = self._stage_shutdown(autoresume=autoresume, source=source, requested_at=requested_at)
+            logger.warning("[shutdown] requested source=%s autoresume=%s routes=%d", source, autoresume, len(entries))
+            _maint.stop_daemon()
+            return len(entries)
+        except Exception:
+            _maint.shutdown_sentinel_path(self._state_dir()).unlink(missing_ok=True)
+            _maint.discard_resume_markers(self._state_dir())
+            self._maintenance_restart_requested = False
+            self._crash_snapshot_disabled = False
+            logger.exception("[shutdown] preparation or Supervisor stop failed; OBS remains running")
+            await self._send_system_message(
+                route=route, bot=bot,
+                text="shutdown failed; OBS is still running and no auto-resume is staged.",
+                disable_notification=True,
+            )
+            return 0
+
     async def request_plain_restart(self, *, route: TelegramRoute, bot: Any, source: str, delay_seconds: float = 1.0) -> None:
         """Kill-switch restart from inside the daemon: discard every resume file, then exit."""
         if self._maintenance_restart_requested:
             return
         self._maintenance_restart_requested = True
+        _maint.discard_resume_markers(self._state_dir())
         self.discard_crash_snapshot_for_kill_switch()
         logger.warning("[plain_restart] requested source=%s; nothing will be resumed", source)
         try:
@@ -11832,6 +11948,8 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("stop_tree", bot.handle_stop_tree))
     app.add_handler(CommandHandler("maintenance_restart", bot.handle_maintenance_restart))
     app.add_handler(CommandHandler("restart", bot.handle_restart))
+    app.add_handler(CommandHandler("shutdown", bot.handle_shutdown))
+    app.add_handler(CommandHandler("shutdown_autoresume", bot.handle_shutdown_autoresume))
     app.add_handler(CommandHandler("model", bot.handle_model))
     app.add_handler(CommandHandler("effort", bot.handle_effort))
     app.add_handler(CommandHandler("session", bot.handle_session))
@@ -11891,6 +12009,8 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("stop_tree", "Interrupt the complete root team tree"),
         BotCommand("restart", "Restart OBS, auto-resuming mid-turn agents; '/restart plain' resumes nothing"),
         BotCommand("maintenance_restart", "Same as /restart: restart and auto-resume mid-turn agents"),
+        BotCommand("shutdown", "Stop OBS only; no running agents auto-resume at next startup"),
+        BotCommand("shutdown_autoresume", "Stop OBS only; save running agents for auto-resume at next startup, without expiry"),
         BotCommand("model", "Select model before the first message of a new or cleared session"),
         BotCommand("effort", "Show or set effort: low, medium, high, xhigh, max, auto"),
         BotCommand("session", "Show agent, model, files, runtime and hooks"),

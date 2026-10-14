@@ -46,6 +46,11 @@ export OBS_LOCAL_LLM_AUTH_TOKEN
 unset OBS_LOCAL_LLM_API_KEY
 KILLSWITCH_SENTINEL="${OBS_KILLSWITCH_SENTINEL:-/workspace/runtime/state/obs-telegram-prod.killswitch}"
 export OBS_KILLSWITCH_SENTINEL="$KILLSWITCH_SENTINEL"
+SHUTDOWN_SENTINEL="${OBS_SHUTDOWN_SENTINEL:-/workspace/runtime/state/obs-telegram-prod.shutdown}"
+export OBS_SHUTDOWN_SENTINEL="$SHUTDOWN_SENTINEL"
+# An explicit Supervisor start or boot autostart ends the intentional stop.
+# Clearing this never discards shutdown-resume.json: the daemon consumes it once.
+rm -f -- "$SHUTDOWN_SENTINEL"
 MAINTENANCE_EXIT_WAIT_SECONDS="${OBS_WRAPPER_MAINTENANCE_EXIT_WAIT_SECONDS:-30}"
 /workspace/obs/.venv/bin/python -m obs_agent.telegram_main --prod &
 child=$!

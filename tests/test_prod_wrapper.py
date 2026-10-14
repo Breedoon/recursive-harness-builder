@@ -69,6 +69,7 @@ def _start(tmp_path: Path, script: Path, mode: str, **extra_env) -> subprocess.P
         FAKE_OUT=str(out),
         FAKE_MODE=mode,
         OBS_KILLSWITCH_SENTINEL=str(tmp_path / "sentinel"),
+        OBS_SHUTDOWN_SENTINEL=str(tmp_path / "shutdown-sentinel"),
         OBS_WRAPPER_MAINTENANCE_EXIT_WAIT_SECONDS="2",
         **extra_env,
     )
@@ -182,3 +183,24 @@ def test_unresponsive_daemon_gets_sigkill_after_usr1(tmp_path, health_server):
     assert not (tmp_path / "sentinel").exists()  # crash path: snapshot resumes
     time.sleep(0.2)
     assert not _alive(cli)
+
+
+def test_start_clears_shutdown_latch_but_stop_preserves_new_latch(tmp_path, health_server):
+    latch = tmp_path / "shutdown-sentinel"
+    latch.write_text("previous shutdown")
+    checkpoint = tmp_path / "shutdown-resume.json"
+    checkpoint.write_text("checkpoint remains for the daemon")
+    proc = _start(tmp_path, _prepare(tmp_path, health_server.port), "normal")
+    try:
+        _wait_for(tmp_path / "out" / "cli.pid")
+        assert not latch.exists()
+        assert checkpoint.read_text() == "checkpoint remains for the daemon"
+        latch.write_text("new shutdown request")
+        os.killpg(proc.pid, signal.SIGTERM)
+        assert proc.wait(timeout=10) == 143
+        assert latch.read_text() == "new shutdown request"
+        assert checkpoint.exists()
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=10)
