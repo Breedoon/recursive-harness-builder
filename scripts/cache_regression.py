@@ -129,20 +129,29 @@ def run_one(args, provider: str, name: str, out_dir: Path) -> dict:
     return res
 
 
-def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, results: list,
-                       overall: str) -> None:
-    """gate.json: what scripts/cache_gate.py (vault-3px5) matches before a restart or merge."""
+def _code_identity() -> dict:
+    """Identity of the code under test, taken when the run STARTS (vault-3px5)."""
     try:
         sys.path.insert(0, str(REPO / "src"))
         from obs_agent.cache_gate import code_identity
-        code = code_identity(REPO)
+        return code_identity(REPO)
     except Exception as e:  # the report stays usable for humans even if identity fails
-        code = {"error": str(e)}
+        return {"error": str(e)}
+
+
+def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, results: list,
+                       overall: str) -> None:
+    """gate.json: what scripts/cache_gate.py (vault-3px5) matches before a restart or merge."""
+    code = ident.get("code") or _code_identity()
     providers = sorted({r["provider"] for r in results if r.get("status") == "PASS"})
     route_ok = {p: all(r.get("status") == "PASS" for r in results if r["provider"] == p)
                 for p in {r["provider"] for r in results}}
+    scenario_results: dict = {}
+    for r in results:
+        scenario_results.setdefault(r["provider"], {})[r["scenario"]] = r.get("status")
     report = {
         "result": overall,
+        "scenario_results": scenario_results,
         "providers": [p for p in providers if route_ok.get(p)],
         "scenarios": "all" if not args.scenarios else list(args.scenarios),
         "code": code,
@@ -173,6 +182,7 @@ def main(argv=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ident = identity(args.base_url)
+    ident["code"] = _code_identity()
     (out_dir / "identity.json").write_text(json.dumps(ident, indent=1))
     live = (ident.get("health") or {}).get("source_sha256")
     print(f"proxy {args.base_url}: " + (f"pid {ident['health'].get('pid')} loaded {live[:12]}"

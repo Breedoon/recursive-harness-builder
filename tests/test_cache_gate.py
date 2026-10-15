@@ -215,3 +215,34 @@ def test_regression_runner_writes_matching_gate_report(tmp_path):
     results[2]["status"] = "PROVIDER-ERROR"
     runner._write_gate_report(tmp_path, args=args, ident={}, live="abc", results=results, overall="INCONCLUSIVE")
     assert json.loads((tmp_path / "gate.json").read_text())["providers"] == ["anthropic"]
+
+
+def _report_with(root, repo, name, result, per, scenarios="all"):
+    out = root / name
+    out.mkdir(parents=True)
+    ident = cache_gate.code_identity(repo)
+    (out / "gate.json").write_text(json.dumps({
+        "result": result, "providers": [], "scenarios": scenarios, "scenario_results": per,
+        "code": ident, "proxy_source": ident["proxy_source_sha256"],
+    }))
+    return out
+
+
+def test_intermittent_fail_accepted_only_after_rerun_passes(repo, tmp_path):
+    import os
+    import time
+
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "src/obs_agent/session.py", "# CACHE-PREFIX WARNING\nY = 9\n")
+    reports = tmp_path / "reports"
+    full = _report_with(reports, repo, "a-full", "FAIL", {
+        "anthropic": {"baseline": "PASS", "recovery_multi": "FAIL"}, "codex": {"baseline": "PASS"}})
+    result = cache_gate.check(repo, base=base, report_root=reports)
+    assert not result.ok and "anthropic/recovery_multi=FAIL" in result.message
+    time.sleep(0.01)
+    rerun = _report_with(reports, repo, "b-rerun", "PASS", {"anthropic": {"recovery_multi": "PASS"}},
+                         scenarios=["recovery_multi"])
+    later = time.time() + 5
+    os.utime(rerun / "gate.json", (later, later))
+    result = cache_gate.check(repo, base=base, report_root=reports)
+    assert result.ok and result.report == full
