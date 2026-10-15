@@ -225,6 +225,23 @@ legacy `bodies/`) into the production directory unless you unset it:
 `env -u CACHE_PROXY_LOG_DIR -u CACHE_PROXY_SAVE_BODIES pytest ...`. The request
 log itself stays off on non-production ports unless forced.
 
+### Cold-cache guard on agent wakes (vault-vokl)
+
+When an agent's `SendInboxMessage`, `AgentTask resume=` or `AgentTask session_source=` would
+wake a session that has been idle longer than its provider's prompt-cache lifetime, OBS refuses
+it (tool outcome `cold_blocked`) and returns the target's transcript path, so the sender can
+search it with a cheap fork instead of re-billing the whole context. `allow_cold_wake=true` on
+the same call overrides. Human Telegram messages and scheduled wakes are never guarded.
+
+- Idle time = now minus the timestamp of the target's last assistant record in its JSONL (file
+  mtime as fallback). A target that is running is always warm.
+- `OBS_CACHE_READINESS_TTLS` — per model family, seconds or `off`. Default
+  `claude=3480,gpt=1800,local=off`: Claude cache entries live one hour and the guard subtracts a
+  2-minute margin; GPT caching fades gradually and 30 minutes is the soft border; local models
+  are not guarded.
+- Code: `src/obs_agent/cache_readiness.py`; wiring in `telegram.py`
+  (`_make_inbox_recipient_validator`, `_launch_fork_task`).
+
 ## Voice transcription
 
 Current runtime expects an executable transcription script:

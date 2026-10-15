@@ -75,6 +75,7 @@ from obs_agent.session_info import (
 )
 from obs_agent.telegram_format import md_to_telegram_html, split_message
 from obs_agent import schedule_scope as _schedule_scope
+from obs_agent import cache_readiness as _cache_readiness
 from obs_agent.telegram_ingest import TelegramInboundNormalizer
 from obs_agent.telegram_state_store import TelegramStateStore
 from obs_agent.telegram_userbot import TelegramUserbotProvisioner
@@ -3001,12 +3002,79 @@ class TelegramBot:
     def _make_inbox_recipient_validator(self, route: TelegramRoute):
         async def _validate(payload: dict[str, Any]) -> dict[str, Any]:
             _ = route
-            return self._recipient_delivery_status(
-                team_name=str(payload.get("team_name") or "").strip() or None,
-                agent_name=str(payload.get("recipient") or "").strip() or None,
-            )
+            team_name = str(payload.get("team_name") or "").strip() or None
+            agent_name = str(payload.get("recipient") or "").strip() or None
+            status = self._recipient_delivery_status(team_name=team_name, agent_name=agent_name)
+            if not status.get("deliverable") or payload.get("allow_cold_wake"):
+                return status
+            readiness = self._recipient_cache_readiness(team_name=team_name, agent_name=agent_name)
+            if readiness is not None and readiness.cold:
+                logger.info(
+                    "[cache_readiness] blocked inbox wake team=%s recipient=%s idle=%.0fs family=%s",
+                    team_name,
+                    agent_name,
+                    readiness.idle_seconds or 0,
+                    readiness.family,
+                )
+                return {
+                    "deliverable": False,
+                    "cold": True,
+                    "reason": _cache_readiness.cold_warning(
+                        readiness, action="message to", target=agent_name or "recipient"
+                    ),
+                    "transcript": str(readiness.jsonl_path) if readiness.jsonl_path else None,
+                }
+            return status
 
         return _validate
+
+    def _state_cache_readiness(
+        self,
+        *,
+        state: TelegramSessionState | None,
+        session_id: str | None,
+    ) -> "_cache_readiness.Readiness | None":
+        """Read-only cache-readiness of a target session (vault-vokl); None when unknown."""
+        session_id = session_id or (state.session_id if state is not None else None)
+        if not session_id:
+            return None
+        running = bool(state is not None and (state.busy or state.hook_state.execution_active))
+        model_hint = None
+        if state is not None:
+            try:
+                model_hint = state.session_manager.effective_model
+                if callable(model_hint):
+                    model_hint = model_hint()
+            except Exception:
+                model_hint = None
+        try:
+            jsonl_path = find_session_jsonl(session_id=session_id, cwd=self._config.vault_path)
+            return _cache_readiness.assess(
+                jsonl_path=jsonl_path,
+                model_hint=model_hint if isinstance(model_hint, str) else None,
+                running=running,
+            )
+        except Exception:
+            logger.debug("cache readiness check failed session=%s", session_id, exc_info=True)
+            return None
+
+    def _recipient_cache_readiness(
+        self,
+        *,
+        team_name: str | None,
+        agent_name: str | None,
+    ) -> "_cache_readiness.Readiness | None":
+        record = self._resolve_team_worker_record(team_name=team_name, agent_name=agent_name)
+        if record is not None:
+            state = self._get_state(record.child_route, create=False)
+            return self._state_cache_readiness(
+                state=state,
+                session_id=(state.session_id if state is not None else None) or record.child_session_id,
+            )
+        state = self._resolve_route_inbox_target(team_name=team_name, agent_name=agent_name)
+        if state is None:
+            return None
+        return self._state_cache_readiness(state=state, session_id=state.session_id)
 
     def _make_stop_event_notifier(self, route: TelegramRoute):
         async def _notify(payload: dict[str, Any]) -> None:
@@ -11208,9 +11276,27 @@ class TelegramBot:
         session_source_raw = str(args.get("session_source") or "").strip() or None
         if resume_task_id and session_source_raw:
             raise ValueError("resume and session_source are mutually exclusive")
+        allow_cold_wake = bool(args.get("allow_cold_wake"))
         if resume_task_id:
             if args.get("effort") is not None or "CLAUDE_CODE_EFFORT_LEVEL" in (args.get("env") or {}):
                 raise ValueError("resume preserves the child's effort; use /effort in its topic")
+            if not allow_cold_wake:
+                resume_record = self._fork_tasks_by_id.get(resume_task_id)
+                if resume_record is not None:
+                    child_state = self._get_state(resume_record.child_route, create=False)
+                    readiness = self._state_cache_readiness(
+                        state=child_state,
+                        session_id=(child_state.session_id if child_state is not None else None)
+                        or resume_record.child_session_id,
+                    )
+                    if readiness is not None and readiness.cold:
+                        raise ValueError(
+                            _cache_readiness.cold_warning(
+                                readiness,
+                                action="resume of",
+                                target=resume_record.agent_name or resume_task_id,
+                            )
+                        )
             return await self._resume_fork_task(
                 route=route,
                 state=state,
@@ -11247,6 +11333,28 @@ class TelegramBot:
                 explicit_session_source = True
                 source_session_id = source_descriptor.source_session_id
                 source_jsonl_path = source_descriptor.source_jsonl_path
+                if not allow_cold_wake and source_jsonl_path is not None:
+                    source_route_for_check = self._route_by_session_id.get(source_session_id or "")
+                    source_state = (
+                        self._get_state(source_route_for_check, create=False)
+                        if source_route_for_check is not None
+                        else None
+                    )
+                    readiness = _cache_readiness.assess(
+                        jsonl_path=source_jsonl_path,
+                        running=bool(
+                            source_state is not None
+                            and (source_state.busy or source_state.hook_state.execution_active)
+                        ),
+                    )
+                    if readiness.cold:
+                        raise ValueError(
+                            _cache_readiness.cold_warning(
+                                readiness,
+                                action="fork from",
+                                target=f"session {source_session_id}",
+                            )
+                        )
             else:
                 source_session_id, source_uuid, source_route, source_message_id = self._resolve_fork_source(
                     state=state

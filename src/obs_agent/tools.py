@@ -619,6 +619,10 @@ def create_obs_tools(
         description = display_name  # Internal payload still uses "description" key
         resume = _normalize_resume_arg(args.get("resume"))
         session_source = _normalize_session_source_arg(args.get("session_source"))
+        try:
+            allow_cold_wake = _coerce_bool_arg(args.get("allow_cold_wake", False), name="allow_cold_wake")
+        except ValueError:
+            return _error_result(f"Cannot launch {tool_name}: allow_cold_wake must be true or false")
         run_in_background = args.get("run_in_background")
         team_name = str(args.get("team_name", "")).strip() or None
         agent_name = str(args.get("agent_name") or "").strip() or None
@@ -795,6 +799,7 @@ def create_obs_tools(
                 "temperature": temperature,
                 "hooks": user_hooks,
                 "inherit_hooks": inherit_hooks,
+                "allow_cold_wake": allow_cold_wake,
             }
             if prompt_file:
                 payload["prompt_file"] = prompt_file
@@ -930,6 +935,13 @@ def create_obs_tools(
                     "(hook_input, tool_use_id, context). Hook functions run AFTER built-in OBS guards. Errors in hooks are "
                     "logged but never crash the session. "
                     'Example: \'{"PreToolUse": "procedures/hooks/guard.py::check_access"}\''
+                ),
+            },
+            "allow_cold_wake": {
+                "type": "boolean",
+                "description": (
+                    "Default false: resume or session_source of a session idle past its prompt-cache "
+                    "lifetime is refused with its transcript path. Set true only when really needed."
                 ),
             },
             "inherit_hooks": {
@@ -1338,6 +1350,10 @@ def create_obs_tools(
             return _error_result(
                 "Cannot send must_reply to yourself — this would cause an infinite wake loop."
             )
+        try:
+            allow_cold_wake = _coerce_bool_arg(args.get("allow_cold_wake", False), name="allow_cold_wake")
+        except ValueError:
+            return _error_result("Cannot use SendInboxMessage: allow_cold_wake must be true or false")
 
         async def _validate_recipient(target: str) -> dict[str, Any] | None:
             if hook_state is None or hook_state.inbox_recipient_validator is None:
@@ -1347,6 +1363,7 @@ def create_obs_tools(
                     {
                         "team_name": team_name,
                         "recipient": target,
+                        "allow_cold_wake": allow_cold_wake,
                     }
                 )
             except Exception:
@@ -1387,12 +1404,13 @@ def create_obs_tools(
 
         if validation is not None and not _is_deliverable(validation):
             reason = str(validation.get("reason") or validation.get("warning") or "recipient has no current route binding")
+            cold = bool(validation.get("cold"))
             return {
-                "content": [{"type": "text", "text": f"message underdelivered: {reason}"}],
+                "content": [{"type": "text", "text": reason if cold else f"message underdelivered: {reason}"}],
                 "tool_use_result": {
                     "success": False,
                     "delivered": False,
-                    "outcome": "underdelivered",
+                    "outcome": "cold_blocked" if cold else "underdelivered",
                     "reason": reason,
                     "recipient": resolved_recipient,
                     "team_name": team_name,
@@ -1649,6 +1667,14 @@ def create_obs_tools(
                 "sender": {
                     "type": "string",
                     "description": "Optional sender label; defaults to the current agent name.",
+                },
+                "allow_cold_wake": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false: a message that would wake an agent idle past its prompt-cache "
+                        "lifetime is refused with its transcript path. Set true only when the wake is "
+                        "really needed."
+                    ),
                 },
                 # Backend-only optional flags intentionally omitted from the MCP schema:
                 # "needs_reply": {"type": "boolean", ...}
