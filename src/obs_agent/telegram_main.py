@@ -101,6 +101,16 @@ def main() -> None:
                 "Cache proxy failed to start — sessions will use direct Anthropic API"
             )
 
+    # Record exactly which code is now live, for the cache-prefix gate (vault-3px5).
+    try:
+        from pathlib import Path as _Path
+
+        from obs_agent.cache_gate import write_running_record
+
+        write_running_record(_Path(__file__).resolve().parents[2])
+    except Exception:
+        logging.getLogger("obs_agent.cache_gate").warning("could not record running code", exc_info=True)
+
     asyncio.run(run_telegram_bot(config))
 
 

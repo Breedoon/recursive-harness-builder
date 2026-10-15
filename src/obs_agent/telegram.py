@@ -76,6 +76,7 @@ from obs_agent.session_info import (
 from obs_agent.telegram_format import md_to_telegram_html, split_message
 from obs_agent import schedule_scope as _schedule_scope
 from obs_agent import cache_readiness as _cache_readiness
+from obs_agent import cache_gate as _cache_gate
 from obs_agent.telegram_ingest import TelegramInboundNormalizer
 from obs_agent.telegram_state_store import TelegramStateStore
 from obs_agent.telegram_userbot import TelegramUserbotProvisioner
@@ -141,6 +142,7 @@ _TELEGRAM_HELP_TEXT = """Usage:
 /unschedule [branch|tree|all|chat] — remove schedules of this topic, branch, tree, every tree, or this chat; responsibility-owned schedules are kept unless you add --include-protected
 /restart — restart OBS and auto-resume agents that were mid-turn (alias /maintenance_restart)
 /restart plain — kill-switch restart: nothing is resumed
+/restart skip-cache-gate REASON — emergency: restart although cache-sensitive code has no passing cache regression report (logged)
 /shutdown — stop OBS only; no agents auto-resume at the next startup
 /shutdown_autoresume — stop OBS only; save running agents for one-time resume at the next startup, with no expiry
 /fork [name] — create a new topic from this head or a replied message
@@ -2485,25 +2487,74 @@ class TelegramBot:
         )
         await self.request_maintenance_restart(source=f"telegram:/maintenance_restart user={update.effective_user.id}")
 
+    async def _run_cache_gate(self):
+        """Cache-prefix gate for planned restarts (vault-3px5); None if it cannot run."""
+        try:
+            repo = Path(_cache_gate.__file__).resolve().parents[2]
+            return await asyncio.to_thread(_cache_gate.check, repo)
+        except Exception:
+            logger.warning("cache gate could not run; restart not gated", exc_info=True)
+            return None
+
     async def handle_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /restart [plain] - maintenance restart by default; ``plain`` resumes nothing."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
             return
-        args = [str(arg).strip().lower() for arg in (context.args or [])]
-        if not args:
-            await self.handle_maintenance_restart(update, context)
-            return
-        if args != ["plain"]:
-            route = self._route_for_message(update.effective_message)
+        raw_args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+        args = [arg.lower() for arg in raw_args]
+        route = self._route_for_message(update.effective_message)
+        bypass_reason: str | None = None
+        if args and args[0].lstrip("-\u2014\u2013") == "skip-cache-gate":
+            bypass_reason = " ".join(raw_args[1:]).strip()
+            if not bypass_reason:
+                await self._send_system_message(
+                    route=route,
+                    bot=context.bot,
+                    text="usage: /restart skip-cache-gate <reason> (emergency only; the reason is logged)",
+                    disable_notification=True,
+                )
+                return
+            args = []
+        if args and args != ["plain"]:
             await self._send_system_message(
                 route=route,
                 bot=context.bot,
-                text="usage: /restart (resume mid-turn agents) or /restart plain (kill switch: resume nothing)",
+                text=(
+                    "usage: /restart (resume mid-turn agents), /restart plain (kill switch: resume nothing), "
+                    "or /restart skip-cache-gate <reason>"
+                ),
                 disable_notification=True,
             )
             return
+        gate = await self._run_cache_gate()
+        if not args:
+            if gate is not None and not gate.ok:
+                if bypass_reason is None:
+                    await self._send_system_message(
+                        route=route, bot=context.bot, text=gate.message, disable_notification=True,
+                    )
+                    return
+                _cache_gate.log_bypass(
+                    reason=bypass_reason,
+                    source=f"telegram:/restart user={update.effective_user.id}",
+                    result=gate,
+                )
+                await self._send_system_message(
+                    route=route,
+                    bot=context.bot,
+                    text=f"cache gate bypassed (logged): {bypass_reason}",
+                    disable_notification=True,
+                )
+            await self.handle_maintenance_restart(update, context)
+            return
+        if gate is not None and not gate.ok:
+            _cache_gate.log_bypass(
+                reason="plain restart (kill switch, ungated)",
+                source=f"telegram:/restart plain user={update.effective_user.id}",
+                result=gate,
+            )
         await self.request_plain_restart(
             route=self._route_for_message(update.effective_message),
             bot=context.bot,
@@ -12260,7 +12311,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     app.add_handler(CommandHandler("stop", bot.handle_stop))
     app.add_handler(CommandHandler("stop_branch", bot.handle_stop_branch))
     app.add_handler(CommandHandler("stop_tree", bot.handle_stop_tree))
-    app.add_handler(CommandHandler("maintenance_restart", bot.handle_maintenance_restart))
+    app.add_handler(CommandHandler("maintenance_restart", bot.handle_restart))
     app.add_handler(CommandHandler("restart", bot.handle_restart))
     app.add_handler(CommandHandler("shutdown", bot.handle_shutdown))
     app.add_handler(CommandHandler("shutdown_autoresume", bot.handle_shutdown_autoresume))

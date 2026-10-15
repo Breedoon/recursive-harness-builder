@@ -34,6 +34,7 @@ obs-agent = "obs_agent.cli:main"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
+    "real_cache_gate: run the real cache-prefix gate (scripts/cache_gate) instead of the unit-test stub",
     "live: tests that spend live model/provider calls",
     "eval: eval scenarios run by SDK judge agent against real CLI + vault",
     "integration: live HTTP + SDK integration tests",

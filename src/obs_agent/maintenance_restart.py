@@ -707,6 +707,17 @@ def plain_restart(*, popen=subprocess.Popen) -> int:
     return 0
 
 
+def _run_cache_gate(repo: Path):
+    """The cache-prefix gate (vault-3px5); None if it cannot run (never blocks on its own bug)."""
+    try:
+        from obs_agent import cache_gate
+
+        return cache_gate.check(repo)
+    except Exception as exc:
+        print(f"cache gate could not run ({exc}); continuing", file=sys.stderr)
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m obs_agent.maintenance_restart",
@@ -721,6 +732,14 @@ def main(argv: list[str] | None = None) -> int:
         "--plain",
         action="store_true",
         help="plain kill-switch restart: resume nothing (runs supervisorctl restart obs-telegram-prod)",
+    )
+    parser.add_argument(
+        "--skip-cache-gate",
+        metavar="REASON",
+        help=(
+            "emergency only: restart even though the cache-prefix gate refuses (no passing "
+            "scripts/cache_regression.py report for this code); the reason is logged"
+        ),
     )
     parser.add_argument(
         "--status",
@@ -746,8 +765,28 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    repo = Path(__file__).resolve().parents[2]
+    gate = _run_cache_gate(repo)
     if args.plain:
+        if gate is not None and not gate.ok:
+            from obs_agent import cache_gate
+
+            cache_gate.log_bypass(reason="plain restart (kill switch, ungated)", source="cli --plain", result=gate)
         return plain_restart()
+    if gate is not None and not gate.ok:
+        if args.skip_cache_gate is not None:
+            if not args.skip_cache_gate.strip():
+                print("--skip-cache-gate needs a reason", file=sys.stderr)
+                return 2
+            from obs_agent import cache_gate
+
+            cache_gate.log_bypass(reason=args.skip_cache_gate, source="cli", result=gate)
+            print(f"cache gate bypassed (logged): {args.skip_cache_gate}")
+        else:
+            print(gate.message, file=sys.stderr)
+            return 3
+    elif gate is not None:
+        print(gate.message)
 
     pids = [args.pid] if args.pid else find_daemon_pids()
     if len(pids) != 1:

@@ -129,6 +129,30 @@ def run_one(args, provider: str, name: str, out_dir: Path) -> dict:
     return res
 
 
+def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, results: list,
+                       overall: str) -> None:
+    """gate.json: what scripts/cache_gate.py (vault-3px5) matches before a restart or merge."""
+    try:
+        sys.path.insert(0, str(REPO / "src"))
+        from obs_agent.cache_gate import code_identity
+        code = code_identity(REPO)
+    except Exception as e:  # the report stays usable for humans even if identity fails
+        code = {"error": str(e)}
+    providers = sorted({r["provider"] for r in results if r.get("status") == "PASS"})
+    route_ok = {p: all(r.get("status") == "PASS" for r in results if r["provider"] == p)
+                for p in {r["provider"] for r in results}}
+    report = {
+        "result": overall,
+        "providers": [p for p in providers if route_ok.get(p)],
+        "scenarios": "all" if not args.scenarios else list(args.scenarios),
+        "code": code,
+        "proxy_source": live,
+        "base_url": args.base_url,
+        "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    (out_dir / "gate.json").write_text(json.dumps(report, indent=1))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("scenarios", nargs="*", help="default: every scenario")
@@ -195,6 +219,9 @@ def main(argv=None) -> int:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     print("\nSUMMARY " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) + f"   (files: {out_dir})")
     fails = [r for r in results if r["status"] == "FAIL"]
+    overall = ("FAIL" if fails else "INCONCLUSIVE"
+               if any(r["status"] in ("PROVIDER-ERROR", "SKIPPED") for r in results) else "PASS")
+    _write_gate_report(out_dir, args=args, ident=ident, live=live, results=results, overall=overall)
     if fails:
         print("RESULT: FAIL -- cache-prefix regression. For each bad pair run:\n"
               f"  .venv/bin/python scripts/prefix_diff.py --log-dir {args.log_dir} --prev-any <request id>\n"

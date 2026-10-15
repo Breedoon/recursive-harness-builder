@@ -34,6 +34,29 @@ def _mock_session_get_client(request):
         with patch("obs_agent.session.SessionManager.get_client", new_callable=AsyncMock):
             yield
 
+@pytest.fixture(autouse=True)
+def _isolate_cache_gate(request, tmp_path_factory, monkeypatch):
+    """Keep the cache-prefix gate (vault-3px5) off production state in unit tests.
+
+    Restart-command tests see a passing gate; tests of the gate itself are marked
+    ``@pytest.mark.real_cache_gate`` and get isolated state/report paths instead.
+    """
+    base = tmp_path_factory.mktemp("cache-gate")
+    monkeypatch.setenv("OBS_RUNNING_CODE_FILE", str(base / "running.json"))
+    monkeypatch.setenv("OBS_CACHE_GATE_LOG", str(base / "bypass.jsonl"))
+    if request.node.get_closest_marker("real_cache_gate"):
+        yield
+        return
+    from obs_agent import cache_gate
+
+    monkeypatch.setattr(
+        cache_gate,
+        "check",
+        lambda repo, **_: cache_gate.GateResult(True, [], None, "cache gate: test stub pass", {}),
+    )
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Load .env file for credentials (Telegram API keys, session, etc.)
 # Only sets variables not already in the environment.

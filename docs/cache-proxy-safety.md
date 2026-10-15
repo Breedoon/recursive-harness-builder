@@ -148,7 +148,20 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
    port: `git show HEAD:src/cache_proxy.py > /workspace/runtime/cache-proxy-scratch/old.py`.
    Required result: `RESULT: PASS` on both routes, and your new scenario FAILs
    on the old code and PASSes on the new.
-4. **Commit, push, deploy with the maintenance restart only:**
+4. **The gate enforces steps 3-5 (vault-3px5).** `python -m obs_agent.maintenance_restart`,
+   Telegram `/restart` and a push to `main` (pre-push hook: `scripts/cache_gate.py install-hook`)
+   refuse to go ahead when cache-sensitive files changed since the running code
+   (`/workspace/runtime/state/obs-running-code.json`, written by telegram_main at start) and no
+   `gate.json` from `scripts/cache_regression.py` shows `PASS` on both routes, full scenario set,
+   for exactly this code (HEAD + uncommitted-change hash, the proxy under test having loaded this
+   `src/cache_proxy.py`). Sensitive = files with a `CACHE-PREFIX` marker plus `tools.py`,
+   `pyproject.toml`, `uv.lock` and the CLIProxyAPI binary/config. Check any time with
+   `.venv/bin/python scripts/cache_gate.py check`. Emergency override:
+   `--skip-cache-gate "<reason>"`, `/restart skip-cache-gate <reason>` or
+   `OBS_CACHE_GATE_SKIP=<reason> git push`; every bypass (and every plain restart that skipped a
+   failing gate) is appended to `/workspace/runtime/state/cache-gate-bypass.jsonl`. The kill
+   switch and crash/watchdog restarts are never gated.
+5. **Commit, push, deploy with the maintenance restart only:**
    `/workspace/obs/.venv/bin/python -m obs_agent.maintenance_restart`
    (running agents resume by themselves). Then confirm the live proxy loaded
    your code: `curl -s 127.0.0.1:28925/health` → `source_sha256` must equal
@@ -156,10 +169,10 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
    `cache_proxy.py` also changes that hash, so do a maintenance restart after it
    too, or the identity check (and the runner's first line) will report a
    mismatch.
-5. **Run the live check on production:** `.venv/bin/python scripts/cache_regression.py`.
+6. **Run the live check on production:** `.venv/bin/python scripts/cache_regression.py`.
    It must say `RESULT: PASS`. Write down the output directory (it keeps every
    request id).
-6. **Watch real traffic for at least 1-2 hours.**
+7. **Watch real traffic for at least 1-2 hours.**
    ```text
    .venv/bin/python scripts/cache_tally.py --since <deploy time UTC> \
        --exclude-sessions <runner out dir>/harness_sessions.txt --breaks-out breaks.jsonl
@@ -168,10 +181,10 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
    ("anthropic") and GPT ("cli-proxy"). Explain every break in `breaks.jsonl`
    with `prefix_diff.py`. Light traffic proves little — say so rather than
    claiming an improvement.
-7. **Record it**: commit message or note with the runner output dir, the request
+8. **Record it**: commit message or note with the runner output dir, the request
    ids of any FAIL you fixed, and the tally numbers.
 
-**Rollback:** `git revert <commit>`, push, maintenance restart, re-run step 5.
+**Rollback:** `git revert <commit>`, push, maintenance restart, re-run step 6.
 
 ### How to read the runner's result
 
