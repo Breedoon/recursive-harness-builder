@@ -242,6 +242,22 @@ the same call overrides. Human Telegram messages and scheduled wakes are never g
 - Code: `src/obs_agent/cache_readiness.py`; wiring in `telegram.py`
   (`_make_inbox_recipient_validator`, `_launch_fork_task`).
 
+### Start-step check on root AgentTask launches (vault-a6qm)
+
+A root agent (lineage length 1) that launches an `AgentTask` with no registered task bead in
+the prompt, the `prompt_file`, or anywhere earlier in its own session transcript gets a warning
+appended to the launch result, pointing to the Agent Operations start step
+(`register.py task`, `procedures/task/start.md`). Bead ids are confirmed against the vault Beads
+store, so any project prefix counts and ordinary hyphenated words never do. Children are not
+checked (they receive the brief from their parent).
+
+- `OBS_START_STEP_CHECK` — `warn` (default; the launch goes ahead), `block` (refused with the
+  same text), `off`.
+- Warnings are logged to `/workspace/runtime/state/start-step-warnings.jsonl`
+  (`OBS_START_STEP_LOG`) so reflections can count skipped start steps.
+- The warning travels in the AgentTask tool result, not in native hook context: tool results
+  are persisted in the session JSONL, so live and replayed conversations stay byte-identical.
+
 ## Voice transcription
 
 Current runtime expects an executable transcription script:

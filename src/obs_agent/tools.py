@@ -28,6 +28,7 @@ from claude_agent_sdk import tool, create_sdk_mcp_server
 
 from obs_agent.context_probe import probe_context_via_claude_cli
 from obs_agent.context_jsonl import find_session_jsonl_index
+from obs_agent import start_step as _start_step
 from obs_agent.context_stats import (
     apply_context_probe,
     build_context_snapshot,
@@ -583,6 +584,44 @@ def create_obs_tools(
             return None, "caller team context is unavailable"
         return next(iter(candidates)), None
 
+    _start_step_seen: dict[str, bool] = {}
+
+    def _start_step_warning(*, session_id: str | None, texts, display_name: str | None) -> str | None:
+        """Agent Operations start-step check (vault-a6qm); None when nothing to say."""
+        try:
+            check_mode = _start_step.mode()
+            if check_mode == "off":
+                return None
+            bootstrap = _current_obs_bootstrap()
+            if not _start_step.is_root(bootstrap.lineage if bootstrap is not None else None):
+                return None
+            known = _start_step.known_bead_ids(config.vault_path)
+            if not known:
+                return None  # no Beads store: nothing to check against
+            if any(_start_step.find_bead_ids(text, known) for text in texts):
+                return None
+            if session_id and _start_step_seen.get(session_id):
+                return None
+            jsonl = None
+            if session_id:
+                jsonl = find_session_jsonl_index(session_ids={session_id}, cwd=config.vault_path).get(session_id)
+            if _start_step.transcript_has_bead(jsonl, known):
+                if session_id:
+                    _start_step_seen[session_id] = True
+                return None
+            blocked = check_mode == "block"
+            _start_step.log_warning(
+                session_id=session_id,
+                agent_name=bootstrap.agent_name if bootstrap is not None else None,
+                team_name=bootstrap.root_team_key if bootstrap is not None else None,
+                display_name=display_name,
+                blocked=blocked,
+            )
+            return _start_step.warning_text(blocked=blocked)
+        except Exception:
+            logger.debug("start-step check failed", exc_info=True)
+            return None
+
     async def _launch_task(
         args: dict,
         *,
@@ -804,7 +843,21 @@ def create_obs_tools(
             if prompt_file:
                 payload["prompt_file"] = prompt_file
                 payload["prompt_file_content"] = prompt_file_content
-            return await hook_state.fork_task_launcher(payload)
+            start_warning = None
+            if not resume:
+                start_warning = _start_step_warning(
+                    session_id=effective_session_id,
+                    texts=(prompt, prompt_file_content),
+                    display_name=display_name,
+                )
+            if start_warning is not None and _start_step.mode() == "block":
+                return _error_result(start_warning)
+            result = await hook_state.fork_task_launcher(payload)
+            if start_warning is not None and isinstance(result, dict) and not result.get("is_error"):
+                content = result.get("content")
+                if isinstance(content, list):
+                    result["content"] = [*content, {"type": "text", "text": start_warning}]
+            return result
         except Exception as exc:
             logger.exception("%s launch failed", tool_name)
             return _error_result(f"{tool_name} failed: {type(exc).__name__}: {exc}")

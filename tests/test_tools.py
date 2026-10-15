@@ -483,6 +483,7 @@ class TestAgentTaskTools:
                 "temperature": None,
                 "hooks": None,
                 "inherit_hooks": False,
+                "allow_cold_wake": False,
             }
         )
         assert "AgentTask launched." in result["content"][0]["text"]
