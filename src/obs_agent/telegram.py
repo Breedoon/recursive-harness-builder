@@ -74,6 +74,7 @@ from obs_agent.session_info import (
     SessionViewContext, build_session_info, format_session_info_lines, session_context_window,
 )
 from obs_agent.telegram_format import md_to_telegram_html, split_message
+from obs_agent import schedule_scope as _schedule_scope
 from obs_agent.telegram_ingest import TelegramInboundNormalizer
 from obs_agent.telegram_state_store import TelegramStateStore
 from obs_agent.telegram_userbot import TelegramUserbotProvisioner
@@ -133,9 +134,10 @@ _AUTO_DELIVERY_PROMPT = (
 
 _TELEGRAM_HELP_TEXT = """Usage:
 /help — show this help
-/stop — interrupt this topic; /stop all interrupts every topic in the chat
+/stop — interrupt this topic; /stop all interrupts every running agent in every tree; /stop chat every topic in this chat
 /stop_branch — interrupt this agent and all recursive descendants
 /stop_tree — interrupt the entire agent tree, including its trunk
+/unschedule [branch|tree|all|chat] — remove schedules of this topic, branch, tree, every tree, or this chat; responsibility-owned schedules are kept unless you add --include-protected
 /restart — restart OBS and auto-resume agents that were mid-turn (alias /maintenance_restart)
 /restart plain — kill-switch restart: nothing is resumed
 /shutdown — stop OBS only; no agents auto-resume at the next startup
@@ -5276,36 +5278,50 @@ class TelegramBot:
         for task_id, record in list(self._fork_tasks_by_id.items()):
             if record.child_route != route and record.parent_route != route:
                 continue
-            if record.terminal_request is None:
-                record.terminal_request = status
-            if record.status not in {"completed", "failed", "stopped"}:
-                record.status = status
-            record.idle_ready = False
-            record.wake_requested = False
-            if record.completed_at is None:
-                record.completed_at = time.time()
+            await self._cancel_fork_task_record(task_id, record, status)
 
-            parent_state = self._get_state(record.parent_route, create=False)
-            if parent_state is not None:
-                parent_state.active_fork_task_ids.discard(task_id)
-
-            child_state = self._get_state(record.child_route, create=False)
-            if child_state is not None:
-                child_state.hook_state.interrupt_flag = True
-                self._mark_stop_requested(child_state)
-                try:
-                    client = await child_state.session_manager.get_client()
-                    await client.interrupt()
-                except Exception:
-                    logger.debug("Failed interrupting child while clearing task_id=%s", task_id, exc_info=True)
-
+    async def _cancel_running_fork_tasks(self, status: str) -> int:
+        """Cancel every AgentTask child whose task is still running, in every tree (/stop all)."""
+        cancelled = 0
+        for task_id, record in list(self._fork_tasks_by_id.items()):
             task = self._fork_task_tasks.get(task_id)
-            if task is not None and not task.done():
-                task.cancel()
+            if task is None or task.done():
+                continue
+            await self._cancel_fork_task_record(task_id, record, status)
+            cancelled += 1
+        return cancelled
 
-            self._fork_task_by_child_route.pop(record.child_route, None)
-            self._remove_team_worker_mappings_for_task(task_id)
-            self._persist_task_handle_record(record)
+    async def _cancel_fork_task_record(self, task_id: str, record: Any, status: str) -> None:
+        if record.terminal_request is None:
+            record.terminal_request = status
+        if record.status not in {"completed", "failed", "stopped"}:
+            record.status = status
+        record.idle_ready = False
+        record.wake_requested = False
+        if record.completed_at is None:
+            record.completed_at = time.time()
+
+        parent_state = self._get_state(record.parent_route, create=False)
+        if parent_state is not None:
+            parent_state.active_fork_task_ids.discard(task_id)
+
+        child_state = self._get_state(record.child_route, create=False)
+        if child_state is not None:
+            child_state.hook_state.interrupt_flag = True
+            self._mark_stop_requested(child_state)
+            try:
+                client = await child_state.session_manager.get_client()
+                await client.interrupt()
+            except Exception:
+                logger.debug("Failed interrupting child while clearing task_id=%s", task_id, exc_info=True)
+
+        task = self._fork_task_tasks.get(task_id)
+        if task is not None and not task.done():
+            task.cancel()
+
+        self._fork_task_by_child_route.pop(record.child_route, None)
+        self._remove_team_worker_mappings_for_task(task_id)
+        self._persist_task_handle_record(record)
 
     def _task_lookup_error_result(self, message: str) -> dict[str, Any]:
         text = f"Invalid task lookup: {message}"
@@ -6800,6 +6816,140 @@ class TelegramBot:
         state = self._get_state(route)
         return ([state] if state is not None else []), False
 
+    def _route_tree_identity(
+        self, route: TelegramRoute
+    ) -> tuple[str, str, tuple[str, ...]] | None:
+        """(root team, agent name, normalized lineage) of the agent behind *route*, if known.
+
+        Used by scoped /unschedule so schedules of idle or cold descendants are found from the
+        schedule store itself, not only from routes that are active now (vault-maw0).
+        """
+        state = self._states_by_route.get(route)
+        key = self._route_inbox_target_keys_by_route.get(route)
+        lineage: tuple[str, ...] = ()
+        if state is not None and state.agent_lineage:
+            lineage = tuple(
+                normalize_lineage_name(item)
+                for item in state.agent_lineage
+                if isinstance(item, str) and normalize_lineage_name(item)
+            )
+        if key is not None and lineage:
+            return key[0], key[1], lineage
+        if state is not None:
+            try:
+                context_tuple = self._current_tree_context(state)
+            except Exception:
+                logger.debug("tree identity lookup failed route=%s", route, exc_info=True)
+                context_tuple = None
+            if context_tuple is not None:
+                team_name, agent_name, raw_lineage = context_tuple
+                return team_name, agent_name, tuple(
+                    normalize_lineage_name(item)
+                    for item in raw_lineage
+                    if isinstance(item, str) and normalize_lineage_name(item)
+                )
+        if key is not None:
+            return key[0], key[1], ()
+        return None
+
+    def _scoped_schedule_records(
+        self,
+        *,
+        route: TelegramRoute,
+        scope: str,
+    ) -> tuple[list[_TopicScheduleRecord], str | None, str | None]:
+        """Schedules in *scope* relative to the topic at *route*.
+
+        Returns (records, tree team name or None, error text or None). ``all`` covers every
+        stored schedule; ``chat`` every topic of this Telegram chat; ``tree``/``branch`` use the
+        same lineage identity as /stop_tree and /stop_branch, plus the identity of each
+        schedule's own route so schedules of idle or never-loaded descendants are included.
+        """
+        records = list(self._topic_schedules_by_id.values())
+        if scope == "all":
+            return records, None, None
+        if scope == "chat":
+            return [record for record in records if record.route.chat_id == route.chat_id], None, None
+        state = self._get_state(route, create=False)
+        if state is None:
+            return [], None, "no agent tree identity found for this topic"
+        context_tuple = self._current_tree_context(state)
+        if context_tuple is None:
+            return [], None, "no agent tree identity found for this topic"
+        team_name, agent_name, raw_lineage = context_tuple
+        lineage = tuple(
+            normalize_lineage_name(item)
+            for item in raw_lineage
+            if isinstance(item, str) and normalize_lineage_name(item)
+        )
+        member_routes: set[TelegramRoute] = set()
+        try:
+            snapshot_states, _stale, _ = self._tree_stop_snapshot(state=state, scope=scope)
+            member_routes.update(candidate.route for candidate in snapshot_states)
+        except Exception:
+            logger.debug("tree snapshot failed for scoped unschedule route=%s", route, exc_info=True)
+        member_routes.add(route)
+        selected: list[_TopicScheduleRecord] = []
+        for record in records:
+            if record.route in member_routes:
+                selected.append(record)
+                continue
+            identity = self._route_tree_identity(record.route)
+            if identity is None or identity[0] != team_name:
+                continue
+            if scope == "tree":
+                selected.append(record)
+            elif identity[1] == agent_name or _schedule_scope.lineage_in_branch(identity[2], lineage):
+                selected.append(record)
+        return selected, team_name, None
+
+    async def _handle_scoped_unschedule(
+        self,
+        *,
+        route: TelegramRoute,
+        bot: Any,
+        scope: str,
+        include_protected: bool,
+    ) -> str:
+        """Delete schedules in *scope*, sparing responsibility-protected ones unless asked."""
+        records, tree_team, error = self._scoped_schedule_records(route=route, scope=scope)
+        if error is not None:
+            return f"/unschedule {scope} unavailable: {error}"
+        ownership = _schedule_scope.ScheduleOwnership.load(getattr(self._config, "vault_path", None))
+        deleted: dict[str, list[tuple[str, str]]] = {}
+        protected: list[tuple[str, str, _schedule_scope.Protection]] = []
+        for record in sorted(records, key=lambda r: r.schedule_id):
+            identity = self._route_tree_identity(record.route)
+            record_tree = identity[0] if identity is not None else ""
+            protection = ownership.protection(
+                schedule_id=record.schedule_id,
+                description=record.description,
+                tree=tree_team if scope in ("tree", "branch") else record_tree or None,
+            )
+            if protection.protected and scope == "all" and not protection.reason.startswith("ongoing"):
+                # Under "all" every tree is being swept, so tree ownership alone is no reason
+                # to keep a schedule; only ongoing responsibilities are spared.
+                protection = _schedule_scope.Protection(False, protection.owner_bead, protection.reason)
+            if protection.protected and not include_protected:
+                protected.append((record.schedule_id, record.description or "", protection))
+                continue
+            self._delete_topic_schedule(record.schedule_id)
+            deleted.setdefault(record_tree, []).append((record.schedule_id, record.description or ""))
+        logger.info(
+            "[unschedule] scope=%s route=%s deleted=%d protected_kept=%d include_protected=%s",
+            scope,
+            route,
+            sum(len(items) for items in deleted.values()),
+            len(protected),
+            include_protected,
+        )
+        return _schedule_scope.format_unschedule_report(
+            scope=scope,
+            deleted=deleted,
+            protected=protected,
+            load_errors=ownership.load_errors,
+        )
+
     def _build_session_lines(self, state: TelegramSessionState) -> list[str]:
         task = self._find_task_by_child_route(state.route)
         route_key = self._route_inbox_target_keys_by_route.get(state.route)
@@ -7767,15 +7917,16 @@ class TelegramBot:
     async def handle_unschedule(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /unschedule - remove schedule(s) from this topic or chat (/unschedule all)."""
+        """Handle /unschedule [branch|tree|all|chat] [--include-protected] (vault-maw0)."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
             return
 
         route = self._route_for_message(update.effective_message)
-        states, apply_all = self._command_targets(route=route, args=context.args)
-        if apply_all:
+        parsed = _schedule_scope.parse_scope_args(context.args)
+        if parsed.scope == "chat":
+            states, _ = self._command_targets(route=route, args=["all"])
             deleted = 0
             for state in states:
                 schedule_ids = sorted(self._schedule_ids_by_route.get(state.route, set()))
@@ -7793,6 +7944,21 @@ class TelegramBot:
                 disable_notification=True,
             )
             return
+        if parsed.scope in ("all", "tree", "branch"):
+            text = await self._handle_scoped_unschedule(
+                route=route,
+                bot=context.bot,
+                scope=parsed.scope,
+                include_protected=parsed.include_protected,
+            )
+            for chunk in split_message(text):
+                await self._send_system_message(
+                    route=route,
+                    bot=context.bot,
+                    text=chunk,
+                    disable_notification=True,
+                )
+            return
 
         schedule_ids = sorted(self._schedule_ids_by_route.get(route, set()))
         if not schedule_ids:
@@ -7804,8 +7970,8 @@ class TelegramBot:
             )
             return
 
-        if context.args:
-            target_id = context.args[0].strip()
+        if parsed.rest:
+            target_id = parsed.rest[0].strip()
             record = self._topic_schedules_by_id.get(target_id)
             if record is None or record.route != route:
                 await self._send_system_message(
@@ -8004,7 +8170,7 @@ class TelegramBot:
     async def handle_stop(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /stop - interrupt current response in this topic."""
+        """Handle /stop - this topic; /stop all every tree; /stop chat every topic of this chat."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
@@ -8012,7 +8178,47 @@ class TelegramBot:
 
         await self._ensure_background_poller(context.bot)
         route = self._route_for_message(update.effective_message)
-        states, apply_all = self._command_targets(route=route, args=context.args)
+        parsed = _schedule_scope.parse_scope_args(context.args)
+        if parsed.scope == "all":
+            # Every running agent in every tree (vault-maw0). Only routes with a live turn or a
+            # connected client are touched: idle disconnected agents have nothing to stop, and
+            # touching thousands of idle routes would only queue stale interrupt notices.
+            states = [
+                candidate
+                for candidate in list(self._states_by_route.values())
+                if candidate.busy
+                or candidate.hook_state.execution_active
+                or (candidate.session_manager._client is not None and candidate.session_manager._connected)
+            ]
+            if route not in {candidate.route for candidate in states}:
+                current = self._get_state(route, create=False)
+                if current is not None:
+                    states.insert(0, current)
+            counts = await self._interrupt_scoped_states(states=states, bot=context.bot)
+            cancelled_tasks = await self._cancel_running_fork_tasks(status="stopped")
+            logger.info(
+                "Global interrupt via /stop all from user %d interrupted=%d inactive=%d failed=%d tasks=%d",
+                update.effective_user.id,
+                counts["interrupted"],
+                counts["already_inactive"],
+                counts["failed"],
+                cancelled_tasks,
+            )
+            await self._send_system_message(
+                route=route,
+                bot=context.bot,
+                text=(
+                    f"/stop all (every tree): interrupted {counts['interrupted']}; "
+                    f"already inactive {counts['already_inactive']}; failed {counts['failed']}; "
+                    f"running agent tasks cancelled {cancelled_tasks}. "
+                    "Schedules are untouched — /unschedule all removes them."
+                ),
+                disable_notification=True,
+            )
+            return
+        states, apply_all = self._command_targets(
+            route=route, args=["all"] if parsed.scope == "chat" else []
+        )
         interrupt_sent = 0
         for state in states:
             state.last_bot = context.bot
@@ -12003,8 +12209,8 @@ async def _set_bot_commands(app: Application) -> None:
         BotCommand("new", "Reset this topic into a new trunk agent; optional: /new [emoji] [name]"),
         BotCommand("new_group", "Create a new forum supergroup and add the configured OBS bots"),
         BotCommand("new_bot", "Create a new Claudia sender bot through BotFather"),
-        BotCommand("unschedule", "Remove schedule(s) from this topic; use /unschedule all"),
-        BotCommand("stop", "Interrupt this topic; use '/stop all' for the whole group"),
+        BotCommand("unschedule", "Remove schedules: topic, or branch|tree|all|chat; --include-protected"),
+        BotCommand("stop", "Interrupt this topic; '/stop all' every tree, '/stop chat' this chat"),
         BotCommand("stop_branch", "Interrupt this agent and all recursive descendants"),
         BotCommand("stop_tree", "Interrupt the complete root team tree"),
         BotCommand("restart", "Restart OBS, auto-resuming mid-turn agents; '/restart plain' resumes nothing"),

@@ -211,7 +211,8 @@ host/container recovery-disable files retain their previous behavior.
 
 ## A stop that really stops (vault-u3b.65)
 
-`/stop`, `/stop_branch`, `/stop_tree`, `/stop all`, `/clear`, `/new` and
+`/stop`, `/stop_branch`, `/stop_tree`, `/stop all` (every running agent in every
+tree since vault-maw0; `/stop chat` is the old whole-chat form), `/clear`, `/new` and
 `AgentTaskStop` mark the running turn as stopped. While it is marked:
 
 - If the CLI exits, OBS ends the turn. It no longer reconnects with "Resume the

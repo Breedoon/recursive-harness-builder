@@ -4483,9 +4483,9 @@ class TestCommands:
             )
         )
 
-        update = _make_update("/unschedule all", thread_id=1)
+        update = _make_update("/unschedule chat", thread_id=1)
         ctx = _make_context()
-        ctx.args = ["all"]
+        ctx.args = ["chat"]
         await bot.handle_unschedule(update, ctx)
         assert bot._schedule_ids_by_route.get(route_a, set()) == set()
         assert bot._schedule_ids_by_route.get(route_b, set()) == set()
@@ -4511,7 +4511,7 @@ class TestCommands:
         ctx.bot.send_message.assert_called_once()
         assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent</i></u>"
 
-    async def test_stop_all_sets_interrupt_flag_for_all_routes(self, config):
+    async def test_stop_chat_sets_interrupt_flag_for_all_routes(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         general = _state(bot)
         topic = _state(bot, thread_id=321)
@@ -4524,9 +4524,9 @@ class TestCommands:
         topic.session_manager._client = topic_client
         topic.session_manager._connected = True
 
-        update = _make_update("/stop all")
+        update = _make_update("/stop chat")
         ctx = _make_context()
-        ctx.args = ["all"]
+        ctx.args = ["chat"]
         await bot.handle_stop(update, ctx)
 
         assert general.hook_state.interrupt_flag is True
@@ -4539,7 +4539,7 @@ class TestCommands:
         topic_client.interrupt.assert_awaited_once()
         assert ctx.bot.send_message.call_args.kwargs["text"] == "<u><i>interrupt sent to all topics</i></u>"
 
-    async def test_stop_all_with_mention_suffix_targets_all_routes(self, config):
+    async def test_stop_chat_with_mention_suffix_targets_all_routes(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         general = _state(bot)
         topic = _state(bot, thread_id=321)
@@ -4552,9 +4552,9 @@ class TestCommands:
         topic.session_manager._client = topic_client
         topic.session_manager._connected = True
 
-        update = _make_update("/stop all@obs_bot")
+        update = _make_update("/stop chat@obs_bot")
         ctx = _make_context()
-        ctx.args = ["all@obs_bot"]
+        ctx.args = ["chat@obs_bot"]
         await bot.handle_stop(update, ctx)
 
         assert general.hook_state.interrupt_flag is True
@@ -4576,9 +4576,9 @@ class TestCommands:
         topic.session_manager._client = topic_client
         topic.session_manager._connected = True
 
-        update = _make_update("/stop@obs_bot all")
+        update = _make_update("/stop@obs_bot chat")
         ctx = _make_context()
-        ctx.args = ["all"]
+        ctx.args = ["chat"]
         await bot.handle_stop(update, ctx)
 
         assert general.hook_state.interrupt_flag is True
