@@ -679,17 +679,13 @@ def create_obs_tools(
             return _error_result(
                 f"Cannot launch {tool_name}: resume and session_source are mutually exclusive"
             )
-        # Model selection — "inherit" or empty means use parent's model.
+        # Model selection. Empty, "inherit" or "source" = the fork source's own model (the
+        # launcher's own head, or the session_source); fresh launches inherit the parent's.
+        # An explicit model on a fork is honoured within the source's model family and refused
+        # across families by the launcher, which knows the source's model (fork_model.py).
         model_raw = str(args.get("model", "")).strip()
         model: str | None = None
-        if model_raw and model_raw.lower() != "inherit":
-            if fork:
-                return _error_result(
-                    f"Cannot launch {tool_name}: cross-model forking is not supported. "
-                    f"When fork=true, the model parameter must be omitted or set to 'inherit' "
-                    f"(got model='{model_raw}'). Use fork=false instead to launch a fresh "
-                    f"session with a different model."
-                )
+        if model_raw and model_raw.lower() not in ("inherit", "source"):
             model = model_raw
         # Effort is independent of model/context and may change on a fork.
         from obs_agent.effort import EFFORT_ENV, normalize_effort
@@ -904,8 +900,10 @@ def create_obs_tools(
             "session_source": {
                 "type": "string",
                 "description": (
-                    "Optional Claude session source to fork from when fork=true. "
-                    "Accepts a stored session ID or JSONL file path. Not supported with fork=false."
+                    "Optional session to fork from when fork=true (any agent's session, any model). "
+                    "Accepts a stored session ID or JSONL file path. The fork runs on that "
+                    "session's own model and effort unless model is given, and appears under the "
+                    "launcher in the agent tree. Not supported with fork=false."
                 ),
             },
             "fork": {
@@ -924,12 +922,13 @@ def create_obs_tools(
                     "budget (default: model-specific). The suffix is a capacity/budget "
                     "selector, not the served window: the served window comes from the model "
                     "table (e.g. local-qwen3.8-27b[1m] serves a 262k window, not 1M; [1m] is "
-                    "a literal 1M only on a true-1M profile). 'inherit' or omitted = use the "
-                    "same model as the current "
-                    "session. When fork=true, the model must be omitted or set to 'inherit' — "
-                    "cross-model forking is not supported because the forked JSONL contains "
-                    "conversation turns from the parent's model format. Use fork=false to launch "
-                    "a fresh session with a different model."
+                    "a literal 1M only on a true-1M profile). fork=false: 'inherit' or omitted = "
+                    "the current session's model. fork=true: omitted, 'inherit' or 'source' = the "
+                    "FORK SOURCE's own model and effort (the session_source when given, else this "
+                    "session), which is what reuses its prompt cache; an explicit model is honoured "
+                    "within the source's family (Claude, GPT, local) and refused across families, "
+                    "because the copied history and its cache belong to the source's provider. Use "
+                    "fork=false for a fresh session on another family."
                 ),
             },
             "effort": {

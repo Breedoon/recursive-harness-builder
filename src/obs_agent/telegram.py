@@ -77,6 +77,7 @@ from obs_agent.telegram_format import md_to_telegram_html, split_message
 from obs_agent import schedule_scope as _schedule_scope
 from obs_agent import cache_readiness as _cache_readiness
 from obs_agent import cache_gate as _cache_gate
+from obs_agent import fork_model as _fork_model
 from obs_agent.telegram_ingest import TelegramInboundNormalizer
 from obs_agent.telegram_state_store import TelegramStateStore
 from obs_agent.telegram_userbot import TelegramUserbotProvisioner
@@ -3078,6 +3079,40 @@ class TelegramBot:
             return status
 
         return _validate
+
+    def _fork_source_model(
+        self,
+        *,
+        state: TelegramSessionState,
+        source_session_id: str | None,
+        source_jsonl_path: Path | None,
+        explicit: bool,
+    ) -> "_fork_model.SourceModel":
+        """Model and effort of the session a fork copies (fork_model.py)."""
+        if not explicit or not source_session_id or source_session_id == state.session_id:
+            return _fork_model.SourceModel(
+                state.session_manager.effective_model,
+                state.session_manager.effective_effort,
+                "launcher",
+            )
+        route = self._route_by_session_id.get(source_session_id)
+        owner = self._get_state(route, create=False) if route is not None else None
+        if owner is not None and owner.session_id == source_session_id:
+            return _fork_model.SourceModel(
+                owner.session_manager.effective_model,
+                owner.session_manager.effective_effort,
+                "route",
+            )
+        jsonl_path = source_jsonl_path or find_session_jsonl(
+            session_id=source_session_id, cwd=self._config.vault_path
+        )
+        model = _fork_model.jsonl_model(jsonl_path)
+        if model:
+            return _fork_model.SourceModel(model, None, "jsonl")
+        raise _fork_model.ForkModelError(
+            f"cannot determine the model of session_source {source_session_id}: no live route owns "
+            "it and its transcript has no model record. Pass model explicitly."
+        )
 
     def _state_cache_readiness(
         self,
@@ -9874,6 +9909,7 @@ class TelegramBot:
         temperature: float | None = None,
         user_hooks: dict[str, str] | None = None,
         inherit_hooks: bool = False,
+        launcher_lineage: bool = False,
     ) -> dict[str, Any]:
         from obs_agent.effort import child_effort_override, build_effort_env, resolve_effort
 
@@ -9982,7 +10018,11 @@ class TelegramBot:
         if normalized_lineage_name:
             parent_lineage = self._ensure_state_lineage(
                 parent_state,
-                session_id=source_session_id or parent_state.session_id,
+                # A fork of a foreign session_source belongs under the LAUNCHER in the tree,
+                # never under the source session's own lineage.
+                session_id=(parent_state.session_id if launcher_lineage else None)
+                or source_session_id
+                or parent_state.session_id,
             )
             child_lineage = parent_lineage + (normalized_lineage_name,)
             # Children inherit the parent's root_team_key — only trunk generates
@@ -11374,8 +11414,8 @@ class TelegramBot:
         source_route = route
         source_message_id: int | None = None
         source_jsonl_path: Path | None = None
+        explicit_session_source = False
         if is_fork:
-            explicit_session_source = False
             if session_source_raw:
                 source_descriptor = resolve_session_source(
                     session_source_raw,
@@ -11489,7 +11529,30 @@ class TelegramBot:
         prompt_file = str(args.get("prompt_file") or "").strip() or None
         prompt_file_content = str(args.get("prompt_file_content") or "").strip() or None
         model_raw = str(args.get("model") or "").strip()
-        model = model_raw if model_raw and model_raw.lower() != "inherit" else None
+        model = model_raw if model_raw and model_raw.lower() not in ("inherit", "source") else None
+        child_effort = args.get("effort")
+        if is_fork:
+            # A fork runs on its SOURCE's model and effort unless a same-family model is given
+            # (fork_model.py; Daniel 2026-10-15: never silently use the launcher's model).
+            source = self._fork_source_model(
+                state=state,
+                source_session_id=source_session_id,
+                source_jsonl_path=source_jsonl_path,
+                explicit=explicit_session_source,
+            )
+            model, same_as_source = _fork_model.choose(
+                model,
+                source,
+                source_label=(f"session {source_session_id}" if explicit_session_source else "this session"),
+            )
+            if source.origin == "launcher" and same_as_source:
+                model = None  # own-head fork: unchanged path, the child inherits the parent
+            elif same_as_source and child_effort is None and "CLAUDE_CODE_EFFORT_LEVEL" not in (args.get("env") or {}):
+                child_effort = source.effort or "auto"
+            logger.info(
+                "[fork_task] child model=%s effort=%s source=%s origin=%s explicit_source=%s",
+                model, child_effort, source_session_id, source.origin, explicit_session_source,
+            )
         inherit_schedules = args.get("inherit_schedules", True)
         env_override: dict[str, str] | None = args.get("env")
         temperature: float | None = args.get("temperature")
@@ -11524,8 +11587,9 @@ class TelegramBot:
             lineage_name=lineage_name,
             lineage_origin="agent_task_fork" if is_fork else "agent_task_fresh",
             model=model,
-            effort=args.get("effort"),
+            effort=child_effort,
             inherit_schedules=inherit_schedules,
+            launcher_lineage=bool(is_fork and explicit_session_source),
             env_override=env_override,
             temperature=temperature,
             user_hooks=user_hooks,

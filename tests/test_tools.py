@@ -622,8 +622,9 @@ class TestAgentTaskTools:
         state.fork_task_launcher.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_agent_task_rejects_cross_model_fork(self, monkeypatch, skill_config):
-        """fork=true with an explicit non-inherit model must be rejected."""
+    async def test_agent_task_passes_fork_model_to_launcher(self, monkeypatch, skill_config):
+        """fork=true with an explicit model reaches the launcher, which knows the source's model
+        and refuses cross-family forks there (fork_model.py); 'source' means inherit."""
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
@@ -632,12 +633,10 @@ class TestAgentTaskTools:
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
         handler = _tool_handler(captured["tools"], "AgentTask")
 
-        result = await handler({"prompt": "Do work", "fork": True, "model": "gpt-5.5"})
-
-        assert result["is_error"] is True
-        assert "cross-model forking is not supported" in result["content"][0]["text"]
-        assert "fork=false" in result["content"][0]["text"]
-        state.fork_task_launcher.assert_not_awaited()
+        await handler({"prompt": "Do work", "fork": True, "model": "gpt-5.5"})
+        assert state.fork_task_launcher.await_args.args[0]["model"] == "gpt-5.5"
+        await handler({"prompt": "Do work", "fork": True, "model": "source"})
+        assert state.fork_task_launcher.await_args.args[0]["model"] is None
 
     @pytest.mark.asyncio
     async def test_agent_task_allows_fork_with_inherit_model(self, monkeypatch, skill_config):

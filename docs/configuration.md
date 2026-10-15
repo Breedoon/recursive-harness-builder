@@ -225,6 +225,22 @@ legacy `bodies/`) into the production directory unless you unset it:
 `env -u CACHE_PROXY_LOG_DIR -u CACHE_PROXY_SAVE_BODIES pytest ...`. The request
 log itself stays off on non-production ports unless forced.
 
+### Which model a fork runs on
+
+A fork (`AgentTask fork=true`) copies its source's history: the launcher's own head, or the
+`session_source` session when given. By default the child runs on the **source's** own model and
+effort, which is what reuses the source's prompt cache. A GLM agent forking an Opus transcript
+therefore runs the fork on Opus, and a fork of a Sol transcript runs on Sol. Before 2026-10-15 a
+`session_source` fork silently ran on the launcher's model, a total cache miss.
+
+- Source model: the live route that owns the source session (keeps context suffix and effort),
+  else the source JSONL's last `message.model` with that model's default effort; if neither is
+  known the launch fails with a clear error.
+- `model=` on a fork is honoured within the source's family (Claude, GPT, local) and refused
+  across families, because the copied history and its cache belong to the source's provider.
+- A `session_source` fork is placed under the launcher in the agent tree, never under the source.
+- Code: `src/obs_agent/fork_model.py`, `telegram.py` `_fork_source_model`.
+
 ### Cold-cache guard on agent wakes (vault-vokl)
 
 When an agent's `SendInboxMessage`, `AgentTask resume=` or `AgentTask session_source=` would
