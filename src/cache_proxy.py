@@ -70,6 +70,7 @@ import json
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -98,6 +99,38 @@ LOCAL_UPSTREAM = os.environ.get("OBS_LOCAL_LLM_BASE_URL", "").strip().rstrip("/"
 # Credential the local gate expects. Used ONLY to recognise a local request on
 # endpoints that carry no model name (see _forward_simple). Never logged.
 LOCAL_AUTH_TOKEN = os.environ.get("OBS_LOCAL_LLM_AUTH_TOKEN", "").strip()
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Local-route liveness (bead obs-3, 2026-10-16). A local model can legitimately
+# send nothing for many minutes: a cold 500k-token prefill on the Sparks, a queue
+# behind other prefills, or the 3090 gate holding requests while the GPUs are
+# lent out. The bundled CLI drops any request that receives no bytes for about
+# five minutes ("Request timed out"), retries it from scratch eleven times and so
+# kills the turn after an hour. Meanwhile this proxy kept every abandoned request
+# open upstream for its 600 s read timeout, so the retries piled more prefills
+# onto the same slots. On the local route only, the proxy therefore:
+#   - answers with its own 200 headers when upstream has not responded within
+#     LOCAL_HEADER_WAIT_SECONDS (fast upstream errors, such as the overflow 400
+#     translation, still pass through with their real status);
+#   - writes an Anthropic `ping` event (streaming) or a JSON-insignificant space
+#     (non-streaming) every LOCAL_KEEPALIVE_SECONDS of upstream silence;
+#   - closes the upstream request as soon as a keepalive write shows the client
+#     has gone, so abandoned prefills stop occupying slots;
+#   - gives up only after LOCAL_UPSTREAM_SILENCE_SECONDS without an upstream
+#     byte, and then reports a retryable overloaded_error instead of hanging.
+# Response bytes only: the request sent upstream is unchanged (cache-neutral).
+LOCAL_KEEPALIVE_SECONDS = _env_seconds("OBS_LOCAL_KEEPALIVE_SECONDS", 15.0)
+LOCAL_HEADER_WAIT_SECONDS = _env_seconds("OBS_LOCAL_HEADER_WAIT_SECONDS", 20.0)
+LOCAL_UPSTREAM_SILENCE_SECONDS = _env_seconds("OBS_LOCAL_UPSTREAM_SILENCE_SECONDS", 1800.0)
+SSE_PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 DEFAULT_PORT = 18923
 # The port the production instance listens on; a different port means this is a
 # test/private instance (used only for a startup hygiene warning).
@@ -202,6 +235,10 @@ stats = {
     "schemas_sanitized": 0,
     "local_usage_rewrites": 0,
     "local_overflow_translations": 0,
+    "local_keepalives": 0,
+    "local_early_commits": 0,
+    "local_client_gone": 0,
+    "local_upstream_silence": 0,
 }
 
 
@@ -1810,6 +1847,90 @@ class LocalUsageFixer:
 # ── HTTP Handler ─────────────────────────────────────────────────────────
 
 
+class _LocalUpstreamCall:
+    """One local-route upstream request, run in a worker thread.
+
+    Puts ("headers", status, headers), then ("chunk", bytes)..., then ("end",)
+    or ("error", exc) on *events*. cancel() closes the upstream connection, which
+    is how the local server learns that the client is gone.
+    """
+
+    def __init__(self, url: str, body: bytes, headers: dict, events: queue.Queue,
+                 stream: bool):
+        self.url, self.body, self.headers, self.events = url, body, headers, events
+        self.stream = stream
+        self._cancelled = threading.Event()
+        self._sock = None
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="local-upstream")
+
+    def start(self):
+        self._thread.start()
+
+    def _trace(self, event_name: str, info: dict):
+        # Keep the upstream socket so cancel() can shut it down even while this
+        # thread is blocked reading (closing the client would not wake it).
+        if event_name == "connection.connect_tcp.complete":
+            try:
+                self._sock = info["return_value"].get_extra_info("socket")
+            except Exception:
+                self._sock = None
+            if self._cancelled.is_set():
+                self._shutdown_socket()
+
+    def _shutdown_socket(self):
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _run(self):
+        timeout = httpx.Timeout(connect=30, read=LOCAL_UPSTREAM_SILENCE_SECONDS,
+                                write=30, pool=30)
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                if self._cancelled.is_set():
+                    return
+                with client.stream("POST", self.url, content=self.body,
+                                   headers=self.headers,
+                                   extensions={"trace": self._trace}) as resp:
+                    self.events.put(("headers", resp.status_code, resp.headers))
+                    # Streaming bytes pass through untouched, as on the hosted
+                    # routes; a non-streaming body is decoded like resp.content.
+                    pieces = resp.iter_raw() if self.stream else resp.iter_bytes()
+                    for chunk in pieces:
+                        if self._cancelled.is_set():
+                            return
+                        self.events.put(("chunk", chunk))
+            self.events.put(("end",))
+        except Exception as e:
+            if not self._cancelled.is_set():
+                self.events.put(("error", e))
+
+    def read_rest(self, events: queue.Queue) -> bytes:
+        """Collect the remaining body (used for error responses)."""
+        parts: list[bytes] = []
+        while True:
+            try:
+                ev = events.get(timeout=LOCAL_UPSTREAM_SILENCE_SECONDS)
+            except queue.Empty:
+                break
+            if ev[0] == "chunk":
+                parts.append(ev[1])
+            else:
+                break
+        return b"".join(parts)
+
+    def cancel(self):
+        if self._cancelled.is_set():
+            return
+        self._cancelled.set()
+        if self._thread.is_alive():
+            self._shutdown_socket()
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
@@ -2127,6 +2248,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _forward_messages_upstream(self, url, body, headers, is_streaming,
                                    norm_action, log_model, route_label):
         rl = getattr(self, "_rl", None) or {}
+        if route_label == "local":
+            self._forward_local(url, body, headers, is_streaming, norm_action, log_model)
+            return
         timeout = httpx.Timeout(connect=30, read=600, write=30, pool=30)
         try:
             with httpx.Client(timeout=timeout) as client:
@@ -2138,10 +2262,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     rl["status"] = resp.status_code
                     if resp.status_code >= 400:
                         rl["error"] = resp.content[:500].decode("utf-8", errors="replace")
-                    if route_label == "local" and self._send_translated_overflow(
-                        resp.status_code, resp.content
-                    ):
-                        return
                     self.send_response(resp.status_code)
                     for k, v in resp.headers.multi_items():
                         if k.lower() not in ("transfer-encoding", "connection",
@@ -2173,6 +2293,191 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _forward_local(self, url, body, headers, is_streaming, norm_action, log_model):
+        """Forward a local-route request, keeping the client connection alive.
+
+        See LOCAL_KEEPALIVE_SECONDS for why. The upstream exchange runs in a
+        worker thread that feeds a queue; this thread writes to the client and
+        fills every silent LOCAL_KEEPALIVE_SECONDS with a keepalive.
+        """
+        rl = getattr(self, "_rl", None)
+        if rl is None:
+            rl = self._rl = {}
+        events: queue.Queue = queue.Queue()
+        upstream = _LocalUpstreamCall(url, body, headers, events, bool(is_streaming))
+        upstream.start()
+        committed = False      # we have sent response headers to the client
+        at_boundary = True     # streaming output so far ends at an SSE event boundary
+        chunks: list[bytes] = []
+        fixer = LocalUsageFixer() if is_streaming else None
+        status = None
+
+        def commit(code: int, resp_headers=None):
+            nonlocal committed
+            self.send_response(code)
+            if resp_headers is not None:
+                for k, v in resp_headers.multi_items():
+                    if k.lower() not in ("transfer-encoding", "connection",
+                                          "content-encoding", "content-length"):
+                        self.send_header(k, v)
+            else:
+                self.send_header("content-type", "text/event-stream" if is_streaming
+                                 else "application/json")
+            self.end_headers()
+            self.wfile.flush()
+            committed = True
+
+        def write(data: bytes):
+            nonlocal at_boundary
+            if not data:
+                return
+            self.wfile.write(data)
+            self.wfile.flush()
+            at_boundary = data.endswith(b"\n\n") or data.endswith(b"\r\n\r\n")
+
+        def keepalive():
+            if is_streaming:
+                if not at_boundary:
+                    return
+                self.wfile.write(SSE_PING)
+            else:
+                self.wfile.write(b" ")
+            self.wfile.flush()
+            stats["local_keepalives"] += 1
+
+        def fail(message: str, *, error_type: str = "overloaded_error", code: int = 529):
+            # A retryable error the CLI understands; status only if not yet committed.
+            rl["status"] = rl.get("status") or code
+            rl["error"] = message[:500]
+            payload = json.dumps({"type": "error",
+                                  "error": {"type": error_type, "message": message}})
+            if not committed:
+                data = payload.encode()
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            elif is_streaming:
+                prefix = b"" if at_boundary else b"\n\n"
+                self.wfile.write(prefix + b"event: error\ndata: " + payload.encode() + b"\n\n")
+            else:
+                self.wfile.write(payload.encode())
+            self.wfile.flush()
+
+        try:
+            deadline = time.monotonic() + LOCAL_HEADER_WAIT_SECONDS
+            while True:
+                wait = (LOCAL_KEEPALIVE_SECONDS if committed
+                        else max(0.0, deadline - time.monotonic()))
+                try:
+                    ev = events.get(timeout=wait)
+                except queue.Empty:
+                    if not committed:
+                        commit(200)
+                        stats["local_early_commits"] += 1
+                        log(f"LOCAL: no upstream response in {LOCAL_HEADER_WAIT_SECONDS:.0f}s; "
+                            f"sent own 200 headers, keeping alive (stream={is_streaming})")
+                    else:
+                        keepalive()
+                    continue
+                kind = ev[0]
+                if kind == "headers":
+                    status, resp_headers = ev[1], ev[2]
+                    rl["status"] = status
+                    if status >= 400:
+                        error_body = upstream.read_rest(events)
+                        rl["error"] = error_body[:500].decode("utf-8", errors="replace")
+                        log(f"LOCAL: upstream error status={status} "
+                            f"{error_body[:300].decode('utf-8', errors='replace')}")
+                        if not committed:
+                            if self._send_translated_overflow(status, error_body):
+                                return
+                            self.send_response(status)
+                            for k, v in resp_headers.multi_items():
+                                if k.lower() not in ("transfer-encoding", "connection",
+                                                      "content-encoding", "content-length"):
+                                    self.send_header(k, v)
+                            self.send_header("Content-Length", str(len(error_body)))
+                            self.end_headers()
+                            self.wfile.write(error_body)
+                        else:
+                            try:
+                                err = json.loads(error_body)["error"]
+                                fail(str(err.get("message", "")),
+                                     error_type=str(err.get("type", "api_error")))
+                            except Exception:
+                                fail(f"local upstream returned {status}: "
+                                     f"{error_body[:300].decode('utf-8', errors='replace')}",
+                                     error_type="api_error")
+                        return
+                    if not committed:
+                        commit(status, resp_headers)
+                elif kind == "chunk":
+                    chunk = ev[1]
+                    if fixer is not None:
+                        chunk = fixer.feed(chunk)
+                    if chunk:
+                        chunks.append(chunk)
+                        if is_streaming:
+                            write(chunk)
+                elif kind == "end":
+                    break
+                elif kind == "error":
+                    exc = ev[1]
+                    if isinstance(exc, httpx.ReadTimeout):
+                        stats["local_upstream_silence"] += 1
+                        msg = (f"local upstream sent nothing for "
+                               f"{LOCAL_UPSTREAM_SILENCE_SECONDS:.0f}s")
+                        log(f"LOCAL: {msg}")
+                        fail(msg)
+                    else:
+                        log(f"upstream error: {exc}")
+                        fail(f"proxy upstream error: {exc}", error_type="api_error", code=502)
+                    return
+
+            if fixer is not None:
+                tail = fixer.flush()
+                if tail:
+                    chunks.append(tail)
+                    write(tail)
+                if fixer.rewrites:
+                    stats["local_usage_rewrites"] += fixer.rewrites
+                usage = parse_sse_usage(chunks)
+                if usage:
+                    rl["usage"] = usage
+                    log_usage_entry(norm_action, usage, model=log_model, route="local",
+                                    req_id=rl.get("req_id", ""),
+                                    session_id=rl.get("session_id", ""),
+                                    http_status=status)
+                else:
+                    raw_preview = b"".join(chunks)[:500].decode("utf-8", errors="replace")
+                    rl["error"] = raw_preview
+                    log(f"STREAM: no usage in {len(chunks)} chunks. Preview: {raw_preview[:200]}")
+            else:
+                content = b"".join(chunks)
+                self.wfile.write(content)
+                self.wfile.flush()
+                try:
+                    usage = json.loads(content).get("usage", {})
+                    if usage:
+                        rl["usage"] = usage
+                        log_usage_entry(norm_action, usage, model=log_model, route="local",
+                                        req_id=rl.get("req_id", ""),
+                                        session_id=rl.get("session_id", ""),
+                                        http_status=status)
+                    else:
+                        log(f"NON-STREAM: no usage in response (status={status})")
+                except Exception as e:
+                    log(f"NON-STREAM: response parse error: {e}")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+            stats["local_client_gone"] += 1
+            rl["status"] = rl.get("status") or 499
+            rl["error"] = f"client disconnected: {e}"
+            log(f"LOCAL: client disconnected ({e}); closing upstream request")
+        finally:
+            upstream.cancel()
+
     def _send_translated_overflow(self, status: int, error_body: bytes) -> bool:
         translated = translate_local_overflow_error(status, error_body)
         if translated is None:
@@ -2195,22 +2500,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             rl = self._rl = {}
         with client.stream("POST", url, content=body, headers=headers) as resp:
             rl["status"] = resp.status_code
-            if route == "local" and resp.status_code >= 400:
-                error_body = resp.read()
-                rl["error"] = error_body[:500].decode("utf-8", errors="replace")
-                if self._send_translated_overflow(resp.status_code, error_body):
-                    return
-                self.send_response(resp.status_code)
-                for k, v in resp.headers.multi_items():
-                    if k.lower() not in ("transfer-encoding", "connection",
-                                          "content-encoding", "content-length"):
-                        self.send_header(k, v)
-                self.send_header("Content-Length", str(len(error_body)))
-                self.end_headers()
-                self.wfile.write(error_body)
-                log(f"STREAM: local upstream error status={resp.status_code} "
-                    f"{error_body[:300].decode('utf-8', errors='replace')}")
-                return
             self.send_response(resp.status_code)
             for k, v in resp.headers.multi_items():
                 if k.lower() not in ("transfer-encoding", "connection",
@@ -2219,23 +2508,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             chunks: list[bytes] = []
-            fixer = LocalUsageFixer() if route == "local" else None
             for chunk in resp.iter_raw():
-                if fixer is not None:
-                    chunk = fixer.feed(chunk)
-                    if not chunk:
-                        continue
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 chunks.append(chunk)
-            if fixer is not None:
-                tail = fixer.flush()
-                if tail:
-                    self.wfile.write(tail)
-                    self.wfile.flush()
-                    chunks.append(tail)
-                if fixer.rewrites:
-                    stats["local_usage_rewrites"] += fixer.rewrites
 
             usage = parse_sse_usage(chunks)
             if usage:

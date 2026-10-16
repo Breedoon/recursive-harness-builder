@@ -146,6 +146,40 @@ OBS_CACHE_PROXY_PORT=18923
 
 Use `OBS_SKIP_CACHE_PROXY=1` for debugging or if the proxy fails to start. When disabled or unhealthy, sessions route directly to Anthropic for Claude models.
 
+### Local-route liveness (bead obs-3)
+
+A local model can stay silent for many minutes before its first token: a cold
+500k-token prefill on the Sparks, queueing behind other prefills, or the 3090
+gate holding requests while the GPUs are lent out. The bundled CLI drops a
+request that receives no bytes for about five minutes ("Request timed out"),
+retries it from scratch up to eleven times, and so kills the turn after about
+an hour. The proxy also used to keep every abandoned request open upstream
+until its own 600 s read timeout. The local server kept prefilling it, and the
+retries piled more prefills onto the same slots (2026-10-16: five 500k
+prefills, no decoding, every local agent starved).
+
+For `local-*` models only (hosted routes are unchanged), the proxy:
+
+- sends its own `200` headers if upstream has not answered within
+  `OBS_LOCAL_HEADER_WAIT_SECONDS` (default 20). Faster upstream errors, such as
+  the context-overflow 400 translation, keep their real status;
+- writes an Anthropic `ping` event (streaming) or one space before the JSON body
+  (non-streaming) every `OBS_LOCAL_KEEPALIVE_SECONDS` (default 15) of upstream
+  silence;
+- shuts the upstream socket down as soon as a write shows that the client has
+  gone, so abandoned requests stop using local capacity (TensorFold cancels on
+  disconnect within seconds; measured 2026-10-16);
+- after `OBS_LOCAL_UPSTREAM_SILENCE_SECONDS` (default 1800) without one upstream
+  byte, ends the response with a retryable `overloaded_error` (an SSE `error`
+  event if headers were already sent) instead of hanging.
+
+The request sent upstream is not changed, so this cannot affect prompt caching.
+Each case is logged in the proxy's stderr with a `LOCAL:` prefix. In-process
+`stats` counters: `local_keepalives`, `local_early_commits`,
+`local_client_gone`, `local_upstream_silence`. Tests:
+`tests/test_cache_proxy_local_keepalive.py`; end-to-end reproduction with the
+real CLI: `scripts/local_stall_repro.py`.
+
 ### Request log (prompt-cache diagnosis)
 
 Since 2026-10-08 the proxy keeps a standing, session-keyed pool of recent
