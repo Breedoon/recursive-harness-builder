@@ -81,6 +81,18 @@ def find_bead_ids(text: str | None, known: frozenset[str]) -> set[str]:
     return {m.group(1) for m in _CANDIDATE.finditer(text) if m.group(1) in known}
 
 
+# Platform-injected context that every root transcript carries (CLAUDE.md and the OBS platform
+# notes). CLAUDE.md names real bead ids (e.g. vault-x5tk, vault-0xs8), so counting this text made
+# every root look registered and the warning never fired (found live 2026-10-16, ops-1.12).
+_INJECTED = re.compile(
+    r"<(obs-agent-entry-file-context|obs-platform-context)\b.*?</\1>", re.DOTALL
+)
+
+
+def strip_injected_context(text: str) -> str:
+    return _INJECTED.sub("", text)
+
+
 def transcript_has_bead(jsonl_path: Path | None, known: frozenset[str]) -> bool:
     if jsonl_path is None or not known:
         return False
@@ -90,7 +102,7 @@ def transcript_has_bead(jsonl_path: Path | None, known: frozenset[str]) -> bool:
             if size > _SCAN_LIMIT:
                 fh.seek(size - _SCAN_LIMIT)
             for raw in fh:
-                line = raw.decode("utf-8", errors="ignore")
+                line = strip_injected_context(raw.decode("utf-8", errors="ignore"))
                 if find_bead_ids(line, known):
                     return True
     except OSError:

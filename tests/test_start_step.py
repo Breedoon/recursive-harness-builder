@@ -38,6 +38,27 @@ def test_transcript_scan(beads, tmp_path):
     assert not start_step.transcript_has_bead(jsonl, known)
 
 
+def test_injected_context_does_not_count(beads, tmp_path):
+    """CLAUDE.md (entry-file context) names real bead ids; every root transcript carries it, so it
+    must not exempt the root (live defect 2026-10-16, ops-1.12: the warning never fired)."""
+    known = start_step.known_bead_ids(tmp_path)
+    jsonl = tmp_path / "s.jsonl"
+    injected = (
+        '<obs-agent-entry-file-context source="CLAUDE.md">\nmission epic vault-maw0, ac-1\n'
+        "</obs-agent-entry-file-context>\n<obs-platform-context>\nsee ops-1.5\n</obs-platform-context>\n"
+    )
+    jsonl.write_text(
+        json.dumps({"type": "queue-operation", "content": injected + "please fix the login"}) + "\n"
+        + json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": injected},
+                                                              {"type": "text", "text": "no id here"}]}}) + "\n"
+    )
+    assert not start_step.transcript_has_bead(jsonl, known)
+    # The user's own words in the same message still count.
+    jsonl.write_text(json.dumps({"type": "user", "message": {"content": [
+        {"type": "text", "text": injected}, {"type": "text", "text": "continue ac-1"}]}}) + "\n")
+    assert start_step.transcript_has_bead(jsonl, known)
+
+
 def _tools(monkeypatch, config, *, lineage, jsonl=None):
     from obs_agent.tools import create_obs_tools
 
