@@ -214,15 +214,17 @@ def test_regression_runner_writes_matching_gate_report(tmp_path):
     assert report["scenarios"] == "all" and report["code"]["head"] and report["proxy_source"] == "abc"
     results[2]["status"] = "PROVIDER-ERROR"
     runner._write_gate_report(tmp_path, args=args, ident={}, live="abc", results=results, overall="INCONCLUSIVE")
-    assert json.loads((tmp_path / "gate.json").read_text())["providers"] == ["anthropic"]
+    report = json.loads((tmp_path / "gate.json").read_text())
+    assert report["providers"] == ["anthropic", "codex"] and report["providers_all_pass"] == ["anthropic"]
 
 
-def _report_with(root, repo, name, result, per, scenarios="all", failures=None):
+def _report_with(root, repo, name, result, per, scenarios="all", failures=None, providers=None):
     out = root / name
     out.mkdir(parents=True)
     ident = cache_gate.code_identity(repo)
     report = {
-        "result": result, "providers": [], "scenarios": scenarios, "scenario_results": per,
+        "result": result, "providers": sorted(per) if providers is None else list(providers),
+        "scenarios": scenarios, "scenario_results": per,
         "code": ident, "proxy_source": ident["proxy_source_sha256"],
     }
     if failures is not None:
@@ -278,6 +280,7 @@ def _full_fail_then_rerun(repo, tmp_path, provider, scenario, failure):
     ("codex", "boundary_marker", _fail("append", 0.0)),        # documented 2026-10-12
     ("codex", "cch_collision", _fail("append", 0.0)),          # observed 2026-10-15
     ("codex", "boundary_marker", _fail("append", 0.835)),      # observed 2026-10-15, pure append
+    ("codex", "reminder_block", _fail("append", 0.0)),         # observed 2026-10-16
     ("anthropic", "recovery_multi", _fail("tail-block-append", 0.8721)),
     ("anthropic", "recovery_multi", _fail("tail-block-append", 0.944)),
     ("codex", "baseline", {"status": "PROVIDER-ERROR", "bad_pairs": []}),
@@ -294,6 +297,9 @@ def test_documented_shapes_accepted_after_rerun(repo, tmp_path, provider, scenar
     ("anthropic", "recovery_multi", _fail("tail-block-append", 0.70), "not a documented"),
     ("codex", "baseline", _fail("tools-changed", 0.5), "not a documented"),
     ("codex", "baseline", {"status": "FAIL", "bad_pairs": []}, "without bad pairs"),
+    ("codex", "boundary_marker", _fail("append", 0.9), "not a documented"),    # unobserved partial read
+    ("codex", "boundary_marker", _fail("append", 0.5), "not a documented"),
+    ("codex", "boundary_marker", _fail("append", 0.79), "not a documented"),
 ])
 def test_undocumented_shapes_block_even_after_rerun(repo, tmp_path, provider, scenario, failure, why):
     result, _ = _full_fail_then_rerun(repo, tmp_path, provider, scenario, failure)
@@ -345,3 +351,39 @@ def test_runner_records_failure_shapes(tmp_path):
     report = json.loads((tmp_path / "gate.json").read_text())
     assert report["scenario_failures"] == {"codex": {"boundary_marker": {
         "status": "FAIL", "bad_pairs": [{"b": "r", "class": "append", "ratio": 0.835}], "error": None}}}
+
+
+def test_deterministic_gpt_append_at_0_9_blocked(repo, tmp_path):
+    """A real ~0.9 regression that fails its rerun too must block (branch D verifier fix 4)."""
+    import os
+    import time
+
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "src/obs_agent/session.py", "# CACHE-PREFIX WARNING\nY = 9\n")
+    reports = tmp_path / "reports"
+    per = {"anthropic": {"baseline": "PASS"}, "codex": {"baseline": "PASS", "boundary_marker": "FAIL"}}
+    _report_with(reports, repo, "a-full", "FAIL", per,
+                 failures={"codex": {"boundary_marker": _fail("append", 0.9)}})
+    time.sleep(0.01)
+    rerun = _report_with(reports, repo, "b-rerun", "FAIL", {"codex": {"boundary_marker": "FAIL"}},
+                         scenarios=["boundary_marker"],
+                         failures={"codex": {"boundary_marker": _fail("append", 0.9)}})
+    later = time.time() + 5
+    os.utime(rerun / "gate.json", (later, later))
+    result = cache_gate.check(repo, base=base, report_root=reports)
+    assert not result.ok and "append at 0.9" in result.message
+
+
+def test_report_missing_a_provider_refused(repo, tmp_path):
+    """gate.json must show both routes actually ran (branch D verifier fix 3)."""
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "src/obs_agent/session.py", "# CACHE-PREFIX WARNING\nY = 9\n")
+    reports = tmp_path / "reports"
+    per = {"anthropic": {"baseline": "PASS"}, "codex": {"baseline": "PASS"}}
+    _report_with(reports, repo, "a-pass", "PASS", per, providers=["anthropic"])
+    result = cache_gate.check(repo, base=base, report_root=reports)
+    assert not result.ok and "providers missing ['codex']" in result.message
+    _report_with(reports, repo, "b-fail", "FAIL", {**per, "codex": {"baseline": "PASS", "x": "FAIL"}},
+                 failures={"codex": {"x": _fail("append", 0.0)}}, providers=["codex"])
+    result = cache_gate.check(repo, base=base, report_root=reports)
+    assert not result.ok and "providers missing ['anthropic']" in result.message

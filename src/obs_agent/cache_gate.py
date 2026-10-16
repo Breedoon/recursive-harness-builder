@@ -175,20 +175,23 @@ def _same_code(report: dict, target: dict) -> tuple[bool, str]:
 
 # Documented intermittent FAIL shapes (docs/cache-proxy-safety.md §How to read the runner's
 # result). A FAIL is accepted on a passing rerun ONLY when every one of its bad pairs matches one
-# of these exactly; any other class, ratio or a FAIL without bad pairs blocks. Keep this table and
-# the doc identical — tests/test_cache_gate.py checks both directions.
-# 1. GPT route, class `append`: our bytes were a perfect prefix (the runner classifies the pair as
-#    a pure append) but the provider read less than 95% from cache. The proxy controls only bytes
-#    on this route (automatic prefix caching), so a short read is provider-side. Observed 0.0
-#    (codex boundary_marker 2026-10-12, codex cch_collision 2026-10-15) and 0.835 (codex
-#    boundary_marker 2026-10-15, prefix_diff: pure append, cached 15104 of 18089 = 59 of 70
-#    256-token blocks). On the Claude route a short-read append is NOT accepted: there it can mean
-#    a misplaced cache breakpoint, which is ours.
-# 2. Claude route, scenario `recovery_multi`, class `tail-block-append`, ratio 0.85 to <0.95: the
-#    open "Continue from where you left off." mechanism (bead vault-1r7n.9). Observed 0.8721,
-#    0.9216, 0.944.
+# of these rows exactly (ratio bounds inclusive); any other class, ratio or scenario, or a FAIL
+# without bad pairs blocks. Keep this table and the doc identical — tests/test_cache_gate.py
+# checks both directions. Bands are only as wide as the evidence (V1 / branch D verifier,
+# 2026-10-16): a byte-intact but intermittent cache-key regression on our side would look like a
+# partial GPT append, so an unobserved ratio must block until observations justify it.
+# 1. GPT route, class `append`, ratio exactly 0: our bytes were a perfect prefix, the provider read
+#    nothing (codex boundary_marker 2026-10-12; codex cch_collision 2026-10-15; codex
+#    reminder_block 2026-10-16). Each passed on rerun.
+# 2. GPT route, class `append`, ratio 0.80-0.86: the single observed partial read, codex
+#    boundary_marker 0.835 on 2026-10-15 (cached 15104 of 18089). Widening needs more
+#    observations first (bead filed under ops-1.11).
+# 3. Claude route, scenario `recovery_multi`, class `tail-block-append`, ratio 0.85-0.95: the open
+#    "Continue from where you left off." mechanism (bead vault-1r7n.9). Observed 0.8721, 0.9216,
+#    0.944.
 KNOWN_INTERMITTENT_SHAPES = (
-    {"provider": "codex", "scenario": None, "class": "append", "min_ratio": 0.0, "max_ratio": 0.95},
+    {"provider": "codex", "scenario": None, "class": "append", "min_ratio": 0.0, "max_ratio": 0.0},
+    {"provider": "codex", "scenario": None, "class": "append", "min_ratio": 0.8, "max_ratio": 0.86},
     {"provider": "anthropic", "scenario": "recovery_multi", "class": "tail-block-append",
      "min_ratio": 0.85, "max_ratio": 0.95},
 )
@@ -211,7 +214,7 @@ def known_intermittent(provider: str, scenario: str, failure: dict | None) -> tu
             shape["provider"] == provider
             and shape["scenario"] in (None, scenario)
             and shape["class"] == cls
-            and shape["min_ratio"] <= ratio < shape["max_ratio"]
+            and shape["min_ratio"] <= ratio <= shape["max_ratio"]
             for shape in KNOWN_INTERMITTENT_SHAPES
         ):
             return False, f"{cls} at {ratio} is not a documented intermittent shape"
@@ -228,10 +231,14 @@ def _report_matches(report: dict, target: dict, reruns: list[dict] | None = None
     if report.get("scenarios") not in (None, "all"):
         return False, "not the full scenario set"
     per = report.get("scenario_results") or {}
+    # Both routes must have actually run: the report's top-level `providers` lists every route
+    # the runner ran (scripts/cache_regression.py), and every scenario result must belong to one.
+    providers = set(report.get("providers") or [])
+    missing = [p for p in REQUIRED_PROVIDERS if p not in providers]
+    if missing:
+        return False, f"providers missing {missing}"
     if report.get("result") == "PASS":
-        providers = set(report.get("providers") or per)
-        missing = [p for p in REQUIRED_PROVIDERS if p not in providers]
-        return (False, f"providers missing {missing}") if missing else (True, "match")
+        return True, "match"
     if not per:
         return False, f"result {report.get('result')}"
     missing = [p for p in REQUIRED_PROVIDERS if p not in per]

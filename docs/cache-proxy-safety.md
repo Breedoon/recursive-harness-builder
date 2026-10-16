@@ -193,40 +193,48 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
   error). The line shows the bad pairs; run `prefix_diff.py` on them.
   Two known FAIL shapes are not caused by a proxy change and are usually
   intermittent, so rerun that one scenario before concluding:
-  - class `append` on the GPT route with ratio below 0.95 (0 or partial): our
-    bytes were a perfect prefix but the provider read less than the full
-    prefix from cache. The GPT route caches prefixes automatically and the
-    proxy controls only the bytes, so a short read on a pure append is
-    provider-side. Seen 2026-10-12 (`codex boundary_marker`, ratio 0),
-    2026-10-15 (`codex cch_collision`, ratio 0) and 2026-10-15
-    (`codex boundary_marker`, ratio 0.835: `prefix_diff.py` reports a pure
-    append, cached 15104 of 18089 tokens); each passed on rerun. The same
-    class on the Claude route is NOT this shape: there a short read can mean
-    a misplaced cache breakpoint, which is ours.
-  - class `tail-block-append` with ratio 0.85 to below 0.95 in
-    `recovery_multi` on the Claude route: the open "Continue from where you
-    left off." mechanism (bead `vault-1r7n.9`); it passes on some runs and
-    fails on others. Seen 0.8721, 0.9216 and 0.944.
+  - class `append` on the GPT route with ratio 0, or with a ratio in the one
+    observed partial band 0.80 to 0.86: our bytes were a perfect prefix but the
+    provider read nothing, or less than the full prefix, from cache. Ratio 0 was
+    seen 2026-10-12 (`codex boundary_marker`), 2026-10-15 (`codex cch_collision`)
+    and 2026-10-16 (`codex reminder_block`, `prefix_diff.py`: pure append). The
+    only partial read so far is 0.835 on 2026-10-15 (`codex boundary_marker`,
+    cached 15104 of 18089 tokens). Its request bodies were not kept, so
+    "provider-side" there is the runner's own `append` classification, not a
+    re-run diff. Each passed on rerun. Other partial ratios are NOT accepted:
+    a byte-intact but intermittent cache-key regression on our side
+    (`prompt_cache_key`, `cache_proxy.py`) would look exactly like a partial
+    GPT append, so the band widens only when more observations justify it
+    (bead under `ops-1.11`). The same class on the Claude route is not this
+    shape: there a short read can mean a misplaced cache breakpoint, which is
+    ours.
+  - class `tail-block-append` with ratio 0.85 to 0.95 in `recovery_multi` on the
+    Claude route: the open "Continue from where you left off." mechanism (bead
+    `vault-1r7n.9`); it passes on some runs and fails on others. Seen 0.8721,
+    0.9216 and 0.944.
   Any other class (`history-changed`, `system-changed`, `config-changed`,
   `tools-changed`, missing breakpoint), any other ratio, a different
   scenario for the second shape, or a FAIL with no recorded bad pairs is a
   real regression until proven otherwise.
 
   Known-shape table: the cache gate (`src/obs_agent/cache_gate.py`,
-  `KNOWN_INTERMITTENT_SHAPES`) accepts a full run with a FAIL only when every
-  bad pair of that FAIL matches one of these two rows exactly AND the same
-  scenario passed on a later rerun of the same code:
-  - GPT route, any scenario, class `append`, ratio 0.0 to below 0.95.
+  `KNOWN_INTERMITTENT_SHAPES`, ratio bounds inclusive) accepts a full run with a
+  FAIL only when every bad pair of that FAIL matches one of these rows exactly
+  AND the same scenario passed on a later rerun of the same code:
+  - GPT route, any scenario, class `append`, ratio 0.0 to 0.0 (exactly 0).
+  - GPT route, any scenario, class `append`, ratio 0.8 to 0.86.
   - Claude route, scenario `recovery_multi`, class `tail-block-append`,
-    ratio 0.85 to below 0.95.
+    ratio 0.85 to 0.95.
   `PROVIDER-ERROR` and `SKIPPED` scenarios (no cache verdict) are also
-  accepted once they pass on rerun. Changing a row needs evidence here and the
+  accepted once they pass on rerun. The report's top-level `providers` must
+  list both routes as actually run. Changing a row needs evidence here and the
   same change in the gate; `tests/test_cache_gate.py` checks they agree.
   History: OBS `28cfbe3` (2026-10-15) first let the gate accept any rerun-passed
   FAIL; it accepted the 0.835 append above although this list then documented
-  only ratio 0. `prefix_diff.py` later confirmed that pair was a pure append
-  (provider-side), and the rule was narrowed to this table (vault-3px5, V1
-  finding).
+  only ratio 0. OBS `5f94fbc` (2026-10-16) narrowed acceptance to a shape table
+  but widened the GPT row to "below 0.95" on that single observation; the branch
+  D verifier judged that a relaxation beyond the evidence, and the row was
+  narrowed to ratio 0 plus the observed 0.80–0.86 band (vault-3px5).
 - `PROVIDER-ERROR` — the scenario failed or timed out while the upstream API
   returned 5xx errors. Usually provider overload, not our code. It is not a
   pass: rerun that route later.

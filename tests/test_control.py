@@ -196,6 +196,32 @@ class TestBotDispatchReusesAgentTools:
         assert kwargs["args"]["prompt"].startswith("[external trigger: cron]\nfix it")
         assert kwargs["args"]["fork"] is False and kwargs["args"]["session_id"] == "sid-parent"
 
+    async def test_launch_fork_of_warm_parent_runs_agenttask_fork(self, config, tmp_path):
+        """`obs-agentctl launch --fork` goes through the AgentTask handler as a fork of the parent."""
+        bot = self._bot(config)
+        parent = self._parent(bot)
+        bot._launch_fork_task = AsyncMock(return_value={"content": [{"type": "text", "text": "AgentTask launched."}]})
+        path = _jsonl(tmp_path, model="claude-opus-5-5", age_seconds=60)
+        with patch("obs_agent.telegram.find_session_jsonl", return_value=path):
+            result = await bot._control_dispatch("launch", "cron", {
+                "parent_team": TEAM, "parent_agent": "parent-agent", "display_name": "Forker",
+                "prompt": "look", "fork": True})
+        assert result["ok"] is True and "AgentTask launched." in result["text"]
+        kwargs = bot._launch_fork_task.await_args.kwargs
+        assert kwargs["route"] == parent.route
+        args = kwargs["args"]
+        assert args["fork"] is True and args["session_id"] == "sid-parent"
+        assert args["model"] is None and args["session_source"] is None and args["allow_cold_wake"] is False
+        assert args["prompt"].startswith("[external trigger: cron]\nlook")
+
+    def test_cli_launch_defaults_to_fork(self, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(control, "send_request", lambda op, caller, args, **kw: (sent.update(op=op, args=args) or (0, {"ok": True, "text": "x"})))
+        assert control.main(["--as", "cron", "launch", "--parent-team", TEAM, "--parent", "p", "--name", "n", "--prompt", "q"]) == 0
+        assert sent["op"] == "launch" and sent["args"]["fork"] is True
+        assert control.main(["--as", "cron", "launch", "--parent-team", TEAM, "--parent", "p", "--name", "n", "--prompt", "q", "--fresh"]) == 0
+        assert sent["args"]["fork"] is False
+
     async def test_new_tree_requires_chat_when_ambiguous(self, config):
         bot = self._bot(config)
         bot._primary_bot = object()

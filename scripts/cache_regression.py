@@ -143,7 +143,7 @@ def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, re
                        overall: str) -> None:
     """gate.json: what scripts/cache_gate.py (vault-3px5) matches before a restart or merge."""
     code = ident.get("code") or _code_identity()
-    providers = sorted({r["provider"] for r in results if r.get("status") == "PASS"})
+    providers_run = sorted({r["provider"] for r in results if r.get("status") != "SKIPPED"})
     route_ok = {p: all(r.get("status") == "PASS" for r in results if r["provider"] == p)
                 for p in {r["provider"] for r in results}}
     scenario_results: dict = {}
@@ -162,7 +162,9 @@ def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, re
         "result": overall,
         "scenario_results": scenario_results,
         "scenario_failures": scenario_failures,
-        "providers": [p for p in providers if route_ok.get(p)],
+        # every route that actually ran; the gate refuses a report missing either required route
+        "providers": providers_run,
+        "providers_all_pass": sorted(p for p, ok in route_ok.items() if ok),
         "scenarios": "all" if not args.scenarios else list(args.scenarios),
         "code": code,
         "proxy_source": live,

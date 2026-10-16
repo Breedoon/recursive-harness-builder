@@ -21,7 +21,12 @@ obs-agentctl --as nightly-check new-tree --title "Disk alert" --prompt "..." [--
   (override `OBS_CONTROL_DIR`; `OBS_CONTROL_DISABLE=1` turns the listener off). No TCP port.
 - Callers must run as the OBS user on this host (directory 0700, socket 0600, `SO_PEERCRED` uid
   check) and present the token in `obs-control/token` (0600, new at every bot start; the CLI reads
-  it). From another machine: SSH into the `obs-test` container (port 2220) and run the CLI there.
+  it). From another machine, SSH into the `obs-test` container (port 2220) and run the CLI there:
+  - from the Ubuntu host: `ssh -p 2220 agent@127.0.0.1 '/workspace/runtime/bin/obs-agentctl --as NAME ping'`
+    (verified 2026-10-16; the host's `breedoon@breedoon-ubuntu-host` key was added to the
+    containers' shared `/data/config/authorized_keys`, backup `authorized_keys.bak-20261016-d2d`);
+  - over Tailscale: `ssh -p 2220 agent@100.66.160.62 '...'` with a key in that same file.
+- Global flags (`--as`, `--json`, `--idempotency-key`) go BEFORE the op name.
 - Every request, accepted or refused, is appended to `obs-control/audit.jsonl`.
 
 ## What runs
