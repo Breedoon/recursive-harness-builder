@@ -200,3 +200,46 @@ def test_heading_added_later_records_current_form_without_change(tmp_path):
     gone = _mcp_body(False, extra=_turn() + _turn())
     cache_proxy.pin_volatile_config(gone, reloaded)
     assert gone["system"] == _mcp_body(True)["system"]
+
+
+def _adjacent_body(on, extra=()):
+    # live volatile_flip 2026-10-16 12:28Z (scratch request ...-000078-a4c164b1):
+    # the pinned OE section's anchor is the MCP heading, itself being restored
+    b = _body(False, extra=extra)
+    if on:
+        t = b["system"][2]["text"]
+        cut = t.index("# auto memory")
+        b["system"][2]["text"] = t[:cut] + OE + MCP + t[cut:]
+    return b
+
+
+def test_adjacent_pinned_sections_both_restored(tmp_path):
+    store = _store(tmp_path)
+    cache_proxy.pin_volatile_config(_adjacent_body(True), store)
+    later = _adjacent_body(False, extra=_turn())
+    res = cache_proxy.pin_volatile_config(later, store)
+    assert later["system"] == _adjacent_body(True)["system"]
+    assert sorted(res["applied"]) == ["restored:# MCP Server Instructions", "restored:# Output efficiency"]
+
+
+def test_adjacent_pinned_sections_both_removed(tmp_path):
+    store = _store(tmp_path)
+    cache_proxy.pin_volatile_config(_adjacent_body(False), store)
+    later = _adjacent_body(True, extra=_turn())
+    cache_proxy.pin_volatile_config(later, store)
+    assert later["system"] == _adjacent_body(False)["system"]
+
+
+def test_changed_text_replaced_in_place_with_other_section_removed(tmp_path):
+    # MCP pinned present; later OE appears (removed) AND MCP text changed:
+    # the second edit must use positions after the first one
+    store = _store(tmp_path)
+    first = _body(False)
+    t = first["system"][2]["text"]
+    cut = t.index("gitStatus: ")
+    first["system"][2]["text"] = t[:cut] + MCP + t[cut:]
+    expected = json.loads(json.dumps(first["system"]))
+    cache_proxy.pin_volatile_config(first, store)
+    later = _mcp_body(True, mcp=MCP.replace("## exa\n", "## exa\nchanged\n"), extra=_turn())
+    cache_proxy.pin_volatile_config(later, store)
+    assert later["system"] == expected

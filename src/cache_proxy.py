@@ -1122,6 +1122,7 @@ def pin_volatile_config(body: dict, store: "EffortPinStore | None" = None) -> di
         else:
             entry[1] = now
             pinned = entry[0]
+            restores = []
             for h, f in found.items():
                 if h not in (pinned.get("s") or {}):
                     # heading added after this pin was made: record the
@@ -1139,23 +1140,39 @@ def pin_volatile_config(body: dict, store: "EffortPinStore | None" = None) -> di
                 have = hashlib.sha256(f[3].encode()).hexdigest() if f else None
                 if want == have:
                     continue
-                if want is None and f:  # section appeared: remove it
-                    i, start, end = f[0], f[1], f[2]
-                    t = system[i]["text"]
-                    system[i]["text"] = t[:start] + t[end:]
+                # positions are re-found: another section's edit in the same
+                # block shifts them
+                f = _find_volatile_section(system, h)
+                if f and want is None:  # section appeared: remove it
+                    t = system[f[0]]["text"]
+                    system[f[0]]["text"] = t[:f[1]] + t[f[2]:]
                     result["applied"].append(f"removed:{h}")
-                elif want is not None:
+                elif f:  # different text in place: put the pinned text there
+                    text = store.texts.get(want)
+                    if text is not None:
+                        t = system[f[0]]["text"]
+                        system[f[0]]["text"] = t[:f[1]] + text + t[f[2]:]
+                        result["applied"].append(f"restored:{h}")
+                elif want is not None:  # section disappeared
+                    restores.append(h)
+            # A pinned section's anchor (the line that followed it) may itself
+            # be another pinned section that is being restored, so retry until
+            # no restore makes progress.
+            while restores:
+                progressed = False
+                for h in list(restores):
+                    want = pinned["s"][h]
                     text = store.texts.get(want)
                     anchor = (pinned.get("a") or {}).get(h) or [None, None]
                     i, following = anchor
                     if text is None or i is None or i >= len(system):
+                        restores.remove(h)
                         continue
                     blk = system[i]
                     if not isinstance(blk, dict) or not isinstance(blk.get("text"), str):
+                        restores.remove(h)
                         continue
                     t = blk["text"]
-                    if f:  # different text in place: drop the new one first
-                        t = t[:f[1]] + t[f[2]:]
                     if following is None:
                         if t and not t.endswith("\n\n"):
                             continue
@@ -1165,7 +1182,11 @@ def pin_volatile_config(body: dict, store: "EffortPinStore | None" = None) -> di
                         if not m:
                             continue
                         blk["text"] = t[:m.start()] + text + t[m.start():]
+                    restores.remove(h)
+                    progressed = True
                     result["applied"].append(f"restored:{h}")
+                if not progressed:
+                    break
             want_cm = pinned.get("cm", cm_json)
             if (json.loads(want_cm) if want_cm is not None else None) != cm:
                 if want_cm is None:
