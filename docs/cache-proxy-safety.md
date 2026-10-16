@@ -55,9 +55,15 @@ real break mechanisms in live traffic; none was caught by a unit test:
    cache key (fixed 2026-10-12: one key per conversation,
    `assign_conversation_cache_key`).
 
-Still open: a "Continue from where you left off." block the CLI adds at the
-end of some recovered conversations costs a little cache on Claude and caused
-some large GPT fork misses (bead `vault-1r7n.9`).
+Not a mechanism (checked 2026-10-16, bead `vault-1r7n.9`): the "Continue from
+where you left off." block the CLI adds to the last user message when a fork or
+recovery ends on a tool result. Anthropic caches by block prefix, so adding a
+block after cached ones costs nothing (live A/B below, under the
+`recovery_multi` shape). On the GPT route the block comes after the shared
+prefix too; the short GPT fork reads seen in production also happen on pure
+appends (the parent's own request just before one fork read 135k of 177k), and
+the fork-vs-parent ratio compares against a parent request that already holds
+content the fork never had, which makes forks look worse than they are.
 
 ## When this checklist applies
 
@@ -220,9 +226,21 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
     shape: there a short read can mean a misplaced cache breakpoint, which is
     ours.
   - class `tail-block-append` with ratio 0.85 to 0.95 in `recovery_multi` on the
-    Claude route: the open "Continue from where you left off." mechanism (bead
-    `vault-1r7n.9`); it passes on some runs and fails on others. Seen 0.8721,
-    0.9216 and 0.944.
+    Claude route. Seen 0.8721, 0.9216, 0.932, 0.9333 and 0.944. It fails only
+    on runs where the recovery target is a tool result (the killed turn had
+    finished a tool round), and passes when the target is a plain user message.
+    Cause (measured 2026-10-16, bead `vault-1r7n.9`): the harness model, Haiku
+    4.5, drops the thinking of earlier assistant turns once a plain-text user
+    turn follows a tool round. That changes the API prompt from that assistant
+    message on, so the cache read stops just before it. This is the API, not
+    OBS. A/B with a fork that ends on a large tool result: Haiku read 0.7394
+    with the CLI's "Continue" block and 0.7396 without it (OBS writing the CLI's
+    own "No response requested." row instead, a pure `append`). Opus 4.6, which
+    keeps earlier thinking, read 1.0 both ways. Production runs on Opus 4.5 or
+    later, which keeps earlier thinking, so production forks do not lose this.
+    Reports: `/workspace/runtime/cache-regression/20261016T-p1forktail-*`; the
+    rejected fork-tail patch and the A/B scenario are in obs-artifacts
+    `Drafts/Artifacts/2026-10-16-opus-p1-fixes/fork-tail/`.
   Any other class (`history-changed`, `system-changed`, `config-changed`,
   `tools-changed`, missing breakpoint), any other ratio, a different
   scenario for the second shape, or a FAIL with no recorded bad pairs is a
