@@ -57,6 +57,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -678,7 +679,12 @@ async def sc_volatile_flip(args):
     two requests of the same conversation. The CLI cannot be flipped on demand
     without touching the fleet's shared config, so this probe sends three
     variants of one real CLI request (A: section + context_management; B: both
-    removed; C: both back). The proxy must send B and C upstream exactly as A."""
+    removed; C: both back). The proxy must send B and C upstream exactly as A.
+    Since ops-30 (2026-10-16 04:10Z, ~3.7M re-billed) the variants also carry
+    the "# MCP Server Instructions" section the CLI rebuilds from the MCP
+    servers connected in each process, placed as observed (before gitStatus):
+    A has it, B drops it (server not connected), C has it, D has different
+    instructions text. B, C and D must all go upstream exactly as A."""
     if args.provider != "anthropic":
         raise RuntimeError("volatile_flip is an Anthropic-route scenario")
     sid = str(uuid.uuid4())
@@ -687,21 +693,35 @@ async def sc_volatile_flip(args):
     oe = ("# Output efficiency\n\nIMPORTANT: Go straight to the point. Be extra concise.\n\n"
           "Keep your text output brief and direct.\n\n")
 
-    def with_section(on):
+    mcp = ("# MCP Server Instructions\n\nThe following MCP servers have provided instructions "
+           "for how to use their tools and resources:\n\n## exa\nOnly use tools returned by "
+           "tools/list.\n\n")
+
+    def with_section(on, mcp_text=mcp):
         def build(b):
             b["max_tokens"] = 2048
             b["thinking"] = {"type": "enabled", "budget_tokens": 1024}
             sys2 = b["system"][2]
-            t = sys2["text"]
+            # drop any section the harness CLI's own MCP servers produced, so
+            # every variant carries exactly the one under test
+            t = re.sub(r"(?ms)^# MCP Server Instructions\n.*?(?:\n\n(?=# |gitStatus: )|\Z)",
+                       "", sys2["text"])
             cut = t.rfind("\n# ")  # insert before the last top-level heading
             if on:
-                sys2["text"] = t[:cut + 1] + oe + t[cut + 1:] if cut >= 0 else t + "\n\n" + oe
+                t = t[:cut + 1] + oe + t[cut + 1:] if cut >= 0 else t + "\n\n" + oe
                 b["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
+            if mcp_text:  # as the CLI places it: before gitStatus, else before the last heading
+                g = t.find("\ngitStatus: ")
+                cut = g if g >= 0 else t.rfind("\n# ")
+                t = t[:cut + 1] + mcp_text + t[cut + 1:] if cut >= 0 else t + "\n\n" + mcp_text
+            sys2["text"] = t
         return build
 
+    mcp_d = mcp.replace("## exa\n", "## exa\nInstructions changed on reconnect.\n")
     meta = _direct_probe(args, sid, since, [("A-section-on", with_section(True)),
-                                           ("B-section-off", with_section(False)),
-                                           ("C-section-on", with_section(True))])
+                                           ("B-section-off", with_section(False, None)),
+                                           ("C-section-on", with_section(True)),
+                                           ("D-mcp-changed", with_section(True, mcp_d))])
     return [sid], meta
 
 

@@ -54,6 +54,13 @@ real break mechanisms in live traffic; none was caught by a unit test:
 8. On the GPT route our own metadata rewrite gave the whole fleet ONE provider
    cache key (fixed 2026-10-12: one key per conversation,
    `assign_conversation_cache_key`).
+9. An MCP server that starts (or stops) supplying instructions adds (or
+   removes) the CLI's `# MCP Server Instructions` system section, which the
+   CLI rebuilds in every process from the servers connected there. On
+   2026-10-16 04:10Z the remote exa server began returning instructions and
+   about 11 live Opus sessions re-billed ~3.7M tokens (fixed 2026-10-16: added
+   to `VOLATILE_SYSTEM_SECTIONS`, kept as first seen per conversation; bead
+   `ops-30`).
 
 Not a mechanism (checked 2026-10-16, bead `vault-1r7n.9`): the "Continue from
 where you left off." block the CLI adds to the last user message when a fork or
@@ -348,9 +355,18 @@ These are deliberate tradeoffs. Re-decide them if they start to hurt.
   kept rather than cleared, so long conversations may grow a little faster
   toward compaction. If it disappears, it is restored, but only when thinking
   is enabled.
-- **Only one system section is pinned.** That is `"# Output efficiency"`, the
-  only one seen flipping. Any other flag-driven section that starts flipping
-  is not covered until it is added to `VOLATILE_SYSTEM_SECTIONS`.
+- **Only two system sections are pinned.** `"# Output efficiency"` and, since
+  2026-10-16, `"# MCP Server Instructions"`, the only ones seen flipping. Any
+  other section that starts flipping is not covered until it is added to
+  `VOLATILE_SYSTEM_SECTIONS`. A heading added later is recorded for existing
+  conversations on their next request, as they are, so adding one re-bills
+  nothing.
+- **MCP instructions stay as first seen per conversation.** A conversation
+  that began before a server supplied instructions does not see them until it
+  ends (or its pin expires); one that began with them keeps them even in a
+  process where that server failed to connect. New conversations get the
+  current text. A server whose instructions contain a line starting with `# `
+  ends the matched section early, so such a flip is only partly pinned.
 - **Why these sections flip is a hypothesis.** It comes from reading the
   bundled CLI, not from observing the mechanism end to end. The guess: a
   server feature flag (`tengu_swann_brevity`) is cached in the fleet's shared

@@ -130,3 +130,73 @@ def test_conversation_cache_key_per_conversation_shared_by_fork():
     assert a1["metadata"]["user_id"] == "user_ab_account__session_" + k1
     untouched = {"model": "m", "messages": a1["messages"], "metadata": {"user_id": "user_x"}}
     assert cache_proxy.assign_conversation_cache_key(untouched) is None
+
+
+# ── ops-30: "# MCP Server Instructions" appears/disappears mid-conversation ──
+# Real 2026-10-16 04:18Z shape (request 20261016T041859...-3a2ffe01): the CLI
+# puts the section after the last top-level section and before gitStatus.
+MCP = ("# MCP Server Instructions\n\nThe following MCP servers have provided instructions "
+       "for how to use their tools and resources:\n\n## exa\nOnly use tools returned by "
+       "tools/list.\n\n")
+
+
+def _mcp_body(with_mcp=True, mcp=MCP, first="hello", extra=()):
+    b = _body(True, first=first, extra=extra)
+    t = b["system"][2]["text"]
+    if with_mcp:
+        cut = t.index("gitStatus: ")
+        b["system"][2]["text"] = t[:cut] + mcp + t[cut:]
+    return b
+
+
+def _turn():
+    return [{"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "user", "content": [{"type": "text", "text": "more"}]}]
+
+
+def test_mcp_section_stops_before_gitstatus():
+    b = _mcp_body(True)
+    found = cache_proxy._find_volatile_section(b["system"], "# MCP Server Instructions")
+    assert found[3] == MCP and found[4] == "gitStatus: normalized"
+    t = b["system"][2]["text"]
+    assert t[:found[1]] + t[found[2]:] == _mcp_body(False)["system"][2]["text"]
+
+
+def test_mcp_section_appearing_mid_conversation_is_removed(tmp_path):
+    store = _store(tmp_path)
+    cache_proxy.pin_volatile_config(_mcp_body(False), store)
+    later = _mcp_body(True, extra=_turn())
+    res = cache_proxy.pin_volatile_config(later, store)
+    assert "removed:# MCP Server Instructions" in res["applied"]
+    assert later["system"] == _mcp_body(False)["system"]
+
+
+def test_mcp_section_disappearing_or_changing_is_restored(tmp_path):
+    store = _store(tmp_path)
+    cache_proxy.pin_volatile_config(_mcp_body(True), store)
+    gone = _mcp_body(False, extra=_turn())  # server failed to connect this process
+    cache_proxy.pin_volatile_config(gone, store)
+    assert gone["system"] == _mcp_body(True)["system"]
+    other = MCP.replace("## exa\n", "## exa\nNew wording.\n")
+    changed = _mcp_body(True, mcp=other, extra=_turn())
+    cache_proxy.pin_volatile_config(changed, store)
+    assert changed["system"] == _mcp_body(True)["system"]
+
+
+def test_heading_added_later_records_current_form_without_change(tmp_path):
+    # a pin made before this heading existed (deploy of ops-30): the next
+    # request records what the conversation has now and sends it unchanged
+    store = _store(tmp_path)
+    old = cache_proxy.VOLATILE_SYSTEM_SECTIONS
+    try:
+        cache_proxy.VOLATILE_SYSTEM_SECTIONS = ("# Output efficiency",)
+        cache_proxy.pin_volatile_config(_mcp_body(False), store)
+    finally:
+        cache_proxy.VOLATILE_SYSTEM_SECTIONS = old
+    now = _mcp_body(True, extra=_turn())
+    res = cache_proxy.pin_volatile_config(now, store)
+    assert res["applied"] == [] and now["system"] == _mcp_body(True)["system"]
+    reloaded = _store(tmp_path)  # recorded durably
+    gone = _mcp_body(False, extra=_turn() + _turn())
+    cache_proxy.pin_volatile_config(gone, reloaded)
+    assert gone["system"] == _mcp_body(True)["system"]

@@ -50,9 +50,10 @@ Normalizations (applied in order):
 6. Metadata: session-specific IDs normalized
 7. Tool schema sanitization: array types get ``items`` added (non-Claude only)
 After normalization:
-8. Variant pin: the "# Output efficiency" system section and the
-   context_management field stay as first seen for each conversation
-   (pin_volatile_config) — server-side flag refreshes otherwise flip them.
+8. Variant pin: the "# Output efficiency" and "# MCP Server Instructions"
+   system sections and the context_management field stay as first seen for
+   each conversation (pin_volatile_config) — server-side flag refreshes and
+   MCP servers (re)connecting with instructions otherwise flip them.
 9. GPT route only: per-conversation provider cache key (assign_conversation_cache_key).
 10. Anthropic route only: Haiku effort strip and mid-session effort pin.
 
@@ -1031,11 +1032,26 @@ def pin_effort(body: dict, store: EffortPinStore | None = None) -> dict:
 # and forks of that conversation share the pin. New conversations record
 # whatever the server sends at that time. Only the listed section and that one
 # field are ever touched.
+#
+# "# MCP Server Instructions" (2026-10-16, bead ops-30): the CLI rebuilds this
+# section on every request from the MCP servers connected in THIS process
+# (its own source marks it "MCP servers connect/disconnect between turns").
+# At 04:10Z the remote exa server began returning instructions, so every live
+# Claude session's next process gained the section before gitStatus and
+# re-billed its whole prefix (~11 Opus sessions, ~3.7M tokens). A server that
+# fails to connect for one process removes it again. Pinned like the others.
+# Limitation: server instructions containing a line that starts with "# "
+# end the matched section early, so such a flip is not fully pinned.
 # Live check: scripts/cache_regression.py volatile_flip (docs/cache-proxy-safety.md).
 # CACHE-PREFIX WARNING: if another server-flag-driven system section starts
 # flipping mid-conversation (watch system-changed breaks in cache_tally.py
 # --breaks-out + prefix_diff.py), add its heading here and extend volatile_flip.
-VOLATILE_SYSTEM_SECTIONS = ("# Output efficiency",)
+# A heading added later is recorded for existing conversations on their next
+# request (their current form), so adding one never re-bills anything.
+VOLATILE_SYSTEM_SECTIONS = ("# Output efficiency", "# MCP Server Instructions")
+# A section ends at the next top-level heading or at the CLI's trailing
+# gitStatus block (normalized by then), which the MCP section precedes.
+_SECTION_FOLLOWERS = ("# ", "gitStatus: ")
 # A pin only matters while the conversation's cache can still be read (1 hour
 # after its last request); 2 days of inactivity is ample and keeps the file small.
 VARIANT_PIN_TTL = 2 * 86400
@@ -1046,7 +1062,7 @@ def _volatile_section_re(heading: str) -> re.Pattern:
     # The section runs from its heading line up to the next top-level heading
     # (or the end of the block); the separating blank line belongs to it, so
     # removing it yields exactly the CLI's own "section absent" form.
-    return re.compile(r"(?ms)^" + re.escape(heading) + r"\n.*?(?:\n\n(?=# )|\Z)")
+    return re.compile(r"(?ms)^" + re.escape(heading) + r"\n.*?(?:\n\n(?=# |gitStatus: )|\Z)")
 
 
 def _find_volatile_section(system: list, heading: str):
@@ -1061,7 +1077,7 @@ def _find_volatile_section(system: list, heading: str):
         m = rx.search(text)
         if m:
             rest = text[m.end():]
-            following = rest.split("\n", 1)[0] if rest.startswith("# ") else None
+            following = rest.split("\n", 1)[0] if rest.startswith(_SECTION_FOLLOWERS) else None
             return i, m.start(), m.end(), m.group(0), following
     return None
 
@@ -1108,6 +1124,16 @@ def pin_volatile_config(body: dict, store: "EffortPinStore | None" = None) -> di
             pinned = entry[0]
             for h, f in found.items():
                 if h not in (pinned.get("s") or {}):
+                    # heading added after this pin was made: record the
+                    # conversation's current form, change nothing now
+                    if f:
+                        digest = hashlib.sha256(f[3].encode()).hexdigest()
+                        store.texts[digest] = f[3]
+                        pinned.setdefault("s", {})[h] = digest
+                        pinned.setdefault("a", {})[h] = [f[0], f[4]]
+                    else:
+                        pinned.setdefault("s", {})[h] = None
+                    dirty = True
                     continue
                 want = pinned["s"][h]
                 have = hashlib.sha256(f[3].encode()).hexdigest() if f else None
