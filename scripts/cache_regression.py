@@ -147,11 +147,21 @@ def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, re
     route_ok = {p: all(r.get("status") == "PASS" for r in results if r["provider"] == p)
                 for p in {r["provider"] for r in results}}
     scenario_results: dict = {}
+    scenario_failures: dict = {}
     for r in results:
         scenario_results.setdefault(r["provider"], {})[r["scenario"]] = r.get("status")
+        if r.get("status") not in ("PASS", None):
+            # The bad pairs' class and ratio decide whether the gate may accept this FAIL on a rerun:
+            # only shapes documented in docs/cache-proxy-safety.md qualify (cache_gate.py).
+            scenario_failures.setdefault(r["provider"], {})[r["scenario"]] = {
+                "status": r.get("status"),
+                "bad_pairs": r.get("bad_pairs") or [],
+                "error": r.get("error"),
+            }
     report = {
         "result": overall,
         "scenario_results": scenario_results,
+        "scenario_failures": scenario_failures,
         "providers": [p for p in providers if route_ok.get(p)],
         "scenarios": "all" if not args.scenarios else list(args.scenarios),
         "code": code,

@@ -173,10 +173,55 @@ def _same_code(report: dict, target: dict) -> tuple[bool, str]:
     return True, "match"
 
 
+# Documented intermittent FAIL shapes (docs/cache-proxy-safety.md §How to read the runner's
+# result). A FAIL is accepted on a passing rerun ONLY when every one of its bad pairs matches one
+# of these exactly; any other class, ratio or a FAIL without bad pairs blocks. Keep this table and
+# the doc identical — tests/test_cache_gate.py checks both directions.
+# 1. GPT route, class `append`: our bytes were a perfect prefix (the runner classifies the pair as
+#    a pure append) but the provider read less than 95% from cache. The proxy controls only bytes
+#    on this route (automatic prefix caching), so a short read is provider-side. Observed 0.0
+#    (codex boundary_marker 2026-10-12, codex cch_collision 2026-10-15) and 0.835 (codex
+#    boundary_marker 2026-10-15, prefix_diff: pure append, cached 15104 of 18089 = 59 of 70
+#    256-token blocks). On the Claude route a short-read append is NOT accepted: there it can mean
+#    a misplaced cache breakpoint, which is ours.
+# 2. Claude route, scenario `recovery_multi`, class `tail-block-append`, ratio 0.85 to <0.95: the
+#    open "Continue from where you left off." mechanism (bead vault-1r7n.9). Observed 0.8721,
+#    0.9216, 0.944.
+KNOWN_INTERMITTENT_SHAPES = (
+    {"provider": "codex", "scenario": None, "class": "append", "min_ratio": 0.0, "max_ratio": 0.95},
+    {"provider": "anthropic", "scenario": "recovery_multi", "class": "tail-block-append",
+     "min_ratio": 0.85, "max_ratio": 0.95},
+)
+RERUN_STATUSES_WITHOUT_SHAPE = ("PROVIDER-ERROR", "SKIPPED")
+
+
+def known_intermittent(provider: str, scenario: str, failure: dict | None) -> tuple[bool, str]:
+    """Is this non-PASS scenario result one the gate may accept on a passing rerun?"""
+    status = (failure or {}).get("status")
+    if status in RERUN_STATUSES_WITHOUT_SHAPE:
+        return True, status  # not a cache verdict at all: the route did not run cleanly
+    pairs = (failure or {}).get("bad_pairs") or []
+    if not pairs:
+        return False, "FAIL without bad pairs (crash or unrecorded shape)"
+    for pair in pairs:
+        cls, ratio = pair.get("class"), pair.get("ratio")
+        if not isinstance(ratio, (int, float)):
+            return False, f"{cls} with no ratio"
+        if not any(
+            shape["provider"] == provider
+            and shape["scenario"] in (None, scenario)
+            and shape["class"] == cls
+            and shape["min_ratio"] <= ratio < shape["max_ratio"]
+            for shape in KNOWN_INTERMITTENT_SHAPES
+        ):
+            return False, f"{cls} at {ratio} is not a documented intermittent shape"
+    return True, "documented shape"
+
+
 def _report_matches(report: dict, target: dict, reruns: list[dict] | None = None) -> tuple[bool, str]:
     """A full-set report for this code that passed — directly, or with every non-PASS scenario
-    passed on a later rerun of the same code (docs/cache-proxy-safety.md: two known FAIL shapes
-    are intermittent, "rerun that one scenario before concluding")."""
+    a DOCUMENTED intermittent shape (``KNOWN_INTERMITTENT_SHAPES``) that passed on a later rerun
+    of the same code (docs/cache-proxy-safety.md: "rerun that one scenario before concluding")."""
     same, why = _same_code(report, target)
     if not same:
         return False, why
@@ -196,6 +241,13 @@ def _report_matches(report: dict, target: dict, reruns: list[dict] | None = None
     for provider, scenarios in per.items():
         for scenario, status in scenarios.items():
             if status == "PASS":
+                continue
+            failure = ((report.get("scenario_failures") or {}).get(provider) or {}).get(scenario)
+            if failure is None:
+                failure = {"status": status}
+            known, shape_why = known_intermittent(provider, scenario, failure)
+            if not known:
+                unresolved.append(f"{provider}/{scenario}={status} ({shape_why})")
                 continue
             if not any(
                 (r.get("scenario_results") or {}).get(provider, {}).get(scenario) == "PASS"

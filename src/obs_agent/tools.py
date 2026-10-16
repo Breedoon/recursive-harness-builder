@@ -531,6 +531,8 @@ def create_obs_tools(
     config: OBSConfig,
     get_session_id: Callable[[], str | None],
     hook_state: HookState | None = None,
+    *,
+    return_tools: bool = False,
 ):
     """Create the OBS Agent MCP tool server.
 
@@ -2380,9 +2382,7 @@ def create_obs_tools(
             ],
         }
 
-    server = create_sdk_mcp_server(
-        "obs-agent",
-        tools=[
+    tools = [
             agent_task,
             agent_task_output,
             agent_task_stop,
@@ -2396,6 +2396,10 @@ def create_obs_tools(
             session_lineage,
             search_team,
             placeholder_tool,
-        ],
-    )
+    ]
+    if return_tools:
+        # The external control channel (control.py, vault-h667) calls these same handlers so
+        # every guard of the agent tools applies to externally triggered actions too.
+        return tools
+    server = create_sdk_mcp_server("obs-agent", tools=tools)
     return server

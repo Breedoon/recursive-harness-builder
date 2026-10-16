@@ -780,6 +780,8 @@ class TelegramBot:
         self._schedule_poller_task: asyncio.Task | None = None
         self._idle_evict_task: asyncio.Task | None = None
         self._cli_hang_task: asyncio.Task | None = None
+        self._control_server: Any | None = None  # external control channel (control.py, vault-h667)
+        self._control_start_task: asyncio.Task | None = None
         self._cli_hang_samples: dict[tuple[TelegramRoute, int], dict[str, float | None]] = {}
         self._cli_hang_kills: dict[TelegramRoute, list[float]] = {}
         self._transport_queue: asyncio.PriorityQueue[_TransportEnvelope] = asyncio.PriorityQueue()
@@ -5868,6 +5870,139 @@ class TelegramBot:
             self._idle_evict_task = asyncio.create_task(self._idle_evict_loop())
         if _cli_hang_watchdog_seconds() > 0 and (self._cli_hang_task is None or self._cli_hang_task.done()):
             self._cli_hang_task = asyncio.create_task(self._cli_hang_watchdog_loop())
+        if (
+            self._control_server is None
+            and (self._control_start_task is None or self._control_start_task.done())
+            and (os.environ.get("OBS_CONTROL_DISABLE") or "").strip().lower() not in ("1", "true", "yes", "on")
+        ):
+            self._control_start_task = asyncio.create_task(self._start_control_server())
+
+    async def _start_control_server(self) -> None:
+        """Start the external control socket (vault-h667); a failure never affects the bot."""
+        from obs_agent.control import ControlServer
+
+        server = ControlServer(self._control_dispatch)
+        try:
+            await server.start()
+        except Exception:
+            logger.warning("external control channel failed to start", exc_info=True)
+            return
+        self._control_server = server
+        logger.info("external control channel listening")
+
+    def _control_agent_state(self, team_name: str, agent_name: str) -> TelegramSessionState | None:
+        record = self._resolve_team_worker_record(team_name=team_name, agent_name=agent_name)
+        if record is not None:
+            state = self._get_state(record.child_route, create=False)
+            if state is not None:
+                return state
+        return self._resolve_route_inbox_target(team_name=team_name, agent_name=agent_name)
+
+    def _control_tools(self, *, hook_state: HookState, session_id: str | None) -> dict[str, Any]:
+        """The agent tool handlers, so external actions take the exact agent code paths."""
+        from obs_agent.tools import create_obs_tools
+
+        tools = create_obs_tools(self._config, lambda: session_id, hook_state=hook_state, return_tools=True)
+        return {tool.name: tool.handler for tool in tools}
+
+    async def _control_dispatch(self, op: str, caller: str, args: dict[str, Any]) -> dict[str, Any]:
+        from obs_agent.control import tool_result_to_control
+
+        label = f"external:{caller}"
+        if op == "message":
+            hook_state = HookState()
+            sentinel = TelegramRoute(chat_id=0, thread_id=None)
+            hook_state.inbox_recipient_validator = self._make_inbox_recipient_validator(sentinel)
+            hook_state.inbox_message_notifier = self._make_inbox_message_notifier(sentinel)
+            tools = self._control_tools(hook_state=hook_state, session_id=None)
+            result = await tools["SendInboxMessage"]({
+                "team_name": str(args["team_name"]).strip(),
+                "recipient": str(args["recipient"]).strip(),
+                "content": str(args["content"]),
+                "summary": str(args.get("summary") or "").strip() or f"from {label}",
+                "sender": label,
+                "allow_cold_wake": bool(args.get("allow_cold_wake")),
+            })
+            return tool_result_to_control(result)
+        if op == "launch":
+            parent = self._control_agent_state(str(args["parent_team"]).strip(), str(args["parent_agent"]).strip())
+            if parent is None:
+                return {"ok": False, "error": "parent agent has no current route binding"}
+            fork = bool(args.get("fork", True))
+            allow_cold_wake = bool(args.get("allow_cold_wake"))
+            if fork and not args.get("session_source") and not allow_cold_wake:
+                # Forking the parent's head re-reads its whole context, like a wake (vault-vokl).
+                readiness = self._state_cache_readiness(state=parent, session_id=parent.session_id)
+                if readiness is not None and readiness.cold:
+                    return {
+                        "ok": False,
+                        "cold": True,
+                        "error": _cache_readiness.cold_warning(
+                            readiness, action="fork of", target=str(args["parent_agent"])
+                        ),
+                    }
+            parent_hooks = parent.hook_state
+            hook_state = HookState()
+            hook_state.session_id = parent.session_id
+            hook_state.pending_obs_bootstrap_xml = parent_hooks.pending_obs_bootstrap_xml
+            hook_state.sdk_env_overrides = dict(parent_hooks.sdk_env_overrides)
+            hook_state.fork_task_launcher = self._make_fork_task_launcher(parent.route)
+            prompt = str(args.get("prompt") or "")
+            payload: dict[str, Any] = {
+                "display_name": str(args["display_name"]),
+                "prompt": f"[external trigger: {caller}]\n{prompt}".rstrip(),
+                "fork": fork,
+                "allow_cold_wake": allow_cold_wake,
+            }
+            for key in ("prompt_file", "model", "effort", "hooks", "session_source"):
+                if args.get(key):
+                    payload[key] = args[key]
+            tools = self._control_tools(hook_state=hook_state, session_id=parent.session_id)
+            return tool_result_to_control(await tools["AgentTask"](payload))
+        if op == "new_tree":
+            return await self._control_new_tree(caller=caller, args=args)
+        return {"ok": False, "error": f"unsupported op {op}"}
+
+    async def _control_new_tree(self, *, caller: str, args: dict[str, Any]) -> dict[str, Any]:
+        bot = self._primary_bot
+        if bot is None:
+            return {"ok": False, "error": "bot is not connected yet"}
+        chat_id = args.get("chat_id")
+        if chat_id is None:
+            chats = {route.chat_id for route in self._states_by_route if route.thread_id is not None}
+            if len(chats) != 1:
+                return {"ok": False, "error": f"pass --chat-id; forum chats known: {sorted(chats)}"}
+            chat_id = next(iter(chats))
+        title = str(args["title"]).strip()[:120]
+        topic = await self._enqueue_create_topic(
+            route=TelegramRoute(chat_id=int(chat_id), thread_id=None),
+            topic_name=title,
+            fallback_bot=bot,
+            priority=_PRIORITY_SYSTEM,
+        )
+        thread_id = getattr(topic, "message_thread_id", None)
+        if not isinstance(thread_id, int):
+            return {"ok": False, "error": "create_forum_topic returned no message_thread_id"}
+        route = TelegramRoute(chat_id=int(chat_id), thread_id=thread_id)
+        state = self._get_state(route, topic_title=title)
+        assert state is not None
+        state.last_bot = bot
+        self._set_topic_metadata(route=route, title=title, icon_custom_emoji_id=None)
+        self._prime_obs_bootstrap(state, lineage=(title,), origin="new_trunk", is_fork=False)
+        text = f"[external trigger: {caller}]\n{str(args['prompt'])}"
+        notice = await self._send_system_message(
+            route=route, bot=bot, text=f"new tree started by external:{caller}", disable_notification=True,
+        )
+        notice_id = self._sent_message_id(notice) if notice is not None else None
+        task = asyncio.create_task(self._run_and_send(
+            state=state, user_text=text, bot=bot,
+            trigger_message=QueuedMessage(text=text, telegram_message_id=notice_id),
+        ))
+        self._detached_wake_tasks.add(task)
+        task.add_done_callback(self._on_detached_wake_done)
+        link = self._build_message_link(route, thread_id)
+        return {"ok": True, "text": f"new tree '{title}' started: {link or thread_id}",
+                "result": {"chat_id": int(chat_id), "thread_id": thread_id, "link": link}}
 
     async def _idle_evict_loop(self, interval: float = 60.0) -> None:
         """Periodic idle-CLI sweep so eviction does not wait for a fork completion."""

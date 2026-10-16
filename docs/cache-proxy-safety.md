@@ -193,15 +193,40 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
   error). The line shows the bad pairs; run `prefix_diff.py` on them.
   Two known FAIL shapes are not caused by a proxy change and are usually
   intermittent, so rerun that one scenario before concluding:
-  - class `append` with ratio 0 on the GPT route: our bytes were a perfect
-    prefix but the provider read nothing from cache (seen on production
-    2026-10-12 for `codex boundary_marker`; it passed on rerun).
-  - class `tail-block-append` around 0.93 in `recovery_multi`: the open
-    "Continue from where you left off." mechanism (bead `vault-1r7n.9`); it
-    passes on some runs and fails on others.
+  - class `append` on the GPT route with ratio below 0.95 (0 or partial): our
+    bytes were a perfect prefix but the provider read less than the full
+    prefix from cache. The GPT route caches prefixes automatically and the
+    proxy controls only the bytes, so a short read on a pure append is
+    provider-side. Seen 2026-10-12 (`codex boundary_marker`, ratio 0),
+    2026-10-15 (`codex cch_collision`, ratio 0) and 2026-10-15
+    (`codex boundary_marker`, ratio 0.835: `prefix_diff.py` reports a pure
+    append, cached 15104 of 18089 tokens); each passed on rerun. The same
+    class on the Claude route is NOT this shape: there a short read can mean
+    a misplaced cache breakpoint, which is ours.
+  - class `tail-block-append` with ratio 0.85 to below 0.95 in
+    `recovery_multi` on the Claude route: the open "Continue from where you
+    left off." mechanism (bead `vault-1r7n.9`); it passes on some runs and
+    fails on others. Seen 0.8721, 0.9216 and 0.944.
   Any other class (`history-changed`, `system-changed`, `config-changed`,
-  `tools-changed`, missing breakpoint) is a real regression until proven
-  otherwise.
+  `tools-changed`, missing breakpoint), any other ratio, a different
+  scenario for the second shape, or a FAIL with no recorded bad pairs is a
+  real regression until proven otherwise.
+
+  Known-shape table: the cache gate (`src/obs_agent/cache_gate.py`,
+  `KNOWN_INTERMITTENT_SHAPES`) accepts a full run with a FAIL only when every
+  bad pair of that FAIL matches one of these two rows exactly AND the same
+  scenario passed on a later rerun of the same code:
+  - GPT route, any scenario, class `append`, ratio 0.0 to below 0.95.
+  - Claude route, scenario `recovery_multi`, class `tail-block-append`,
+    ratio 0.85 to below 0.95.
+  `PROVIDER-ERROR` and `SKIPPED` scenarios (no cache verdict) are also
+  accepted once they pass on rerun. Changing a row needs evidence here and the
+  same change in the gate; `tests/test_cache_gate.py` checks they agree.
+  History: OBS `28cfbe3` (2026-10-15) first let the gate accept any rerun-passed
+  FAIL; it accepted the 0.835 append above although this list then documented
+  only ratio 0. `prefix_diff.py` later confirmed that pair was a pure append
+  (provider-side), and the rule was narrowed to this table (vault-3px5, V1
+  finding).
 - `PROVIDER-ERROR` — the scenario failed or timed out while the upstream API
   returned 5xx errors. Usually provider overload, not our code. It is not a
   pass: rerun that route later.

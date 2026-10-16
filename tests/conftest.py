@@ -35,6 +35,14 @@ def _mock_session_get_client(request):
             yield
 
 @pytest.fixture(autouse=True)
+def _isolate_control_channel(tmp_path_factory, monkeypatch):
+    """Never let a test bot replace the live bot's external control socket (vault-h667)."""
+    monkeypatch.setenv("OBS_CONTROL_DIR", str(tmp_path_factory.mktemp("obs-control")))
+    monkeypatch.setenv("OBS_CONTROL_DISABLE", "1")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_cache_gate(request, tmp_path_factory, monkeypatch):
     """Keep the cache-prefix gate (vault-3px5) off production state in unit tests.
 

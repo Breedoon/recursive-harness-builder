@@ -217,15 +217,22 @@ def test_regression_runner_writes_matching_gate_report(tmp_path):
     assert json.loads((tmp_path / "gate.json").read_text())["providers"] == ["anthropic"]
 
 
-def _report_with(root, repo, name, result, per, scenarios="all"):
+def _report_with(root, repo, name, result, per, scenarios="all", failures=None):
     out = root / name
     out.mkdir(parents=True)
     ident = cache_gate.code_identity(repo)
-    (out / "gate.json").write_text(json.dumps({
+    report = {
         "result": result, "providers": [], "scenarios": scenarios, "scenario_results": per,
         "code": ident, "proxy_source": ident["proxy_source_sha256"],
-    }))
+    }
+    if failures is not None:
+        report["scenario_failures"] = failures
+    (out / "gate.json").write_text(json.dumps(report))
     return out
+
+
+def _fail(cls, ratio):
+    return {"status": "FAIL", "bad_pairs": [{"b": "req", "class": cls, "ratio": ratio}]}
 
 
 def test_intermittent_fail_accepted_only_after_rerun_passes(repo, tmp_path):
@@ -236,7 +243,8 @@ def test_intermittent_fail_accepted_only_after_rerun_passes(repo, tmp_path):
     _commit(repo, "src/obs_agent/session.py", "# CACHE-PREFIX WARNING\nY = 9\n")
     reports = tmp_path / "reports"
     full = _report_with(reports, repo, "a-full", "FAIL", {
-        "anthropic": {"baseline": "PASS", "recovery_multi": "FAIL"}, "codex": {"baseline": "PASS"}})
+        "anthropic": {"baseline": "PASS", "recovery_multi": "FAIL"}, "codex": {"baseline": "PASS"}},
+        failures={"anthropic": {"recovery_multi": _fail("tail-block-append", 0.9216)}})
     result = cache_gate.check(repo, base=base, report_root=reports)
     assert not result.ok and "anthropic/recovery_multi=FAIL" in result.message
     time.sleep(0.01)
@@ -246,3 +254,94 @@ def test_intermittent_fail_accepted_only_after_rerun_passes(repo, tmp_path):
     os.utime(rerun / "gate.json", (later, later))
     result = cache_gate.check(repo, base=base, report_root=reports)
     assert result.ok and result.report == full
+
+
+def _full_fail_then_rerun(repo, tmp_path, provider, scenario, failure):
+    import os
+    import time
+
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "src/obs_agent/session.py", "# CACHE-PREFIX WARNING\nY = 9\n")
+    reports = tmp_path / "reports"
+    per = {"anthropic": {"baseline": "PASS"}, "codex": {"baseline": "PASS"}}
+    per[provider][scenario] = failure["status"]
+    full = _report_with(reports, repo, "a-full", "FAIL", per, failures={provider: {scenario: failure}})
+    time.sleep(0.01)
+    rerun = _report_with(reports, repo, "b-rerun", "PASS", {provider: {scenario: "PASS"}},
+                         scenarios=[scenario])
+    later = time.time() + 5
+    os.utime(rerun / "gate.json", (later, later))
+    return cache_gate.check(repo, base=base, report_root=reports), full
+
+
+@pytest.mark.parametrize("provider,scenario,failure", [
+    ("codex", "boundary_marker", _fail("append", 0.0)),        # documented 2026-10-12
+    ("codex", "cch_collision", _fail("append", 0.0)),          # observed 2026-10-15
+    ("codex", "boundary_marker", _fail("append", 0.835)),      # observed 2026-10-15, pure append
+    ("anthropic", "recovery_multi", _fail("tail-block-append", 0.8721)),
+    ("anthropic", "recovery_multi", _fail("tail-block-append", 0.944)),
+    ("codex", "baseline", {"status": "PROVIDER-ERROR", "bad_pairs": []}),
+])
+def test_documented_shapes_accepted_after_rerun(repo, tmp_path, provider, scenario, failure):
+    result, full = _full_fail_then_rerun(repo, tmp_path, provider, scenario, failure)
+    assert result.ok and result.report == full
+
+
+@pytest.mark.parametrize("provider,scenario,failure,why", [
+    ("anthropic", "boundary_marker", _fail("append", 0.835), "not a documented"),   # Claude short read is ours
+    ("codex", "boundary_marker", _fail("history-changed", 0.0), "not a documented"),
+    ("anthropic", "recovery", _fail("tail-block-append", 0.93), "not a documented"),  # wrong scenario
+    ("anthropic", "recovery_multi", _fail("tail-block-append", 0.70), "not a documented"),
+    ("codex", "baseline", _fail("tools-changed", 0.5), "not a documented"),
+    ("codex", "baseline", {"status": "FAIL", "bad_pairs": []}, "without bad pairs"),
+])
+def test_undocumented_shapes_block_even_after_rerun(repo, tmp_path, provider, scenario, failure, why):
+    result, _ = _full_fail_then_rerun(repo, tmp_path, provider, scenario, failure)
+    assert not result.ok and why in result.message
+
+
+def test_old_report_without_failure_detail_is_not_rerun_accepted(repo, tmp_path):
+    import os
+    import time
+
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "src/obs_agent/session.py", "# CACHE-PREFIX WARNING\nY = 9\n")
+    reports = tmp_path / "reports"
+    _report_with(reports, repo, "a-full", "FAIL", {
+        "anthropic": {"baseline": "PASS"}, "codex": {"baseline": "PASS", "boundary_marker": "FAIL"}})
+    time.sleep(0.01)
+    rerun = _report_with(reports, repo, "b-rerun", "PASS", {"codex": {"boundary_marker": "PASS"}},
+                         scenarios=["boundary_marker"])
+    later = time.time() + 5
+    os.utime(rerun / "gate.json", (later, later))
+    assert not cache_gate.check(repo, base=base, report_root=reports).ok
+
+
+def test_shape_table_matches_safety_doc():
+    """The gate's table and docs/cache-proxy-safety.md must describe the same shapes."""
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "cache-proxy-safety.md").read_text()
+    section = doc.split("### How to read the runner's result", 1)[1].split("###", 1)[0]
+    for shape in cache_gate.KNOWN_INTERMITTENT_SHAPES:
+        assert f"`{shape['class']}`" in section
+        assert f"{shape['min_ratio']}" in section and f"{shape['max_ratio']}" in section
+        if shape["scenario"]:
+            assert f"`{shape['scenario']}`" in section
+    assert section.count("Known-shape table:") == 1
+
+
+def test_runner_records_failure_shapes(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("runner", Path(__file__).resolve().parents[1] / "scripts" / "cache_regression.py")
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    args = type("A", (), {"scenarios": [], "base_url": "x"})()
+    results = [
+        {"scenario": "baseline", "provider": "anthropic", "status": "PASS", "bad_pairs": []},
+        {"scenario": "boundary_marker", "provider": "codex", "status": "FAIL",
+         "bad_pairs": [{"b": "r", "class": "append", "ratio": 0.835}]},
+    ]
+    runner._write_gate_report(tmp_path, args=args, ident={"code": {"head": "x"}}, live="abc",
+                              results=results, overall="FAIL")
+    report = json.loads((tmp_path / "gate.json").read_text())
+    assert report["scenario_failures"] == {"codex": {"boundary_marker": {
+        "status": "FAIL", "bad_pairs": [{"b": "r", "class": "append", "ratio": 0.835}], "error": None}}}
