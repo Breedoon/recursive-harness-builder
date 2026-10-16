@@ -11,6 +11,55 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# Unit tests may only signal processes they started (obs-3, 2026-10-16).
+#
+# Tests run inside obs-test next to the live fleet. A test that let a MagicMock
+# pid reach kill_process_tree (int(MagicMock()) == 1) SIGKILLed every process
+# under supervisord three times in nine minutes. Signals to anything that is
+# not this pytest process or one of its descendants are refused with
+# PermissionError (an OSError, so code that tolerates a vanished pid moves on).
+# ---------------------------------------------------------------------------
+_REAL_KILL, _REAL_KILLPG = os.kill, os.killpg
+_PYTEST_PID = os.getpid()
+
+
+def _parent_pid(pid: int) -> int | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return int(stat.rsplit(")", 1)[1].split()[1])
+
+
+def _is_own_process(pid: int) -> bool:
+    seen = 0
+    while pid > 1 and seen < 64:
+        if pid == _PYTEST_PID:
+            return True
+        pid = _parent_pid(pid) or 0
+        seen += 1
+    return False
+
+
+def _guarded_kill(pid, sig):
+    if sig != 0:
+        target = -pid if isinstance(pid, int) and pid < -1 else pid
+        if type(target) is not int or target <= 1 or not _is_own_process(target):
+            raise PermissionError(f"test isolation: refused os.kill({pid!r}, {sig!r}) outside the test process tree")
+    return _REAL_KILL(pid, sig)
+
+
+def _guarded_killpg(pgid, sig):
+    if sig != 0 and (type(pgid) is not int or pgid <= 1 or not _is_own_process(pgid)):
+        raise PermissionError(f"test isolation: refused os.killpg({pgid!r}, {sig!r}) outside the test process tree")
+    return _REAL_KILLPG(pgid, sig)
+
+
+os.kill = _guarded_kill
+os.killpg = _guarded_killpg
+
+
+# ---------------------------------------------------------------------------
 # Prevent real Claude Code CLI subprocess spawning in unit tests.
 #
 # Tests that mock ConversationRunner still hit SessionManager.get_client()

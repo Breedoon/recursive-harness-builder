@@ -12,6 +12,26 @@ named `obs-live-test` with marker `obs-live-test-v1`. The current container name
 `scripts/run_parallel_live_smoke.py` live entry points fail closed and redirect
 to this protocol; only pure unit/library helpers retain compatibility.
 
+## Unit tests share obs-test with production
+
+Agents run `pytest` from worktrees inside `obs-test`, beside the live fleet, with
+the same user. On 2026-10-16 (obs-3) a stop-escalation test left a bare
+`MagicMock` client; `int(MagicMock())` is `1`, so the real
+`kill_process_tree(1)` SIGKILLed every supervisord program and agent CLI three
+times in nine minutes (11:40, 11:44, 11:48 UTC). It looked like an OOM; it was
+not (`memory.events` `oom_kill` never moved, no kernel OOM line).
+
+Two guards now hold:
+
+- `tests/conftest.py` replaces `os.kill`/`os.killpg` for the whole session and
+  raises `PermissionError` for any signal to a process that is not the pytest
+  process or its descendant (signal 0 stays allowed).
+- `maintenance_restart.kill_process_tree` raises `ValueError` unless the root is
+  a plain `int > 1` whose argv is the SDK's bundled `claude`.
+
+Tests that exercise stop/kill/watchdog paths should still mock
+`kill_process_tree` or give the mock client `_transport._process = None`.
+
 ## Repository-owned surfaces
 
 - `scripts/live_test_protocol.py` defines host observation, immutable host

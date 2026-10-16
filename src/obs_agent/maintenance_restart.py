@@ -527,7 +527,16 @@ def kill_process_tree(root_pid: int, *, proc_root: Path = Path("/proc"), kill=os
     The CLI shares the daemon's process group, so a group kill is not an
     option; the tree is walked through ``/proc`` instead. Descendants are
     collected before the root dies so they cannot escape by reparenting.
+
+    The root must be a real agent CLI. On 2026-10-16 a unit test handed this a MagicMock pid;
+    ``int(MagicMock())`` is 1, so the walk SIGKILLed every process under supervisord three
+    times (obs-3). Anything that is not a plain int > 1 naming a live SDK CLI is refused.
     """
+    if type(root_pid) is not int or root_pid <= 1 or root_pid == os.getpid():
+        raise ValueError(f"kill_process_tree refused root pid {root_pid!r}")
+    argv = _proc_argv(root_pid, proc_root)
+    if not argv or AGENT_CLI_MARKER not in argv[0]:
+        raise ValueError(f"kill_process_tree refused pid {root_pid}: not an agent CLI ({argv[:1]})")
     tree = [root_pid, *descendant_pids(root_pid, proc_root=proc_root)]
     for pid in tree:
         try:

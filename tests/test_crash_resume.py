@@ -504,6 +504,33 @@ def test_kill_process_tree_kills_cli_and_its_tool_children(tmp_path: Path):
     assert 600 not in killed and 604 not in killed
 
 
+@pytest.mark.parametrize("bad", [1, 0, -1, True, MagicMock(), "601", 600])
+def test_kill_process_tree_refuses_non_cli_roots(tmp_path: Path, bad):
+    """obs-3: int(MagicMock()) == 1 once made this SIGKILL everything under supervisord."""
+    _proc(tmp_path, 1, ["/usr/bin/supervisord"], ppid=0, pgid=1)
+    _proc(tmp_path, 600, ["python"], ppid=1, pgid=500)
+    _proc(tmp_path, 601, [CLI], ppid=600, pgid=500)
+    sent: list[tuple[int, int]] = []
+    with pytest.raises(ValueError):
+        maint.kill_process_tree(bad, proc_root=tmp_path, kill=lambda pid, sig: sent.append((pid, sig)))
+    assert sent == []
+
+
+def test_unit_tests_cannot_signal_processes_outside_their_tree():
+    """conftest refuses signals to anything the test process did not start (obs-3)."""
+    import os
+
+    with pytest.raises(PermissionError):
+        os.kill(1, signal.SIGKILL)
+    with pytest.raises(PermissionError):
+        os.kill(-1, signal.SIGKILL)
+    with pytest.raises(PermissionError):
+        os.killpg(1, signal.SIGKILL)
+    child = subprocess.Popen(["sleep", "30"])
+    os.kill(child.pid, signal.SIGKILL)
+    assert child.wait(5) == -signal.SIGKILL
+
+
 @pytest.mark.asyncio
 async def test_stop_escalation_kills_process_tree_when_pid_known(config, monkeypatch):
     monkeypatch.setenv("OBS_STOP_KILL_GRACE_SECONDS", "0.05")
@@ -518,6 +545,23 @@ async def test_stop_escalation_kills_process_tree_when_pid_known(config, monkeyp
     bot._mark_stop_requested(state)
     await asyncio.sleep(0.15)
     assert trees == [424242]
+
+
+@pytest.mark.asyncio
+async def test_stop_escalation_with_mock_client_signals_nothing(config, monkeypatch):
+    """obs-3 reproducer: a bare MagicMock client used to reach kill_process_tree(1)."""
+    monkeypatch.setenv("OBS_STOP_KILL_GRACE_SECONDS", "0.05")
+    bot = _bot(config)
+    state = _busy(bot, TelegramRoute(chat_id=67890, thread_id=55), sid="sid-55")
+    state.session_manager._client = MagicMock()
+    monkeypatch.setattr(state.session_manager, "disconnect_idle_client", AsyncMock(return_value=True))
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(maint.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    real = maint.kill_process_tree
+    monkeypatch.setattr(maint, "kill_process_tree", lambda pid: real(pid, kill=lambda p, s: sent.append((p, s))))
+    bot._mark_stop_requested(state)
+    await asyncio.sleep(0.15)
+    assert sent == []
 
 
 def test_orphan_reaper_terms_then_kills_survivors(tmp_path: Path):
