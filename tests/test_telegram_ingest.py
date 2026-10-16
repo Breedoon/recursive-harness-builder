@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -88,6 +89,7 @@ def normalizer(tmp_path: Path) -> TelegramInboundNormalizer:
     instance = TelegramInboundNormalizer(
         temp_root=tmp_path / "obs-agent",
         transcription_script=tmp_path / "transcribe.sh",
+        gpu_ready_probe=lambda: True,
     )
     instance.initialize()
     return instance
@@ -191,6 +193,7 @@ class TestTelegramInboundNormalizer:
         normalizer = TelegramInboundNormalizer(
             temp_root=tmp_path / "obs-agent-progress",
             transcription_script=script,
+            gpu_ready_probe=lambda: True,
         )
         normalizer.initialize()
         voice = _FakeAttachment(
@@ -218,93 +221,6 @@ class TestTelegramInboundNormalizer:
         assert normalized.user_warnings == []
         assert "Transcription correlation ID:" in normalized.agent_text
         assert "hello world" in normalized.agent_text
-
-    async def test_second_voice_is_rejected_before_transcription_subprocess(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        script = tmp_path / "transcribe.py"
-        script.write_text(
-            "#!/usr/bin/env python3\n"
-            "import os\n"
-            "import sys\n"
-            "import time\n"
-            "from pathlib import Path\n"
-            "time.sleep(0.3)\n"
-            "correlation_id = os.environ['OBS_TRANSCRIPTION_CORRELATION_ID']\n"
-            "Path(sys.argv[3], f'{sys.argv[2]}.md').write_text(\n"
-            "    'transcription_status: \\\"ok\\\"\\n'\n"
-            "    f'correlation_id: \\\"{correlation_id}\\\"\\n'\n"
-            "    'device: \\\"cuda\\\"\\n'\n"
-            "    'compute_type: \\\"float16\\\"\\n'\n"
-            "    '# Transcript\\n\\nhello world\\n',\n"
-            "    encoding='utf-8',\n"
-            ")\n",
-            encoding="utf-8",
-        )
-        script.chmod(0o700)
-        monkeypatch.setenv(
-            "OBS_TRANSCRIPTION_NORMALIZER_SLOT_LOCK",
-            str(tmp_path / "normalizer-slot.lock"),
-        )
-        normalizer = TelegramInboundNormalizer(
-            temp_root=tmp_path / "obs-agent-single-slot",
-            transcription_script=script,
-        )
-        normalizer.initialize()
-        first_voice = _FakeAttachment(
-            file_path="voice/first.ogg",
-            payload=b"first",
-            file_unique_id="voice-first",
-            mime_type="audio/ogg",
-        )
-        second_voice = _FakeAttachment(
-            file_path="voice/second.ogg",
-            payload=b"second",
-            file_unique_id="voice-second",
-            mime_type="audio/ogg",
-        )
-        first_message = _make_message(
-            message_id=122,
-            voice=first_voice,
-            effective_attachment=first_voice,
-        )
-        second_message = _make_message(
-            message_id=123,
-            voice=second_voice,
-            effective_attachment=second_voice,
-        )
-        first_waiting = asyncio.Event()
-        first_progress: list[str] = []
-        second_progress: list[str] = []
-
-        async def _first_report(text: str) -> None:
-            first_progress.append(text)
-            if text == "waiting for GPU":
-                first_waiting.set()
-
-        async def _second_report(text: str) -> None:
-            second_progress.append(text)
-
-        first_task = asyncio.create_task(
-            normalizer.normalize_update(
-                _make_update(first_message),
-                transcription_progress=_first_report,
-            )
-        )
-        await asyncio.wait_for(first_waiting.wait(), timeout=1.0)
-        second = await normalizer.normalize_update(
-            _make_update(second_message),
-            transcription_progress=_second_report,
-        )
-        first = await first_task
-
-        assert first.user_warnings == []
-        assert first_progress == ["waiting for GPU"]
-        assert second_progress == ["GPU transcription busy; retry later"]
-        assert second.user_warnings == ["GPU transcription busy; retry later"]
-        assert "GPU transcription busy; retry later" in second.agent_text
-        assert second.attachments[0].transcript_path is not None
-        assert not second.attachments[0].transcript_path.exists()
 
     async def test_voice_transcription_failure_sets_warning(
         self, normalizer: TelegramInboundNormalizer, monkeypatch: pytest.MonkeyPatch
@@ -439,3 +355,151 @@ class TestTelegramInboundNormalizer:
         )
 
         assert first.attachments[0].stored_path != second.attachments[0].stored_path
+
+
+_FAKE_TRANSCRIBER = (
+    "#!/usr/bin/env python3\n"
+    "import os, sys, time\n"
+    "from pathlib import Path\n"
+    "marker = os.environ.get('FAKE_MARKER_DIR')\n"
+    "kind = {kind!r}\n"
+    "if marker:\n"
+    "    Path(marker, kind + '-' + sys.argv[2]).write_text('ran')\n"
+    "time.sleep({sleep})\n"
+    "if {fail}:\n"
+    "    print(kind + ' exploded')\n"
+    "    sys.exit(75)\n"
+    "cid = os.environ['OBS_TRANSCRIPTION_CORRELATION_ID']\n"
+    "device = os.environ.get('OBS_TRANSCRIPTION_DEVICE', 'cuda')\n"
+    "compute = os.environ.get('OBS_TRANSCRIPTION_COMPUTE_TYPE', 'float16')\n"
+    "Path(sys.argv[3], sys.argv[2] + '.md').write_text(\n"
+    "    'transcription_status: \"ok\"\\n'\n"
+    "    f'correlation_id: \"{{cid}}\"\\n'\n"
+    "    f'device: \"{{device}}\"\\n'\n"
+    "    f'compute_type: \"{{compute}}\"\\n'\n"
+    "    '# Transcript\\n\\n' + kind + ' words\\n', encoding='utf-8')\n"
+)
+
+
+def _write_fake(path: Path, *, kind: str, sleep: float = 0.0, fail: bool = False) -> Path:
+    path.write_text(_FAKE_TRANSCRIBER.format(kind=kind, sleep=sleep, fail=fail), encoding="utf-8")
+    path.chmod(0o700)
+    return path
+
+
+def _voice_message(message_id: int, unique: str):
+    voice = _FakeAttachment(
+        file_path=f"voice/{unique}.ogg",
+        payload=b"voice",
+        file_unique_id=unique,
+        mime_type="audio/ogg",
+    )
+    return _make_message(message_id=message_id, voice=voice, effective_attachment=voice)
+
+
+class TestVoiceTranscriptionFallback:
+    """A busy, slow or broken GPU must never cost Daniel a voice message (obs-3, 2026-10-16)."""
+
+    def _normalizer(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        gpu_ready: bool = True,
+        gpu_sleep: float = 0.0,
+        gpu_fail: bool = False,
+        cpu_fail: bool = False,
+        budget: float = 5.0,
+    ) -> TelegramInboundNormalizer:
+        markers = tmp_path / "markers"
+        markers.mkdir(exist_ok=True)
+        monkeypatch.setenv("FAKE_MARKER_DIR", str(markers))
+        monkeypatch.setenv("OBS_TRANSCRIPTION_NORMALIZER_SLOT_LOCK", str(tmp_path / "gpu-slot.lock"))
+        monkeypatch.setenv("OBS_TRANSCRIPTION_NORMALIZER_CPU_SLOT_LOCK", str(tmp_path / "cpu-slot.lock"))
+        instance = TelegramInboundNormalizer(
+            temp_root=tmp_path / "obs-agent",
+            transcription_script=_write_fake(
+                tmp_path / "gpu.py", kind="gpu", sleep=gpu_sleep, fail=gpu_fail
+            ),
+            cpu_python=Path(sys.executable),
+            cpu_script=_write_fake(tmp_path / "cpu.py", kind="cpu", fail=cpu_fail),
+            gpu_ready_probe=lambda: gpu_ready,
+            gpu_fallback_after_seconds=budget,
+        )
+        instance.initialize()
+        return instance
+
+    @staticmethod
+    def _ran(tmp_path: Path) -> set[str]:
+        return {p.name.split("-", 1)[0] for p in (tmp_path / "markers").iterdir()}
+
+    async def test_gpu_free_uses_gpu_only(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        n = self._normalizer(tmp_path, monkeypatch)
+        out = await n.normalize_update(_make_update(_voice_message(1, "a")))
+        assert "gpu words" in out.agent_text
+        assert out.user_warnings == []
+        assert self._ran(tmp_path) == {"gpu"}
+
+    async def test_gpu_busy_goes_straight_to_cpu(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        n = self._normalizer(tmp_path, monkeypatch, gpu_ready=False)
+        progress: list[str] = []
+
+        async def report(text: str) -> None:
+            progress.append(text)
+
+        out = await n.normalize_update(_make_update(_voice_message(2, "b")), transcription_progress=report)
+        assert "cpu words" in out.agent_text
+        assert 'device: "cpu"' in out.agent_text
+        assert out.user_warnings == []
+        assert "retry later" not in out.agent_text
+        assert progress == ["GPU busy; transcribing on CPU"]
+        assert self._ran(tmp_path) == {"cpu"}
+
+    async def test_gpu_failure_falls_back_to_cpu(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        n = self._normalizer(tmp_path, monkeypatch, gpu_fail=True)
+        out = await n.normalize_update(_make_update(_voice_message(3, "c")))
+        assert "cpu words" in out.agent_text
+        assert out.user_warnings == []
+        assert self._ran(tmp_path) == {"gpu", "cpu"}
+
+    async def test_gpu_overlong_wait_is_cut_and_cpu_used(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        n = self._normalizer(tmp_path, monkeypatch, gpu_sleep=30.0, budget=0.5)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        out = await n.normalize_update(_make_update(_voice_message(4, "d")))
+        assert loop.time() - started < 15.0
+        assert "cpu words" in out.agent_text
+        assert out.user_warnings == []
+
+    async def test_concurrent_voice_notes_all_transcribed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Previously the second note got "GPU transcription busy; retry later".
+        n = self._normalizer(tmp_path, monkeypatch, gpu_sleep=0.5)
+        results = await asyncio.gather(
+            *(n.normalize_update(_make_update(_voice_message(10 + i, f"m{i}"))) for i in range(3))
+        )
+        for out in results:
+            assert out.user_warnings == []
+            assert "words" in out.agent_text
+            assert "retry later" not in out.agent_text
+        assert self._ran(tmp_path) == {"gpu", "cpu"}
+
+    async def test_cpu_failure_falls_back_to_full_gpu_wait(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        n = self._normalizer(tmp_path, monkeypatch, gpu_ready=False, cpu_fail=True)
+        out = await n.normalize_update(_make_update(_voice_message(5, "e")))
+        assert "gpu words" in out.agent_text
+        assert out.user_warnings == []
+
+    async def test_everything_failing_reports_every_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        n = self._normalizer(tmp_path, monkeypatch, gpu_fail=True, cpu_fail=True)
+        out = await n.normalize_update(_make_update(_voice_message(6, "f")))
+        error = out.attachments[0].transcription_error or ""
+        assert "GPU:" in error and "CPU:" in error and "GPU (full wait):" in error
+        assert out.user_warnings

@@ -34,6 +34,32 @@ _SAFE_TRANSCRIPTION_TERMINALS = (
 )
 TranscriptionProgress = Callable[[str], Awaitable[None]]
 
+# CPU fallback (Daniel, 2026-10-16: voice transcription "has to be 100% reliable,
+# fallback to cpu or whatever"). The GPU sidecar is shared with long leases
+# (vault-search bulk embedding held it 35 min on 2026-10-16), so a voice note
+# must never wait on it or fail because of it.
+_DEFAULT_CPU_PYTHON = "/workspace/runtime/transcription/venv/bin/python"
+_DEFAULT_CPU_SCRIPT = "/workspace/runtime/transcription/transcribe_faster_whisper.py"
+_DEFAULT_GPU_READY_URL = "http://obs-transcription:8765/ready"
+_CPU_TRANSCRIPTION_PROGRESS = "GPU busy; transcribing on CPU"
+_CPU_OUTER_TIMEOUT_SECONDS = 1800.0
+_GPU_FULL_OUTER_TIMEOUT_SECONDS = 5700.0
+
+
+def _probe_gpu_ready_now() -> bool:
+    """True only when the GPU sidecar says it can admit a job right now."""
+    import json
+    import urllib.request
+
+    url = os.environ.get("OBS_TRANSCRIPTION_HEALTH_URL", _DEFAULT_GPU_READY_URL)
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=4.0) as response:
+            value = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return False
+    return bool(value.get("ok") is True and value.get("ready_now") is True)
+
 
 @dataclass(frozen=True)
 class DownloadedAttachment:
@@ -71,9 +97,30 @@ class _AttachmentSpec:
 class TelegramInboundNormalizer:
     """Normalizes Telegram updates into one agent-facing string."""
 
-    def __init__(self, *, temp_root: Path, transcription_script: Path) -> None:
+    def __init__(
+        self,
+        *,
+        temp_root: Path,
+        transcription_script: Path,
+        cpu_python: Path | None = None,
+        cpu_script: Path | None = None,
+        gpu_ready_probe: Callable[[], bool] | None = None,
+        gpu_fallback_after_seconds: float | None = None,
+    ) -> None:
         self._temp_root = temp_root
         self._transcription_script = transcription_script
+        self._cpu_python = cpu_python or Path(
+            os.environ.get("OBS_TRANSCRIPTION_CPU_PYTHON", _DEFAULT_CPU_PYTHON)
+        )
+        self._cpu_script = cpu_script or Path(
+            os.environ.get("OBS_TRANSCRIPTION_CPU_SCRIPT", _DEFAULT_CPU_SCRIPT)
+        )
+        self._gpu_ready_probe = gpu_ready_probe or _probe_gpu_ready_now
+        self._gpu_fallback_after_seconds = (
+            gpu_fallback_after_seconds
+            if gpu_fallback_after_seconds is not None
+            else float(os.environ.get("OBS_TRANSCRIPTION_GPU_FALLBACK_AFTER_SECONDS", "120"))
+        )
         self._boot_id = uuid.uuid4().hex
         self._boot_root = self._temp_root / self._boot_id
         self._initialized = False
@@ -434,14 +481,7 @@ class TelegramInboundNormalizer:
         correlation_id: str,
         transcription_progress: TranscriptionProgress | None = None,
     ) -> None:
-        if not self._transcription_script.is_file():
-            raise FileNotFoundError(
-                f"transcription script not found: {self._transcription_script}"
-            )
-
-        transcript_path = dest_dir / f"{title}.md"
-        if transcript_path.exists() or transcript_path.is_symlink():
-            transcript_path.unlink()
+        """GPU when it is free now, else CPU; full GPU wait only if CPU also fails."""
 
         async def report_progress(text: str) -> None:
             if transcription_progress is None:
@@ -450,6 +490,148 @@ class TelegramInboundNormalizer:
                 await asyncio.wait_for(transcription_progress(text), timeout=10.0)
             except Exception:
                 return
+
+        kwargs: dict[str, Any] = {
+            "audio_file": audio_file,
+            "title": title,
+            "dest_dir": dest_dir,
+            "correlation_id": correlation_id,
+            "report_progress": report_progress,
+        }
+        errors: list[str] = []
+        gpu_ready = await asyncio.to_thread(self._gpu_ready_probe)
+        if gpu_ready:
+            try:
+                await self._run_gpu_transcription(
+                    **kwargs,
+                    outer_timeout=self._gpu_fallback_after_seconds,
+                    wait_for_slot=False,
+                )
+                return
+            except Exception as exc:
+                errors.append(f"GPU: {_normalize_whitespace(str(exc)) or type(exc).__name__}")
+        else:
+            errors.append("GPU: not ready now")
+
+        try:
+            await report_progress(_CPU_TRANSCRIPTION_PROGRESS)
+            await self._run_cpu_transcription(**kwargs)
+            return
+        except Exception as exc:
+            errors.append(f"CPU: {_normalize_whitespace(str(exc)) or type(exc).__name__}")
+
+        try:
+            await self._run_gpu_transcription(
+                **kwargs,
+                outer_timeout=_GPU_FULL_OUTER_TIMEOUT_SECONDS,
+                wait_for_slot=True,
+            )
+            return
+        except Exception as exc:
+            errors.append(f"GPU (full wait): {_normalize_whitespace(str(exc)) or type(exc).__name__}")
+        raise RuntimeError("voice transcription failed on GPU and CPU: " + " | ".join(errors))
+
+    async def _run_cpu_transcription(
+        self,
+        *,
+        audio_file: Path,
+        title: str,
+        dest_dir: Path,
+        correlation_id: str,
+        report_progress: Callable[[str], Awaitable[None]],
+    ) -> None:
+        if not self._cpu_python.is_file() or not self._cpu_script.is_file():
+            raise FileNotFoundError(
+                f"CPU transcription runtime not found: {self._cpu_python} {self._cpu_script}"
+            )
+        transcript_path = dest_dir / f"{title}.md"
+        transcript_path.unlink(missing_ok=True)
+        # One CPU decode at a time (each uses all cores); later notes queue, never fail.
+        slot_path = Path(
+            os.environ.get(
+                "OBS_TRANSCRIPTION_NORMALIZER_CPU_SLOT_LOCK",
+                "/workspace/runtime/transcription/run/normalizer-cpu-slot.lock",
+            )
+        )
+        slot_path.parent.mkdir(parents=True, exist_ok=True)
+        slot = slot_path.open("a+")
+        try:
+            await _flock_wait(slot, timeout=_CPU_OUTER_TIMEOUT_SECONDS)
+            child_env = {
+                **os.environ,
+                "OBS_TRANSCRIPTION_CORRELATION_ID": correlation_id,
+                "OBS_TRANSCRIPTION_DEVICE": "cpu",
+                "OBS_TRANSCRIPTION_COMPUTE_TYPE": "int8",
+                "HF_HUB_OFFLINE": "1",
+            }
+            proc = await asyncio.create_subprocess_exec(
+                str(self._cpu_python),
+                str(self._cpu_script),
+                str(audio_file),
+                title,
+                str(dest_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+                env=child_env,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=_CPU_OUTER_TIMEOUT_SECONDS
+                )
+            except BaseException:
+                if proc.returncode is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+                transcript_path.unlink(missing_ok=True)
+                raise
+            if proc.returncode != 0:
+                transcript_path.unlink(missing_ok=True)
+                output = (stdout or b"").decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    _normalize_whitespace(output)[-500:] or f"exit code {proc.returncode}"
+                )
+            if transcript_path.is_symlink() or not transcript_path.is_file():
+                transcript_path.unlink(missing_ok=True)
+                raise RuntimeError("CPU transcription exited without a transcript")
+            transcript = transcript_path.read_text(encoding="utf-8", errors="strict")
+            required = (
+                'transcription_status: "ok"',
+                f'correlation_id: "{correlation_id}"',
+                'device: "cpu"',
+                "# Transcript",
+            )
+            if any(value not in transcript for value in required):
+                transcript_path.unlink(missing_ok=True)
+                raise RuntimeError("CPU transcription returned an incomplete transcript")
+        finally:
+            try:
+                fcntl.flock(slot, fcntl.LOCK_UN)
+            finally:
+                slot.close()
+
+    async def _run_gpu_transcription(
+        self,
+        *,
+        audio_file: Path,
+        title: str,
+        dest_dir: Path,
+        correlation_id: str,
+        report_progress: Callable[[str], Awaitable[None]],
+        outer_timeout: float,
+        wait_for_slot: bool,
+    ) -> None:
+        if not self._transcription_script.is_file():
+            raise FileNotFoundError(
+                f"transcription script not found: {self._transcription_script}"
+            )
+
+        transcript_path = dest_dir / f"{title}.md"
+        if transcript_path.exists() or transcript_path.is_symlink():
+            transcript_path.unlink()
 
         slot_path = Path(
             os.environ.get(
@@ -460,11 +642,13 @@ class TelegramInboundNormalizer:
         slot_path.parent.mkdir(parents=True, exist_ok=True)
         slot = slot_path.open("a+")
         try:
-            try:
-                fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                await report_progress(_GPU_TRANSCRIPTION_BUSY)
-                raise RuntimeError(_GPU_TRANSCRIPTION_BUSY) from exc
+            if wait_for_slot:
+                await _flock_wait(slot, timeout=outer_timeout)
+            else:
+                try:
+                    fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise RuntimeError(_GPU_TRANSCRIPTION_BUSY) from exc
 
             await report_progress("waiting for GPU")
             child_env = {**os.environ, "OBS_TRANSCRIPTION_CORRELATION_ID": correlation_id}
@@ -485,11 +669,7 @@ class TelegramInboundNormalizer:
                     await asyncio.sleep(30.0)
                     await report_progress("still waiting for GPU or transcribing")
 
-            progress_task = (
-                asyncio.create_task(progress_loop())
-                if transcription_progress is not None
-                else None
-            )
+            progress_task: asyncio.Task[None] | None = asyncio.create_task(progress_loop())
 
             async def stop_progress() -> None:
                 if progress_task is None:
@@ -526,13 +706,13 @@ class TelegramInboundNormalizer:
                 try:
                     stdout, _ = await asyncio.wait_for(
                         asyncio.shield(communicate_task),
-                        timeout=5700.0,
+                        timeout=outer_timeout,
                     )
                 except TimeoutError as exc:
                     await terminate_group()
                     transcript_path.unlink(missing_ok=True)
                     raise RuntimeError(
-                        "GPU voice transcription exceeded its 5700-second outer bound; retry later"
+                        f"GPU voice transcription exceeded its {outer_timeout:.0f}-second bound"
                     ) from exc
                 except BaseException:
                     await terminate_group()
@@ -545,10 +725,6 @@ class TelegramInboundNormalizer:
                 transcript_path.unlink(missing_ok=True)
                 output = (stdout or b"").decode("utf-8", errors="replace")
                 detail = _normalize_whitespace(output) or f"exit code {proc.returncode}"
-                for terminal in _SAFE_TRANSCRIPTION_TERMINALS:
-                    if terminal in detail:
-                        await report_progress(terminal)
-                        break
                 raise RuntimeError(detail)
             if transcript_path.is_symlink() or not transcript_path.is_file():
                 transcript_path.unlink(missing_ok=True)
@@ -692,6 +868,22 @@ class TelegramInboundNormalizer:
         if suffix and Path(cleaned).suffix != suffix:
             cleaned += suffix
         return cleaned
+
+
+async def _flock_wait(handle: Any, *, timeout: float) -> None:
+    """Take an exclusive flock, queueing (async-polling) up to ``timeout`` seconds."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if loop.time() >= deadline:
+                raise RuntimeError(
+                    f"transcription slot still busy after {timeout:.0f} seconds"
+                ) from None
+            await asyncio.sleep(0.5)
 
 
 def _normalize_whitespace(text: str) -> str:
