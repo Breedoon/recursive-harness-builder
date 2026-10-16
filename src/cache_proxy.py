@@ -1847,6 +1847,48 @@ class LocalUsageFixer:
 # ── HTTP Handler ─────────────────────────────────────────────────────────
 
 
+# Scratch-proxy idle exit (2026-10-16). Agents start scratch proxies for tests
+# and regression runs and often never stop them; 57 leaked ones were found that
+# day. CACHE_PROXY_IDLE_EXIT_SECONDS=N makes a proxy exit after N seconds with no
+# request in flight and none started. Unset (the default) means never; it is
+# ignored on the production port.
+IDLE_EXIT_SECONDS = _env_seconds("CACHE_PROXY_IDLE_EXIT_SECONDS", 0.0)
+
+
+class _Activity:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.active = 0
+        self.last = time.monotonic()
+
+    def begin(self):
+        with self._lock:
+            self.active += 1
+            self.last = time.monotonic()
+
+    def end(self):
+        with self._lock:
+            self.active -= 1
+            self.last = time.monotonic()
+
+    def idle_for(self) -> float:
+        with self._lock:
+            return 0.0 if self.active else time.monotonic() - self.last
+
+
+_ACTIVITY = _Activity()
+
+
+def _idle_exit_watch(server, limit: float):
+    while True:
+        time.sleep(min(30.0, max(0.5, limit / 10)))
+        if _ACTIVITY.idle_for() >= limit:
+            log(f"idle for {limit:.0f}s (CACHE_PROXY_IDLE_EXIT_SECONDS); exiting. "
+                f"stats={json.dumps(stats)}")
+            server.shutdown()
+            return
+
+
 class _LocalUpstreamCall:
     """One local-route upstream request, run in a worker thread.
 
@@ -1933,6 +1975,13 @@ class _LocalUpstreamCall:
 
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
+
+    def handle(self):
+        _ACTIVITY.begin()
+        try:
+            super().handle()
+        finally:
+            _ACTIVITY.end()
 
     def _upstream_headers(self, upstream: str = ANTHROPIC_UPSTREAM) -> dict:
         h = {}
@@ -2589,6 +2638,13 @@ def main():
     log(f"normalizations: billing, string→list, strip all system reminders, "
         f"git status, tool sort, metadata (cache_control: passthrough)")
     log(f"Set ANTHROPIC_BASE_URL=http://localhost:{port}")
+    if IDLE_EXIT_SECONDS:
+        if port == PROD_PORT:
+            log("WARN: CACHE_PROXY_IDLE_EXIT_SECONDS ignored on the production port")
+        else:
+            log(f"idle_exit: after {IDLE_EXIT_SECONDS:.0f}s without requests")
+            threading.Thread(target=_idle_exit_watch, args=(server, IDLE_EXIT_SECONDS),
+                             daemon=True, name="idle-exit").start()
 
     try:
         server.serve_forever()

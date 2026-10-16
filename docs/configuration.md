@@ -157,6 +157,13 @@ OBS_CACHE_PROXY_PORT=18923
 
 Use `OBS_SKIP_CACHE_PROXY=1` for debugging or if the proxy fails to start. When disabled or unhealthy, sessions route directly to Anthropic for Claude models.
 
+### Scratch-proxy idle exit
+
+`CACHE_PROXY_IDLE_EXIT_SECONDS=N` makes a proxy exit after N seconds with no
+request in flight or started. Set it (for example 1800) on every scratch or test
+proxy you start by hand; leave it unset on the production proxies. It is
+ignored on the production port. Tests: `tests/test_cache_proxy_idle_exit.py`.
+
 ### Local-route liveness (bead obs-3)
 
 A local model can stay silent for many minutes before its first token: a cold

@@ -138,7 +138,7 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
    working tree on a spare port with its own log dir:
    ```text
    PYTHONPATH=/workspace/obs/src CACHE_PROXY_LOG_DIR=/workspace/runtime/cache-proxy-scratch/new \
-   CACHE_PROXY_REQUEST_LOG=1 .venv/bin/python src/cache_proxy.py 28942
+   CACHE_PROXY_REQUEST_LOG=1 CACHE_PROXY_IDLE_EXIT_SECONDS=1800 .venv/bin/python src/cache_proxy.py 28942
    .venv/bin/python scripts/cache_regression.py --base-url http://127.0.0.1:28942 \
        --log-dir /workspace/runtime/cache-proxy-scratch/new/requests
    ```
@@ -148,7 +148,9 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
    2026-10-12 test proxies that did not override it wrote about 320 rows into
    the production `usage.jsonl` and the production `effort-pins.json` (unit
    tests now use `isolated_proxy_env()` in `tests/conftest_cache_proxy.py`).
-   Stop scratch proxies by their PID, not with `pkill -f <pattern>` or a
+   `CACHE_PROXY_IDLE_EXIT_SECONDS=1800` makes the scratch proxy exit by itself
+   after 30 idle minutes (57 forgotten scratch proxies were found on 2026-10-16);
+   never set it for 28925/28931. Stop scratch proxies by their PID, not with `pkill -f <pattern>` or a
    `pgrep -f` wait loop: the pattern also matches your own shell command, which
    then kills itself or waits forever. To compare with the old code, start the committed version on another
    port: `git show HEAD:src/cache_proxy.py > /workspace/runtime/cache-proxy-scratch/old.py`.
