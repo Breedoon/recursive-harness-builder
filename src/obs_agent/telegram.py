@@ -77,6 +77,7 @@ from obs_agent.telegram_format import md_to_telegram_html, split_message
 from obs_agent import schedule_scope as _schedule_scope
 from obs_agent import cache_readiness as _cache_readiness
 from obs_agent import cache_gate as _cache_gate
+from obs_agent import credit_limit as _credit_limit
 from obs_agent import fork_model as _fork_model
 from obs_agent.telegram_ingest import TelegramInboundNormalizer
 from obs_agent.telegram_state_store import TelegramStateStore
@@ -116,6 +117,8 @@ _SUPER_TASK_HEARTBEAT_SECONDS = 15.0
 _SUPER_TASK_IDLE_SECONDS = 30.0
 _SUPER_TASK_MONITOR_TICK_SECONDS = 1.0
 _SCHEDULE_STOP_SUPPRESS_SECONDS = 3.0
+_SCHEDULE_IN_PROGRESS_PREFIX = "run in progress, started "
+_SCHEDULE_INTERRUPTED_PREFIX = "interrupted: run started "
 _SCHEDULE_STOP_MAX_DEFERS = 5
 _TASK_OUTPUT_MAX_CHARS = 12_000
 _TASK_OUTPUT_SCAN_BYTES = 96_000
@@ -756,6 +759,10 @@ class TelegramBot:
         self._active_schedule_execution_by_route: dict[TelegramRoute, str] = {}
         self._schedule_stop_events: asyncio.Queue[tuple[TelegramRoute, dict[str, Any]]] = asyncio.Queue()
         self._schedule_stop_suppress_until: dict[TelegramRoute, float] = {}
+        # vault-ns5: a route whose last turn hit a provider credit limit holds its
+        # schedules until this epoch time, so outage fires neither run nor count.
+        self._route_credit_limit_until: dict[TelegramRoute, float] = {}
+        self._schedule_limit_streak: dict[str, int] = {}
         self._primary_bot: Any | None = None
         self._media_group_receipt_ids: dict[tuple[int, int, int | None, str], list[int]] = {}
         self._settings_payload = self._load_settings_payload()
@@ -1798,6 +1805,20 @@ class TelegramBot:
                 retry_delay_seconds=entry.retry_delay_seconds,
                 retry_attempt_count=entry.retry_attempt_count,
             )
+            if record.last_error and record.last_error.startswith(_SCHEDULE_IN_PROGRESS_PREFIX):
+                # ops-29: the previous process died mid-run; this fire is still due and re-fires.
+                started = record.last_error[len(_SCHEDULE_IN_PROGRESS_PREFIX):]
+                record.last_error = (
+                    f"{_SCHEDULE_INTERRUPTED_PREFIX}{started} did not finish before OBS "
+                    "restarted; the fire is retried"
+                )
+                logger.info(
+                    "[schedule_interrupted] schedule_id=%s route=%s started=%s next_run_at=%s",
+                    record.schedule_id,
+                    route,
+                    started,
+                    entry.next_run_at,
+                )
             self._topic_schedules_by_id[record.schedule_id] = record
             self._schedule_ids_by_route.setdefault(route, set()).add(record.schedule_id)
 
@@ -4092,7 +4113,113 @@ class TelegramBot:
                 record.enabled = False
                 record.last_error = f"schedule config error: {exc}"
                 record.next_run_at = None
+            hold_until = self._route_credit_limit_until.get(route)
+            if (
+                hold_until is not None
+                and record.next_run_at is not None
+                and record.next_run_at < hold_until
+            ):
+                record.next_run_at = hold_until
             self._register_topic_schedule(record)
+
+    def _note_route_credit_limit(
+        self,
+        *,
+        route: TelegramRoute,
+        failed: bool,
+        error_text: str | None,
+        assistant_text: str | None = None,
+        now: float | None = None,
+    ) -> float | None:
+        """Record (or clear) the route's credit-limit hold from one finished turn (vault-ns5)."""
+        limit_text = _credit_limit.turn_limit_text(
+            failed=failed, error_text=error_text, assistant_text=assistant_text
+        )
+        if limit_text is None:
+            if not failed:
+                self._route_credit_limit_until.pop(route, None)
+            return None
+        ts = now if now is not None else time.time()
+        limit = _credit_limit.parse_credit_limit(limit_text, ts)
+        if limit is None:
+            return None
+        hold_until = _credit_limit.rearm_at(limit, now=ts, consecutive_limit_fires=1)
+        previous = self._route_credit_limit_until.get(route)
+        if previous is None or previous < hold_until:
+            self._route_credit_limit_until[route] = hold_until
+        logger.info(
+            "[credit_limit_hold] route=%s hold_until=%s reset_parsed=%s error=%.120s",
+            route,
+            self._schedule_iso_timestamp(self._route_credit_limit_until[route]),
+            limit.reset_at is not None,
+            limit.text,
+        )
+        return self._route_credit_limit_until[route]
+
+    async def _defer_schedule_for_credit_limit(
+        self,
+        *,
+        record: _TopicScheduleRecord,
+        limit: _credit_limit.CreditLimit,
+        now_after: float,
+        bot: Any,
+    ) -> None:
+        """A fire that hit a credit limit: do not count it; re-arm it after the reset."""
+        streak = self._schedule_limit_streak.get(record.schedule_id, 0) + 1
+        self._schedule_limit_streak[record.schedule_id] = streak
+        rearm = _credit_limit.rearm_at(limit, now=now_after, consecutive_limit_fires=streak)
+        route_hold = self._route_credit_limit_until.get(record.route)
+        if route_hold is None or route_hold < rearm:
+            self._route_credit_limit_until[record.route] = rearm
+        else:
+            rearm = route_hold
+        record.retry_attempt_count = 0
+        record.last_error = (
+            f"credit limit; fire not counted; retry at {self._schedule_iso_timestamp(rearm)}: "
+            f"{limit.text}"
+        )
+        if not self._owns_topic_schedule_record(record):
+            return
+        past_window = record.until_ts is not None and rearm > float(record.until_ts)
+        if self._schedule_is_exhausted(record, now_after) or past_window:
+            record.enabled = False
+            record.next_run_at = None
+        elif record.trigger_kind in {"interval", "cron"}:
+            record.next_run_at = rearm
+        self._register_topic_schedule(record)
+        logger.info(
+            "[schedule_limit_deferred] schedule_id=%s route=%s streak=%d next_run_at=%s run_count=%d",
+            record.schedule_id,
+            record.route,
+            streak,
+            self._schedule_iso_timestamp(record.next_run_at),
+            record.run_count,
+        )
+        if record.enabled and record.next_run_at is not None:
+            when = self._format_schedule_timestamp(ts=record.next_run_at, record=record, now_ts=now_after)
+            text = (
+                f"schedule deferred: {self._schedule_display_name(record)}: credit limit; "
+                f"this fire was not counted; next try {when}"
+            )
+        else:
+            text = (
+                f"schedule ended: {self._schedule_display_name(record)}: credit limit "
+                "and the schedule window has closed"
+            )
+        try:
+            await self._send_system_message(
+                route=record.route,
+                bot=bot,
+                text=text,
+                disable_notification=True,
+            )
+        except Exception:
+            logger.debug(
+                "Failed sending schedule deferred marker route=%s schedule_id=%s",
+                record.route,
+                record.schedule_id,
+                exc_info=True,
+            )
 
     async def _execute_topic_schedule(
         self,
@@ -4117,6 +4244,23 @@ class TelegramBot:
                     record.last_error = f"schedule config error: {exc}"
                     record.next_run_at = None
                 self._register_topic_schedule(record)
+            return False
+        hold_until = self._route_credit_limit_until.get(record.route)
+        if hold_until is not None and now < hold_until:
+            # vault-ns5: the route is inside a known credit-limit outage. Do not run (the
+            # prompt would only append a limit error to the session and poison its tail,
+            # forking a fresh session at the next wake) and do not count; fire after reset.
+            if record.trigger_kind in {"interval", "cron"} and (
+                record.next_run_at is None or record.next_run_at < hold_until
+            ):
+                record.next_run_at = hold_until
+                self._register_topic_schedule(record)
+            logger.info(
+                "[schedule_limit_hold] schedule_id=%s route=%s hold_until=%s",
+                record.schedule_id,
+                record.route,
+                self._schedule_iso_timestamp(hold_until),
+            )
             return False
 
         state = self._get_state(record.route, create=False)
@@ -4197,6 +4341,14 @@ class TelegramBot:
                     f"{record.prompt}"
                 )
                 record.last_run_at = time.time()
+                # ops-29: persist the start, so a fire cut off by a restart is visible
+                # (the scheduler re-fires it because next_run_at only advances on completion).
+                record.last_error = (
+                    f"{_SCHEDULE_IN_PROGRESS_PREFIX}"
+                    f"{self._schedule_iso_timestamp(record.last_run_at)}"
+                )
+                if self._owns_topic_schedule_record(record):
+                    self._persist_topic_schedule(record)
                 self._schedule_stop_suppress_until[record.route] = (
                     time.time() + _SCHEDULE_STOP_SUPPRESS_SECONDS
                 )
@@ -4213,15 +4365,41 @@ class TelegramBot:
                         suppress_completion_summary=True,
                     )
                     now_after = time.time()
+                    silent_limit = (
+                        None
+                        if outcome.failed
+                        else _credit_limit.turn_limit_text(
+                            failed=False,
+                            error_text=None,
+                            assistant_text=outcome.assistant_text,
+                        )
+                    )
                     if outcome.failed:
                         run_failed = True
                         failure_text = outcome.error or "scheduled run failed"
+                    elif silent_limit is not None:
+                        # vault-ns5: the reply is only the provider's limit line; it ran nothing.
+                        run_failed = True
+                        failure_text = silent_limit
                     else:
                         run_succeeded = True
                 finally:
                     state.hook_state.schedule_run_active = False
                     state.hook_state.triggered_schedule_id = None
                     state.hook_state.active_schedule = None
+        except asyncio.CancelledError:
+            if record.last_error and record.last_error.startswith(_SCHEDULE_IN_PROGRESS_PREFIX):
+                started = record.last_error[len(_SCHEDULE_IN_PROGRESS_PREFIX):]
+                record.last_error = (
+                    f"{_SCHEDULE_INTERRUPTED_PREFIX}{started} was cancelled before it "
+                    "finished; the fire is retried"
+                )
+                if self._owns_topic_schedule_record(record):
+                    try:
+                        self._persist_topic_schedule(record)
+                    except Exception:
+                        logger.debug("Failed persisting interrupted schedule", exc_info=True)
+            raise
         except Exception as exc:
             now_after = time.time()
             run_failed = True
@@ -4236,11 +4414,24 @@ class TelegramBot:
             self._schedule_running_by_route.discard(record.route)
             self._active_schedule_execution_by_route.pop(record.route, None)
 
+        limit = (
+            _credit_limit.parse_credit_limit(failure_text, now_after) if run_failed else None
+        )
         if run_succeeded:
             record.run_count += 1
             record.retry_attempt_count = 0
             record.last_error = None
             record.last_success_at = now_after
+            self._schedule_limit_streak.pop(record.schedule_id, None)
+        elif limit is not None:
+            await self._defer_schedule_for_credit_limit(
+                record=record,
+                limit=limit,
+                now_after=now_after,
+                bot=bot,
+            )
+            await _emit_post_schedule_summary()
+            return False
         elif run_failed:
             record.last_error = failure_text or "scheduled run failed"
             if (
@@ -9404,8 +9595,15 @@ class TelegramBot:
             state.inbox_wake_summary = None
             state.inbox_wake_content = None
 
+        assistant_text = "\n".join(part for part in captured_text_parts if part).strip()
+        self._note_route_credit_limit(
+            route=state.route,
+            failed=failed,
+            error_text=error_text,
+            assistant_text=assistant_text,
+        )
         return _RunOutcome(
-            assistant_text="\n".join(part for part in captured_text_parts if part).strip(),
+            assistant_text=assistant_text,
             failed=failed,
             error=error_text,
         )

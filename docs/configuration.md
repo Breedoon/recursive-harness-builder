@@ -93,6 +93,17 @@ This mode depends on Telethon and Telegram API credentials from my.telegram.org.
 
 Schedule wall-clock evaluation and all user-visible schedule timestamps use `OBS_USER_TIMEZONE`, an IANA timezone name. The default is `Europe/Warsaw`. For example, `OBS_USER_TIMEZONE=America/New_York` makes cron expressions use New York wall time and renders `from`, `until`, and `next_run_at` with that timezone's UTC offset.
 
+## Schedule fires during a credit-limit outage
+
+A schedule fire whose turn ends with a provider credit-limit (quota) error — for example `You've hit your limit · resets 11am (UTC)`, `usage limit reached|<epoch>`, or a `rate_limit_error` — is **not counted** against `max_runs` and does not use a `retry` attempt (implementation: `src/obs_agent/credit_limit.py`, bead vault-ns5). This also covers a turn whose whole visible reply is only the limit line. Instead:
+
+- Interval and cron schedules are re-armed for just after the parsed reset time (plus 60 s). If the message has no usable reset time, they back off 5, 10, 20, 40 and then every 60 minutes until a fire gets through. A cron schedule fires once at the re-arm time and then returns to its normal cadence.
+- The route is held until that time: other schedules on the same route are pushed past the reset without running, so an outage appends at most one limit-error turn per route instead of one per wake (which used to leave a poisoned session tail and fork a fresh session at every wake). Any successful turn on the route clears the hold; the hold is in memory, so after an OBS restart the first limit hit re-establishes it.
+- `until` still ends the schedule: if the re-arm time falls after `until`, the schedule ends with `schedule ended: … credit limit and the schedule window has closed`.
+- The topic gets a quiet `schedule deferred: … this fire was not counted; next try …` marker, and `last_error` starts with `credit limit; fire not counted; retry at …`.
+
+Other failures keep the old behavior (counted, retried only with `retry > 0`), so schedules no longer need extra `max_runs` headroom for outages. A fire cut off by a restart or cancellation is also not counted and is re-fired; while it runs, `last_error` reads `run in progress, started …`, and after an interruption `interrupted: run started …` (bead ops-29).
+
 ## Model and provider selection
 
 Use `OBS_DEFAULT_MODEL` for normal defaults and `OBS_AGENT_MODEL` only when you want to force every root session to a specific model.
