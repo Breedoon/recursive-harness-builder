@@ -33,6 +33,17 @@ obs-agentctl --as nightly-check new-tree --title "Disk alert" --prompt "..." [--
   - over Tailscale: `ssh -p 2220 agent@100.66.160.62 '...'` with a key in that same file.
 - Global flags (`--as`, `--json`, `--idempotency-key`) go BEFORE the op name.
 - Every request, accepted or refused, is appended to `obs-control/audit.jsonl`.
+  - Outcomes: `ok`; `failed` when the dispatched action did not happen; `refused` only for an
+    authentication failure (peer uid or token); `invalid` for a malformed request; `replayed`
+    for an idempotency hit.
+  - **Caveat:** a cold-cache guard refusal is logged as `failed`, not `refused` (`control.py`
+    writes `failed` for any non-ok dispatch result). Read the `detail` field (`cold-cache guard: …`)
+    to tell them apart. Bead `ops-1.11.13` tracks a distinct label.
+  - Retention: append-only and **never rotated or auto-deleted** (Daniel's standing never-auto-delete
+    rule). It grows about 368 bytes per call (12,981 bytes for 35 calls on 2026-10-16).
+  - The file is mode 0644 inside the 0700 `obs-control` directory, so only the OBS user can reach it.
+    It records op, caller, outcome, target names and a 300-character detail. It holds no token and no
+    message or prompt bodies.
 
 ## What runs
 
