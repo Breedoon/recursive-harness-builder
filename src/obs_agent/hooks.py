@@ -344,6 +344,16 @@ class HookState:
     # Wall time of a /stop, /stop_* or AgentTaskStop for the running turn. While
     # set, a CLI exit ends the turn instead of reconnecting (vault-u3b.65).
     stop_requested_at: float | None = None
+    # Wall time of an AgentTaskStop / task-scoped stop that outlives the turn
+    # (obs-2). While set, queued work is not auto-delivered, the route is left
+    # out of restart snapshots, and a turn that starts anyway keeps
+    # stop_requested_at armed. Explicit new input (a user message, an inbox
+    # wake, AgentTask resume, a schedule) clears it.
+    stop_latched_at: float | None = None
+    # Teammate notices that arrived while a stopped turn was winding down. They
+    # are new input, so they survive the stop's leftover-batch discard and are
+    # handed back to the route when the turn ends (obs-2).
+    post_stop_messages: list = field(default_factory=list)
     interrupt_notice_pending: bool = False
     pause_queue_delivery: bool = False
     session_id: str | None = None
@@ -403,6 +413,8 @@ class HookState:
         self.interrupt_flag = False
         self.interrupt_requested = False
         self.stop_requested_at = None
+        self.stop_latched_at = None
+        self.post_stop_messages = []
         self.interrupt_notice_pending = False
         self.pause_queue_delivery = False
         self.session_id = None

@@ -2087,8 +2087,9 @@ class TelegramBot:
             if record is not None and record.terminal_request:
                 # /stop, /stop_branch or /stop_tree before the restart wins.
                 continue
-            if state.hook_state.stop_requested_at is not None:
-                # A stop was requested for this turn (also plain trunk /stop).
+            if state.hook_state.stop_requested_at is not None or state.hook_state.stop_latched_at is not None:
+                # A stop was requested for this turn (also plain trunk /stop),
+                # or the route's task was stopped (obs-2).
                 continue
             session_id = state.session_id
             inflight_prompt: str | None = None
@@ -4352,6 +4353,7 @@ class TelegramBot:
                 self._schedule_stop_suppress_until[record.route] = (
                     time.time() + _SCHEDULE_STOP_SUPPRESS_SECONDS
                 )
+                self._clear_stop_latch(state, "schedule")
                 state.hook_state.schedule_run_active = True
                 state.hook_state.triggered_schedule_id = record.schedule_id
                 state.hook_state.active_schedule = self._schedule_summary_payload(record)
@@ -5552,7 +5554,7 @@ class TelegramBot:
                 logger.debug("Scoped route interrupt failed route=%s", state.route, exc_info=True)
         return counts
 
-    def _mark_stop_requested(self, state: TelegramSessionState) -> None:
+    def _mark_stop_requested(self, state: TelegramSessionState, *, stamp: float | None = None) -> None:
         """Record a stop for the running turn and arm the kill escalation (vault-u3b.65).
 
         While set, a CLI exit ends the turn instead of reconnecting with
@@ -5561,7 +5563,7 @@ class TelegramBot:
         """
         if not (state.busy or state.hook_state.execution_active):
             return
-        stamp = time.time()
+        stamp = time.time() if stamp is None else stamp
         state.hook_state.stop_requested_at = stamp
         grace = _stop_kill_grace_seconds()
         if grace <= 0:
@@ -5569,6 +5571,53 @@ class TelegramBot:
         task = asyncio.create_task(self._escalate_stop(state, stamp=stamp, grace=grace))
         self._stop_escalation_tasks.add(task)
         task.add_done_callback(self._stop_escalation_tasks.discard)
+
+    def _latch_task_stop(self, state: TelegramSessionState) -> None:
+        """Stop a task's route durably (obs-2): AgentTaskStop and task-scoped stops.
+
+        Unlike a plain turn stop, the latch outlives the running turn. Queued
+        work that was waiting when the stop landed is discarded (the /stop
+        policy), later queued items are not auto-delivered, the route is left
+        out of restart snapshots and the running turn, if any, gets the stop
+        mark and kill escalation. Explicit new input clears the latch
+        (``_clear_stop_latch``): agents stay idle, not dead.
+        """
+        hook_state = state.hook_state
+        stamp = time.time()
+        hook_state.stop_latched_at = stamp
+        hook_state.interrupt_flag = True
+        active = bool(state.busy or hook_state.execution_active)
+        if active:
+            # Discard the runner's leftover batch at turn end, like /stop.
+            hook_state.interrupt_requested = True
+        discarded = len(_drain_queue(hook_state.message_queue)) + len(state.pending_messages)
+        state.pending_messages = []
+        state.inbox_wake_pending = False  # a wake queued before the stop
+        logger.info(
+            "[task_stop] latched route=%s active=%s discarded_queued=%d",
+            state.route,
+            active,
+            discarded,
+        )
+        self._mark_stop_requested(state, stamp=stamp)
+
+    @staticmethod
+    def _clear_stop_latch(state: TelegramSessionState | None, reason: str) -> None:
+        if state is None or state.hook_state.stop_latched_at is None:
+            return
+        state.hook_state.stop_latched_at = None
+        logger.info("[task_stop] latch cleared route=%s reason=%s", state.route, reason)
+
+    async def _interrupt_live_client(self, state: TelegramSessionState) -> None:
+        """Interrupt the route's running CLI without starting one for an idle route."""
+        session_mgr = state.session_manager
+        client = session_mgr._client
+        if client is None or not session_mgr._connected:
+            return
+        try:
+            await client.interrupt()
+        except Exception:
+            logger.debug("Task stop interrupt failed route=%s", state.route, exc_info=True)
 
     async def _escalate_stop(self, state: TelegramSessionState, *, stamp: float, grace: float) -> None:
         await asyncio.sleep(grace)
@@ -5580,6 +5629,10 @@ class TelegramBot:
         client = session_mgr._client
         process = getattr(getattr(client, "_transport", None), "_process", None)
         pid = getattr(process, "pid", None)
+        # Only a real child pid is killable; a mock or bogus value (int(MagicMock())
+        # == 1) once made this SIGKILL every descendant of PID 1 and took down the fleet.
+        if type(pid) is not int or pid <= 1 or pid == os.getpid():
+            pid = None
         logger.warning(
             "[stop_escalation] turn still running %.0fs after stop; killing Claude CLI pid=%s route=%s",
             grace,
@@ -5590,7 +5643,7 @@ class TelegramBot:
             # Kill the CLI's tool subprocesses too; they would otherwise be
             # reparented to PID 1 and keep running after the stop.
             try:
-                killed = await asyncio.to_thread(_maint.kill_process_tree, int(pid))
+                killed = await asyncio.to_thread(_maint.kill_process_tree, pid)
                 logger.warning("[stop_escalation] killed pids=%s route=%s", killed, state.route)
             except Exception:
                 logger.warning("[stop_escalation] process-tree kill failed pid=%s", pid, exc_info=True)
@@ -5654,13 +5707,8 @@ class TelegramBot:
 
         child_state = self._get_state(record.child_route, create=False)
         if child_state is not None:
-            child_state.hook_state.interrupt_flag = True
-            self._mark_stop_requested(child_state)
-            try:
-                client = await child_state.session_manager.get_client()
-                await client.interrupt()
-            except Exception:
-                logger.debug("Failed interrupting child while clearing task_id=%s", task_id, exc_info=True)
+            self._latch_task_stop(child_state)
+            await self._interrupt_live_client(child_state)
 
         task = self._fork_task_tasks.get(task_id)
         if task is not None and not task.done():
@@ -6295,7 +6343,7 @@ class TelegramBot:
             # Same effect as /stop: the CLI exit ends the turn, no auto-resume.
             state.hook_state.stop_requested_at = time.time()
         try:
-            await asyncio.to_thread(_maint.kill_process_tree, int(pid))
+            await asyncio.to_thread(_maint.kill_process_tree, pid)
         except Exception:
             logger.warning("[cli_hang_watchdog] process-tree kill failed pid=%s", pid, exc_info=True)
         session_mgr = state.session_manager
@@ -9078,7 +9126,9 @@ class TelegramBot:
         state.last_bot = bot
         state.hook_state.interrupt_flag = False
         state.hook_state.interrupt_requested = False
-        state.hook_state.stop_requested_at = None
+        # A latched task stop (obs-2) survives turn starts: a turn that starts
+        # without explicit new input stays marked stopped and cannot reconnect.
+        state.hook_state.stop_requested_at = state.hook_state.stop_latched_at
         state.hook_state.pause_queue_delivery = False
         run_user_text = user_text
         # A stop ends the prior turn, not the task described by the next message.
@@ -9476,6 +9526,9 @@ class TelegramBot:
             if runner_events is not None:
                 await runner_events.aclose()
             _store_remaining_pending()
+            if state.hook_state.post_stop_messages:
+                state.pending_messages = list(state.pending_messages) + state.hook_state.post_stop_messages
+                state.hook_state.post_stop_messages = []
             state.busy = False
             state.inflight_user_text = None
             state.hook_state.execution_active = False
@@ -9658,6 +9711,7 @@ class TelegramBot:
         self._persist_state_for_route(route)
         state.last_bot = context.bot
         state.warning_sent = False
+        self._clear_stop_latch(state, "user_message")
 
         logger.info("Processing message from route %s: %s", route, user_text[:100])
 
@@ -9804,6 +9858,9 @@ class TelegramBot:
                 continue
             if state.busy or state.hook_state.pause_queue_delivery:
                 continue
+            if state.hook_state.stop_latched_at is not None:
+                # A stopped task's queue waits for explicit new input (obs-2).
+                continue
             if self._chat_pending_ops.get(state.route.chat_id, 0) > 0:
                 # Keep model-visible queue delivery behind Telegram transport drain.
                 # Otherwise the model can process queued updates before users have
@@ -9839,6 +9896,7 @@ class TelegramBot:
                 bot is None
                 or state.busy
                 or state.hook_state.pause_queue_delivery
+                or state.hook_state.stop_latched_at is not None
                 or self._chat_pending_ops.get(state.route.chat_id, 0) > 0
             ):
                 return
@@ -10819,17 +10877,24 @@ class TelegramBot:
         summary: str | None,
         content: str | None,
     ) -> None:
-        state.hook_state.message_queue.put_nowait(
-            QueuedMessage(
-                text=self._build_running_team_worker_prompt(
-                    team_name=team_name,
-                    agent_name=agent_name,
-                    sender=sender,
-                    summary=summary,
-                    content=content,
-                )
+        # A teammate message sent to a stopped agent is new input: it wakes the
+        # agent once the stopped turn has ended (agents are idle, not dead).
+        self._clear_stop_latch(state, "inbox_message")
+        notice = QueuedMessage(
+            text=self._build_running_team_worker_prompt(
+                team_name=team_name,
+                agent_name=agent_name,
+                sender=sender,
+                summary=summary,
+                content=content,
             )
         )
+        if state.busy and state.hook_state.stop_requested_at is not None:
+            # The stopped turn discards its leftover queue when it ends; keep
+            # this later notice out of that discard.
+            state.hook_state.post_stop_messages.append(notice)
+            return
+        state.hook_state.message_queue.put_nowait(notice)
 
     @staticmethod
     def _team_inbox_path(team_name: str, agent_name: str) -> Path:
@@ -11193,6 +11258,7 @@ class TelegramBot:
             summary=summary_norm,
             content=content_norm,
         )
+        self._clear_stop_latch(state, "inbox_wake")
         queued_before = _drain_queue(state.hook_state.message_queue)
         await self._run_and_send(
             state=state,
@@ -12051,6 +12117,9 @@ class TelegramBot:
             or (parent_state.last_bot if parent_state is not None else None)
             or self._primary_bot
         )
+        if child_state is not None:
+            # Launch, resume and wake of this task are explicit (re)starts.
+            self._clear_stop_latch(child_state, "agent_task_run")
         if child_state is None or bot is None:
             if wake_reserved and child_state is not None:
                 child_state.busy = False
@@ -12427,6 +12496,17 @@ class TelegramBot:
             return self._task_not_found_result(lookup_label)
         task_id = record.task_id
         task = self._fork_task_tasks.get(task_id)
+        child_state = self._get_state(record.child_route, create=False)
+        # obs-2: the task record can look idle or finished while its route is
+        # still running a turn that is not this task's fork run (a maintenance
+        # resume, a queued-update delivery). Stop the route itself, always.
+        record.wake_requested = False  # a wake queued before the stop
+        if child_state is not None:
+            self._latch_task_stop(child_state)
+            await self._interrupt_live_client(child_state)
+        route_active = child_state is not None and bool(
+            child_state.busy or child_state.hook_state.execution_active
+        )
         if record.idle_ready and (task is None or task.done()):
             record.idle_ready = False
             record.wake_requested = False
@@ -12449,6 +12529,27 @@ class TelegramBot:
                 "task_type": "local_agent",
                 "command": record.description or "fork task",
                 "status": "stopped",
+                "idempotent": False,
+            }
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=True)}],
+                "tool_use_result": payload,
+            }
+        if record.status in {"completed", "failed", "stopped"} and route_active:
+            # The record is terminal but its route is still executing (obs-2).
+            prior_status = record.status
+            record.terminal_request = "stopped"
+            record.status = "stopped"
+            self._persist_task_handle_record(record)
+            payload = {
+                "message": f"Task was {prior_status} but its agent was still running; interrupting it: {task_id}",
+                "task_id": task_id,
+                "task_id_scope": "deprecated_internal_compatibility",
+                "team_name": record.team_name,
+                "agent_name": record.agent_name,
+                "session_id": record.child_session_id or None,
+                "task_type": "local_agent",
+                "status": "stopping",
                 "idempotent": False,
             }
             return {
@@ -12490,15 +12591,6 @@ class TelegramBot:
 
         record.terminal_request = "stopped"
         self._persist_task_handle_record(record)
-        child_state = self._get_state(record.child_route, create=False)
-        if child_state is not None:
-            child_state.hook_state.interrupt_flag = True
-            self._mark_stop_requested(child_state)
-            try:
-                client = await child_state.session_manager.get_client()
-                await client.interrupt()
-            except Exception:
-                logger.debug("ForkTaskStop interrupt failed task_id=%s", task_id, exc_info=True)
         payload = {
             "message": f"Successfully stopped task: {task_id} ({record.description or 'fork task'})",
             "task_id": task_id,
