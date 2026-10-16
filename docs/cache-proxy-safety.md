@@ -199,11 +199,21 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
     prefix, from cache. Ratio 0 was
     seen 2026-10-12 (`codex boundary_marker`), 2026-10-15 (`codex cch_collision`)
     and 2026-10-16 (`codex reminder_block`, `prefix_diff.py`: pure append). The
-    only partial read so far is 0.835 on 2026-10-15 (`codex boundary_marker`,
-    cached 15104 of 18089 tokens). Its request bodies were not kept, so
-    "provider-side" there is the runner's own `append` classification, not a
-    re-run diff, and the case is under investigation (bead `ops-1.11.2`). Each
-    passed on rerun. Every other partial ratio is NOT accepted: a byte-intact
+    only partial read in a gate run so far is 0.835 on 2026-10-15 (`codex
+    boundary_marker`, cached 15104 of 18089 tokens). Investigated 2026-10-16
+    (bead `ops-1.11.2`): its bodies are kept in
+    `/workspace/runtime/cache-proxy-scratch/s6/requests/2026-10-15/`;
+    `prefix_diff.py --part wire` on pair `…000267-b0f948b2` → `…000268-b0f948b2`
+    says pure `append`, and all four requests of the session carry the same
+    `metadata.user_id` session part, so the provider cache key was unchanged.
+    15104 is a cross-conversation cached length: it is also the first-request
+    read of other, differently keyed conversations (scratch `eb93ae38`,
+    `f524dffc`; nine production sessions 2026-10-09 to 10-13), and a second
+    pure-append 15104 read (0.8272, production `…000305-42e4a8cb`, 2026-10-12,
+    before per-conversation keys) shows the same thing. So the provider served
+    a shorter shared-prefix entry; our bytes and key were intact. Two
+    pure-append observations, both at cache read 15104, are not enough for a
+    band, so the row stays one exact point. Each passed on rerun. Every other partial ratio is NOT accepted: a byte-intact
     but intermittent cache-key regression on our side (`prompt_cache_key`,
     `cache_proxy.py`) would look exactly like a partial GPT append and could pass
     after one lucky rerun, so no band is accepted without evidence. The same class on the Claude route is not this
@@ -221,13 +231,31 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
   Known-shape table: the cache gate (`src/obs_agent/cache_gate.py`,
   `KNOWN_INTERMITTENT_SHAPES`, ratio bounds inclusive) accepts a full run with a
   FAIL only when every bad pair of that FAIL matches one of these rows exactly
-  AND the same scenario passed on a later rerun of the same code:
+  AND the later reruns of that scenario for the same code satisfy the rerun
+  rule below:
   - GPT route, any scenario, class `append`, ratio 0.0 to 0.0 (exactly 0).
   - GPT route, any scenario, class `append`, ratio 0.835 to 0.835 (exactly 0.835).
   - Claude route, scenario `recovery_multi`, class `tail-block-append`,
     ratio 0.85 to 0.95.
   `PROVIDER-ERROR` and `SKIPPED` scenarios (no cache verdict) are also
-  accepted once they pass on rerun. The report's top-level `providers` must
+  accepted under the rerun rule.
+  Rerun rule: the gate reads every later same-code rerun of the scenario in
+  time order and skips `PROVIDER-ERROR` and `SKIPPED` reruns (no verdict). It
+  refuses if any rerun FAILs after a passing rerun; if more than one rerun
+  FAILs before the first pass (at most one rerun may fail); or if a failed
+  rerun is not itself a documented
+  shape (a rerun FAIL with no bad pairs counts as undocumented). After any FAIL
+  (the full run's or a rerun's) the scenario must then pass two times in a row
+  (`RERUN_PASSES_AFTER_FAIL`, `RERUN_FAILS_ALLOWED`); a full run whose only
+  problem was `PROVIDER-ERROR`/`SKIPPED` needs one passing rerun. Why: until
+  2026-10-16 any single passing rerun accepted the FAIL and failed reruns were
+  ignored, so on `2a1eb44` a `recovery_multi` FAIL (0.9241) whose first rerun
+  FAILed again passed on the second rerun (bead `ops-1.11.3`); a flaky
+  regression of ours could pass after enough retries. "No FAIL after a pass"
+  makes retrying-until-green impossible, and two passes after a failure cut a
+  lucky single pass of a 50%-flaky regression to 25%; for a known intermittent
+  shape it costs one extra single-scenario rerun. A blocked code identity
+  needs a fresh full run, or a fix. The report's top-level `providers` must
   list both routes as actually run. Changing a row needs evidence here and the
   same change in the gate; `tests/test_cache_gate.py` checks they agree.
   History: OBS `28cfbe3` (2026-10-15) first let the gate accept any rerun-passed

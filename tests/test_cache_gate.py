@@ -255,10 +255,16 @@ def test_intermittent_fail_accepted_only_after_rerun_passes(repo, tmp_path):
     later = time.time() + 5
     os.utime(rerun / "gate.json", (later, later))
     result = cache_gate.check(repo, base=base, report_root=reports)
+    assert not result.ok and "1 of 2 passing reruns" in result.message  # one lucky pass is not enough
+    rerun2 = _report_with(reports, repo, "c-rerun", "PASS", {"anthropic": {"recovery_multi": "PASS"}},
+                          scenarios=["recovery_multi"])
+    os.utime(rerun2 / "gate.json", (later + 1, later + 1))
+    result = cache_gate.check(repo, base=base, report_root=reports)
     assert result.ok and result.report == full
 
 
-def _full_fail_then_rerun(repo, tmp_path, provider, scenario, failure):
+def _full_fail_then_rerun(repo, tmp_path, provider, scenario, failure, sequence=("PASS", "PASS")):
+    """Full run with one non-PASS scenario, then reruns of it in order (oldest first)."""
     import os
     import time
 
@@ -269,10 +275,14 @@ def _full_fail_then_rerun(repo, tmp_path, provider, scenario, failure):
     per[provider][scenario] = failure["status"]
     full = _report_with(reports, repo, "a-full", "FAIL", per, failures={provider: {scenario: failure}})
     time.sleep(0.01)
-    rerun = _report_with(reports, repo, "b-rerun", "PASS", {provider: {scenario: "PASS"}},
-                         scenarios=[scenario])
     later = time.time() + 5
-    os.utime(rerun / "gate.json", (later, later))
+    for index, rerun_status in enumerate(sequence):
+        rerun_failure = rerun_status if isinstance(rerun_status, dict) else {"status": rerun_status}
+        status = rerun_failure["status"]
+        rerun = _report_with(reports, repo, f"b-rerun-{index:02d}", "PASS" if status == "PASS" else status,
+                             {provider: {scenario: status}}, scenarios=[scenario],
+                             failures=None if status == "PASS" else {provider: {scenario: rerun_failure}})
+        os.utime(rerun / "gate.json", (later + index, later + index))
     return cache_gate.check(repo, base=base, report_root=reports), full
 
 
@@ -389,3 +399,56 @@ def test_report_missing_a_provider_refused(repo, tmp_path):
                  failures={"codex": {"x": _fail("append", 0.0)}}, providers=["codex"])
     result = cache_gate.check(repo, base=base, report_root=reports)
     assert not result.ok and "providers missing ['anthropic']" in result.message
+
+
+# Rerun rule (bead ops-1.11.3): reruns read in time order; no FAIL after a pass, at most one failed
+# rerun (itself a documented shape), then two passes after any FAIL; PROVIDER-ERROR/SKIPPED are no verdict.
+_RM = ("anthropic", "recovery_multi", _fail("tail-block-append", 0.9241))
+_GPT0 = ("codex", "boundary_marker", _fail("append", 0.0))
+
+
+@pytest.mark.parametrize("shape,sequence", [
+    (_RM, ("PASS", "PASS")),
+    (_RM, ("PASS", "PASS", "PASS")),
+    (_RM, (_fail("tail-block-append", 0.8721), "PASS", "PASS")),       # one documented failed rerun
+    (_RM, ("PASS", "PROVIDER-ERROR", "PASS")),                          # no-verdict rerun skipped
+    (_GPT0, ("SKIPPED", "PASS", "PASS")),
+    (("codex", "baseline", {"status": "PROVIDER-ERROR", "bad_pairs": []}), ("PASS",)),  # no FAIL seen: one pass
+])
+def test_rerun_rule_accepts(repo, tmp_path, shape, sequence):
+    result, full = _full_fail_then_rerun(repo, tmp_path, *shape, sequence=sequence)
+    assert result.ok and result.report == full
+
+
+@pytest.mark.parametrize("shape,sequence,why", [
+    (_RM, (), "0 of 2 passing reruns"),
+    (_RM, ("PASS",), "1 of 2 passing reruns"),
+    (_RM, ("PROVIDER-ERROR", "PASS"), "1 of 2 passing reruns"),
+    # observed 2026-10-16 on 2a1eb44: full FAIL 0.9241, rerun 1 FAIL without bad pairs, rerun 2 PASS
+    (_RM, ({"status": "FAIL", "bad_pairs": []}, "PASS"), "rerun FAIL: FAIL without bad pairs"),
+    (_RM, ({"status": "FAIL", "bad_pairs": []}, "PASS", "PASS"), "rerun FAIL: FAIL without bad pairs"),
+    (_RM, ("PASS", _fail("tail-block-append", 0.9), "PASS", "PASS"), "after a passing rerun"),
+    (_RM, ("PASS", "PASS", _fail("tail-block-append", 0.9)), "after a passing rerun"),
+    (_RM, (_fail("tail-block-append", 0.9),) * 2 + ("PASS", "PASS"), "2 failed reruns"),
+    (_RM, (_fail("history-changed", 0.5), "PASS", "PASS"), "rerun FAIL: history-changed"),
+    (_RM, (_fail("tail-block-append", 0.70), "PASS", "PASS"), "not a documented"),
+    (_GPT0, ("PASS", _fail("append", 0.0), "PASS"), "after a passing rerun"),
+    (_GPT0, (_fail("append", 0.6), "PASS", "PASS"), "not a documented"),  # rerun shape outside the table
+    (("codex", "baseline", {"status": "PROVIDER-ERROR", "bad_pairs": []}), (_fail("append", 0.0), "PASS"),
+     "1 of 2 passing reruns"),  # first verdict was a FAIL: two passes then
+])
+def test_rerun_rule_blocks(repo, tmp_path, shape, sequence, why):
+    result, _ = _full_fail_then_rerun(repo, tmp_path, *shape, sequence=sequence)
+    assert not result.ok and why in result.message
+
+
+def test_rerun_rule_matches_safety_doc():
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "cache-proxy-safety.md").read_text()
+    section = doc.split("### How to read the runner's result", 1)[1].split("###", 1)[0]
+    rule = " ".join(section.split("Rerun rule:", 1)[1].split("\n- ", 1)[0].split())
+    words = {1: "one", 2: "two", 3: "three"}
+    assert f"pass {words[cache_gate.RERUN_PASSES_AFTER_FAIL]} times in a row" in rule
+    assert f"at most {words[cache_gate.RERUN_FAILS_ALLOWED]} rerun" in rule
+    assert "after a passing rerun" in rule and "time order" in rule
+    for status in cache_gate.RERUN_STATUSES_WITHOUT_SHAPE:
+        assert f"`{status}`" in rule

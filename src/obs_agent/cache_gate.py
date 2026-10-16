@@ -184,9 +184,10 @@ def _same_code(report: dict, target: dict) -> tuple[bool, str]:
 #    nothing (codex boundary_marker 2026-10-12; codex cch_collision 2026-10-15; codex
 #    reminder_block 2026-10-16). Each passed on rerun.
 # 2. GPT route, class `append`, ratio exactly 0.835: the single observed partial read, codex
-#    boundary_marker on 2026-10-15 (cached 15104 of 18089), an exact point and not a band. Its
-#    request bodies are gone, so its cause is under investigation (bead ops-1.11.2); no other
-#    partial ratio is accepted.
+#    boundary_marker on 2026-10-15 (cached 15104 of 18089), an exact point and not a band. Bead
+#    ops-1.11.2 (2026-10-16): wire bodies pure append, same cache key, and 15104 is a cached length
+#    shared across conversations (provider served a shorter shared-prefix entry). Only two
+#    pure-append partial reads are known (both 15104), so no other partial ratio is accepted.
 # 3. Claude route, scenario `recovery_multi`, class `tail-block-append`, ratio 0.85-0.95: the open
 #    "Continue from where you left off." mechanism (bead vault-1r7n.9). Observed 0.8721, 0.9216,
 #    0.944.
@@ -197,6 +198,16 @@ KNOWN_INTERMITTENT_SHAPES = (
      "min_ratio": 0.85, "max_ratio": 0.95},
 )
 RERUN_STATUSES_WITHOUT_SHAPE = ("PROVIDER-ERROR", "SKIPPED")
+# Rerun rule (bead ops-1.11.3; docs/cache-proxy-safety.md "Rerun rule"). Reruns of one scenario
+# for the same code are read in time order; PROVIDER-ERROR/SKIPPED reruns are no verdict and are
+# skipped. Accept only when (a) no rerun FAILs after a passing rerun, (b) at most
+# RERUN_FAILS_ALLOWED reruns FAIL before the first pass, each itself a documented shape, and
+# (c) the scenario then passes RERUN_PASSES_AFTER_FAIL times when any FAIL was seen (the full
+# run's or a rerun's), or once when the full run had no cache verdict (PROVIDER-ERROR/SKIPPED).
+# One lucky pass after a failure is no longer enough, and retrying until a pass cannot hide a
+# flaky regression of ours: a later failure, or a second failed rerun, blocks this code identity.
+RERUN_PASSES_AFTER_FAIL = 2
+RERUN_FAILS_ALLOWED = 1
 
 
 def known_intermittent(provider: str, scenario: str, failure: dict | None) -> tuple[bool, str]:
@@ -222,10 +233,38 @@ def known_intermittent(provider: str, scenario: str, failure: dict | None) -> tu
     return True, "documented shape"
 
 
+def rerun_verdict(provider: str, scenario: str, original_status: str, reruns: list[dict]) -> tuple[bool, str]:
+    """Apply the rerun rule to one documented non-PASS scenario. ``reruns`` are later same-code
+    reports in chronological order (oldest first)."""
+    fails = 0 if original_status in RERUN_STATUSES_WITHOUT_SHAPE else 1
+    rerun_fails = passes = 0
+    for rerun in reruns:
+        status = (rerun.get("scenario_results") or {}).get(provider, {}).get(scenario)
+        if status is None or status in RERUN_STATUSES_WITHOUT_SHAPE:
+            continue  # scenario not rerun here, or the route did not run cleanly: no verdict
+        if status == "PASS":
+            passes += 1
+            continue
+        if passes:
+            return False, f"rerun {status} after a passing rerun"
+        failure = ((rerun.get("scenario_failures") or {}).get(provider) or {}).get(scenario) or {"status": status}
+        known, why = known_intermittent(provider, scenario, failure)
+        if not known:
+            return False, f"rerun {status}: {why}"
+        fails += 1
+        rerun_fails += 1
+        if rerun_fails > RERUN_FAILS_ALLOWED:
+            return False, f"{rerun_fails} failed reruns (at most {RERUN_FAILS_ALLOWED})"
+    needed = RERUN_PASSES_AFTER_FAIL if fails else 1
+    if passes < needed:
+        return False, f"{passes} of {needed} passing reruns"
+    return True, f"{passes} passing reruns"
+
+
 def _report_matches(report: dict, target: dict, reruns: list[dict] | None = None) -> tuple[bool, str]:
     """A full-set report for this code that passed — directly, or with every non-PASS scenario
-    a DOCUMENTED intermittent shape (``KNOWN_INTERMITTENT_SHAPES``) that passed on a later rerun
-    of the same code (docs/cache-proxy-safety.md: "rerun that one scenario before concluding")."""
+    a DOCUMENTED intermittent shape (``KNOWN_INTERMITTENT_SHAPES``) whose later reruns of the same
+    code satisfy the rerun rule (``rerun_verdict``; docs/cache-proxy-safety.md "Rerun rule")."""
     same, why = _same_code(report, target)
     if not same:
         return False, why
@@ -257,11 +296,9 @@ def _report_matches(report: dict, target: dict, reruns: list[dict] | None = None
             if not known:
                 unresolved.append(f"{provider}/{scenario}={status} ({shape_why})")
                 continue
-            if not any(
-                (r.get("scenario_results") or {}).get(provider, {}).get(scenario) == "PASS"
-                for r in reruns or []
-            ):
-                unresolved.append(f"{provider}/{scenario}={status}")
+            passed, rerun_why = rerun_verdict(provider, scenario, status, reruns or [])
+            if not passed:
+                unresolved.append(f"{provider}/{scenario}={status} ({rerun_why})")
     if unresolved:
         return False, f"result {report.get('result')}; not passed on rerun: {', '.join(unresolved[:6])}"
     return True, "match (non-PASS scenarios passed on rerun)"
@@ -281,9 +318,9 @@ def find_passing_report(target: dict, report_root: Path | None = None) -> tuple[
     loaded.sort(key=lambda item: item[0], reverse=True)
     for index, (mtime, directory, report) in enumerate(loaded):
         reruns = [
-            other for other_mtime, _, other in loaded
+            other for other_mtime, _, other in sorted(loaded, key=lambda item: item[0])
             if other_mtime >= mtime and other is not report and _same_code(other, target)[0]
-        ]
+        ]  # oldest first: the rerun rule reads them in order
         ok, why = _report_matches(report, target, reruns)
         if ok:
             return directory, notes
