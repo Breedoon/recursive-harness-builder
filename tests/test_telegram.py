@@ -129,6 +129,13 @@ def _state(bot: TelegramBot, chat_id: int = 67890, thread_id: int | None = None)
     return bot._get_state(TelegramRoute(chat_id=chat_id, thread_id=thread_id))
 
 
+
+def _attach_live_client(state, client) -> None:
+    """A running child owns a connected CLI; stops interrupt it without starting one (obs-2)."""
+    client._transport = None  # no pid: a stop must never reach a real process kill
+    state.session_manager._client = client
+    state.session_manager._connected = True
+
 class TestTimezoneAndSenderIdentity:
     def test_schedule_times_render_in_warsaw(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
@@ -4798,6 +4805,7 @@ class TestCommands:
         child_state.session_manager.set_session_id("sid-child")
         child_client = MagicMock()
         child_client.interrupt = AsyncMock()
+        _attach_live_client(child_state, child_client)
         with patch.object(
             child_state.session_manager,
             "get_client",
@@ -4845,6 +4853,8 @@ class TestCommands:
         child_a_client.interrupt = AsyncMock()
         child_b_client = MagicMock()
         child_b_client.interrupt = AsyncMock()
+        _attach_live_client(child_a_state, child_a_client)
+        _attach_live_client(child_b_state, child_b_client)
 
         with (
             patch.object(
@@ -7690,6 +7700,7 @@ class TestForkTaskRuntime:
         assert child_state is not None
         fake_client = MagicMock()
         fake_client.interrupt = AsyncMock()
+        _attach_live_client(child_state, fake_client)
         parent_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=None))
         assert parent_state is not None
         parent_state.session_manager.sdk_env_overrides["CLAUDE_CODE_TEAM_NAME"] = "2026-03-31-10-00-root"
@@ -7883,6 +7894,8 @@ class TestForkTaskRuntime:
         fake_client_a.interrupt = AsyncMock()
         fake_client_b = MagicMock()
         fake_client_b.interrupt = AsyncMock()
+        _attach_live_client(child_a_state, fake_client_a)
+        _attach_live_client(child_b_state, fake_client_b)
         with (
             patch.object(child_a_state.session_manager, "get_client", AsyncMock(return_value=fake_client_a)),
             patch.object(child_b_state.session_manager, "get_client", AsyncMock(return_value=fake_client_b)),
