@@ -23,8 +23,13 @@ obs-agentctl --as nightly-check new-tree --title "Disk alert" --prompt "..." [--
   check) and present the token in `obs-control/token` (0600, new at every bot start; the CLI reads
   it). From another machine, SSH into the `obs-test` container (port 2220) and run the CLI there:
   - from the Ubuntu host: `ssh -p 2220 agent@127.0.0.1 '/workspace/runtime/bin/obs-agentctl --as NAME ping'`
-    (verified 2026-10-16; the host's `breedoon@breedoon-ubuntu-host` key was added to the
-    containers' shared `/data/config/authorized_keys`, backup `authorized_keys.bak-20261016-d2d`);
+    (verified 2026-10-16). The host's `breedoon@breedoon-ubuntu-host` key, ED25519
+    `SHA256:sIH80NjEmhl4rHBqp4TyPEVHqfMFnzpkQaaSMbFAPE0`, was appended to the host file
+    `/data/config/authorized_keys`. That file is bind-mounted read-only into obs-test,
+    obs-transcription, video-gen and lobby, so host user `breedoon` has SSH as `agent` in all four.
+    Backup: `/data/config/authorized_keys.bak-20261016-d2d`. It persists across container restarts
+    and re-creation, because the bind source is a host file that Docker re-binds at every start.
+    Append in place (same inode); a replaced file is only seen after a container restart;
   - over Tailscale: `ssh -p 2220 agent@100.66.160.62 '...'` with a key in that same file.
 - Global flags (`--as`, `--json`, `--idempotency-key`) go BEFORE the op name.
 - Every request, accepted or refused, is appended to `obs-control/audit.jsonl`.
