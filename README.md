@@ -26,6 +26,7 @@ Start with the bundled recursive workflow example:
 
 - [`examples/recursive-workflow/`](examples/recursive-workflow/) — a small project with flat markdown procedures and a guard hook.
 - [`docs/procedures.md`](docs/procedures.md) — how procedure files are organized and launched.
+- [`docs/external-control.md`](docs/external-control.md) — `obs-agentctl`: message, launch or start agent trees from bash/cron through the agent tools (local socket, uid + token auth, audit log).
 
 The example shows the intended pattern: describe coordination behavior in markdown, point an agent at the right procedure file, and let the harness manage forks, messages, hooks, and artifacts.
 
