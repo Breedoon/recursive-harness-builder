@@ -183,15 +183,16 @@ def _same_code(report: dict, target: dict) -> tuple[bool, str]:
 # 1. GPT route, class `append`, ratio exactly 0: our bytes were a perfect prefix, the provider read
 #    nothing (codex boundary_marker 2026-10-12; codex cch_collision 2026-10-15; codex
 #    reminder_block 2026-10-16). Each passed on rerun.
-# 2. GPT route, class `append`, ratio 0.80-0.86: the single observed partial read, codex
-#    boundary_marker 0.835 on 2026-10-15 (cached 15104 of 18089). Widening needs more
-#    observations first (bead filed under ops-1.11).
+# 2. GPT route, class `append`, ratio exactly 0.835: the single observed partial read, codex
+#    boundary_marker on 2026-10-15 (cached 15104 of 18089), an exact point and not a band. Its
+#    request bodies are gone, so its cause is under investigation (bead ops-1.11.2); no other
+#    partial ratio is accepted.
 # 3. Claude route, scenario `recovery_multi`, class `tail-block-append`, ratio 0.85-0.95: the open
 #    "Continue from where you left off." mechanism (bead vault-1r7n.9). Observed 0.8721, 0.9216,
 #    0.944.
 KNOWN_INTERMITTENT_SHAPES = (
     {"provider": "codex", "scenario": None, "class": "append", "min_ratio": 0.0, "max_ratio": 0.0},
-    {"provider": "codex", "scenario": None, "class": "append", "min_ratio": 0.8, "max_ratio": 0.86},
+    {"provider": "codex", "scenario": None, "class": "append", "min_ratio": 0.835, "max_ratio": 0.835},
     {"provider": "anthropic", "scenario": "recovery_multi", "class": "tail-block-append",
      "min_ratio": 0.85, "max_ratio": 0.95},
 )

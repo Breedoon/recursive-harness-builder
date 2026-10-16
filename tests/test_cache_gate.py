@@ -300,6 +300,8 @@ def test_documented_shapes_accepted_after_rerun(repo, tmp_path, provider, scenar
     ("codex", "boundary_marker", _fail("append", 0.9), "not a documented"),    # unobserved partial read
     ("codex", "boundary_marker", _fail("append", 0.5), "not a documented"),
     ("codex", "boundary_marker", _fail("append", 0.79), "not a documented"),
+    ("codex", "boundary_marker", _fail("append", 0.84), "not a documented"),   # no band around 0.835
+    ("codex", "boundary_marker", _fail("append", 0.82), "not a documented"),
 ])
 def test_undocumented_shapes_block_even_after_rerun(repo, tmp_path, provider, scenario, failure, why):
     result, _ = _full_fail_then_rerun(repo, tmp_path, provider, scenario, failure)
