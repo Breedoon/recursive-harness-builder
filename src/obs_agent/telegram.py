@@ -669,6 +669,12 @@ class MediaGroupBuffer:
             logger.exception("Error in media-group flush callback")
 
 
+def _is_killable_cli_pid(pid: object) -> bool:
+    """True only for a real child pid; never coerce (int(MagicMock()) == 1 once
+    made a stop SIGKILL every descendant of PID 1, 2026-10-16)."""
+    return isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 and pid != os.getpid()
+
+
 class TelegramBot:
     """Telegram bot that wraps ConversationRunner."""
 
@@ -5631,7 +5637,7 @@ class TelegramBot:
         pid = getattr(process, "pid", None)
         # Only a real child pid is killable; a mock or bogus value (int(MagicMock())
         # == 1) once made this SIGKILL every descendant of PID 1 and took down the fleet.
-        if type(pid) is not int or pid <= 1 or pid == os.getpid():
+        if not _is_killable_cli_pid(pid):
             pid = None
         logger.warning(
             "[stop_escalation] turn still running %.0fs after stop; killing Claude CLI pid=%s route=%s",
@@ -6288,7 +6294,7 @@ class TelegramBot:
             client = state.session_manager._client
             process = getattr(getattr(client, "_transport", None), "_process", None)
             pid = getattr(process, "pid", None)
-            if not isinstance(pid, int) or getattr(process, "returncode", None) is not None:
+            if not _is_killable_cli_pid(pid) or getattr(process, "returncode", None) is not None:
                 continue
             cpu = read_cpu(pid)
             if cpu is None:

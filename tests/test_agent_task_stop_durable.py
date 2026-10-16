@@ -341,3 +341,22 @@ async def test_teammate_message_during_stopped_turn_survives_the_discard(config,
     assert len(texts) == 1 and "after stop" in texts[0]
     assert state.hook_state.stop_latched_at is None
     assert state.hook_state.post_stop_messages == []
+
+
+@pytest.mark.parametrize(
+    "pid,ok",
+    [(None, False), (True, False), (False, False), (0, False), (1, False), (-5, False),
+     ("1234", False), (1234.0, False), (MagicMock(), False), (4242, True)],
+)
+def test_killable_cli_pid_is_strict(pid, ok):
+    from obs_agent.telegram import _is_killable_cli_pid
+
+    assert _is_killable_cli_pid(pid) is ok
+
+
+def test_killable_cli_pid_refuses_own_pid():
+    import os
+
+    from obs_agent.telegram import _is_killable_cli_pid
+
+    assert _is_killable_cli_pid(os.getpid()) is False
