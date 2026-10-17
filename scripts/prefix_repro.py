@@ -546,7 +546,10 @@ async def sc_recovered_poison(args):
     real answer chained to it (as prod a00b512b line 79 chains to a timeout).
     A test-injected tail poison then forces a recovery. The old analyzer
     recovered to the row before the first poison (history-changed, re-bill);
-    the fixed one keeps the continuation (append)."""
+    the fixed one keeps the continuation (append). Anthropic only: on the GPT
+    route the cap produces no synthetic row (2026-10-17 gate run), and the
+    analyzer under test is provider-independent; GPT recovery forks stay
+    covered by recovery, recovery_multi and poisoned_recovery."""
     import hashlib
     from datetime import datetime, timezone
     from obs_agent.context_jsonl import find_session_jsonl
@@ -810,7 +813,7 @@ def _provider_errors(log_dir, since):
             if r.get("ts", 0) >= since and (r.get("http_status") or 0) >= 500]
 
 
-ANTHROPIC_ONLY = {"volatile_flip", "ws_resume"}
+ANTHROPIC_ONLY = {"volatile_flip", "ws_resume", "recovered_poison"}
 
 
 def run(args, name):
