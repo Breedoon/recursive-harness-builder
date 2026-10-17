@@ -131,9 +131,10 @@ class ScheduleOwnership:
     def owner_of(self, *, schedule_id: str, description: str | None) -> tuple[str | None, dict]:
         match = _PREFIX.match(description or "")
         adoption = self.owners.get(schedule_id) or {}
-        if match:
-            return match.group(1), adoption
         bead = adoption.get("bead")
+        if match and (match.group(1) in self.beads or not bead):
+            return match.group(1), adoption
+        # Match schedules.py: a non-bead route tag cannot defeat a real adoption.
         return (str(bead) if bead else None), adoption
 
     def creation_warnings(self, *, schedule_id: str, description: str | None) -> list[str]:

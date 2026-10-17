@@ -28,6 +28,20 @@ def test_creation_ownership_is_warning_only_prefix_or_mapping():
     assert "orphaned" in owners.creation_warnings(schedule_id="new", description="[ops-missing] missing")[0]
 
 
+def test_adopted_nonbead_route_tag_matches_inventory_and_stays_protected():
+    owners = schedule_scope.ScheduleOwnership(
+        beads={"ops-1": {"status": "open", "labels": ["responsibility"]},
+               "ops-2": {"status": "closed"}},
+        owners={"mapped": {"bead": "ops-1"}},
+    )
+    assert owners.owner_of(schedule_id="mapped", description="[deckpress-phase2] legacy")[0] == "ops-1"
+    assert not owners.creation_warnings(schedule_id="mapped", description="[deckpress-phase2] legacy")
+    assert owners.protection(schedule_id="mapped", description="[deckpress-phase2] legacy", tree=TEAM).protected
+    # A real bead prefix still wins, including a closed one: do not silently reparent it.
+    assert owners.owner_of(schedule_id="mapped", description="[ops-2] closed")[0] == "ops-2"
+    assert "orphaned" in owners.creation_warnings(schedule_id="mapped", description="[ops-2] closed")[0]
+
+
 def _sched(bot, schedule_id, route, description=""):
     bot._register_topic_schedule(
         _TopicScheduleRecord(
