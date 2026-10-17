@@ -46,6 +46,9 @@ class JsonlSessionHealth:
     # UUIDs of the analyzed chain: the CLI's active chain, or the branch named
     # by ``branch_uuid``.
     chain_uuids: frozenset[str] = frozenset()
+    # Poison rows on the chain that a later complete answer descends from
+    # (vault-1bc2): API-accepted history, not unsafe for their descendants.
+    recovered_poison_uuids: frozenset[str] = frozenset()
 
     @property
     def needs_recovery(self) -> bool:
@@ -357,9 +360,10 @@ def analyze_jsonl_path(
     real_assistant_entries = [entry for entry in entries if _is_real_assistant(entry)]
     last_real_assistant = real_assistant_entries[-1] if real_assistant_entries else None
     all_poison_uuids = {entry.uuid for entry in entries if _is_poison(entry) and entry.uuid}
-    unrecovered_poison_uuids = all_poison_uuids - _recovered_poison_uuids(
+    recovered_poison_uuids = _recovered_poison_uuids(
         entries=entries, by_uuid=by_uuid, poison_uuids=all_poison_uuids,
     )
+    unrecovered_poison_uuids = all_poison_uuids - recovered_poison_uuids
     poison_descendants = _collect_chain_unsafe(by_uuid=by_uuid, poison_uuids=unrecovered_poison_uuids)
     complete_message_targets: dict[str, str] = {}
     complete_assistant_entries = _completed_boundaries(
@@ -454,7 +458,23 @@ def analyze_jsonl_path(
         unsafe_tail_reason=unsafe_tail_reason,
         complete_message_targets=MappingProxyType(complete_message_targets),
         chain_uuids=frozenset(active_uuids),
+        recovered_poison_uuids=frozenset(recovered_poison_uuids),
     )
+
+
+def is_stale_session_head(health: JsonlSessionHealth, head: str | None) -> bool:
+    """A session head the pre-vault-1bc2 analyzer clamped before a poison row.
+
+    That analyzer treated every row after a synthetic API-error row as unsafe,
+    so session-head refreshes pinned the head before it while the session went
+    on working. A safe head that precedes a now-recovered poison row on the
+    active chain is such a pin: it is not the agent's latest turn, and resolving
+    recovery at it would discard the API-accepted work after it.
+    """
+    if not head or head not in health.chain_uuids or not health.is_uuid_safe(head):
+        return False
+    line = health.uuid_line_numbers[head]
+    return any(health.uuid_line_numbers[uuid] > line for uuid in health.recovered_poison_uuids)
 
 
 # CACHE-PREFIX WARNING (M5): safe recovery means a complete API message,

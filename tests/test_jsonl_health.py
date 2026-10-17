@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from obs_agent.jsonl_fork import fork_session_jsonl
-from obs_agent.jsonl_health import analyze_jsonl_path, resolve_safe_jsonl_target
+from obs_agent.jsonl_health import analyze_jsonl_path, is_stale_session_head, resolve_safe_jsonl_target
 
 
 def _write_raw(path: Path, raw_lines: list[str]) -> None:
@@ -365,6 +365,56 @@ def test_analyze_jsonl_path_ignores_recovered_errors_in_middle(tmp_path: Path) -
     assert target.target_uuid == "a2"
     assert target.changed is True
     assert target.reason == "preferred_uuid_unsafe"
+
+
+def test_stale_session_head_is_a_pin_before_a_recovered_poison_row(tmp_path: Path) -> None:
+    # vault-1bc2 round 3: the pre-fix analyzer pinned session heads before err1
+    # (prod f896fe4b: head line 661, poison 672, 80 rows of later work).
+    path = tmp_path / "sid-root.jsonl"
+    _write_raw(
+        path,
+        [
+            _entry("user", "u1", None, role="user", content="start"),
+            _assistant_text("a1", "u1"),
+            _entry("user", "u2", "a1", role="user", content="bad"),
+            _poison("err1", "u2"),
+            _entry("user", "u3", "err1", role="user", content="recovered"),
+            _assistant_text("a2", "u3", "real recovery"),
+            _entry("user", "u4", "a2", role="user", content="next"),
+            _poison("err2", "u4"),
+        ],
+    )
+    health = analyze_jsonl_path(path=path, session_id="sid-root")
+    assert health.recovered_poison_uuids == frozenset({"err1"})
+    assert health.needs_recovery is True
+    assert is_stale_session_head(health, "a1") is True
+    # Heads at or after the recovered row, unsafe or unknown heads are not pins.
+    assert is_stale_session_head(health, "a2") is False
+    assert is_stale_session_head(health, "u4") is False
+    assert is_stale_session_head(health, "err2") is False
+    assert is_stale_session_head(health, "missing") is False
+    assert is_stale_session_head(health, None) is False
+    # The pin itself is safe, so resolving at it would roll back past a2.
+    pinned = resolve_safe_jsonl_target(session_id="sid-root", cwd=tmp_path, source_path=path, preferred_uuid="a1")
+    assert pinned is not None and pinned.target_uuid == "a1"
+    unpinned = resolve_safe_jsonl_target(session_id="sid-root", cwd=tmp_path, source_path=path, preferred_uuid=None)
+    assert unpinned is not None and unpinned.target_uuid == "u4"
+
+
+def test_stale_session_head_ignores_unrecovered_poison(tmp_path: Path) -> None:
+    path = tmp_path / "sid-root.jsonl"
+    _write_raw(
+        path,
+        [
+            _entry("user", "u1", None, role="user", content="start"),
+            _assistant_text("a1", "u1"),
+            _entry("user", "u2", "a1", role="user", content="bad"),
+            _poison("err1", "u2"),
+        ],
+    )
+    health = analyze_jsonl_path(path=path, session_id="sid-root")
+    assert health.recovered_poison_uuids == frozenset()
+    assert is_stale_session_head(health, "a1") is False
 
 
 def test_resolved_recovery_target_forks_verbatim_without_poison_tail(tmp_path: Path) -> None:

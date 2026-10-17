@@ -544,6 +544,66 @@ class TestTelegramMessageFlow:
         assert len(recovered_lines) == 3
         assert all("Prompt is too long" not in line for line in recovered_lines)
 
+    async def test_run_start_recovery_ignores_head_pinned_before_recovered_poison(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        # vault-1bc2 round 3: the pre-fix analyzer pinned the head at a-safe
+        # before err1; the session then kept working (a2). Recovery from the
+        # err2 tail must keep a2, not roll back to the pin.
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        project_dir = tmp_path / ".claude" / "projects" / "-fixture"
+        project_dir.mkdir(parents=True)
+        source_path = project_dir / "sid-pinned.jsonl"
+
+        def row(kind, uid, parent, content, **extra):
+            message = {"role": kind, "content": content}
+            obj = {"type": kind, "uuid": uid, "parentUuid": parent, "sessionId": "sid-pinned"}
+            if kind == "assistant":
+                message["model"] = extra.pop("model", "gpt-5.5")
+                if "stop_reason" in extra:
+                    message["stop_reason"] = extra.pop("stop_reason")
+            obj["message"] = message
+            obj.update(extra)
+            return json.dumps(obj)
+
+        def err(uid, parent):
+            return row("assistant", uid, parent, [{"type": "text", "text": "Request timed out"}],
+                       model="<synthetic>", isApiErrorMessage=True)
+
+        source_path.write_text(
+            "\n".join(
+                [
+                    row("user", "u1", None, "start"),
+                    row("assistant", "a-safe", "u1", [{"type": "text", "text": "safe"}], stop_reason="end_turn"),
+                    row("user", "u2", "a-safe", "slow"),
+                    err("err1", "u2"),
+                    row("user", "u3", "err1", "again"),
+                    row("assistant", "a2", "u3", [{"type": "text", "text": "kept"}], stop_reason="end_turn"),
+                    row("user", "u4", "a2", "next"),
+                    err("err2", "u4"),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.session_manager.set_session_id("sid-pinned")
+        bot._bind_state_session(state)
+        bot._set_session_head(session_id="sid-pinned", jsonl_uuid="a-safe")
+
+        recovered = await bot._recover_route_session_if_needed(state=state, source="test")
+
+        assert recovered is not None
+        assert state.session_id != "sid-pinned"
+        assert bot._session_heads["sid-pinned"] == "u4"
+        recovered_lines = (project_dir / f"{state.session_id}.jsonl").read_text(encoding="utf-8").splitlines()
+        assert [json.loads(line)["uuid"] for line in recovered_lines] == ["u1", "a-safe", "u2", "err1", "u3", "a2", "u4"]
+
     async def test_run_start_recovers_silent_dangling_user_tail_before_runner(
         self,
         config,

@@ -53,6 +53,7 @@ from obs_agent.hooks import HookState
 from obs_agent.context_jsonl import find_session_jsonl
 from obs_agent.jsonl_health import (
     JsonlSessionHealth,
+    is_stale_session_head,
     resolve_safe_jsonl_target,
 )
 from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
@@ -5008,6 +5009,24 @@ class TelegramBot:
             cwd=self._config.vault_path,
             preferred_uuid=preferred_uuid,
         )
+        if target is not None and is_stale_session_head(target.health, preferred_uuid):
+            # vault-1bc2: a head the pre-fix analyzer pinned before a since-recovered
+            # API-error row. Resolve as if no head were known (latest safe boundary)
+            # instead of rolling the session back to the pin.
+            target = resolve_safe_jsonl_target(
+                session_id=session_id,
+                cwd=self._config.vault_path,
+                preferred_uuid=None,
+            )
+            logger.warning(
+                "[session_head] stale_head route=%s session_id=%s stale_uuid=%s resolved_uuid=%s",
+                state.route,
+                session_id,
+                preferred_uuid,
+                target.target_uuid if target is not None else None,
+            )
+            if target is not None and target.target_uuid and not target.health.needs_recovery:
+                self._set_session_head(session_id=session_id, jsonl_uuid=target.target_uuid)
         if target is None or not target.health.needs_recovery or not target.target_uuid:
             return None
 
