@@ -63,7 +63,9 @@ row while the session kept working (3 idle production routes on 2026-10-17, up
 to 80 rows behind). Run-start route recovery treats a safe head that precedes a
 recovered error row on the active chain as stale (`is_stale_session_head`): it
 resolves as if no head were known and, when no recovery is needed, rewrites
-the head to the latest safe boundary.
+the head to the latest safe boundary. A reply to the message bound to a stale
+head is therefore not a reply to the latest message: it forks that message
+(test `test_reply_to_message_at_stale_head_forks_that_message`).
 Since vault-w0eg, `fork_session_jsonl` raises `KeyError` for a target UUID that
 is not in the file, and `resolve_safe_jsonl_target` resolves a row on a
 non-active branch on that branch's own chain (`SafeJsonlTarget.branch_health`),

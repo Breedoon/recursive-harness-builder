@@ -604,6 +604,70 @@ class TestTelegramMessageFlow:
         recovered_lines = (project_dir / f"{state.session_id}.jsonl").read_text(encoding="utf-8").splitlines()
         assert [json.loads(line)["uuid"] for line in recovered_lines] == ["u1", "a-safe", "u2", "err1", "u3", "a2", "u4"]
 
+    async def test_reply_to_message_at_stale_head_forks_that_message(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        # G1 verifier r3 F5: a reply to the message bound to a stale head is not a
+        # reply to the latest message; it must fork the replied-to message, and
+        # run-start recovery must not then move past it.
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        project_dir = tmp_path / ".claude" / "projects" / "-fixture"
+        project_dir.mkdir(parents=True)
+        sid = "sid-reply"
+
+        def row(kind, uid, parent, content, **extra):
+            message = {"role": kind, "content": content}
+            if kind == "assistant":
+                message["model"] = extra.pop("model", "gpt-5.5")
+                message["id"] = "msg_" + uid
+                if "stop_reason" in extra:
+                    message["stop_reason"] = extra.pop("stop_reason")
+            obj = {"type": kind, "uuid": uid, "parentUuid": parent, "sessionId": sid, "message": message}
+            obj.update(extra)
+            return json.dumps(obj)
+
+        def err(uid, parent):
+            return row("assistant", uid, parent, [{"type": "text", "text": "Request timed out"}],
+                       model="<synthetic>", isApiErrorMessage=True)
+
+        (project_dir / f"{sid}.jsonl").write_text(
+            "\n".join(
+                [
+                    row("user", "u1", None, "start"),
+                    row("assistant", "aT", "u1", [{"type": "text", "text": "T"}], stop_reason="end_turn"),
+                    row("user", "u2", "aT", "slow"),
+                    err("err1", "u2"),
+                    row("user", "u3", "err1", "again"),
+                    row("assistant", "a2", "u3", [{"type": "text", "text": "kept"}], stop_reason="end_turn"),
+                    row("user", "u4", "a2", "next"),
+                    err("err2", "u4"),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.session_manager.set_session_id(sid)
+        bot._bind_state_session(state)
+        bot._set_session_head(session_id=sid, jsonl_uuid="aT")
+        bot._record_message_binding(route=state.route, message_id=100, jsonl_uuid="aT", session_id=sid, role="assistant")
+
+        trigger = QueuedMessage(text="reply to T", telegram_message_id=200, reply_to_message_id=100)
+        proceed, _ = await bot._resolve_session_for_trigger(
+            state=state, trigger_message=trigger, bot=MagicMock(send_message=AsyncMock()),
+        )
+        assert proceed is True
+        assert state.session_id != sid
+        await bot._recover_route_session_if_needed(state=state, source="run_start")
+
+        lines = (project_dir / f"{state.session_id}.jsonl").read_text(encoding="utf-8").splitlines()
+        assert [json.loads(line)["uuid"] for line in lines] == ["u1", "aT"]
+
     async def test_run_start_recovers_silent_dangling_user_tail_before_runner(
         self,
         config,

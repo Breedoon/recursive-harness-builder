@@ -7243,7 +7243,11 @@ class TelegramBot:
             )
             return False, reply_to_user_message_id
 
-        if latest_uuid == binding.jsonl_uuid and safe_uuid == binding.jsonl_uuid:
+        # A stale head (vault-1bc2: pinned before a since-recovered API-error row)
+        # is not the latest message: the session went on past it, and run-start
+        # recovery would resolve past the replied-to message, so fork it instead.
+        if (latest_uuid == binding.jsonl_uuid and safe_uuid == binding.jsonl_uuid
+                and not (_health is not None and is_stale_session_head(_health, latest_uuid))):
             await self._activate_route_session(state, binding.session_id)
             return True, reply_to_user_message_id
 
