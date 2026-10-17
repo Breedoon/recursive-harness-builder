@@ -16,6 +16,18 @@ TEAM = "2026-08-12-08-05-root"
 OTHER_TEAM = "2026-08-13-09-00-other"
 
 
+def test_creation_ownership_is_warning_only_prefix_or_mapping():
+    owners = schedule_scope.ScheduleOwnership(
+        beads={"ops-1": {"status": "open"}, "ops-2": {"status": "closed"}},
+        owners={"mapped": {"bead": "ops-1"}},
+    )
+    assert "schedule ownership rule" in owners.creation_warnings(schedule_id="new", description="unnamed")[0]
+    assert not owners.creation_warnings(schedule_id="new", description="[ops-1] work")
+    assert not owners.creation_warnings(schedule_id="mapped", description="legacy")
+    assert "orphaned" in owners.creation_warnings(schedule_id="new", description="[ops-2] closed")[0]
+    assert "orphaned" in owners.creation_warnings(schedule_id="new", description="[ops-missing] missing")[0]
+
+
 def _sched(bot, schedule_id, route, description=""):
     bot._register_topic_schedule(
         _TopicScheduleRecord(

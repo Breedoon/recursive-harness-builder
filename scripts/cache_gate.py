@@ -42,7 +42,7 @@ def _pre_push(argv: list[str]) -> int:
         if remote_ref not in ("refs/heads/main", "refs/heads/master") or set(local_sha) == {"0"}:
             continue
         base = None if set(remote_sha) == {"0"} else remote_sha
-        result = cache_gate.check(repo, base=base)
+        result = cache_gate.check(repo, base=base, target_ref=local_sha)
         if result.ok:
             print(result.message, file=sys.stderr)
             continue

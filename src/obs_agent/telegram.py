@@ -2734,6 +2734,10 @@ class TelegramBot:
             changed = False
             for item in entries:
                 if isinstance(item, dict) and not bool(item.get("read", False)):
+                    if self._outage_inbox_floor is not None:
+                        # B9: restarting is not a read acknowledgement. A launcher
+                        # may not yet have consumed its pre-outage final report.
+                        continue
                     message_ts = self._try_parse_rfc3339_timestamp(item.get("timestamp"))
                     if message_ts is not None and message_ts >= self._inbox_wake_floor:
                         # Sent during the outage of a non-kill-switch restart:
@@ -4045,8 +4049,13 @@ class TelegramBot:
             except Exception:
                 logger.debug("Failed sending schedule create marker route=%s", route, exc_info=True)
 
+        warnings = _schedule_scope.ScheduleOwnership.load(self._config.vault_path).creation_warnings(
+            schedule_id=record.schedule_id, description=record.description)
+        for warning in warnings:
+            logger.warning("[schedule_ownership] %s", warning)
         payload = {
             "schedule": self._schedule_summary_payload(record),
+            "warnings": warnings,
         }
         return self._cron_ok_result(payload)
 

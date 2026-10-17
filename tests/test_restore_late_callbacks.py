@@ -149,6 +149,24 @@ async def test_finished_stopped_called_back_and_self_parented_records_owe_nothin
 # --- delivering the owed callback -----------------------------------------------------
 
 
+def test_unread_final_report_survives_recovery_and_parent_session_change(config):
+    import json
+
+    bot = _bot(config)
+    path = bot._team_inbox_path("team-lc", "launcher")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    report = {"from": "child", "text": "/artifacts/child/report.md", "read": False,
+              "timestamp": "2026-10-16T00:00:00Z"}
+    path.write_text(json.dumps([report]))
+    parent = bot._get_state(PARENT, topic_title="Parent")
+    parent.session_manager.set_session_id("new-recovered-parent-session")
+    bot._outage_inbox_floor = time.time()
+    bot._mark_restored_team_inboxes_read({("team-lc", "launcher")})
+    stored = json.loads(path.read_text())
+    assert stored == [report]  # old unread reports are not silently acknowledged
+    assert bot._team_inbox_path("team-lc", "launcher") == path
+
+
 def _schedule_without_running(*, task_id, parent_state, **_kwargs):
     # What _schedule_fork_task does before the turn starts: the run is in flight.
     parent_state.active_fork_task_ids.add(task_id)

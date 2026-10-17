@@ -586,8 +586,6 @@ def create_obs_tools(
             return None, "caller team context is unavailable"
         return next(iter(candidates)), None
 
-    _start_step_seen: dict[str, bool] = {}
-
     def _start_step_warning(*, session_id: str | None, texts, display_name: str | None) -> str | None:
         """Agent Operations start-step check (vault-a6qm); None when nothing to say."""
         try:
@@ -595,21 +593,15 @@ def create_obs_tools(
             if check_mode == "off":
                 return None
             bootstrap = _current_obs_bootstrap()
-            if not _start_step.is_root(bootstrap.lineage if bootstrap is not None else None):
-                return None
             known = _start_step.known_bead_ids(config.vault_path)
             if not known:
                 return None  # no Beads store: nothing to check against
             if any(_start_step.find_bead_ids(text, known) for text in texts):
                 return None
-            if session_id and _start_step_seen.get(session_id):
-                return None
             jsonl = None
             if session_id:
                 jsonl = find_session_jsonl_index(session_ids={session_id}, cwd=config.vault_path).get(session_id)
-            if _start_step.transcript_has_bead(jsonl, known):
-                if session_id:
-                    _start_step_seen[session_id] = True
+            if _start_step.transcript_has_bead(jsonl, known, session_id=session_id):
                 return None
             blocked = check_mode == "block"
             _start_step.log_warning(

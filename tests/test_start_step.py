@@ -59,6 +59,24 @@ def test_injected_context_does_not_count(beads, tmp_path):
     assert start_step.transcript_has_bead(jsonl, known)
 
 
+def test_incidental_beads_and_ancestor_prompts_do_not_count(beads, tmp_path):
+    known = start_step.known_bead_ids(tmp_path)
+    transcript = tmp_path / "fork.jsonl"
+    rows = [
+        {"type": "user", "sessionId": "parent", "message": {"content": "implement ac-1"}},
+        {"type": "user", "sessionId": "child", "message": {"content": [{"type": "tool_result", "tool_use_id": "read", "content": "ops-1.5"}]}},
+        {"type": "assistant", "sessionId": "child", "message": {"content": [{"type": "text", "text": "I found vault-maw0"}]}},
+    ]
+    transcript.write_text("\n".join(json.dumps(r) for r in rows))
+    assert not start_step.transcript_has_bead(transcript, known, session_id="child")
+    rows.extend([
+        {"type": "assistant", "sessionId": "child", "message": {"content": [{"type": "tool_use", "id": "create", "name": "Bash", "input": {"command": "python3 register.py task --title test"}}]}},
+        {"type": "user", "sessionId": "child", "message": {"content": [{"type": "tool_result", "tool_use_id": "create", "content": "Created task ops-1.5"}]}},
+    ])
+    transcript.write_text("\n".join(json.dumps(r) for r in rows))
+    assert start_step.transcript_has_bead(transcript, known, session_id="child")
+
+
 def _tools(monkeypatch, config, *, lineage, jsonl=None):
     from obs_agent.tools import create_obs_tools
 
@@ -107,16 +125,16 @@ async def test_bead_in_prompt_or_session_is_silent(beads, monkeypatch, config, t
     result = await handler({"prompt": "Implement vault-maw0", "display_name": "W"})
     assert len(result["content"]) == 1
     jsonl = tmp_path / "root.jsonl"
-    jsonl.write_text(json.dumps({"type": "tool_result", "content": '{"task": "ops-1.5"}'}) + "\n")
+    jsonl.write_text(json.dumps({"type": "user", "message": {"content": "work on ops-1.5"}}) + "\n")
     handler, _ = _tools(monkeypatch, config, lineage=("Root",), jsonl=jsonl)
     result = await handler({"prompt": "one-sentence fork prompt", "display_name": "W"})
     assert len(result["content"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_children_unaffected_and_modes(beads, monkeypatch, config, tmp_path):
+async def test_forks_checked_and_modes(beads, monkeypatch, config, tmp_path):
     handler, _ = _tools(monkeypatch, config, lineage=("Root", "Child"), jsonl=None)
-    assert len((await handler({"prompt": "x", "display_name": "W"}))["content"]) == 1
+    assert len((await handler({"prompt": "x", "display_name": "W", "fork": True}))["content"]) == 2
     monkeypatch.setenv("OBS_START_STEP_CHECK", "off")
     handler, _ = _tools(monkeypatch, config, lineage=("Root",), jsonl=None)
     assert len((await handler({"prompt": "x", "display_name": "W"}))["content"]) == 1

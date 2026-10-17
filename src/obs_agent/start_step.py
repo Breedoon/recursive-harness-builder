@@ -1,4 +1,4 @@
-"""Start-step check: a root agent's AgentTask launch should carry a registered task bead
+"""Start-step check: every agent's AgentTask launch should carry a registered task bead
 (bead vault-a6qm, Agent Operations "Task start").
 
 Daniel 2026-10-13: even small tasks should be logged, "and there's some tasks seem like they're
@@ -14,12 +14,10 @@ which is persisted like any tool output (block mode returns a normal tool error)
 fork/resume prefixes byte-identical.
 
 Rules:
-* Only root agents (lineage length 1, or no lineage known) are checked; children get the brief
-  path from their parent's prompt.
-* A bead is "present" when an id that exists in the vault Beads store appears in the AgentTask
-  prompt or prompt_file, or anywhere earlier in the caller's session transcript (the user's
-  messages, register.py output, earlier tool inputs). Ids are confirmed against the store, so
-  ordinary hyphenated words never count, and any project prefix works.
+* Every AgentTask launch is checked, including forks and child agents.
+* A bead is present when an existing id is explicitly named in the launch/user prompt or
+  prompt_file, or returned by a bead-creation command in the caller's own session. Unrelated
+  tool output and fork-copied ancestor rows do not count. Ids are confirmed against the store.
 * ``OBS_START_STEP_CHECK``: ``warn`` (default: launch proceeds, warning appended and logged),
   ``block`` (launch refused with the same text), ``off``.
 * Every warning is logged to ``/workspace/runtime/state/start-step-warnings.jsonl``
@@ -93,18 +91,57 @@ def strip_injected_context(text: str) -> str:
     return _INJECTED.sub("", text)
 
 
-def transcript_has_bead(jsonl_path: Path | None, known: frozenset[str]) -> bool:
+def transcript_has_bead(jsonl_path: Path | None, known: frozenset[str],
+                        session_id: str | None = None) -> bool:
+    """Only explicit user prompts or the result of this session's bead creation count.
+
+    Fork-copied ancestor rows and arbitrary read/search/tool output are not registration.
+    Decode JSON before stripping injected XML: raw JSON escapes its multiline contents.
+    """
     if jsonl_path is None or not known:
         return False
+    creation_calls: set[str] = set()
     try:
         size = Path(jsonl_path).stat().st_size
         with open(jsonl_path, "rb") as fh:
             if size > _SCAN_LIMIT:
                 fh.seek(size - _SCAN_LIMIT)
             for raw in fh:
-                line = strip_injected_context(raw.decode("utf-8", errors="ignore"))
-                if find_bead_ids(line, known):
-                    return True
+                try:
+                    row = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if session_id and row.get("sessionId") not in (None, session_id):
+                    continue
+                message = row.get("message") or {}
+                content = message.get("content") if isinstance(message, dict) else None
+                if row.get("type") == "assistant" and isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_use":
+                            continue
+                        command = str((block.get("input") or {}).get("command") or "")
+                        if re.search(r"(?:register\.py[\"']?\s+task\b|bd(?:-safe)?[\"']?\s+create\b)", command):
+                            creation_calls.add(block.get("id"))
+                if row.get("type") != "user":
+                    continue
+                if isinstance(content, str):
+                    if find_bead_ids(strip_injected_context(content), known):
+                        return True
+                elif isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "text":
+                            text = block.get("text") or ""
+                        elif (block.get("type") == "tool_result"
+                              and block.get("tool_use_id") in creation_calls and not block.get("is_error")):
+                            text = json.dumps(block.get("content"), ensure_ascii=False)
+                        else:
+                            continue
+                        if find_bead_ids(strip_injected_context(text), known):
+                            return True
     except OSError:
         return False
     return False

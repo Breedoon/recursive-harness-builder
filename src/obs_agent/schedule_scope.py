@@ -136,6 +136,17 @@ class ScheduleOwnership:
         bead = adoption.get("bead")
         return (str(bead) if bead else None), adoption
 
+    def creation_warnings(self, *, schedule_id: str, description: str | None) -> list[str]:
+        """B7 is warning-only; either a prefix or an adoption mapping establishes ownership."""
+        bead_id, _ = self.owner_of(schedule_id=schedule_id, description=description)
+        rule = "Agent Operations schedule ownership rule (Scheduler steps 3–4)"
+        if not bead_id:
+            return [f"{rule}: missing [bead-id] description prefix or schedule-owners.json mapping; "
+                    f"adopt schedule {schedule_id} under an open task/responsibility bead."]
+        if bead_id not in self.beads or self.beads[bead_id].get("status") == "closed":
+            return [f"{rule}: owner {bead_id} is missing or closed; schedule {schedule_id} is orphaned."]
+        return []
+
     def protection(self, *, schedule_id: str, description: str | None, tree: str | None) -> Protection:
         bead_id, adoption = self.owner_of(schedule_id=schedule_id, description=description)
         if not bead_id:

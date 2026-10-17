@@ -86,9 +86,15 @@ def cliproxy_identity(cliproxy_dir: Path | None = None) -> str | None:
     return hashlib.sha256("|".join(p or "-" for p in parts).encode()).hexdigest()
 
 
-def code_identity(repo: Path, *, cliproxy_dir: Path | None = None) -> dict:
-    """HEAD commit, hash of uncommitted tracked changes, and CLIProxyAPI identity."""
+def code_identity(repo: Path, *, cliproxy_dir: Path | None = None, ref: str | None = None) -> dict:
+    """Working-tree identity, or the clean committed bytes of an explicit push target."""
     repo = Path(repo)
+    if ref is not None:
+        head = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}").strip()
+        source = subprocess.run(["git", "-C", str(repo), "show", f"{head}:src/cache_proxy.py"],
+                                capture_output=True, check=False)
+        return {"head": head, "dirty": "clean", "cliproxy": cliproxy_identity(cliproxy_dir),
+                "proxy_source_sha256": hashlib.sha256(source.stdout).hexdigest() if source.returncode == 0 else None}
     head = _git(repo, "rev-parse", "HEAD").strip()
     diff = _git(repo, "diff", "HEAD", "--", *IDENTITY_PATHS)
     untracked = _git(repo, "ls-files", "--others", "--exclude-standard", "--", "src", "scripts", "deploy")
@@ -105,10 +111,16 @@ def code_identity(repo: Path, *, cliproxy_dir: Path | None = None) -> dict:
     }
 
 
-def sensitive_files(repo: Path) -> set[str]:
+def sensitive_files(repo: Path, ref: str | None = None) -> set[str]:
     """Repo-relative files that carry the CACHE-PREFIX marker, plus the fixed extras."""
     repo = Path(repo)
     found: set[str] = set(EXTRA_SENSITIVE)
+    if ref is not None:
+        paths = _git(repo, "ls-tree", "-r", "--name-only", ref, "--", *SCAN_DIRS).splitlines()
+        for rel in paths:
+            if MARKER in _git(repo, "show", f"{ref}:{rel}"):
+                found.add(rel)
+        return found
     for top in SCAN_DIRS:
         root = repo / top
         if not root.is_dir():
@@ -124,14 +136,16 @@ def sensitive_files(repo: Path) -> set[str]:
     return found
 
 
-def changed_files(repo: Path, base: str | None) -> set[str] | None:
+def changed_files(repo: Path, base: str | None, ref: str | None = None) -> set[str] | None:
     """Files changed from *base* to the working tree (None = base unknown)."""
     if not base:
         return None
     try:
-        committed = _git(Path(repo), "diff", "--name-only", f"{base}", "--", *IDENTITY_PATHS)
+        committed = _git(Path(repo), "diff", "--name-only", base, *([ref] if ref else []), "--", *IDENTITY_PATHS)
     except subprocess.CalledProcessError:
         return None
+    if ref is not None:
+        return set(committed.splitlines())
     untracked = _git(Path(repo), "ls-files", "--others", "--exclude-standard", "--", "src", "scripts", "deploy")
     return {line.strip() for line in (committed + "\n" + untracked).splitlines() if line.strip()}
 
@@ -340,20 +354,26 @@ class GateResult:
     target: dict = field(default_factory=dict)
 
 
-def check(repo: Path, *, base: str | None = None, report_root: Path | None = None) -> GateResult:
+def check(repo: Path, *, base: str | None = None, report_root: Path | None = None,
+          target_ref: str | None = None) -> GateResult:
     repo = Path(repo)
     release = os.environ.get("OBS_CACHE_GATE_RELEASE")
     candidate = os.environ.get("OBS_CACHE_GATE_CANDIDATE")
-    if release and candidate and repo.resolve() == Path(release).resolve():
+    if target_ref is None and release and candidate and repo.resolve() == Path(release).resolve():
         repo = Path(candidate)  # a daemon in a saved release still gates the next candidate
-    target = code_identity(repo)
+    target = code_identity(repo, ref=target_ref) if target_ref else code_identity(repo)
     running = read_running_record()
     if base is None and running:
         base = running.get("head")
         if running.get("dirty") not in (None, "clean"):
             base = None  # running code had uncommitted changes: cannot diff from a commit
-    sensitive = sensitive_files(repo)
-    changed = changed_files(repo, base)
+    sensitive = sensitive_files(repo, target_ref) if target_ref else sensitive_files(repo)
+    if base:
+        try:
+            sensitive |= sensitive_files(repo, base)  # removed markers must not hide a change
+        except subprocess.CalledProcessError:
+            pass  # unknown base already forces the conservative changed-files path
+    changed = changed_files(repo, base, target_ref) if target_ref else changed_files(repo, base)
     if changed is None:
         touched = sorted(sensitive)
         why = "running code unknown"

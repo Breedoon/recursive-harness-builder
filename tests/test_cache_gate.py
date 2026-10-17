@@ -59,6 +59,38 @@ def test_sensitive_files_follow_markers_plus_extras(repo):
     assert "src/obs_agent/plain.py" not in files
 
 
+def test_push_target_ignores_later_head_and_dirty_checkout(repo, tmp_path):
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "src/obs_agent/plain.py", "W = 2\n")
+    pushed = _git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "src/obs_agent/tools.py", "Z = 2\n")
+    (repo / "src/cache_proxy.py").write_text("# CACHE-PREFIX WARNING\nDIRTY = True\n")
+    result = cache_gate.check(repo, base=base, target_ref=pushed, report_root=tmp_path / "reports")
+    assert result.ok and not result.touched
+    assert result.target["head"] == pushed and result.target["dirty"] == "clean"
+    assert not cache_gate.check(repo, base=base, report_root=tmp_path / "reports").ok
+
+
+def test_push_target_requires_its_own_report_not_head_report(repo, tmp_path):
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "src/obs_agent/tools.py", "Z = 2\n")
+    pushed = _git(repo, "rev-parse", "HEAD").strip()
+    reports = tmp_path / "reports"
+    target_report = _report(reports, repo)
+    _commit(repo, "src/obs_agent/tools.py", "Z = 3\n")
+    result = cache_gate.check(repo, base=base, target_ref=pushed, report_root=reports)
+    assert result.ok and result.report == target_report
+    assert not cache_gate.check(repo, base=base, report_root=reports).ok
+
+
+def test_removed_marker_still_sensitive_at_push(repo, tmp_path):
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    _commit(repo, "src/obs_agent/session.py", "Y = 2\n")
+    pushed = _git(repo, "rev-parse", "HEAD").strip()
+    result = cache_gate.check(repo, base=base, target_ref=pushed, report_root=tmp_path / "reports")
+    assert not result.ok and "src/obs_agent/session.py" in result.touched
+
+
 def test_no_sensitive_change_passes_free(repo, tmp_path):
     base = _git(repo, "rev-parse", "HEAD").strip()
     _commit(repo, "src/obs_agent/plain.py", "W = 2\n")
