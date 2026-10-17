@@ -70,7 +70,11 @@ Since vault-w0eg, `fork_session_jsonl` raises `KeyError` for a target UUID that
 is not in the file. A reply to a message whose bound uuid is missing from the
 JSONL (a streamed uuid the CLI never persisted) is refused with "can't fork from
 this message" rather than forking the resolver's substitute; a reply to the
-latest such message continues the session. `resolve_safe_jsonl_target` resolves a row on a
+latest such message continues the session. `/fork` sent as a reply forks the
+replied message even when the stability wait sees the JSONL advance; only a head
+fork (no reply, or a reply to the true, non-stale head) follows the advanced
+JSONL, and a `/fork` reply to an unpersisted uuid is refused the same way.
+`resolve_safe_jsonl_target` resolves a row on a
 non-active branch on that branch's own chain (`SafeJsonlTarget.branch_health`),
 also when the row is unsafe there: it then recovers to that branch's last safe
 boundary (reason `preferred_uuid_unsafe`). Only a branch that cannot be analyzed

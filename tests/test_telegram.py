@@ -5413,6 +5413,89 @@ class TestTopicCommands:
             icon_custom_emoji_id=None,
         )
 
+    def _real_jsonl_fork_fixture(self, config, tmp_path, monkeypatch):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        project_dir = tmp_path / ".claude" / "projects" / "-fixture"
+        project_dir.mkdir(parents=True)
+
+        def row(kind, uid, parent, content):
+            message = {"role": kind, "content": content}
+            if kind == "assistant":
+                message.update({"model": "gpt-5.5", "id": "msg_" + uid, "stop_reason": "end_turn"})
+            return json.dumps({"type": kind, "uuid": uid, "parentUuid": parent, "sessionId": "sid-root", "message": message})
+
+        (project_dir / "sid-root.jsonl").write_text(
+            "\n".join([
+                row("user", "u1", None, "start"),
+                row("assistant", "a1", "u1", [{"type": "text", "text": "HERON-1"}]),
+                row("user", "u2", "a1", "next"),
+                row("assistant", "a2", "u2", [{"type": "text", "text": "KITE-2"}]),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.session_manager.set_session_id("sid-root")
+        bot._bind_state_session(state)
+        bot._set_session_head(session_id="sid-root", jsonl_uuid="a2")
+        bot._record_message_binding(route=state.route, message_id=12, jsonl_uuid="a1", session_id="sid-root", role="assistant")
+        bot._record_message_binding(route=state.route, message_id=13, jsonl_uuid="ghost", session_id="sid-root", role="assistant")
+        bot._await_jsonl_stability = AsyncMock(return_value="a2")  # the real wait returns the last persisted uuid
+        return bot
+
+    def _fork_ctx(self, reply_to):
+        update = _make_update("/fork", message_id=77)
+        update.effective_message.reply_to_message = MagicMock(message_id=reply_to)
+        ctx = _make_context()
+        ctx.args = []
+        ctx.bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=444))
+        ctx.bot.send_message = AsyncMock(side_effect=[MagicMock(message_id=910 + i) for i in range(6)])
+        return update, ctx
+
+    async def test_fork_command_reply_to_older_message_keeps_replied_source(self, config, tmp_path, monkeypatch):
+        # G1 verifier r6 F14 (vault-w0eg): the stability wait returns the latest row
+        # (a2); a /fork replying to a1 must still fork a1 (live: topic 392 HERON-1).
+        bot = self._real_jsonl_fork_fixture(config, tmp_path, monkeypatch)
+        update, ctx = self._fork_ctx(12)
+        with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-child") as mock_fork:
+            await bot.handle_fork(update, ctx)
+        assert mock_fork.call_args.kwargs["target_uuid"] == "a1"
+
+    async def test_fork_command_reply_to_unpersisted_uuid_is_refused(self, config, tmp_path, monkeypatch):
+        bot = self._real_jsonl_fork_fixture(config, tmp_path, monkeypatch)
+        bot._send_system_message = AsyncMock()
+        update, ctx = self._fork_ctx(13)
+        with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-child") as mock_fork:
+            await bot.handle_fork(update, ctx)
+        mock_fork.assert_not_called()
+        texts = [call.kwargs.get("text") for call in bot._send_system_message.await_args_list]
+        assert "can't fork from this message" in texts
+
+    async def test_fork_command_reply_to_stale_head_keeps_replied_source(self, config, tmp_path, monkeypatch):
+        bot = self._real_jsonl_fork_fixture(config, tmp_path, monkeypatch)
+        path = tmp_path / ".claude" / "projects" / "-fixture" / "sid-root.jsonl"
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        rows[2]["parentUuid"] = "a1"
+        err = {"type": "assistant", "uuid": "err1", "parentUuid": "u2", "sessionId": "sid-root", "isApiErrorMessage": True,
+               "message": {"role": "assistant", "model": "<synthetic>", "content": [{"type": "text", "text": "Request timed out"}]}}
+        u3 = {"type": "user", "uuid": "u3", "parentUuid": "err1", "sessionId": "sid-root", "message": {"role": "user", "content": "again"}}
+        rows[3]["parentUuid"] = "u3"
+        path.write_text("\n".join(json.dumps(r) for r in [rows[0], rows[1], rows[2], err, u3, rows[3]]) + "\n", encoding="utf-8")
+        bot._set_session_head(session_id="sid-root", jsonl_uuid="a1")  # pinned before the recovered err1
+        update, ctx = self._fork_ctx(12)
+        with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-child") as mock_fork:
+            await bot.handle_fork(update, ctx)
+        assert mock_fork.call_args.kwargs["target_uuid"] == "a1"
+
+    async def test_fork_command_without_reply_follows_the_advanced_jsonl(self, config, tmp_path, monkeypatch):
+        bot = self._real_jsonl_fork_fixture(config, tmp_path, monkeypatch)
+        bot._set_session_head(session_id="sid-root", jsonl_uuid="a1")
+        update, ctx = self._fork_ctx(None)
+        update.effective_message.reply_to_message = None
+        with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-child") as mock_fork:
+            await bot.handle_fork(update, ctx)
+        assert mock_fork.call_args.kwargs["target_uuid"] == "a2"
+
     async def test_deferred_bindings_can_backfill_topic_head_after_session_id_appears(self, config):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         state = _state(bot)

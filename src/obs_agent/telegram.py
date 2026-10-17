@@ -7245,13 +7245,9 @@ class TelegramBot:
         # vault-w0eg: a bound uuid missing from the session JSONL (a streamed uuid
         # the CLI never persisted) must not silently fork a substitute row. A reply
         # to the latest message continues the session; any other reply is refused.
-        if _health is not None:
-            bound_missing = not _health.has_uuid(binding.jsonl_uuid)
-        else:
-            # No analyzable JSONL: judge only against what is persisted; with nothing
-            # persisted, fork_session_jsonl's own KeyError stays the backstop.
-            persisted = self._persisted_session_uuids(binding.session_id)
-            bound_missing = bool(persisted) and binding.jsonl_uuid not in persisted
+        # No health means no JSONL was found (same finder as _persisted_session_uuids),
+        # so nothing can be judged; fork_session_jsonl's own KeyError is the backstop.
+        bound_missing = _health is not None and not _health.has_uuid(binding.jsonl_uuid)
         if bound_missing:
             logger.warning(
                 "[reply_fork] bound uuid missing from JSONL route=%s session_id=%s uuid=%s latest=%s",
@@ -12795,7 +12791,32 @@ class TelegramBot:
         stable_uuid = await self._await_jsonl_stability(
             session_id=source_session_id,
         )
-        if stable_uuid and stable_uuid != source_uuid:
+        # vault-w0eg: an explicit reply source never moves to the latest row. Only a
+        # head fork (no reply, or a reply to the true, non-stale head) follows the
+        # JSONL as it advances; a reply whose bound uuid never reached the JSONL is
+        # refused, as in the reply fork.
+        follows_head = reply_message_id is None
+        if not follows_head and source_uuid == self._session_heads.get(source_session_id or ""):
+            _uuid, head_health = self._resolve_safe_jsonl_target(
+                session_id=source_session_id, preferred_uuid=source_uuid, purpose="fork_command_head",
+            )
+            follows_head = not (head_health is not None and is_stale_session_head(head_health, source_uuid))
+        if not follows_head:
+            persisted = self._persisted_session_uuids(source_session_id)
+            if persisted and source_uuid not in persisted:
+                logger.warning(
+                    "[fork_command] replied uuid missing from JSONL route=%s session_id=%s uuid=%s",
+                    route, source_session_id, source_uuid,
+                )
+                await self._send_system_message(
+                    route=route,
+                    bot=context.bot,
+                    text="can't fork from this message",
+                    disable_notification=True,
+                    reply_to_message_id=message.message_id,
+                )
+                return
+        elif stable_uuid and stable_uuid != source_uuid:
             logger.info(
                 "[fork_command] JSONL advanced during stability wait: %s → %s",
                 source_uuid,
