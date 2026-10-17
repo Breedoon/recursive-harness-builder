@@ -150,7 +150,12 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
        --log-dir /workspace/runtime/cache-proxy-scratch/new/requests
    ```
    (`--log-dir` must be the `requests` subdirectory, or the runner finds no
-   rows.) Always give a scratch or test proxy its own `CACHE_PROXY_LOG_DIR`:
+   rows.) An OBS Codex shell may inherit its routing dummy API key: run the harness
+   with `env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN` so Claude scenarios use
+   their stored OAuth credentials (an auth-only failure is not cache evidence).
+   The full dual-route suite can exceed a ten-minute tool deadline; run it detached
+   with persistent output if necessary. Partial results without a final `gate.json`
+   are not a completed gate. Always give a scratch or test proxy its own `CACHE_PROXY_LOG_DIR`:
    agent shells inherit the production value from the OBS daemon, and on
    2026-10-12 test proxies that did not override it wrote about 320 rows into
    the production `usage.jsonl` and the production `effort-pins.json` (unit
@@ -170,7 +175,9 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
    `gate.json` from `scripts/cache_regression.py` shows `PASS` on both routes, full scenario set,
    for exactly this code (HEAD + uncommitted-change hash, the proxy under test having loaded this
    `src/cache_proxy.py`). Sensitive = files with a `CACHE-PREFIX` marker plus `tools.py`,
-   `pyproject.toml`, `uv.lock` and the CLIProxyAPI binary/config. Check any time with
+   `pyproject.toml`, `uv.lock` and the CLIProxyAPI binary/config. When the target has an external
+   CLIProxyAPI digest the report must contain exactly that digest; a missing/null legacy
+   value is inconclusive, not a match. Check any time with
    `.venv/bin/python scripts/cache_gate.py check`. Emergency override:
    `--skip-cache-gate "<reason>"`, `/restart skip-cache-gate <reason>` or
    `OBS_CACHE_GATE_SKIP=<reason> git push`; every bypass (and every plain restart that skipped a

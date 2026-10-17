@@ -90,9 +90,28 @@ def _restart_override(target: dict) -> str | None:
     return None
 
 
-def select(repo: Path, state: Path, *, report_root: Path | None = None, dry_run: bool = False) -> dict:
+def _audit(state: Path, answer: dict, result: gate.GateResult | None = None) -> None:
+    if answer["decision"] == "emergency-current":
+        gate.log_bypass(reason=answer["reason"], source="supervisor launch", result=result)
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+        with (state / "launches.jsonl").open("a") as handle:
+            handle.write(json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(), **answer}) + "\n")
+    except OSError as exc:
+        print(f"cache launch audit unavailable: {exc}", file=sys.stderr)
+
+
+def select(repo: Path, state: Path, *, report_root: Path | None = None, dry_run: bool = False,
+           fallback_only: bool = False) -> dict:
     repo, state = Path(repo).resolve(), Path(state).resolve()
     previous, previous_reason = _fallback(state)
+    if fallback_only:
+        answer = {"decision": "fallback" if previous else "emergency-current",
+                  "selected": previous["repo"] if previous else str(repo),
+                  "reason": "admission command failed/timed out; " + previous_reason}
+        if not dry_run:
+            _audit(state, answer)
+        return answer
     result = None
     try:
         target = gate.code_identity(repo)
@@ -128,14 +147,7 @@ def select(repo: Path, state: Path, *, report_root: Path | None = None, dry_run:
                   "selected": previous["repo"] if previous else str(repo),
                   "reason": f"launch gate error: {type(exc).__name__}: {exc}; {previous_reason}"}
     if not dry_run:
-        if answer["decision"] == "emergency-current":
-            gate.log_bypass(reason=answer["reason"], source="supervisor launch", result=result)
-        try:
-            state.mkdir(parents=True, exist_ok=True)
-            with (state / "launches.jsonl").open("a") as handle:
-                handle.write(json.dumps({"at": dt.datetime.now(dt.timezone.utc).isoformat(), **answer}) + "\n")
-        except OSError as exc:
-            print(f"cache launch audit unavailable: {exc}", file=sys.stderr)
+        _audit(state, answer, result)
     return answer
 
 
@@ -158,12 +170,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", type=Path, default=Path("/workspace/obs"))
     parser.add_argument("--state", type=Path, default=gate.STATE_DIR / "obs-admitted-releases")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--fallback-only", action="store_true")
     parser.add_argument("--install-control", type=Path)
     args = parser.parse_args(argv)
     if args.install_control:
         print(install_control(args.install_control))
         return 0
-    answer = select(args.repo, args.state, dry_run=args.dry_run)
+    answer = select(args.repo, args.state, dry_run=args.dry_run, fallback_only=args.fallback_only)
     if args.dry_run:
         print(json.dumps(answer, indent=1))
     else:

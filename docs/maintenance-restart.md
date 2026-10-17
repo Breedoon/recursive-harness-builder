@@ -71,6 +71,12 @@ The selected snapshot's `src` is first on `PYTHONPATH`, so the daemon, delayed
 imports and cache proxy all use the same admitted bytes. `.env`, `.venv` and
 `.obs-agent` stay shared; source rollback is not a dependency/database rollback.
 Maintenance checks from a saved release still check `/workspace/obs`, not themselves.
+The wrapper bounds admission to 45 s, then independently verifies only the saved
+fallback within 10 s (each command has a 2 s forced-kill grace); a hung Git/clone
+or report read cannot keep an empty wrapper alive indefinitely. Test-only timings
+can be shortened with `OBS_CACHE_LAUNCH_TIMEOUT_SECONDS` and
+`OBS_CACHE_FALLBACK_TIMEOUT_SECONDS`. If both commands fail/time out, the wrapper
+starts current code and writes an emergency bypass even without a Python audit.
 
 Deployment order, after tests and the matching scratch regression:
 

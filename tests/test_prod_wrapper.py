@@ -41,7 +41,8 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _prepare(tmp_path: Path, port: int, launch_command="printf '%s' /workspace/obs") -> Path:
+def _prepare(tmp_path: Path, port: int, launch_command="printf '%s' /workspace/obs",
+             fallback_command="printf '%s' /workspace/obs") -> Path:
     text = WRAPPER.read_text()
     assert "28925" in text
     auth = tmp_path / "auth"
@@ -52,7 +53,8 @@ def _prepare(tmp_path: Path, port: int, launch_command="printf '%s' /workspace/o
     text = (
         text.replace("28925", str(port))
         .replace("/run/secrets/obs-local-llm-auth", str(auth))
-        .replace("PYTHONPATH=/workspace/runtime/bin/obs-cache-launch-control /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo /workspace/obs", launch_command)
+        .replace("env PYTHONPATH=/workspace/runtime/bin/obs-cache-launch-control /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo /workspace/obs --fallback-only", fallback_command)
+        .replace("env PYTHONPATH=/workspace/runtime/bin/obs-cache-launch-control /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo /workspace/obs", launch_command)
         .replace("/workspace/obs/.venv/bin/python -m obs_agent.telegram_main --prod", str(child))
         .replace("startup_deadline=$((SECONDS + 20))", "startup_deadline=$((SECONDS + 2))")
         .replace("    sleep 5\n  done", "    sleep 0.2\n  done")
@@ -73,6 +75,7 @@ def _start(tmp_path: Path, script: Path, mode: str, **extra_env) -> subprocess.P
         FAKE_MODE=mode,
         OBS_KILLSWITCH_SENTINEL=str(tmp_path / "sentinel"),
         OBS_SHUTDOWN_SENTINEL=str(tmp_path / "shutdown-sentinel"),
+        OBS_CACHE_GATE_LOG=str(tmp_path / "wrapper-bypass.jsonl"),
         OBS_WRAPPER_MAINTENANCE_EXIT_WAIT_SECONDS="2",
         **extra_env,
     )

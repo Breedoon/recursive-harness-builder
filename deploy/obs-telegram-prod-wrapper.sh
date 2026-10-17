@@ -53,10 +53,15 @@ export OBS_SHUTDOWN_SENTINEL="$SHUTDOWN_SENTINEL"
 rm -f -- "$SHUTDOWN_SENTINEL"
 MAINTENANCE_EXIT_WAIT_SECONDS="${OBS_WRAPPER_MAINTENANCE_EXIT_WAIT_SECONDS:-30}"
 # Admission happens before importing telegram_main, including supervisor/crash starts.
-# A selector failure must not create an outage; it is visible in Supervisor stderr.
-SELECTED_REPO="$(PYTHONPATH=/workspace/runtime/bin/obs-cache-launch-control /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo /workspace/obs)" || {
-  echo "cache launch selector failed; emergency mutable-checkout start (no fallback selected)" >&2
-  SELECTED_REPO=/workspace/obs
+# Bound both admission and independent fallback verification: Git, report I/O or
+# a stuck clone must not strand a live wrapper with no daemon/watchdog underneath.
+SELECTED_REPO="$(timeout -k 2s "${OBS_CACHE_LAUNCH_TIMEOUT_SECONDS:-45}s" env PYTHONPATH=/workspace/runtime/bin/obs-cache-launch-control /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo /workspace/obs)" || {
+  echo "cache launch admission failed/timed out; checking saved fallback independently" >&2
+  SELECTED_REPO="$(timeout -k 2s "${OBS_CACHE_FALLBACK_TIMEOUT_SECONDS:-10}s" env PYTHONPATH=/workspace/runtime/bin/obs-cache-launch-control /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo /workspace/obs --fallback-only)" || {
+    echo "cache launch fallback failed/timed out; emergency mutable-checkout start" >&2
+    printf '%s\n' '{"source":"supervisor launch","reason":"admission and fallback commands failed/timed out; emergency-current","code":null}' >> "${OBS_CACHE_GATE_LOG:-/workspace/runtime/state/cache-gate-bypass.jsonl}" 2>/dev/null || true
+    SELECTED_REPO=/workspace/obs
+  }
 }
 export OBS_CACHE_GATE_CANDIDATE=/workspace/obs
 export OBS_CACHE_GATE_RELEASE="$SELECTED_REPO"

@@ -142,7 +142,7 @@ def test_real_wrapper_launches_verified_fallback_not_dirty_checkout(repo, state,
     control = tmp_path / "control"
     cache_launch.install_control(control)
     (repo / "src/obs_agent/cache_gate.py").write_text("# CACHE-PREFIX\ninvalid python!\n")
-    command = f"PYTHONPATH={control} /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo {repo} --state {state}"
+    command = f"env PYTHONPATH={control} /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo {repo} --state {state}"
     script = _prepare(tmp_path, _free_port(), launch_command=command)
     proc = _start(tmp_path, script, "crash", CACHE_REGRESSION_OUT=str(tmp_path / "reports"),
                   OBS_CLIPROXY_DIR=str(tmp_path / "no-cliproxy"))
@@ -150,6 +150,52 @@ def test_real_wrapper_launches_verified_fallback_not_dirty_checkout(repo, state,
     assert (tmp_path / "out/release").read_text() == first["selected"]
     assert (tmp_path / "out/pythonpath").read_text().startswith(first["selected"] + "/src")
     assert not (tmp_path / "sentinel").exists()
+
+
+def test_hung_admission_starts_verified_fallback_within_deadline(repo, state, tmp_path):
+    from tests.test_prod_wrapper import _prepare, _start, _free_port
+
+    _report(tmp_path / "reports", repo)
+    first = select(repo, state, tmp_path)
+    control = tmp_path / "control"
+    cache_launch.install_control(control)
+    fallback = f"env PYTHONPATH={control} /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo {repo} --state {state} --fallback-only"
+    script = _prepare(tmp_path, _free_port(), launch_command="sleep 300", fallback_command=fallback)
+    proc = _start(tmp_path, script, "crash", OBS_CACHE_LAUNCH_TIMEOUT_SECONDS="0.2",
+                  OBS_CACHE_FALLBACK_TIMEOUT_SECONDS="3", OBS_CLIPROXY_DIR=str(tmp_path / "no-cliproxy"))
+    assert proc.wait(timeout=10) == 1
+    assert (tmp_path / "out/release").read_text() == first["selected"]
+    assert "failed/timed out" in json.loads((state / "launches.jsonl").read_text().splitlines()[-1])["reason"]
+
+
+def test_both_selectors_hung_still_starts_daemon(tmp_path):
+    from tests.test_prod_wrapper import _prepare, _start, _free_port
+
+    script = _prepare(tmp_path, _free_port(), launch_command="sleep 300", fallback_command="sleep 300")
+    proc = _start(tmp_path, script, "crash", OBS_CACHE_LAUNCH_TIMEOUT_SECONDS="0.2",
+                  OBS_CACHE_FALLBACK_TIMEOUT_SECONDS="0.2")
+    assert proc.wait(timeout=10) == 1
+    assert (tmp_path / "out/release").read_text() == "/workspace/obs"
+    assert "emergency-current" in json.loads((tmp_path / "wrapper-bypass.jsonl").read_text())["reason"]
+
+
+@pytest.mark.parametrize("missing", [None, "absent"])
+def test_report_missing_external_digest_is_not_exact_evidence(repo, state, tmp_path, monkeypatch, missing):
+    external = tmp_path / "cliproxy"
+    external.mkdir()
+    (external / "config.yaml").write_text("old")
+    monkeypatch.setattr(cache_gate, "CLIPROXY_DIR", external)
+    report = _report(tmp_path / "reports", repo) / "gate.json"
+    data = json.loads(report.read_text())
+    if missing == "absent":
+        data["code"].pop("cliproxy")
+    else:
+        data["code"]["cliproxy"] = None
+    report.write_text(json.dumps(data))
+    (external / "config.yaml").write_text("new")
+    result = select(repo, state, tmp_path)
+    assert result["decision"] == "emergency-current"
+    assert "different CLIProxyAPI" in result["reason"]
 
 
 def test_explicit_restart_override_does_not_replace_gated_baseline(repo, state, tmp_path):

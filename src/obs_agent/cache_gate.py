@@ -170,7 +170,7 @@ def _same_code(report: dict, target: dict) -> tuple[bool, str]:
         return False, "different code identity"
     if target.get("proxy_source_sha256") and report.get("proxy_source") != target["proxy_source_sha256"]:
         return False, "proxy under test did not load this src/cache_proxy.py"
-    if target.get("cliproxy") and code.get("cliproxy") not in (None, target["cliproxy"]):
+    if target.get("cliproxy") and code.get("cliproxy") != target["cliproxy"]:
         return False, "different CLIProxyAPI"
     return True, "match"
 
