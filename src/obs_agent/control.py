@@ -197,12 +197,25 @@ class ControlServer:
             self._results[key] = result
         _audit({
             "op": op, "caller": caller, "idempotency_key": key or None,
-            "outcome": "ok" if result.get("ok") else "failed",
+            "outcome": _audit_outcome(result),
             "target": {k: args.get(k) for k in ("team_name", "recipient", "parent_team", "parent_agent", "title")
                        if args.get(k)},
             "detail": str(result.get("error") or result.get("text") or "")[:300],
         })
         return result
+
+
+def _audit_outcome(result: dict[str, Any]) -> str:
+    """ok / cold_blocked (cold-cache guard refusal, vault-vokl) / failed (ops-1.11.13).
+
+    "refused" stays reserved for authentication failures.
+    """
+    if result.get("ok"):
+        return "ok"
+    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+    if result.get("cold") or nested.get("outcome") == "cold_blocked":
+        return "cold_blocked"
+    return "failed"
 
 
 def tool_result_to_control(result: dict[str, Any]) -> dict[str, Any]:
@@ -253,18 +266,24 @@ def send_request(op: str, caller: str, args: dict[str, Any], *, idempotency_key:
 
 def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="obs-agentctl", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--as", dest="caller", required=True, help="who is calling (audit + sender label)")
+    ap.add_argument("--as", dest="caller", default=None, help="who is calling (audit + sender label); required")
     ap.add_argument("--idempotency-key", default=None)
     ap.add_argument("--json", action="store_true", help="print the full JSON response")
+    # The same global flags are accepted after the op too (ops-1.11.5). SUPPRESS keeps a
+    # subcommand from overwriting a value given before the op with its own default.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--as", dest="caller", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("--idempotency-key", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="op", required=True)
-    sub.add_parser("ping")
-    m = sub.add_parser("message", help="SendInboxMessage as external:NAME")
+    sub.add_parser("ping", parents=[common])
+    m = sub.add_parser("message", parents=[common], help="SendInboxMessage as external:NAME")
     m.add_argument("--team", dest="team_name", required=True)
     m.add_argument("--to", dest="recipient", required=True)
     m.add_argument("--text", dest="content", required=True)
     m.add_argument("--summary", default=None)
     m.add_argument("--allow-cold-wake", action="store_true")
-    la = sub.add_parser("launch", help="AgentTask as if PARENT called it")
+    la = sub.add_parser("launch", parents=[common], help="AgentTask as if PARENT called it")
     la.add_argument("--parent-team", required=True)
     la.add_argument("--parent", dest="parent_agent", required=True)
     la.add_argument("--name", dest="display_name", required=True)
@@ -278,7 +297,7 @@ def _parser() -> argparse.ArgumentParser:
     la.add_argument("--hooks", default=None, help="JSON hook map, as for AgentTask")
     la.add_argument("--session-source", default=None)
     la.add_argument("--allow-cold-wake", action="store_true")
-    nt = sub.add_parser("new-tree", help="new root topic whose first turn is PROMPT")
+    nt = sub.add_parser("new-tree", parents=[common], help="new root topic whose first turn is PROMPT")
     nt.add_argument("--title", required=True)
     nt.add_argument("--prompt", required=True)
     nt.add_argument("--chat-id", type=int, default=None)
@@ -286,7 +305,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ns = _parser().parse_args(argv)
+    parser = _parser()
+    ns = parser.parse_args(argv)
+    if not ns.caller:
+        parser.error("--as NAME is required (before or after the op)")
     op = "new_tree" if ns.op == "new-tree" else ns.op
     skip = {"caller", "idempotency_key", "json", "op"}
     args = {k: v for k, v in vars(ns).items() if k not in skip and v not in (None, "")}

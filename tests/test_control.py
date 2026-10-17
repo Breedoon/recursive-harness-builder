@@ -230,3 +230,44 @@ class TestBotDispatchReusesAgentTools:
             next(iter(bot._states_by_route))]
         result = await bot._control_dispatch("new_tree", "cron", {"title": "t", "prompt": "p"})
         assert result["ok"] is False and "--chat-id" in result["error"]
+
+
+class TestCliFlagPlacementAndAuditOutcome:
+    """ops-1.11.5 / ops-1.11.13."""
+
+    def _capture(self, monkeypatch):
+        seen = {}
+
+        def fake_send(op, caller, args, *, idempotency_key=None, timeout=120.0):
+            seen.update(op=op, caller=caller, args=args, key=idempotency_key)
+            return 0, {"ok": True, "text": "pong"}
+        monkeypatch.setattr(control, "send_request", fake_send)
+        return seen
+
+    def test_global_flags_after_the_op(self, monkeypatch, capsys):
+        seen = self._capture(monkeypatch)
+        assert control.main(["ping", "--as", "cron", "--json", "--idempotency-key", "k1"]) == 0
+        assert seen == {"op": "ping", "caller": "cron", "args": {}, "key": "k1"}
+        assert '"ok": true' in capsys.readouterr().out
+
+    def test_global_flags_before_the_op_still_work_and_are_not_overwritten(self, monkeypatch, capsys):
+        seen = self._capture(monkeypatch)
+        assert control.main(["--as", "cron", "--json", "--idempotency-key", "k2", "message",
+                             "--team", TEAM, "--to", "x", "--text", "hi"]) == 0
+        assert seen["caller"] == "cron" and seen["key"] == "k2"
+        assert seen["args"] == {"team_name": TEAM, "recipient": "x", "content": "hi", "allow_cold_wake": False}
+        assert '"ok": true' in capsys.readouterr().out
+
+    def test_missing_caller_is_a_clear_usage_error(self, monkeypatch, capsys):
+        self._capture(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            control.main(["ping"])
+        assert exc.value.code == 2
+        assert "--as NAME is required" in capsys.readouterr().err
+
+    def test_audit_outcome_labels(self):
+        assert control._audit_outcome({"ok": True}) == "ok"
+        assert control._audit_outcome({"ok": False, "cold": True, "error": "cold-cache guard"}) == "cold_blocked"
+        assert control._audit_outcome({"ok": False, "result": {"outcome": "cold_blocked"}}) == "cold_blocked"
+        assert control._audit_outcome({"ok": False, "result": {"outcome": "underdelivered"}}) == "failed"
+        assert control._audit_outcome({"ok": False, "error": "boom"}) == "failed"
