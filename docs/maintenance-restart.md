@@ -86,9 +86,11 @@ Selection output is temporary under the runtime state directory, overridable by
 Deployment order, after tests and the matching scratch regression:
 
 1. Install the controller atomically (does not restart OBS):
-   `.venv/bin/python -m obs_agent.cache_launch --install-control /workspace/runtime/bin/obs-cache-launch-control`.
-2. Seed a gated baseline before exposing the wrapper:
-   `.venv/bin/python -m obs_agent.cache_launch --repo /workspace/obs`.
+   `env PYTHONPATH=/workspace/obs/src /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --install-control /workspace/runtime/bin/obs-cache-launch-control`.
+   Post-deploy agent shells inherit the saved release on `PYTHONPATH`; pinning the
+   candidate source here prevents silently reinstalling an older controller.
+2. Seed a gated baseline through the installed controller before exposing the wrapper:
+   `env PYTHONPATH=/workspace/runtime/bin/obs-cache-launch-control /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo /workspace/obs`.
    Require `admitted`, not `emergency-current`; a known gated older clean clone
    may be seeded instead if current work lacks evidence. Give that clone the
    production `.env`, `.venv` and `.obs-agent` links before seeding. Do not use
