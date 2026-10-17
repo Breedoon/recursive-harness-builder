@@ -175,7 +175,22 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
    `--skip-cache-gate "<reason>"`, `/restart skip-cache-gate <reason>` or
    `OBS_CACHE_GATE_SKIP=<reason> git push`; every bypass (and every plain restart that skipped a
    failing gate) is appended to `/workspace/runtime/state/cache-gate-bypass.jsonl`. The kill
-   switch and crash/watchdog restarts are never gated.
+   switch still stops unconditionally. **Every Supervisor start, including crash/watchdog and
+   plain starts, now selects admitted source bytes before importing the daemon** (`vault-nsha`):
+   `obs_agent.cache_launch` admits a matching full two-provider report or unchanged sensitive
+   bytes relative to its previous admitted snapshot, otherwise selects that verified snapshot.
+   Sensitive comparison includes markers in both old and new files (removing a marker cannot
+   hide a change). It never resets or edits the working checkout. Decisions and rejected
+   candidate identities go to `state/obs-admitted-releases/launches.jsonl`; the pointer is
+   `current.json`. If no usable snapshot exists, it records an `emergency-current` bypass and
+   starts current code rather than deliberately keeping OBS down. Corrupt snapshots and a
+   changed external CLIProxyAPI identity are not presented as safe fallback. External
+   CLIProxyAPI processes, credentials and the shared venv are not rolled back by source selection.
+   Explicit CLI/Telegram maintenance overrides match the complete candidate identity for
+   five minutes; their snapshots do not replace the last gated baseline. A push override or
+   plain restart is not deployment approval. Install the controller and seed a genuinely
+   gated snapshot **before installing the new wrapper**; see `docs/maintenance-restart.md`.
+   Dry-run (read-only): `.venv/bin/python -m obs_agent.cache_launch --dry-run`.
 5. **Commit, push, deploy with the maintenance restart only:**
    `/workspace/obs/.venv/bin/python -m obs_agent.maintenance_restart`
    (running agents resume by themselves). Then confirm the live proxy loaded

@@ -61,6 +61,41 @@ The container latch defaults to `/workspace/runtime/state/obs-telegram-prod.shut
 same file if the runtime mount or configuration changes. The existing independent
 host/container recovery-disable files retain their previous behavior.
 
+## Cache-safe launch selection (vault-nsha)
+
+All Supervisor starts use the installed controller at
+`/workspace/runtime/bin/obs-cache-launch-control` before importing the daemon.
+Its own Python package is copied independently of the mutable development checkout,
+so even syntax errors in candidate gate code cannot bypass fallback selection.
+The selected snapshot's `src` is first on `PYTHONPATH`, so the daemon, delayed
+imports and cache proxy all use the same admitted bytes. `.env`, `.venv` and
+`.obs-agent` stay shared; source rollback is not a dependency/database rollback.
+Maintenance checks from a saved release still check `/workspace/obs`, not themselves.
+
+Deployment order, after tests and the matching scratch regression:
+
+1. Install the controller atomically (does not restart OBS):
+   `.venv/bin/python -m obs_agent.cache_launch --install-control /workspace/runtime/bin/obs-cache-launch-control`.
+2. Seed a gated baseline before exposing the wrapper:
+   `.venv/bin/python -m obs_agent.cache_launch --repo /workspace/obs`.
+   Require `admitted`, not `emergency-current`; a known gated older clean clone
+   may be seeded instead if current work lacks evidence. Give that clone the
+   production `.env`, `.venv` and `.obs-agent` links before seeding. Do not use
+   the mutable running-code record alone as proof of admission.
+3. Copy `deploy/obs-telegram-prod-wrapper.sh` to a sibling temporary file at its
+   installed path and atomically rename it, then coordinate a maintenance restart.
+4. Verify the live daemon's module path, its running-code record, proxy health
+   hash and `state/obs-admitted-releases/launches.jsonl`, then run the production
+   regression. Do not claim a crash was tested merely because a restart succeeded;
+   the isolated wrapper test exercises dirty fallback without killing production.
+
+Install a fresh controller when changing the launch/gate implementation. Keep the
+last admitted snapshot; do not delete releases while a daemon may be running from
+one. A missing/corrupt fallback or changed external CLIProxyAPI means the selector
+logs an emergency current-code start rather than creating an outage. The kill
+switch and snapshot/resume semantics below are unchanged. Restoring the old wrapper
+by atomic rename rolls back selection without touching the development checkout.
+
 ## Restart and crash paths (unchanged five-minute window)
 
 - **Maintenance restart — the default for planned restarts.** Agents that are

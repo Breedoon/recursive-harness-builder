@@ -21,6 +21,8 @@ FAKE_CHILD = """#!/bin/bash
 # fake telegram_main: records signals; mode from $FAKE_MODE
 out="$FAKE_OUT"
 echo $$ > "$out/child.pid"
+printf '%s' "$OBS_CACHE_GATE_RELEASE" > "$out/release"
+printf '%s' "$PYTHONPATH" > "$out/pythonpath"
 sleep 300 &            # a "Claude CLI" in the same process group
 echo $! > "$out/cli.pid"
 case "$FAKE_MODE" in
@@ -39,7 +41,7 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _prepare(tmp_path: Path, port: int) -> Path:
+def _prepare(tmp_path: Path, port: int, launch_command="printf '%s' /workspace/obs") -> Path:
     text = WRAPPER.read_text()
     assert "28925" in text
     auth = tmp_path / "auth"
@@ -50,6 +52,7 @@ def _prepare(tmp_path: Path, port: int) -> Path:
     text = (
         text.replace("28925", str(port))
         .replace("/run/secrets/obs-local-llm-auth", str(auth))
+        .replace("PYTHONPATH=/workspace/runtime/bin/obs-cache-launch-control /workspace/obs/.venv/bin/python -m obs_agent.cache_launch --repo /workspace/obs", launch_command)
         .replace("/workspace/obs/.venv/bin/python -m obs_agent.telegram_main --prod", str(child))
         .replace("startup_deadline=$((SECONDS + 20))", "startup_deadline=$((SECONDS + 2))")
         .replace("    sleep 5\n  done", "    sleep 0.2\n  done")

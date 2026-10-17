@@ -26,9 +26,11 @@ How it decides (``check``):
 
 Overrides: ``--skip-cache-gate REASON`` on ``python -m obs_agent.maintenance_restart`` and
 ``/restart skip-cache-gate REASON`` in Telegram. Every bypass is appended to the bypass log so
-reflections and weekly reviews see it. The kill switch (``--plain``, ``/restart plain``,
-supervisorctl) and crash/watchdog restarts are never gated, so a crash-loop fix can always be
-deployed; a plain restart that skips a failing gate is logged as well.
+reflections and weekly reviews see it. The kill switch still stops unconditionally. Every
+Supervisor start uses cache_launch to select an admitted snapshot or the last admitted fallback;
+if neither is usable it logs an emergency current-code start rather than keeping OBS down.
+A matching explicit maintenance override remains valid for five minutes, but never replaces
+the last gated fallback. A plain restart that skips a failing gate is logged as well.
 """
 
 from __future__ import annotations
@@ -340,6 +342,10 @@ class GateResult:
 
 def check(repo: Path, *, base: str | None = None, report_root: Path | None = None) -> GateResult:
     repo = Path(repo)
+    release = os.environ.get("OBS_CACHE_GATE_RELEASE")
+    candidate = os.environ.get("OBS_CACHE_GATE_CANDIDATE")
+    if release and candidate and repo.resolve() == Path(release).resolve():
+        repo = Path(candidate)  # a daemon in a saved release still gates the next candidate
     target = code_identity(repo)
     running = read_running_record()
     if base is None and running:
@@ -382,6 +388,7 @@ def log_bypass(*, reason: str, source: str, result: GateResult | None) -> None:
         "reason": reason,
         "touched": result.touched if result else None,
         "head": (result.target or {}).get("head") if result else None,
+        "code": result.target if result else None,
         "gate_message": result.message if result else None,
     }
     path = bypass_log_path()
