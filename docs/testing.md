@@ -32,6 +32,29 @@ Two guards now hold:
 Tests that exercise stop/kill/watchdog paths should still mock
 `kill_process_tree` or give the mock client `_transport._process = None`.
 
+Production state paths are isolated by autouse fixtures in `tests/conftest.py`:
+the control socket, the cache-gate state, and (obs-6) the session-replay
+provenance directory (`OBS_SESSION_REPLAY_PROVENANCE_DIR`), which unit tests had
+filled with 148 fork receipts in the live
+`/workspace/runtime/state/session-replay/forks`. A new code path that writes
+under `/workspace/runtime/state` needs the same kind of fixture.
+
+Unit lane (no model calls):
+`.venv/bin/python -m pytest -m "not live and not integration and not eval" tests`.
+The plain default collection also runs `integration` tests that call the API.
+
+## JSONL fork/recovery fixtures
+
+Since 3ae5ea1 the boundary rules in `jsonl_health._completed_boundaries` are:
+a persisted plain user message is a boundary; a tool round is a boundary once
+every `tool_use` has its `tool_result`; a text-only assistant group is a boundary
+only with terminal evidence (`stop_reason` `end_turn`/`stop_sequence`/`max_tokens`,
+a later assistant group, or a completion receipt). Fixture rows that stand for a
+finished answer must therefore carry `type`, `message.role` and `stop_reason`
+like real CLI rows; without them the row is treated as possibly still streaming
+and the fork or recovery target moves to an earlier row. Real CLI rows after a
+synthetic API-error row have that row as `parentUuid`.
+
 ## Repository-owned surfaces
 
 - `scripts/live_test_protocol.py` defines host observation, immutable host
