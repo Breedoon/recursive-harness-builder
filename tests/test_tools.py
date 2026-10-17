@@ -2894,6 +2894,7 @@ class TestCronTools:
                 "schedule_mode": "interval",
                 "cron": "*/2 * * * *",
                 "prompt": "run job",
+                "prompt_file": None,
                 "interval_seconds": 0,
                 "reset_session": True,
                 "description": "maint",

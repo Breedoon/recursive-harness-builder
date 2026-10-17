@@ -122,6 +122,7 @@ class PersistedTopicSchedule:
     max_retry_attempts: int
     retry_delay_seconds: int
     retry_attempt_count: int
+    prompt_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -353,6 +354,12 @@ class TelegramStateStore:
             column="retry_attempt_count",
             declaration="INTEGER NOT NULL DEFAULT 0",
         )
+        # vault-wlh: a schedule may carry a prompt file read at every fire.
+        self._ensure_column_exists(
+            table="topic_schedule",
+            column="prompt_file",
+            declaration="TEXT",
+        )
         self._ensure_column_exists(
             table="route_state",
             column="agent_lineage_json",
@@ -543,7 +550,8 @@ class TelegramStateStore:
                 last_error,
                 max_retry_attempts,
                 retry_delay_seconds,
-                retry_attempt_count
+                retry_attempt_count,
+                prompt_file
             FROM topic_schedule
             ORDER BY updated_at ASC
             """
@@ -756,9 +764,10 @@ class TelegramStateStore:
                 max_retry_attempts=max(int(row["max_retry_attempts"] or 0), 0),
                 retry_delay_seconds=max(int(row["retry_delay_seconds"] or 30), 1),
                 retry_attempt_count=max(int(row["retry_attempt_count"] or 0), 0),
+                prompt_file=str(row["prompt_file"]) if row["prompt_file"] else None,
             )
             for row in schedule_rows
-            if row["schedule_id"] and row["prompt"]
+            if row["schedule_id"] and (row["prompt"] or row["prompt_file"])
         ]
         return TelegramStateSnapshot(
             route_states=route_states,
@@ -1241,6 +1250,7 @@ class TelegramStateStore:
         max_retry_attempts: int,
         retry_delay_seconds: int,
         retry_attempt_count: int,
+        prompt_file: str | None = None,
     ) -> None:
         conn = self._require_conn()
         now = time.time()
@@ -1272,8 +1282,9 @@ class TelegramStateStore:
                 max_retry_attempts,
                 retry_delay_seconds,
                 retry_attempt_count,
+                prompt_file,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(schedule_id) DO UPDATE SET
                 route_key=excluded.route_key,
                 chat_id=excluded.chat_id,
@@ -1299,6 +1310,7 @@ class TelegramStateStore:
                 max_retry_attempts=excluded.max_retry_attempts,
                 retry_delay_seconds=excluded.retry_delay_seconds,
                 retry_attempt_count=excluded.retry_attempt_count,
+                prompt_file=excluded.prompt_file,
                 updated_at=excluded.updated_at
             """,
             (
@@ -1327,6 +1339,7 @@ class TelegramStateStore:
                 max(int(max_retry_attempts), 0),
                 max(int(retry_delay_seconds), 1),
                 max(int(retry_attempt_count), 0),
+                prompt_file,
                 now,
             ),
         )

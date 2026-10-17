@@ -310,6 +310,10 @@ class TelegramSessionState:
         return self.session_manager.session_id
 
 
+class ScheduledPromptFileError(RuntimeError):
+    """vault-wlh: a schedule's prompt_file could not be read at fire time."""
+
+
 class _TopicDeletedError(Exception):
     """Raised when a Telegram topic has been deleted (thread not found)."""
 
@@ -400,6 +404,9 @@ class _TopicScheduleRecord:
     max_retry_attempts: int = 0
     retry_delay_seconds: int = 30
     retry_attempt_count: int = 0
+    # vault-wlh: path (vault-relative, absolute or ~) whose content is read at
+    # every fire and appended after ``prompt``; None = inline prompt only.
+    prompt_file: str | None = None
 
 
 def reply_wake_schedule_id(route: TelegramRoute) -> str:
@@ -1810,6 +1817,7 @@ class TelegramBot:
                 max_retry_attempts=entry.max_retry_attempts,
                 retry_delay_seconds=entry.retry_delay_seconds,
                 retry_attempt_count=entry.retry_attempt_count,
+                prompt_file=entry.prompt_file,
             )
             if record.last_error and record.last_error.startswith(_SCHEDULE_IN_PROGRESS_PREFIX):
                 # ops-29: the previous process died mid-run; this fire is still due and re-fires.
@@ -3753,6 +3761,7 @@ class TelegramBot:
             max_retry_attempts=record.max_retry_attempts,
             retry_delay_seconds=record.retry_delay_seconds,
             retry_attempt_count=record.retry_attempt_count,
+            prompt_file=record.prompt_file,
         )
 
     def _register_topic_schedule(self, record: _TopicScheduleRecord) -> None:
@@ -3828,6 +3837,7 @@ class TelegramBot:
                 trigger_kind=parent_record.trigger_kind,
                 interval_seconds=parent_record.interval_seconds,
                 prompt=parent_record.prompt,
+                prompt_file=parent_record.prompt_file,
                 reset_session=parent_record.reset_session,
                 recurring=parent_record.recurring,
                 enabled=True,
@@ -3875,6 +3885,8 @@ class TelegramBot:
             "next_run_at": self._schedule_iso_timestamp(record.next_run_at),
             "inherit": record.inherit_mode,
         }
+        if record.prompt_file:
+            payload["prompt_file"] = record.prompt_file
         if record.last_error:
             payload["last_error"] = record.last_error
         return payload
@@ -3890,8 +3902,14 @@ class TelegramBot:
             return self._cron_error_result("CronCreate is only available inside an active Telegram topic")
 
         prompt = str(args.get("prompt") or "").strip()
-        if not prompt:
-            return self._cron_error_result("CronCreate failed: prompt is required")
+        prompt_file = str(args.get("prompt_file") or "").strip() or None
+        if not prompt and not prompt_file:
+            return self._cron_error_result("CronCreate failed: prompt is required unless prompt_file is given")
+        if prompt_file:
+            try:
+                self._read_schedule_prompt_file(prompt_file)
+            except OSError as exc:
+                return self._cron_error_result(f"CronCreate failed: cannot read prompt_file: {exc}")
         schedule_mode = str(args.get("schedule_mode") or "").strip().lower()
         cron_expr = str(args.get("cron") or "").strip()
         if not schedule_mode:
@@ -3989,6 +4007,7 @@ class TelegramBot:
             trigger_kind=trigger_kind,
             interval_seconds=interval_seconds,
             prompt=prompt,
+            prompt_file=prompt_file,
             reset_session=bool(reset_session),
             recurring=max_runs != 1,
             enabled=True,
@@ -4326,6 +4345,9 @@ class TelegramBot:
             async with lock:
                 if state.busy:
                     return False
+                # vault-wlh: read the prompt file BEFORE any session reset, so an
+                # unreadable file fails this fire without discarding the session.
+                composed_schedule_prompt = self._compose_schedule_prompt(record)
                 if record.reset_session:
                     await self._reset_route_state(state)
                     state.last_bot = bot
@@ -4345,7 +4367,7 @@ class TelegramBot:
                     )
                 scheduled_prompt = (
                     "(System: scheduled execution.)\n\n"
-                    f"{record.prompt}"
+                    f"{composed_schedule_prompt}"
                 )
                 record.last_run_at = time.time()
                 # ops-29: persist the start, so a fire cut off by a restart is visible
@@ -10656,6 +10678,40 @@ class TelegramBot:
             lines.append("prompt:")
             lines.append(html.escape(prompt))
         return "\n".join(lines)
+
+    def _read_schedule_prompt_file(self, prompt_file: str) -> str:
+        """Read a schedule prompt file (vault-relative, absolute or ~). Raises OSError."""
+        path = Path(prompt_file)
+        if prompt_file.startswith("~"):
+            path = path.expanduser()
+        elif not path.is_absolute():
+            path = Path(self._config.vault_path) / path
+        return path.read_text(encoding="utf-8").strip()
+
+    def _compose_schedule_prompt(self, record: "_TopicScheduleRecord") -> str:
+        """vault-wlh: inline prompt first, then the prompt file read at THIS fire.
+
+        Raises ScheduledPromptFileError when the file cannot be read, so the fire
+        fails visibly instead of sending an empty or stale prompt.
+        """
+        if not record.prompt_file:
+            return record.prompt
+        try:
+            content = self._read_schedule_prompt_file(record.prompt_file)
+        except OSError as exc:
+            raise ScheduledPromptFileError(
+                f"schedule prompt_file unreadable: {record.prompt_file}: {exc}"
+            ) from exc
+        file_block = "\n".join(
+            [
+                f'<schedule_prompt_file path="{html.escape(record.prompt_file)}">',
+                content,
+                "</schedule_prompt_file>",
+            ]
+        )
+        if record.prompt:
+            return f"{record.prompt}\n\n{file_block}"
+        return file_block
 
     @staticmethod
     def _compose_prompt_file_context(

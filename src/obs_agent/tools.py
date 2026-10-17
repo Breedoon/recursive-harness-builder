@@ -1150,8 +1150,9 @@ def create_obs_tools(
 
     async def _cron_create(args: dict, *, tool_name: str) -> dict:
         prompt = str(args.get("prompt", "")).strip()
-        if not prompt:
-            return _error_result(f"Cannot use {tool_name}: prompt is required")
+        prompt_file = str(args.get("prompt_file", "") or "").strip()
+        if not prompt and not prompt_file:
+            return _error_result(f"Cannot use {tool_name}: prompt is required unless prompt_file is given")
         cron = str(args.get("cron", "")).strip()
         schedule_mode_raw = args.get("schedule_mode")
         schedule_mode = (
@@ -1240,6 +1241,7 @@ def create_obs_tools(
                     "schedule_mode": schedule_mode,
                     "cron": cron,
                     "prompt": prompt,
+                    "prompt_file": prompt_file or None,
                     "interval_seconds": interval_seconds,
                     "reset_session": reset_session,
                     "description": str(args.get("description") or "").strip() or None,
@@ -1304,7 +1306,14 @@ def create_obs_tools(
             },
             "prompt": {
                 "type": "string",
-                "description": "Prompt injected when this schedule fires.",
+                "description": "Prompt injected when this schedule fires. Optional when prompt_file is given.",
+            },
+            "prompt_file": {
+                "type": "string",
+                "description": (
+                    "Optional file (vault-relative, absolute or ~) re-read at EVERY fire and "
+                    "appended after prompt, so a memory/checkpoint file can be the wake prompt."
+                ),
             },
             "interval_seconds": {
                 "type": "integer",
