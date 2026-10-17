@@ -1,5 +1,7 @@
 # Notes for agents working on this repository
 
+This repo is the code of the vault project **OBS Platform**. Its goals, priorities, decisions and architecture live in the vault. Start with [VAULT-PROJECT.md](VAULT-PROJECT.md).
+
 ## The cache proxy is easy to break — read this first
 
 Every agent request goes through `src/cache_proxy.py`. Prompt caching only
