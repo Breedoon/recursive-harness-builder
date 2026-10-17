@@ -2340,7 +2340,7 @@ class TestTopicScheduling:
                 "cron": "*/5 * * * *",
                 "prompt": "run stop",
                 "interval_seconds": 0,
-                "description": "StopRunner",
+                "description": "[ops-test] StopRunner",
             },
         )
 
@@ -2363,6 +2363,7 @@ class TestTopicScheduling:
             args={
                 "cron": "*/5 * * * *",
                 "prompt": "run once",
+                "description": "[ops-test] timing-only fixture",
                 "interval_seconds": 30,
             },
         )
@@ -2389,6 +2390,7 @@ class TestTopicScheduling:
                     "schedule_mode": "cron",
                     "cron": "*/5 * * * *",
                     "prompt": "run cron",
+                    "description": "[ops-test] timing-only fixture",
                 },
             )
 
@@ -2413,6 +2415,7 @@ class TestTopicScheduling:
                 "interval_seconds": 60,
                 "cron": "*/1 * * * *",
                 "prompt": "first",
+                "description": "[ops-test] timing-only fixture",
                 "from": "2030-03-10T10:00:00Z",
                 "until": "2030-03-10T11:00:00Z",
             },
@@ -2427,6 +2430,7 @@ class TestTopicScheduling:
                 "interval_seconds": 120,
                 "cron": "*/2 * * * *",
                 "prompt": "second",
+                "description": "[ops-test] timing-only fixture",
                 "from": "2030-03-10T10:30:00Z",
                 "until": "2030-03-10T11:30:00Z",
             },

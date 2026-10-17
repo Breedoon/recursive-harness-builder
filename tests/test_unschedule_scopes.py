@@ -42,6 +42,221 @@ def test_adopted_nonbead_route_tag_matches_inventory_and_stays_protected():
     assert "orphaned" in owners.creation_warnings(schedule_id="mapped", description="[ops-2] closed")[0]
 
 
+@pytest.mark.asyncio
+async def test_prefixless_cron_is_owned_before_registration(config, ownership_files, monkeypatch):
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    register = bot._register_topic_schedule
+    def owned_before_register(record):
+        owners = schedule_scope.ScheduleOwnership.load(config.vault_path)
+        assert owners.owner_of(schedule_id=record.schedule_id, description=record.description)[0] == "ops-1"
+        register(record)
+    monkeypatch.setattr(bot, "_register_topic_schedule", owned_before_register)
+    state = _state(bot, thread_id=104)
+    state.inflight_user_text = "Task bead: ops-1. Continue the registered work."
+    result = await bot._cron_create(route=state.route, args={
+        "schedule_mode": "interval", "interval_seconds": 3600,
+        "prompt": "continue", "description": "prefixless owner proof",
+    })
+    payload = result["tool_use_result"]
+    assert payload["warnings"] == []
+    assert payload["owner_assignment"]["bead"] == "ops-1"
+    owners = schedule_scope.ScheduleOwnership.load(config.vault_path)
+    assert owners.owner_of(schedule_id=payload["schedule"]["id"], description=None)[0] == "ops-1"
+
+
+@pytest.mark.asyncio
+async def test_cron_inherits_nearest_ancestor_task(config, ownership_files):
+    from obs_agent.lineage import agent_name_for_lineage
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    states = [_state(bot, thread_id=n) for n in (105, 106, 107)]
+    for index, state in enumerate(states):
+        lineage = ("Root", "Parent", "Worker")[:index + 1]
+        name = agent_name_for_lineage(lineage, team_key=TEAM)
+        state.agent_lineage = lineage
+        state.session_manager.set_sdk_env_overrides({"CLAUDE_CODE_TEAM_NAME": TEAM, "CLAUDE_CODE_AGENT_NAME": name})
+        bot._route_inbox_targets[(TEAM, name)] = state.route
+        bot._route_inbox_target_keys_by_route[state.route] = (TEAM, name)
+    states[0].inflight_user_text = "Task bead: ops-2"
+    states[1].inflight_user_text = "Task bead: ops-1"
+    result = await bot._cron_create(route=states[2].route, args={
+        "schedule_mode": "interval", "interval_seconds": 3600, "prompt": "continue",
+    })
+    assigned = result["tool_use_result"]["owner_assignment"]
+    assert assigned["bead"] == "ops-1" and assigned["source"] == "ancestor-task"
+
+
+def test_default_schedule_creation_uses_same_owner_path(config, ownership_files):
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    bot._default_schedule_template = bot._parse_default_schedule_template(
+        {"enabled": True, "schedule_mode": "interval", "interval_seconds": 3600,
+         "prompt": "Task bead: ops-1", "description": "default without prefix"}, source_label="test")
+    route = TelegramRoute(chat_id=67890, thread_id=108)
+    bot._get_state(route)
+    sid = next(iter(bot._schedule_ids_by_route[route]))
+    owners = schedule_scope.ScheduleOwnership.load(config.vault_path)
+    assert owners.owner_of(schedule_id=sid, description=None)[0] == "ops-1"
+    assert not owners.creation_warnings(schedule_id=sid, description=None)
+
+
+def test_inherited_prefixless_schedule_keeps_parent_owner(config, ownership_files):
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    parent = _state(bot, thread_id=109)
+    parent.inflight_user_text = "Task bead: ops-1"
+    child = _state(bot, thread_id=110)
+    child.inflight_user_text = "Task bead: reg-1"
+    _sched(bot, "parent", parent.route)
+    bot._topic_schedules_by_id["parent"].inherit_mode = "all"
+    bot._inherit_topic_schedules(parent_route=parent.route, child_route=child.route, is_fork=True)
+    sid = next(iter(bot._schedule_ids_by_route[child.route]))
+    owners = schedule_scope.ScheduleOwnership.load(config.vault_path)
+    assert owners.owner_of(schedule_id=sid, description=None)[0] == "ops-1"
+    assert "inherited-owner" in owners.owners[sid]["note"]
+
+
+@pytest.mark.parametrize("from_file", [False, True])
+def test_restored_ownerless_schedule_is_owned_from_card_or_prompt_file(config, ownership_files, tmp_path, from_file):
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    bot._state_store.initialize()
+    state = _state(bot, thread_id=111)
+    memory = tmp_path / "restore-card.md"
+    memory.write_text("Task bead: ops-1")
+    record = _TopicScheduleRecord(schedule_id="restore-card", route=state.route, description=None,
+        schedule_mode="interval", cron_expr=None, trigger_kind="interval", interval_seconds=3600,
+        prompt="continue" if from_file else "Task bead: ops-1", reset_session=False,
+        prompt_file=str(memory) if from_file else None, next_run_at=5000.0)
+    bot._register_topic_schedule(record)
+    data = json.loads(ownership_files[1].read_text())
+    del data["schedules"][record.schedule_id]  # model an ownerless pre-upgrade persisted row
+    ownership_files[1].write_text(json.dumps(data))
+    restored = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    restored._state_store.initialize()
+    restored._restore_state_from_store()
+    owners = schedule_scope.ScheduleOwnership.load(config.vault_path)
+    assert owners.owner_of(schedule_id=record.schedule_id, description=None)[0] == "ops-1"
+    assert "schedule-prompt" in owners.owners[record.schedule_id]["note"]
+    assert restored._topic_schedules_by_id[record.schedule_id].prompt_file == record.prompt_file
+
+
+@pytest.mark.parametrize("description", ["[ops-1] explicit", "[old-1] closed", "[ops-missing] explicit"])
+def test_auto_owner_explicit_prefix_wins(ownership_files, tmp_path, description):
+    before = ownership_files[1].read_bytes()
+    assert schedule_scope.assign_creation_owner(vault=tmp_path, schedule_id="new", description=description,
+        team=TEAM, agent="worker", session_id=None, contexts=[{"agent": "worker", "texts": ["Task bead: reg-1"]}]) is None
+    assert ownership_files[1].read_bytes() == before
+
+
+def test_auto_owner_prefers_lane_and_understands_brief(ownership_files):
+    owners = schedule_scope.ScheduleOwnership.load(None)
+    owners.beads = {"ops-1": {"status": "open"}, "ops-2": {"status": "open"}}
+    assert schedule_scope._owner_from_text("Task bead: ops-2. Lane bead: ops-1.", owners.beads) == "ops-1"
+    assert schedule_scope._owner_from_text("Use /artifacts/briefs/2026-10/ops-2.md; issue ops-1 is unrelated.", owners.beads) == "ops-2"
+    assert schedule_scope._owner_from_text("Ambiguous ops-1 or ops-2", owners.beads) is None
+
+
+def test_auto_owner_uses_registered_ancestor_when_no_session_is_available(ownership_files, tmp_path):
+    rows = [json.loads(line) for line in ownership_files[0].read_text().splitlines()]
+    next(row for row in rows if row["id"] == "ops-1")["metadata"]["agents"] = {"root_agent": "parent"}
+    ownership_files[0].write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    result = schedule_scope.assign_creation_owner(vault=tmp_path, schedule_id="new", description=None,
+        team=TEAM, agent="worker", session_id=None, contexts=[{"agent": "worker"}, {"agent": "parent"}])
+    assert result["bead"] == "ops-1" and result["source"] == "ancestor-task"
+
+
+def test_auto_owner_does_not_guess_between_conflicting_remembered_tasks(ownership_files, tmp_path):
+    data = json.loads(ownership_files[1].read_text())
+    data["schedules"].update({"old-a": {"bead": "ops-1", "owner_agent": "worker"},
+                              "old-b": {"bead": "ops-2", "owner_agent": "worker"}})
+    ownership_files[1].write_text(json.dumps(data))
+    result = schedule_scope.assign_creation_owner(vault=tmp_path, schedule_id="new", description=None,
+        team=TEAM, agent="worker", session_id=None,
+        contexts=[{"agent": "worker"}, {"agent": "parent", "texts": ["Task bead: reg-1"]}])
+    assert result["bead"] == "reg-1" and result["source"] == "ancestor-task"
+
+
+def test_auto_owner_ignores_injected_context_and_closed_tasks(ownership_files, tmp_path):
+    result = schedule_scope.assign_creation_owner(vault=tmp_path, schedule_id="new", description=None,
+        team=TEAM, agent="worker", session_id=None, contexts=[
+            {"agent": "worker", "texts": ["<obs-agent-entry-file-context>Task bead: ops-2</obs-agent-entry-file-context>", "Task bead: old-1"]},
+            {"agent": "parent", "texts": ["Task bead: ops-1"]},
+        ])
+    assert result["bead"] == "ops-1" and result["source"] == "ancestor-task"
+
+
+def test_auto_owner_session_creation_result_not_arbitrary_read(ownership_files, tmp_path):
+    path = tmp_path / "session.jsonl"
+    rows = [
+        {"type": "user", "sessionId": "ancestor", "message": {"content": "Task bead: ops-2"}},
+        {"type": "user", "sessionId": "current", "message": {"content": [{"type": "tool_result", "tool_use_id": "read", "content": "Task bead: ops-2"}]}},
+        {"type": "assistant", "sessionId": "current", "message": {"content": [{"type": "tool_use", "id": "create", "input": {"command": ".beads/bd-safe create something"}}]}},
+        {"type": "user", "sessionId": "current", "message": {"content": [{"type": "tool_result", "tool_use_id": "create", "content": "Created ops-1"}]}},
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    result = schedule_scope.assign_creation_owner(vault=tmp_path, schedule_id="new", description=None,
+        team=TEAM, agent="worker", session_id="current", contexts=[{"agent": "worker", "jsonl": path, "session_id": "current"}])
+    assert result["bead"] == "ops-1" and result["source"] == "session-task"
+
+
+def test_auto_owner_fallback_is_published_lineage_scoped_and_reused(ownership_files, tmp_path, monkeypatch):
+    calls = []
+    def backend(command, **kwargs):
+        calls.append(command)
+        rows = [json.loads(line) for line in ownership_files[0].read_text().splitlines()]
+        if command[1] == "create":
+            bid = command[command.index("--id") + 1]
+            metadata = json.loads(command[command.index("--metadata") + 1])
+            assert metadata["check"]["of"] is None and metadata["check"]["source_session"] == "session"
+            assert "orphan-check" in command[command.index("--labels") + 1]
+            assert "--priority" not in command and "--force" in command
+            rows.append({"id": bid, "status": "open", "metadata": metadata})
+        else:
+            assert command[1] == "reopen"
+            next(row for row in rows if row["id"] == command[2])["status"] = "open"
+        ownership_files[0].write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    monkeypatch.setattr(schedule_scope.subprocess, "run", backend)
+    def assign(sid, agent="worker"):
+        return schedule_scope.assign_creation_owner(vault=tmp_path, schedule_id=sid, description=None,
+            team=TEAM, agent=agent, session_id="session", contexts=[{"agent": agent}])
+    first = assign("a")
+    second = assign("b")
+    assert first["source"] == "orphan-check" and first["bead"] == second["bead"] and len(calls) == 1
+    rows = [json.loads(line) for line in ownership_files[0].read_text().splitlines()]
+    next(row for row in rows if row["id"] == first["bead"])["status"] = "closed"
+    ownership_files[0].write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    assert assign("c")["bead"] == first["bead"] and calls[-1][1] == "reopen"
+    assert assign("d", "other")["bead"] != first["bead"]
+    owners = schedule_scope.ScheduleOwnership.load(tmp_path)
+    assert not owners.creation_warnings(schedule_id="a", description=None)
+    assert owners.owners["s-adopted"]["bead"] == "reg-1"
+
+
+def test_auto_owner_atomic_failure_never_registers_false_mapping(ownership_files, tmp_path, monkeypatch):
+    before = ownership_files[1].read_bytes()
+    def fail(*args):
+        raise OSError("injected replace failure")
+    monkeypatch.setattr(schedule_scope.os, "replace", fail)
+    with pytest.raises(OSError, match="injected"):
+        schedule_scope.assign_creation_owner(vault=tmp_path, schedule_id="new", description=None,
+            team=TEAM, agent="worker", session_id=None,
+            contexts=[{"agent": "worker", "texts": ["Task bead: ops-1"]}])
+    assert ownership_files[1].read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(p.name for p in ownership_files)
+
+
+def test_concurrent_auto_owner_assignments_preserve_both_and_existing_map(ownership_files, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    data = json.loads(ownership_files[1].read_text())
+    data["_retired"] = {"old": {"note": "preserve"}}
+    ownership_files[1].write_text(json.dumps(data))
+    def assign(sid):
+        return schedule_scope.assign_creation_owner(vault=tmp_path, schedule_id=sid, description=None,
+            team=TEAM, agent="worker", session_id=None, contexts=[{"agent": "worker", "texts": ["Task bead: ops-1"]}])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert all(result["bead"] == "ops-1" for result in pool.map(assign, ["a", "b"]))
+    owners = schedule_scope.ScheduleOwnership.load(tmp_path)
+    assert set(owners.owners) == {"a", "b", "s-adopted"}
+    assert json.loads(ownership_files[1].read_text())["_retired"] == {"old": {"note": "preserve"}}
+
+
 def _sched(bot, schedule_id, route, description=""):
     bot._register_topic_schedule(
         _TopicScheduleRecord(
@@ -201,13 +416,14 @@ class TestScopedUnschedule:
         assert f"- {OTHER_TEAM}: 1" in text and f"- {TEAM}: 2" in text
 
     async def test_unreadable_owner_data_degrades_to_report(self, config, monkeypatch, tmp_path):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        root, *_ = _tree(bot)
+        _sched(bot, "s-root", root.route)
+        # Corrupt after normal registration: this tests unschedule's read-error fallback.
         bad = tmp_path / "owners.json"
         bad.write_text("{not json")
         monkeypatch.setenv("OBS_SCHEDULE_OWNERS_FILE", str(bad))
         monkeypatch.setenv("OBS_BEADS_ISSUES_FILE", str(tmp_path / "missing.jsonl"))
-        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
-        root, *_ = _tree(bot)
-        _sched(bot, "s-root", root.route)
         with patch.object(bot, "_load_tree_members", return_value=_members()):
             ctx = _make_context()
             ctx.args = ["tree"]

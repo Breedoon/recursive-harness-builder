@@ -15,6 +15,7 @@ GUARD = dt.datetime(2026, 10, 15, 19, 9, 12, tzinfo=dt.timezone.utc).timestamp()
 def inert_bot():
     bot = object.__new__(TelegramBot)
     bot._user_timezone = ZoneInfo('Europe/Warsaw')
+    bot._config = types.SimpleNamespace(vault_path=None)
     bot._schedule_retry_max_attempts = 0
     bot._schedule_retry_delay_seconds = 0
     bot._get_state = lambda *a, **kw: object()
@@ -47,7 +48,7 @@ def test_plain_default_unchanged():
 async def test_actual_api_roundtrip_and_repair_representation():
     bot=inert_bot()
     route=TelegramRoute(chat_id=-1,thread_id=1)
-    args=dict(schedule_mode='cron',cron=EXPRESSION,prompt='inert evaluator test, not weekly birth',interval_seconds=0,reset_session=True,max_runs=100000,inherit='none',until='',run_mode='',**{'from':'2026-10-15T19:09:12Z'})
+    args=dict(description='[ops-test] inert timing fixture',schedule_mode='cron',cron=EXPRESSION,prompt='inert evaluator test, not weekly birth',interval_seconds=0,reset_session=True,max_runs=100000,inherit='none',until='',run_mode='',**{'from':'2026-10-15T19:09:12Z'})
     with patch('obs_agent.telegram.time.time',return_value=GUARD-86400):
         result=await bot._cron_create(route=route,args=args)
     assert 'is_error' not in result

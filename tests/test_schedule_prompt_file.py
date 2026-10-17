@@ -160,7 +160,8 @@ class TestCronCreate:
         with patch.object(bot, "_send_system_message", new=AsyncMock()):
             result = await bot._cron_create(
                 route=route,
-                args={"schedule_mode": "interval", "interval_seconds": 60, "prompt_file": str(memory)},
+                args={"schedule_mode": "interval", "interval_seconds": 60, "prompt_file": str(memory),
+                      "description": "[ops-test] prompt-file fixture"},
             )
         assert not result.get("is_error"), result
         created = [r for r in bot._topic_schedules_by_id.values() if r.route == route]

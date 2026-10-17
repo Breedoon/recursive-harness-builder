@@ -23,10 +23,17 @@ Scopes (Daniel, 2026-10-15, bead vault-maw0):
 
 from __future__ import annotations
 
+import datetime as dt
+import fcntl
+import hashlib
 import json
 import logging
 import os
 import re
+import subprocess
+import tempfile
+
+from obs_agent import start_step
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -138,7 +145,7 @@ class ScheduleOwnership:
         return (str(bead) if bead else None), adoption
 
     def creation_warnings(self, *, schedule_id: str, description: str | None) -> list[str]:
-        """B7 is warning-only; either a prefix or an adoption mapping establishes ownership."""
+        """Diagnose invalid explicit ownership or legacy mappings after automatic assignment."""
         bead_id, _ = self.owner_of(schedule_id=schedule_id, description=description)
         rule = "Agent Operations schedule ownership rule (Scheduler steps 3–4)"
         if not bead_id:
@@ -162,6 +169,124 @@ class ScheduleOwnership:
         if tree and owner_team and owner_team != tree:
             return Protection(True, bead_id, f"owned by tree {owner_team}")
         return Protection(False, bead_id, "owned by this tree's own work")
+
+
+def _owner_from_text(text: str, beads: dict[str, dict]) -> str | None:
+    text = start_step.strip_injected_context(text)
+    known = frozenset(bid for bid, row in beads.items() if row.get("status") != "closed")
+    bead_pattern = r"([a-z][a-z0-9]*-[a-z0-9]{1,8}(?:\.[0-9]+)*)"
+    for head in (r"\blane(?:\s+bead)?", r"\btask(?:\s+bead)?", r"\bbead(?:\s+id)?",
+                 r"briefs/(?:\d{4}-\d{2}/)?"):
+        for match in re.finditer(head + r"[\s:`*\"'=]*" + bead_pattern, text, re.IGNORECASE):
+            if match.group(1) in known:
+                return match.group(1)
+    ids = start_step.find_bead_ids(text, known)
+    return next(iter(ids)) if len(ids) == 1 else None
+
+
+def _ensure_orphan_check(vault: Path, owners: ScheduleOwnership, *, team: str,
+                         agent: str, session_id: str | None) -> str:
+    scope = f"{team}/{agent}"
+    bid = "ops-" + hashlib.sha256(scope.encode()).hexdigest()[:8]
+    row = owners.beads.get(bid)
+    if row and (row.get("metadata") or {}).get("schedule_owner_scope") != scope:
+        raise ValueError("schedule owner check id collision")
+    command = [str(vault / ".beads" / "bd-safe")]
+    if row:
+        if row.get("status") != "closed":
+            return bid
+        command += ["reopen", bid, "--reason", "New prefix-less schedule needs this lineage ownership check"]
+    else:
+        due = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        what = f"Resolve schedule ownership for {agent} in lineage tree {team}"
+        metadata = {"owner_team": team, "schedule_owner_scope": scope,
+                    "check": {"kind": "delayed-verification", "of": None, "class": "script",
+                              "series": 1, "n": 1, "of_n": 1, "due": due, "methods": [],
+                              "what": what, "source_agent": agent, "source_session": session_id}}
+        description = (f"Schedule registration automatically created this lineage-scoped orphan check because "
+                       f"no open task owner was found for agent {agent} or its ancestors in tree {team}. "
+                       f"Source session: {session_id}. Inspect its schedules and assign a substantive "
+                       "task/responsibility owner; do not delete useful work just for missing registration.\n"
+                       "priority-authority: none — tooling default, do not trust")
+        command += ["create", "--force", "--id", bid, "--title", what, "--type", "chore",
+                    "--labels", "check,check-class:script,orphan-check,schedule-owner",
+                    "--defer", due, "--description", description, "--metadata", json.dumps(metadata), "--json"]
+    subprocess.run(command, cwd=vault, check=True, capture_output=True, text=True, timeout=60)
+    persisted = ScheduleOwnership.load(vault).beads.get(bid)
+    if not persisted or persisted.get("status") == "closed":
+        raise RuntimeError("schedule ownership check was not published by bd-safe")
+    return bid
+
+
+def assign_creation_owner(*, vault: Path, schedule_id: str, description: str | None,
+                          team: str, agent: str, session_id: str | None,
+                          contexts: list[dict]) -> dict | None:
+    """Assign before schedule registration; no policy refusal or confirmation gate."""
+    if _PREFIX.match(description or ""):
+        return None
+    path = Path(os.environ.get("OBS_SCHEDULE_OWNERS_FILE") or (vault / OWNERS_RELATIVE_PATH))
+    lock_name = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
+    # Empty, ephemeral mutex only; durable evidence remains in Beads and the owners map.
+    with open(Path(tempfile.gettempdir()) / f"obs-schedule-owner-{lock_name}.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        owners = ScheduleOwnership.load(vault)
+        bid = None
+        source = "orphan-check"
+        owner_agent = agent
+        for context in contexts:
+            name = context["agent"]
+            texts = list(context.get("texts") or [])
+            if context.get("jsonl"):
+                texts += list(start_step.transcript_bead_contexts(
+                    context["jsonl"], session_id=context.get("session_id")))[::-1]
+            for text in texts:
+                bid = _owner_from_text(text, owners.beads)
+                if bid:
+                    break
+            if not bid:
+                remembered = {entry["bead"] for entry in owners.owners.values()
+                              if entry.get("owner_agent") == name and entry.get("bead") in owners.beads
+                              and owners.beads[entry["bead"]].get("status") != "closed"}
+                bid = next(iter(remembered)) if len(remembered) == 1 else None
+            if not bid:
+                registered = {key for key, row in owners.beads.items()
+                              if row.get("status") != "closed" and
+                              ((row.get("metadata") or {}).get("agents") or {}).get("root_agent") == name}
+                bid = next(iter(registered)) if len(registered) == 1 else None
+            if bid:
+                owner_agent = name
+                source = ("orphan-check" if (owners.beads[bid].get("metadata") or {}).get("schedule_owner_scope")
+                          else context.get("source") or ("session-task" if name == agent else "ancestor-task"))
+                break
+        if not bid:
+            bid = _ensure_orphan_check(vault, owners, team=team, agent=agent, session_id=session_id)
+        data = json.loads(path.read_text()) if path.exists() else {"schedules": {}}
+        note = f"Schedule ownership automatically assigned {bid} from {source} ({owner_agent})"
+        data.setdefault("schedules", {})[schedule_id] = {
+            "bead": bid, "owner_team": team, "owner_agent": owner_agent, "note": note,
+        }
+        # Preserve register.py's one-entry-per-line owners-map representation.
+        blocks = []
+        for key, value in data.items():
+            if isinstance(value, dict):
+                items = [f"    {json.dumps(k)}: {json.dumps(v, ensure_ascii=False)}" for k, v in value.items()]
+                blocks.append(f"  {json.dumps(key)}: {{\n" + ",\n".join(items) + ("\n" if items else "") + "  }")
+            else:
+                blocks.append(f"  {json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}")
+        text = "{\n" + ",\n".join(blocks) + "\n}\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pending_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as pending:
+                pending_path = Path(pending.name)
+                pending.write(text)
+                pending.flush()
+                os.fsync(pending.fileno())
+            os.replace(pending_path, path)
+        finally:
+            if pending_path is not None:
+                pending_path.unlink(missing_ok=True)
+        return {"bead": bid, "source": source, "agent": owner_agent, "note": note}
 
 
 def format_unschedule_report(

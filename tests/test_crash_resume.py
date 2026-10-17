@@ -616,7 +616,8 @@ async def test_outage_inbox_messages_stay_unread_after_crash(config):
     restored = _bot(config)
     await restored.initialize_runtime()
     items = json.loads(inbox.read_text())
-    assert [i["read"] for i in items] == [True, False]
+    # B9: recovery is not consumption, including unread reports from before the outage.
+    assert [i["read"] for i in items] == [False, False]
     assert restored._inbox_wake_floor < restored._daemon_started_at
     latest = restored._latest_unread_team_inbox_message(team_name=rec.team_name, agent_name=rec.agent_name)
     assert latest is not None and latest[2] == "sent during outage"

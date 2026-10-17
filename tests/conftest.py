@@ -208,8 +208,24 @@ def fixture_vault(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def config(fixture_vault: Path) -> OBSConfig:
-    """OBSConfig pointing at the fixture vault."""
+def config(fixture_vault: Path, monkeypatch) -> OBSConfig:
+    """OBSConfig pointing at the fixture vault; unit bots never call the live Beads backend."""
+    import hashlib
+    import json
+    from obs_agent import schedule_scope
+
+    def orphan_check(vault, owners, *, team, agent, session_id):
+        scope = f"{team}/{agent}"
+        bid = "ops-" + hashlib.sha256(scope.encode()).hexdigest()[:8]
+        path = Path(os.environ.get("OBS_BEADS_ISSUES_FILE") or (vault / ".beads" / "issues.jsonl"))
+        rows = {r["id"]: r for r in (json.loads(line) for line in path.read_text().splitlines())} if path.exists() else {}
+        rows[bid] = {"id": bid, "status": "open", "labels": ["check", "orphan-check"],
+                     "metadata": {"owner_team": team, "schedule_owner_scope": scope}}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(row) for row in rows.values()) + "\n")
+        return bid
+
+    monkeypatch.setattr(schedule_scope, "_ensure_orphan_check", orphan_check)
     return OBSConfig(
         vault_path=fixture_vault,
         telegram_allowed_user_ids=[12345],

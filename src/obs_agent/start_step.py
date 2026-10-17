@@ -93,13 +93,17 @@ def strip_injected_context(text: str) -> str:
 
 def transcript_has_bead(jsonl_path: Path | None, known: frozenset[str],
                         session_id: str | None = None) -> bool:
-    """Only explicit user prompts or the result of this session's bead creation count.
+    return any(find_bead_ids(text, known)
+               for text in transcript_bead_contexts(jsonl_path, session_id=session_id))
 
-    Fork-copied ancestor rows and arbitrary read/search/tool output are not registration.
-    Decode JSON before stripping injected XML: raw JSON escapes its multiline contents.
+
+def transcript_bead_contexts(jsonl_path: Path | None, session_id: str | None = None):
+    """Yield explicit prompts and this session's creation results, never arbitrary tool reads.
+
+    Decode JSON before stripping injected XML; copied ancestor rows do not qualify.
     """
-    if jsonl_path is None or not known:
-        return False
+    if jsonl_path is None:
+        return
     creation_calls: set[str] = set()
     try:
         size = Path(jsonl_path).stat().st_size
@@ -127,8 +131,7 @@ def transcript_has_bead(jsonl_path: Path | None, known: frozenset[str],
                 if row.get("type") != "user":
                     continue
                 if isinstance(content, str):
-                    if find_bead_ids(strip_injected_context(content), known):
-                        return True
+                    yield strip_injected_context(content)
                 elif isinstance(content, list):
                     for block in content:
                         if not isinstance(block, dict):
@@ -140,11 +143,9 @@ def transcript_has_bead(jsonl_path: Path | None, known: frozenset[str],
                             text = json.dumps(block.get("content"), ensure_ascii=False)
                         else:
                             continue
-                        if find_bead_ids(strip_injected_context(text), known):
-                            return True
+                        yield strip_injected_context(text)
     except OSError:
-        return False
-    return False
+        return
 
 
 def is_root(lineage) -> bool:

@@ -1834,6 +1834,8 @@ class TelegramBot:
                     started,
                     entry.next_run_at,
                 )
+            if record.enabled and not self._schedule_is_exhausted(record, time.time()):
+                self._ensure_topic_schedule_owner(record)
             self._topic_schedules_by_id[record.schedule_id] = record
             self._schedule_ids_by_route.setdefault(route, set()).add(record.schedule_id)
 
@@ -3769,8 +3771,43 @@ class TelegramBot:
             prompt_file=record.prompt_file,
         )
 
+    def _ensure_topic_schedule_owner(self, record: _TopicScheduleRecord, *, inherited_from=None):
+        if _schedule_scope._PREFIX.match(record.description or ""):
+            return None
+        owners = _schedule_scope.ScheduleOwnership.load(self._config.vault_path)
+        bead, _ = owners.owner_of(schedule_id=record.schedule_id, description=record.description)
+        if bead in owners.beads and owners.beads[bead].get("status") != "closed":
+            return None
+        state = self._get_state(record.route, create=False)
+        if state is not None:
+            team, agent, contexts = self._schedule_owner_contexts(state)
+        else:
+            team, agent = self._route_inbox_target_keys_by_route.get(
+                record.route, (f"route-{record.route.chat_id}", f"route-{record.route.chat_id}-{record.route.thread_id}"))
+            contexts = []
+        if inherited_from is not None:
+            parent_bead, parent_entry = owners.owner_of(
+                schedule_id=inherited_from.schedule_id, description=inherited_from.description)
+            if parent_bead in owners.beads and owners.beads[parent_bead].get("status") != "closed":
+                contexts.insert(0, {"agent": parent_entry.get("owner_agent") or agent,
+                                   "texts": [f"Task bead: {parent_bead}"], "source": "inherited-owner"})
+                if state is None:
+                    team = parent_entry.get("owner_team") or team
+        texts = [record.prompt]
+        if record.prompt_file:
+            try:
+                texts.append(self._read_schedule_prompt_file(record.prompt_file))
+            except OSError:
+                pass  # The existing fire-time prompt-file error remains separate from ownership.
+        contexts.append({"agent": agent, "texts": texts, "source": "schedule-prompt"})
+        return _schedule_scope.assign_creation_owner(
+            vault=self._config.vault_path, schedule_id=record.schedule_id, description=record.description,
+            team=team, agent=agent, session_id=state.session_id if state is not None else None, contexts=contexts)
+
     def _register_topic_schedule(self, record: _TopicScheduleRecord) -> None:
         previous = self._topic_schedules_by_id.get(record.schedule_id)
+        if previous is None:
+            self._ensure_topic_schedule_owner(record)
         if previous is not None and previous.route != record.route:
             schedule_ids = self._schedule_ids_by_route.get(previous.route)
             if schedule_ids is not None:
@@ -3870,6 +3907,7 @@ class TelegramBot:
                         exc_info=True,
                     )
                     continue
+            self._ensure_topic_schedule_owner(child_record, inherited_from=parent_record)
             self._register_topic_schedule(child_record)
 
     def _schedule_summary_payload(self, record: _TopicScheduleRecord) -> dict[str, Any]:
@@ -3895,6 +3933,30 @@ class TelegramBot:
         if record.last_error:
             payload["last_error"] = record.last_error
         return payload
+
+    def _schedule_owner_contexts(self, state: TelegramSessionState):
+        context = self._current_tree_context(state)
+        if context is None:
+            team = agent = f"route-{state.route.chat_id}-{state.route.thread_id}"
+            lineage = ()
+        else:
+            team, agent, lineage = context
+        names = [agent] + [agent_name_for_lineage(lineage[:n], team_key=team)
+                           for n in range(len(lineage) - 1, 0, -1)]
+        contexts = []
+        for name in dict.fromkeys(names):
+            current = state if name == agent else self._resolve_existing_tree_state(
+                team_name=team, agent_name=name)
+            record = self._resolve_team_worker_record(team_name=team, agent_name=name)
+            sid = current.session_id if current is not None else (record.child_session_id if record else None)
+            texts = []
+            if current is not None and current.inflight_user_text:
+                texts.append(current.inflight_user_text)
+            if record is not None:
+                texts.extend(text for text in (record.prompt, record.prompt_file_content) if text)
+            contexts.append({"agent": name, "session_id": sid, "texts": texts,
+                             "jsonl": find_session_jsonl(session_id=sid, cwd=self._config.vault_path) if sid else None})
+        return team, agent, contexts
 
     async def _cron_create(
         self,
@@ -4031,6 +4093,7 @@ class TelegramBot:
                 record.next_run_at = self._next_timed_run_at(record, base_ts=now)
             except ValueError as exc:
                 return self._cron_error_result(f"CronCreate failed: invalid cron expression: {exc}")
+        owner_assignment = await asyncio.to_thread(self._ensure_topic_schedule_owner, record)
         self._register_topic_schedule(record)
 
         bot = self._bot_for_state(state)
@@ -4056,6 +4119,7 @@ class TelegramBot:
         payload = {
             "schedule": self._schedule_summary_payload(record),
             "warnings": warnings,
+            "owner_assignment": owner_assignment,
         }
         return self._cron_ok_result(payload)
 
