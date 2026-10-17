@@ -133,6 +133,13 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
      snippets; it never prints the OAuth token the direct-probe scenarios send.
      Its per-scenario `.txt` files also keep the harness's stderr, which is not
      filtered, so run them through `scripts/redact.sh` before quoting them.
+   - CLIProxyAPI's own `API REQUEST`/`API RESPONSE` logs can contain unredacted
+     upstream credentials and account identifiers. Match them to the original incoming
+     wire SHA-256, not just timestamps, and derive equality/numeric summaries locally.
+     Never copy secret header values or credential hashes into reports. Equality of
+     sanitized cache-proxy headers alone is not proof of upstream account/auth equality.
+     Actual translated input-prefix/key/header equality plus response usage can locate a
+     miss beyond the translation boundary without proving the provider's internal reason.
 1. **Know the mechanism from real bytes.** If you are fixing a miss, find it in
    the request log (`/workspace/runtime/logs/cache-proxy/requests`) and run
    `.venv/bin/python scripts/prefix_diff.py <earlier req id> <later req id>`
@@ -155,7 +162,13 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
    their stored OAuth credentials (an auth-only failure is not cache evidence).
    The full dual-route suite can exceed a ten-minute tool deadline; run it detached
    with persistent output if necessary. Partial results without a final `gate.json`
-   are not a completed gate. Always give a scratch or test proxy its own `CACHE_PROXY_LOG_DIR`:
+   are not a completed gate. Independent fresh harness conversations seed a nonce in
+   their FIRST user message: cache identity is model-plus-first-message, not the raw
+   SDK session UUID. Resume, recovery and fork keep that copied first nonce unchanged;
+   never regenerate it per turn/child or put it in tools/system. This isolates unrelated
+   tests' cache/pin contexts; it is not a claim that a nonce explains an earlier provider
+   miss, nor permission to relax any threshold or failure-shape rule.
+   Always give a scratch or test proxy its own `CACHE_PROXY_LOG_DIR`:
    agent shells inherit the production value from the OBS daemon, and on
    2026-10-12 test proxies that did not override it wrote about 320 rows into
    the production `usage.jsonl` and the production `effort-pins.json` (unit

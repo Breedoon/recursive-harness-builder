@@ -151,9 +151,16 @@ async def _turn(client, prompt, *, stop_on_tool_use=False):
     return "eof"
 
 
+def _initial_user_prompt(prompt, session_id=None):
+    # Independent roots must not share the model+first-message cache/pin namespace.
+    return f"{prompt}\n\n[cache-regression fixture: {session_id or uuid.uuid4()}]"
+
+
 async def _session(args, prompts, **kw):
     async with ClaudeSDKClient(options=_options(args, **kw)) as client:
-        for p in prompts:
+        for i, p in enumerate(prompts):
+            if i == 0 and not kw.get("resume"):
+                p = _initial_user_prompt(p, kw.get("session_id"))
             await _turn(client, p)
         # let the CLI flush its JSONL before the process is torn down
         await asyncio.sleep(float(os.environ.get("PREFIX_REPRO_SETTLE", "0")))
@@ -293,7 +300,7 @@ async def sc_reminder_block(args):
 async def sc_queued_midturn(args):
     sid = str(uuid.uuid4())
     async with ClaudeSDKClient(options=_options(args, session_id=sid)) as client:
-        await _turn(client, "Reply with the single word: ready.")
+        await _turn(client, _initial_user_prompt("Reply with the single word: ready.", sid))
         await client.query("Run the Bash command `sleep 8 && echo slept`, then reply with the single word: done.")
         await asyncio.sleep(3)  # mid-tool: OBS delivers queued notifications exactly like this
         await client.query("[Queued message from user]: (System notification: New teammate messages "
@@ -375,7 +382,7 @@ async def sc_recovery(args):
     client = ClaudeSDKClient(options=_options(args, session_id=sid))
     await client.connect()
     try:
-        await _turn(client, "Reply with the single word: ready.")
+        await _turn(client, _initial_user_prompt("Reply with the single word: ready.", sid))
         await _turn(client, "Reply with the single word: two.")
         # leave a tool_use in flight, then kill the CLI (crash / restart / 401 death)
         r = await _turn(client, "Say the word 'starting' and then run the Bash command `sleep 60`.",
@@ -458,7 +465,7 @@ async def sc_recovery_multi(args):
     client = ClaudeSDKClient(options=_options(args, session_id=sid))
     await client.connect()
     try:
-        await _turn(client, "Reply with the single word: ready.")
+        await _turn(client, _initial_user_prompt("Reply with the single word: ready.", sid))
         await client.query(
             "Do these steps in order without pausing: (1) say 'working', (2) in ONE message call the "
             f"Read tool on a.txt and b.txt in parallel, (3) run Bash `echo step3 >> {effect_path.name}`, "
