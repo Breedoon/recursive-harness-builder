@@ -107,8 +107,8 @@ def reconcile_stale_demands() -> dict[str, Any]:
 def _validate_transcript(path: Path, correlation_id: str) -> None:
     if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
         raise RuntimeError("GPU child produced no complete transcript")
+    statuses = {'transcription_status: "ok"', 'transcription_status: "degraded"'}
     expected = {
-        'transcription_status: "ok"',
         f'correlation_id: "{correlation_id}"',
         f'model: "{MODEL_SNAPSHOT}"',
         'device: "cuda"',
@@ -121,7 +121,9 @@ def _validate_transcript(path: Path, correlation_id: str) -> None:
             value = line.rstrip("\r\n")
             if value in expected:
                 found.add(value)
-    missing = expected - found
+            elif value in statuses:
+                found.add("transcription_status")
+    missing = (expected | {"transcription_status"}) - found
     if missing:
         raise RuntimeError(f"GPU child transcript is incomplete: {sorted(missing)}")
 
@@ -207,6 +209,15 @@ def transcribe(audio_arg: str, title_arg: str, dest_arg: str) -> dict[str, Any]:
                 "OBS_TRANSCRIPTION_COMPUTE_TYPE": "float16",
                 "OBS_TRANSCRIPTION_BEAM_SIZE": "1",
                 "OBS_TRANSCRIPTION_VAD_FILTER": "1",
+                "OBS_TRANSCRIPTION_CONDITION_ON_PREVIOUS_TEXT": "0",
+                "OBS_TRANSCRIPTION_TEMPERATURES": "0.0,0.2,0.4",
+                "OBS_TRANSCRIPTION_NO_SPEECH_THRESHOLD": "0.6",
+                "OBS_TRANSCRIPTION_LOG_PROB_THRESHOLD": "-1.0",
+                "OBS_TRANSCRIPTION_COMPRESSION_RATIO_THRESHOLD": "2.4",
+                "OBS_TRANSCRIPTION_VAD_THRESHOLD": "0.5",
+                "OBS_TRANSCRIPTION_VAD_MIN_SPEECH_MS": "250",
+                "OBS_TRANSCRIPTION_VAD_MIN_SILENCE_MS": "2000",
+                "OBS_TRANSCRIPTION_VAD_SPEECH_PAD_MS": "200",
                 "OBS_TRANSCRIPTION_GPU_LOCK": str(LOCK_PATH),
                 "OBS_TRANSCRIPTION_ALLOW_CPU_FALLBACK": "0",
                 "HF_HUB_OFFLINE": "1",

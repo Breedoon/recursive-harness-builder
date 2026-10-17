@@ -373,7 +373,7 @@ _FAKE_TRANSCRIBER = (
     "device = os.environ.get('OBS_TRANSCRIPTION_DEVICE', 'cuda')\n"
     "compute = os.environ.get('OBS_TRANSCRIPTION_COMPUTE_TYPE', 'float16')\n"
     "Path(sys.argv[3], sys.argv[2] + '.md').write_text(\n"
-    "    'transcription_status: \"ok\"\\n'\n"
+    "    'transcription_status: \"{status}\"\\n'\n"
     "    f'correlation_id: \"{{cid}}\"\\n'\n"
     "    f'device: \"{{device}}\"\\n'\n"
     "    f'compute_type: \"{{compute}}\"\\n'\n"
@@ -381,8 +381,12 @@ _FAKE_TRANSCRIBER = (
 )
 
 
-def _write_fake(path: Path, *, kind: str, sleep: float = 0.0, fail: bool = False) -> Path:
-    path.write_text(_FAKE_TRANSCRIBER.format(kind=kind, sleep=sleep, fail=fail), encoding="utf-8")
+def _write_fake(
+    path: Path, *, kind: str, sleep: float = 0.0, fail: bool = False, status: str = "ok"
+) -> Path:
+    path.write_text(
+        _FAKE_TRANSCRIBER.format(kind=kind, sleep=sleep, fail=fail, status=status), encoding="utf-8"
+    )
     path.chmod(0o700)
     return path
 
@@ -410,6 +414,7 @@ class TestVoiceTranscriptionFallback:
         gpu_fail: bool = False,
         cpu_fail: bool = False,
         budget: float = 5.0,
+        gpu_status: str = "ok",
     ) -> TelegramInboundNormalizer:
         markers = tmp_path / "markers"
         markers.mkdir(exist_ok=True)
@@ -419,7 +424,7 @@ class TestVoiceTranscriptionFallback:
         instance = TelegramInboundNormalizer(
             temp_root=tmp_path / "obs-agent",
             transcription_script=_write_fake(
-                tmp_path / "gpu.py", kind="gpu", sleep=gpu_sleep, fail=gpu_fail
+                tmp_path / "gpu.py", kind="gpu", sleep=gpu_sleep, fail=gpu_fail, status=gpu_status
             ),
             cpu_python=Path(sys.executable),
             cpu_script=_write_fake(tmp_path / "cpu.py", kind="cpu", fail=cpu_fail),
@@ -439,6 +444,24 @@ class TestVoiceTranscriptionFallback:
         assert "gpu words" in out.agent_text
         assert out.user_warnings == []
         assert self._ran(tmp_path) == {"gpu"}
+
+    async def test_degraded_transcript_is_delivered_not_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # vault-g7h: "degraded" (no speech despite audio energy) is complete; pass it through.
+        n = self._normalizer(tmp_path, monkeypatch, gpu_status="degraded")
+        out = await n.normalize_update(_make_update(_voice_message(7, "g")))
+        assert 'transcription_status: "degraded"' in out.agent_text
+        assert out.attachments[0].transcription_error is None
+        assert self._ran(tmp_path) == {"gpu"}
+
+    async def test_unknown_status_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        n = self._normalizer(tmp_path, monkeypatch, gpu_status="failed")
+        out = await n.normalize_update(_make_update(_voice_message(8, "h")))
+        assert "gpu words" not in out.agent_text
+        assert self._ran(tmp_path) == {"gpu", "cpu"}
 
     async def test_gpu_busy_goes_straight_to_cpu(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         n = self._normalizer(tmp_path, monkeypatch, gpu_ready=False)

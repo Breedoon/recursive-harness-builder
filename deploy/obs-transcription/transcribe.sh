@@ -268,7 +268,7 @@ compute_ok=0
 heading_ok=0
 while IFS= read -r line; do
   case "$line" in
-    'transcription_status: "ok"') status_ok=1 ;;
+    'transcription_status: "ok"'|'transcription_status: "degraded"') status_ok=1 ;;
     "correlation_id: \"$CORRELATION_ID\"") correlation_ok=1 ;;
     "model: \"$MODEL_SNAPSHOT\"") model_ok=1 ;;
     'device: "cuda"') device_ok=1 ;;

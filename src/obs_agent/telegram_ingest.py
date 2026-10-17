@@ -599,12 +599,13 @@ class TelegramInboundNormalizer:
                 raise RuntimeError("CPU transcription exited without a transcript")
             transcript = transcript_path.read_text(encoding="utf-8", errors="strict")
             required = (
-                'transcription_status: "ok"',
                 f'correlation_id: "{correlation_id}"',
                 'device: "cpu"',
                 "# Transcript",
             )
-            if any(value not in transcript for value in required):
+            if any(value not in transcript for value in required) or not _has_complete_status(
+                transcript
+            ):
                 transcript_path.unlink(missing_ok=True)
                 raise RuntimeError("CPU transcription returned an incomplete transcript")
         finally:
@@ -732,13 +733,14 @@ class TelegramInboundNormalizer:
 
             transcript = transcript_path.read_text(encoding="utf-8", errors="strict")
             required = (
-                'transcription_status: "ok"',
                 f'correlation_id: "{correlation_id}"',
                 'device: "cuda"',
                 'compute_type: "float16"',
                 "# Transcript",
             )
-            if any(value not in transcript for value in required):
+            if any(value not in transcript for value in required) or not _has_complete_status(
+                transcript
+            ):
                 transcript_path.unlink(missing_ok=True)
                 raise RuntimeError("GPU transcription returned an incomplete transcript")
         finally:
@@ -884,6 +886,15 @@ async def _flock_wait(handle: Any, *, timeout: float) -> None:
                     f"transcription slot still busy after {timeout:.0f} seconds"
                 ) from None
             await asyncio.sleep(0.5)
+
+
+def _has_complete_status(transcript: str) -> bool:
+    # "degraded" is a complete transcript that carries its own warning (vault-g7h): the
+    # model produced no speech although the audio has energy. Pass it through rather than
+    # retrying the same decode on another device.
+    return any(
+        f'transcription_status: "{status}"' in transcript for status in ("ok", "degraded")
+    )
 
 
 def _normalize_whitespace(text: str) -> str:
