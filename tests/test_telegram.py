@@ -668,6 +668,72 @@ class TestTelegramMessageFlow:
         lines = (project_dir / f"{state.session_id}.jsonl").read_text(encoding="utf-8").splitlines()
         assert [json.loads(line)["uuid"] for line in lines] == ["u1", "aT"]
 
+    def _missing_binding_fixture(self, config, tmp_path, monkeypatch, *, head):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        project_dir = tmp_path / ".claude" / "projects" / "-fixture"
+        project_dir.mkdir(parents=True)
+        sid = "sid-ghost"
+
+        def row(kind, uid, parent, content):
+            message = {"role": kind, "content": content}
+            if kind == "assistant":
+                message.update({"model": "gpt-5.5", "id": "msg_" + uid, "stop_reason": "end_turn"})
+            return json.dumps({"type": kind, "uuid": uid, "parentUuid": parent, "sessionId": sid, "message": message})
+
+        (project_dir / f"{sid}.jsonl").write_text(
+            "\n".join([
+                row("user", "u1", None, "start"),
+                row("assistant", "a1", "u1", [{"type": "text", "text": "one"}]),
+                row("user", "u2", "a1", "next"),
+                row("assistant", "a2", "u2", [{"type": "text", "text": "two"}]),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        state = _state(bot)
+        state.session_manager.set_session_id(sid)
+        bot._bind_state_session(state)
+        bot._set_session_head(session_id=sid, jsonl_uuid=head)
+        # Bindings to streamed uuids the CLI never persisted (prod 391028, 4a470eb9).
+        bot._record_message_binding(route=state.route, message_id=100, jsonl_uuid="ghost-old", session_id=sid, role="assistant")
+        bot._record_message_binding(route=state.route, message_id=101, jsonl_uuid="ghost-latest", session_id=sid, role="assistant")
+        return bot, state, project_dir, sid
+
+    async def test_reply_to_message_with_unpersisted_uuid_is_refused_not_retargeted(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        # G1 verifier r5 F11 (vault-w0eg): the bound uuid is missing from the JSONL;
+        # forking the resolver's substitute (a2) would silently re-target the reply.
+        bot, state, project_dir, sid = self._missing_binding_fixture(config, tmp_path, monkeypatch, head="a2")
+        bot._send_system_message = AsyncMock()
+        trigger = QueuedMessage(text="reply", telegram_message_id=200, reply_to_message_id=100)
+        proceed, _ = await bot._resolve_session_for_trigger(
+            state=state, trigger_message=trigger, bot=MagicMock(send_message=AsyncMock()),
+        )
+        assert proceed is False
+        assert state.session_id == sid
+        assert sorted(p.stem for p in project_dir.glob("*.jsonl")) == [sid]
+        texts = [call.kwargs.get("text") for call in bot._send_system_message.await_args_list]
+        assert "can't fork from this message" in texts
+
+    async def test_reply_to_latest_message_with_unpersisted_uuid_continues_session(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        bot, state, project_dir, sid = self._missing_binding_fixture(config, tmp_path, monkeypatch, head="ghost-latest")
+        trigger = QueuedMessage(text="reply", telegram_message_id=200, reply_to_message_id=101)
+        proceed, _ = await bot._resolve_session_for_trigger(
+            state=state, trigger_message=trigger, bot=MagicMock(send_message=AsyncMock()),
+        )
+        assert proceed is True
+        assert state.session_id == sid
+        assert sorted(p.stem for p in project_dir.glob("*.jsonl")) == [sid]
+
     async def test_run_start_recovers_silent_dangling_user_tail_before_runner(
         self,
         config,

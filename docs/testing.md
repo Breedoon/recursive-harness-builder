@@ -67,7 +67,10 @@ the head to the latest safe boundary. A reply to the message bound to a stale
 head is therefore not a reply to the latest message: it forks that message
 (test `test_reply_to_message_at_stale_head_forks_that_message`).
 Since vault-w0eg, `fork_session_jsonl` raises `KeyError` for a target UUID that
-is not in the file, and `resolve_safe_jsonl_target` resolves a row on a
+is not in the file. A reply to a message whose bound uuid is missing from the
+JSONL (a streamed uuid the CLI never persisted) is refused with "can't fork from
+this message" rather than forking the resolver's substitute; a reply to the
+latest such message continues the session. `resolve_safe_jsonl_target` resolves a row on a
 non-active branch on that branch's own chain (`SafeJsonlTarget.branch_health`),
 also when the row is unsafe there: it then recovers to that branch's last safe
 boundary (reason `preferred_uuid_unsafe`). Only a branch that cannot be analyzed
