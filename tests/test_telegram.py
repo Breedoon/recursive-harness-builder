@@ -459,6 +459,7 @@ class TestTelegramMessageFlow:
                                 "role": "assistant",
                                 "model": "gpt-5.5",
                                 "content": [{"type": "text", "text": "safe"}],
+                                "stop_reason": "end_turn",
                             },
                         }
                     ),
@@ -533,12 +534,14 @@ class TestTelegramMessageFlow:
 
         assert state.session_id is not None
         assert state.session_id != "sid-poisoned"
-        assert bot._session_heads["sid-poisoned"] == "a-safe"
+        # obs-6: since 3ae5ea1 the persisted request u2 is the recovery boundary
+        # (a plain user row is never replaced on recovery); was a-safe.
+        assert bot._session_heads["sid-poisoned"] == "u2"
         assert bot._session_heads[state.session_id] == "a-new"
         recovered_path = project_dir / f"{state.session_id}.jsonl"
         assert recovered_path.exists()
         recovered_lines = recovered_path.read_text(encoding="utf-8").splitlines()
-        assert len(recovered_lines) == 2
+        assert len(recovered_lines) == 3
         assert all("Prompt is too long" not in line for line in recovered_lines)
 
     async def test_run_start_recovers_silent_dangling_user_tail_before_runner(
@@ -573,6 +576,7 @@ class TestTelegramMessageFlow:
                                 "role": "assistant",
                                 "model": "claude-opus-4-7",
                                 "content": [{"type": "text", "text": "safe"}],
+                                "stop_reason": "end_turn",
                             },
                         }
                     ),
@@ -642,12 +646,14 @@ class TestTelegramMessageFlow:
 
         assert state.session_id is not None
         assert state.session_id != "sid-silent"
-        assert bot._session_heads["sid-silent"] == "a-safe"
+        # obs-6: the persisted request u-dead is kept; only the empty answer is
+        # dropped (was a-safe, 2 lines).
+        assert bot._session_heads["sid-silent"] == "u-dead"
         assert bot._session_heads[state.session_id] == "a-new"
         recovered_path = project_dir / f"{state.session_id}.jsonl"
         recovered_lines = recovered_path.read_text(encoding="utf-8").splitlines()
-        assert len(recovered_lines) == 2
-        assert all("u-dead" not in line and "a-empty" not in line for line in recovered_lines)
+        assert len(recovered_lines) == 3
+        assert all("a-empty" not in line for line in recovered_lines)
 
     def test_fork_source_resolution_uses_safe_uuid_instead_of_latest_poison(
         self,
@@ -680,6 +686,7 @@ class TestTelegramMessageFlow:
                                 "role": "assistant",
                                 "model": "gpt-5.5",
                                 "content": [{"type": "text", "text": "safe"}],
+                                "stop_reason": "end_turn",
                             },
                         }
                     ),
@@ -721,7 +728,8 @@ class TestTelegramMessageFlow:
             preferred_route=route,
         )
 
-        assert resolved_uuid == "a-safe"
+        # obs-6: recovery boundary is the persisted request u2 (was a-safe).
+        assert resolved_uuid == "u2"
         assert resolved_route == route
         assert message_id is None
 
@@ -756,6 +764,7 @@ class TestTelegramMessageFlow:
                                 "role": "assistant",
                                 "model": "claude-opus-4-7",
                                 "content": [{"type": "text", "text": "safe"}],
+                                "stop_reason": "end_turn",
                             },
                         }
                     ),
@@ -796,7 +805,9 @@ class TestTelegramMessageFlow:
             preferred_route=route,
         )
 
-        assert resolved_uuid == "a-safe"
+        # obs-6: the persisted request u-dead is kept, the empty answer is not
+        # (was a-safe).
+        assert resolved_uuid == "u-dead"
         assert resolved_route == route
         assert message_id is None
 

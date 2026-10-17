@@ -12,18 +12,22 @@ from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
 
 # Deliberately noncanonical JSON: whitespace, key order, escaped unicode,
 # nested signatures and unknown fields must survive without reserialization.
+# Assistant rows carry role and stop_reason like real CLI rows: since 3ae5ea1 a
+# text-only assistant row is a fork boundary only with terminal evidence (an
+# in-flight streamed row must never be selected), and a tool round only when its
+# assistant row is a real assistant message.
 METADATA = b' { "type": "summary", "summary": "keep \\u0041 verbatim" }\n'
 ROOT = b'{"sessionId":"parent","uuid":"root","parentUuid":null,"type":"user","message":{"content":"hello"}}\n'
 THINKING = (
     b' {"type":"assistant", "uuid":"thinking", "parentUuid":"root", '
-    b'"sessionId":"parent","message":{"content":[{"type":"thinking",'
+    b'"sessionId":"parent","message":{"role":"assistant", "content":[{"type":"thinking",'
     b'"thinking":"private reasoning", "signature":"sig/ABC+=\\u003d"},'
     b'{"type":"redacted_thinking","data":"opaque+/=="},'
     b'{"type":"text","text":"Za\xc5\xbc\xc3\xb3\xc5\x82\xc4\x87"}],'
-    b'"usage":{"input_tokens":37,"cache_read_input_tokens":101}},'
+    b'"stop_reason":"end_turn","usage":{"input_tokens":37,"cache_read_input_tokens":101}},'
     b'"future_unknown":{"keep":true}}  \n'
 )
-TOOL = b'{ "uuid":"tool", "parentUuid":"thinking", "sessionId":"parent", "type":"assistant", "message":{"content":[{"type":"tool_use","id":"call-1","name":"Read","input":{"path":"x"}}]}}\n'
+TOOL = b'{ "uuid":"tool", "parentUuid":"thinking", "sessionId":"parent", "type":"assistant", "message":{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"Read","input":{"path":"x"}}],"stop_reason":"tool_use"}}\n'
 RESULT = b'{"uuid":"result","parentUuid":"tool","sessionId":"parent","type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]}}\n'
 OFF_BRANCH = b'{"uuid":"side","parentUuid":"root","sessionId":"parent","type":"assistant","message":{"content":"unselected"}}\n'
 
@@ -75,7 +79,7 @@ def test_fork_of_fork_keeps_original_parent_prefix(tmp_path: Path) -> None:
     )
     child = source.parent / "child.jsonl"
     prefix = child.read_bytes()
-    child_event = b'{"uuid":"child-event","parentUuid":"result","sessionId":"child","type":"assistant","message":{"content":"child"}}\n'
+    child_event = b'{"uuid":"child-event","parentUuid":"result","sessionId":"child","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"child"}],"stop_reason":"end_turn"}}\n'
     with child.open("ab") as handle:
         handle.write(child_event)
     fork_session_jsonl(

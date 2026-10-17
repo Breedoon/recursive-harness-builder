@@ -21,6 +21,7 @@ def _entry(
     content: object = "",
     model: str | None = None,
     is_api_error: bool | None = None,
+    stop_reason: str | None = None,
 ) -> str:
     obj: dict[str, object] = {
         "type": entry_type,
@@ -32,6 +33,8 @@ def _entry(
         message: dict[str, object] = {"role": role, "content": content}
         if model is not None:
             message["model"] = model
+        if stop_reason is not None:
+            message["stop_reason"] = stop_reason
         obj["message"] = message
     if is_api_error is not None:
         obj["isApiErrorMessage"] = is_api_error
@@ -58,6 +61,7 @@ def _assistant_text(uuid: str, parent: str, text: str = "healthy") -> str:
         role="assistant",
         model="claude-opus-4-7",
         content=[{"type": "text", "text": text}],
+        stop_reason="end_turn",
     )
 
 
@@ -80,7 +84,20 @@ def _tool_only_assistant(uuid: str, parent: str) -> str:
         role="assistant",
         model="claude-opus-4-7",
         content=[{"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}],
+        stop_reason="tool_use",
     )
+
+
+# Recovery boundary rules since 3ae5ea1 (``jsonl_health._completed_boundaries``):
+# - a persisted plain user message is a boundary ("Do not replace that request on
+#   recovery"); 653c463's own regression (test_jsonl_fork
+#   test_recovery_fork_keeps_inherited_damage_verbatim) recovers to such a row;
+# - a tool round is a boundary once every tool_use has its tool_result
+#   (docs/cache-proxy-safety.md: recovery_multi targets a tool result);
+# - a text-only assistant group needs terminal evidence (stop_reason end_turn /
+#   stop_sequence / max_tokens, a later assistant group, or a completion receipt).
+# Fixtures therefore mark finished answers with stop_reason, and expectations that
+# predate these rules were updated in obs-6 (each noted below).
 
 
 def test_analyze_jsonl_path_detects_poison_tail_and_safe_recovery_boundary(tmp_path: Path) -> None:
@@ -95,6 +112,7 @@ def test_analyze_jsonl_path_detects_poison_tail_and_safe_recovery_boundary(tmp_p
             role="assistant",
             model="gpt-5.5",
             content=[{"type": "text", "text": "healthy one"}],
+            stop_reason="end_turn",
         ),
         _entry("user", "u2", "a1", role="user", content="launch"),
         _entry(
@@ -112,6 +130,7 @@ def test_analyze_jsonl_path_detects_poison_tail_and_safe_recovery_boundary(tmp_p
             role="assistant",
             model="gpt-5.5",
             content=[{"type": "tool_use", "id": "call-1", "name": "AgentTask"}],
+            stop_reason="tool_use",
         ),
         _entry(
             "user",
@@ -128,20 +147,27 @@ def test_analyze_jsonl_path_detects_poison_tail_and_safe_recovery_boundary(tmp_p
 
     health = analyze_jsonl_path(path=path, session_id="sid-root")
 
+    # obs-6: the AgentTask round is complete (its tool_result is persisted), so it
+    # is kept and the unsafe tail starts at the first poison row (was: a-tool tail,
+    # recovery to a2, which dropped a completed tool effect).
     assert health.needs_recovery is True
     assert health.first_poison_uuid == "err1"
-    assert health.first_unsafe_tail_uuid == "a-tool"
-    assert health.unsafe_tail_reason == "incomplete_tool_use_tail"
+    assert health.first_unsafe_tail_uuid == "err1"
+    assert health.unsafe_tail_reason == "poisoned_tail"
     assert health.last_poison_uuid == "err2"
     assert health.last_real_assistant_uuid == "a-tool"
-    assert health.safe_recovery_uuid == "a2"
+    assert health.safe_recovery_uuid == "u-tool-result"
     assert health.is_uuid_safe("a1") is True
-    assert health.is_uuid_safe("a-tool") is False
+    assert health.is_uuid_safe("a-tool") is True
+    assert health.is_uuid_safe("u-tool-result") is True
+    assert health.is_uuid_safe("err1") is False
     assert health.is_uuid_safe("err2") is False
     assert health.is_uuid_safe("u3") is False
 
 
-def test_analyze_jsonl_path_recovers_dangling_user_tail(tmp_path: Path) -> None:
+def test_analyze_jsonl_path_keeps_persisted_dangling_user_message(tmp_path: Path) -> None:
+    # obs-6: was test_analyze_jsonl_path_recovers_dangling_user_tail. Since 3ae5ea1 a
+    # persisted plain user message is a safe boundary, so it is no recovery case.
     path = tmp_path / "projects" / "-workspace" / "sid-root.jsonl"
     raw_lines = [
         _entry("user", "u1", None, role="user", content="start"),
@@ -152,13 +178,19 @@ def test_analyze_jsonl_path_recovers_dangling_user_tail(tmp_path: Path) -> None:
 
     health = analyze_jsonl_path(path=path, session_id="sid-root")
 
-    assert health.needs_recovery is True
+    assert health.needs_recovery is False
     assert health.first_poison_uuid is None
-    assert health.first_unsafe_tail_uuid == "u2"
-    assert health.unsafe_tail_reason == "dangling_user_tail"
-    assert health.safe_recovery_uuid == "a1"
+    assert health.first_unsafe_tail_uuid is None
+    assert health.unsafe_tail_reason is None
+    assert health.safe_recovery_uuid is None
     assert health.is_uuid_safe("a1") is True
-    assert health.is_uuid_safe("u2") is False
+    assert health.is_uuid_safe("u2") is True
+
+    target = resolve_safe_jsonl_target(
+        session_id="sid-root", cwd=Path("/workspace"), projects_root=path.parents[1],
+    )
+    assert target is not None
+    assert target.target_uuid == "u2"
 
 
 def test_analyze_jsonl_path_recovers_empty_assistant_tail(tmp_path: Path) -> None:
@@ -178,13 +210,16 @@ def test_analyze_jsonl_path_recovers_empty_assistant_tail(tmp_path: Path) -> Non
         projects_root=path.parents[1],
     )
 
+    # obs-6: the persisted request u2 is kept; only the empty answer is unsafe
+    # (was: tail from u2, recovery to a1).
     assert target is not None
     assert target.health.needs_recovery is True
-    assert target.health.first_unsafe_tail_uuid == "u2"
-    assert target.health.unsafe_tail_reason == "dangling_user_tail"
-    assert target.target_uuid == "a1"
+    assert target.health.first_unsafe_tail_uuid == "a-empty"
+    assert target.health.unsafe_tail_reason == "empty_assistant_tail"
+    assert target.target_uuid == "u2"
     assert target.changed is True
     assert target.reason == "preferred_uuid_unsafe"
+    assert target.health.is_uuid_safe("a-empty") is False
 
 
 def test_analyze_jsonl_path_recovers_unfinished_tool_tail(tmp_path: Path) -> None:
@@ -199,10 +234,13 @@ def test_analyze_jsonl_path_recovers_unfinished_tool_tail(tmp_path: Path) -> Non
 
     health = analyze_jsonl_path(path=path, session_id="sid-root")
 
+    # obs-6: the persisted request u2 is kept; the unanswered tool call is the
+    # unsafe tail (was: tail from u2, recovery to a1).
     assert health.needs_recovery is True
-    assert health.first_unsafe_tail_uuid == "u2"
-    assert health.unsafe_tail_reason == "dangling_user_tail"
-    assert health.safe_recovery_uuid == "a1"
+    assert health.first_unsafe_tail_uuid == "a-tool"
+    assert health.unsafe_tail_reason == "incomplete_tool_use_tail"
+    assert health.safe_recovery_uuid == "u2"
+    assert health.is_uuid_safe("u2") is True
     assert health.is_uuid_safe("a-tool") is False
 
 
@@ -220,6 +258,7 @@ def test_resolve_safe_jsonl_target_keeps_safe_reply_before_poison(tmp_path: Path
                 role="assistant",
                 model="gpt-5.5",
                 content=[{"type": "text", "text": "healthy"}],
+                stop_reason="end_turn",
             ),
             _entry("user", "u2", "a1", role="user", content="later"),
             _poison("err1", "u2"),
@@ -252,6 +291,7 @@ def test_resolve_safe_jsonl_target_rewrites_poisoned_preferred_uuid(tmp_path: Pa
                 role="assistant",
                 model="gpt-5.5",
                 content=[{"type": "text", "text": "healthy"}],
+                stop_reason="end_turn",
             ),
             _entry("user", "u2", "a1", role="user", content="later"),
             _poison("err1", "u2"),
@@ -267,10 +307,13 @@ def test_resolve_safe_jsonl_target_rewrites_poisoned_preferred_uuid(tmp_path: Pa
         projects_root=projects_root,
     )
 
+    # obs-6: recovery keeps the persisted request before the first poison row
+    # (was: a1). Nothing descending from err1 may be selected.
     assert target is not None
-    assert target.target_uuid == "a1"
+    assert target.target_uuid == "u2"
     assert target.changed is True
     assert target.reason == "preferred_uuid_unsafe"
+    assert target.health.is_uuid_safe("u3") is False
 
 
 def test_analyze_jsonl_path_ignores_recovered_errors_in_middle(tmp_path: Path) -> None:
@@ -287,6 +330,7 @@ def test_analyze_jsonl_path_ignores_recovered_errors_in_middle(tmp_path: Path) -
                 role="assistant",
                 model="gpt-5.5",
                 content=[{"type": "text", "text": "healthy"}],
+                stop_reason="end_turn",
             ),
             _entry("user", "u2", "a1", role="user", content="bad"),
             _poison("err1", "u2"),
@@ -298,6 +342,7 @@ def test_analyze_jsonl_path_ignores_recovered_errors_in_middle(tmp_path: Path) -
                 role="assistant",
                 model="gpt-5.5",
                 content=[{"type": "text", "text": "real recovery"}],
+                stop_reason="end_turn",
             ),
         ],
     )
@@ -336,6 +381,7 @@ def test_resolved_recovery_target_forks_verbatim_without_poison_tail(tmp_path: P
             role="assistant",
             model="gpt-5.5",
             content=[{"type": "text", "text": "healthy"}],
+            stop_reason="end_turn",
         ),
         _entry("user", "u2", "a1", role="user", content="later"),
         _poison("err1", "u2"),
@@ -358,8 +404,10 @@ def test_resolved_recovery_target_forks_verbatim_without_poison_tail(tmp_path: P
         new_session_id="sid-recovered",
     )
 
+    # obs-6: the boundary is the persisted request u2 (was a1, raw_lines[:3]).
+    assert target.target_uuid == "u2"
     forked_lines = (project_dir / "sid-recovered.jsonl").read_text(encoding="utf-8").splitlines()
-    assert forked_lines == raw_lines[:3]
+    assert forked_lines == raw_lines[:4]
     assert all("Prompt is too long" not in line for line in forked_lines)
 
 
@@ -382,8 +430,10 @@ def test_resolved_recovery_target_forks_verbatim_without_silent_tail(tmp_path: P
         preferred_uuid="a-empty",
         projects_root=projects_root,
     )
+    # obs-6: the boundary is the persisted request u2 (was a1); the empty
+    # assistant answer is still excluded.
     assert target is not None
-    assert target.target_uuid == "a1"
+    assert target.target_uuid == "u2"
 
     fork_session_jsonl(
         session_id="sid-root",
@@ -394,5 +444,48 @@ def test_resolved_recovery_target_forks_verbatim_without_silent_tail(tmp_path: P
     )
 
     forked_lines = (project_dir / "sid-recovered.jsonl").read_text(encoding="utf-8").splitlines()
-    assert forked_lines == raw_lines[:3]
-    assert all("a-empty" not in line and "u2" not in line for line in forked_lines)
+    assert forked_lines == raw_lines[:4]
+    assert all("a-empty" not in line for line in forked_lines)
+
+
+def test_in_flight_text_row_is_not_a_boundary_until_terminal_evidence(tmp_path: Path) -> None:
+    # obs-6: cover the 3ae5ea1 rule the older fixtures predate (jsonl_fork
+    # CACHE-PREFIX WARNING: "never select an in-flight text-only row"). A final
+    # text-only assistant row with no stop_reason, no later assistant group and no
+    # completion receipt may still be streaming, so a fork/recovery target must
+    # fall back to the persisted request before it; terminal evidence makes it a
+    # boundary. Without this test, treating every text row as complete passed.
+    path = tmp_path / "projects" / "-workspace" / "sid-root.jsonl"
+    in_flight = _entry(
+        "assistant", "a2", "u2", role="assistant", model="claude-opus-4-7",
+        content=[{"type": "text", "text": "partial"}],
+    )
+    finished = _entry(
+        "assistant", "a2", "u2", role="assistant", model="claude-opus-4-7",
+        content=[{"type": "text", "text": "partial"}], stop_reason="end_turn",
+    )
+    head = [
+        _entry("user", "u1", None, role="user", content="start"),
+        _assistant_text("a1", "u1", "healthy answer"),
+        _entry("user", "u2", "a1", role="user", content="next"),
+    ]
+
+    _write_raw(path, head + [in_flight])
+    target = resolve_safe_jsonl_target(
+        session_id="sid-root", cwd=Path("/workspace"), preferred_uuid="a2",
+        projects_root=path.parents[1],
+    )
+    assert target is not None
+    assert target.target_uuid == "u2"
+    assert target.changed is True
+    assert target.reason == "complete_message_boundary"
+    assert "a2" not in target.health.complete_message_targets
+
+    _write_raw(path, head + [finished])
+    target = resolve_safe_jsonl_target(
+        session_id="sid-root", cwd=Path("/workspace"), preferred_uuid="a2",
+        projects_root=path.parents[1],
+    )
+    assert target is not None
+    assert target.target_uuid == "a2"
+    assert target.changed is False

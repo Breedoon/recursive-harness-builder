@@ -92,6 +92,23 @@ def _isolate_control_channel(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_session_replay_state(tmp_path_factory, monkeypatch):
+    """Keep fork/replay provenance and terminal-completion receipts off production.
+
+    ``fork_session_jsonl``/``prepare_session_replay`` write, and
+    ``has_terminal_completion`` reads, under ``OBS_SESSION_REPLAY_PROVENANCE_DIR``
+    (default ``/workspace/runtime/state/session-replay``). Unit tests had written
+    148 fork receipts (``sid-fork.json``, ``child.json`` ...) into the live
+    directory before this fixture (obs-6). Tests that inspect receipts still set
+    their own path.
+    """
+    monkeypatch.setenv(
+        "OBS_SESSION_REPLAY_PROVENANCE_DIR", str(tmp_path_factory.mktemp("session-replay"))
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_session_effort(monkeypatch):
     """Tests run from agent shells, which export the agent's own CLI effort.
 

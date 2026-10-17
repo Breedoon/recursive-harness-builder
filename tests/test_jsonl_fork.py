@@ -30,8 +30,8 @@ def test_fork_session_jsonl_preserves_raw_jsonl_lines(tmp_path: Path) -> None:
     source_path.parent.mkdir(parents=True, exist_ok=True)
     raw_lines = [
         '{"type":"queue-operation","operation":"dequeue"}',
-        '{"uuid":"u1","parentUuid":null,"message":{"role":"user","content":"start"}}',
-        '{"uuid":"a1","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"keep exact","signature":"sig"},{"type":"text","text":"done"}]},"extra":{"z":1,"a":2}}',
+        '{"type":"user","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"start"}}',
+        '{"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"keep exact","signature":"sig"},{"type":"text","text":"done"}],"stop_reason":"end_turn"},"extra":{"z":1,"a":2}}',
     ]
     source_path.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
 
@@ -65,7 +65,7 @@ def test_fork_session_jsonl_copies_only_the_target_parent_chain(tmp_path: Path) 
             "uuid": "a1",
             "parentUuid": "u1",
             "sessionId": "sid-root",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "one"}], "stop_reason": "end_turn"},
         },
         {
             "type": "user",
@@ -79,7 +79,7 @@ def test_fork_session_jsonl_copies_only_the_target_parent_chain(tmp_path: Path) 
             "uuid": "a2",
             "parentUuid": "u2",
             "sessionId": "sid-root",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "two"}], "stop_reason": "end_turn"},
         },
         {
             "type": "user",
@@ -93,7 +93,7 @@ def test_fork_session_jsonl_copies_only_the_target_parent_chain(tmp_path: Path) 
             "uuid": "a-dead",
             "parentUuid": "u-dead",
             "sessionId": "sid-root",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": "dead"}]},
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "dead"}], "stop_reason": "end_turn"},
         },
     ]
     _write_lines(source_path, entries)
@@ -182,7 +182,7 @@ def test_fork_session_jsonl_uses_explicit_source_path(tmp_path: Path) -> None:
                 "uuid": "a1",
                 "parentUuid": "u1",
                 "sessionId": "foreign-sid",
-                "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"},
             },
         ],
     )
