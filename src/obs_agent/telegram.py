@@ -7245,10 +7245,13 @@ class TelegramBot:
         # vault-w0eg: a bound uuid missing from the session JSONL (a streamed uuid
         # the CLI never persisted) must not silently fork a substitute row. A reply
         # to the latest message continues the session; any other reply is refused.
-        bound_missing = (
-            not _health.has_uuid(binding.jsonl_uuid) if _health is not None
-            else binding.jsonl_uuid not in self._persisted_session_uuids(binding.session_id)
-        )
+        if _health is not None:
+            bound_missing = not _health.has_uuid(binding.jsonl_uuid)
+        else:
+            # No analyzable JSONL: judge only against what is persisted; with nothing
+            # persisted, fork_session_jsonl's own KeyError stays the backstop.
+            persisted = self._persisted_session_uuids(binding.session_id)
+            bound_missing = bool(persisted) and binding.jsonl_uuid not in persisted
         if bound_missing:
             logger.warning(
                 "[reply_fork] bound uuid missing from JSONL route=%s session_id=%s uuid=%s latest=%s",
