@@ -77,6 +77,11 @@ or report read cannot keep an empty wrapper alive indefinitely. Test-only timing
 can be shortened with `OBS_CACHE_LAUNCH_TIMEOUT_SECONDS` and
 `OBS_CACHE_FALLBACK_TIMEOUT_SECONDS`. If both commands fail/time out, the wrapper
 starts current code and writes an emergency bypass even without a Python audit.
+An early TERM/INT trap records the kill switch before admission begins and kills
+only the tracked controller process group (including descendants), so a stop cannot
+leave an abandoned admission writing state or accidentally resume a crash checkpoint.
+Selection output is temporary under the runtime state directory, overridable by
+`OBS_CACHE_SELECTION_DIR` for isolated tests; the wrapper removes it after use.
 
 Deployment order, after tests and the matching scratch regression:
 

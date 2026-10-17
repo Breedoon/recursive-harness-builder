@@ -76,6 +76,7 @@ def _start(tmp_path: Path, script: Path, mode: str, **extra_env) -> subprocess.P
         OBS_KILLSWITCH_SENTINEL=str(tmp_path / "sentinel"),
         OBS_SHUTDOWN_SENTINEL=str(tmp_path / "shutdown-sentinel"),
         OBS_CACHE_GATE_LOG=str(tmp_path / "wrapper-bypass.jsonl"),
+        OBS_CACHE_SELECTION_DIR=str(tmp_path),
         OBS_WRAPPER_MAINTENANCE_EXIT_WAIT_SECONDS="2",
         **extra_env,
     )
@@ -189,6 +190,22 @@ def test_unresponsive_daemon_gets_sigkill_after_usr1(tmp_path, health_server):
     assert not (tmp_path / "sentinel").exists()  # crash path: snapshot resumes
     time.sleep(0.2)
     assert not _alive(cli)
+
+
+def test_stop_during_admission_discards_crash_resume(tmp_path):
+    controller = tmp_path / "controller.sh"
+    controller.write_text(f'#!/bin/bash\necho $$ > "{tmp_path}/controller.pid"\nsleep 300 &\necho $! > "{tmp_path}/descendant.pid"\nwait\n')
+    script = _prepare(tmp_path, _free_port(), launch_command=f"/bin/bash {controller}")
+    proc = _start(tmp_path, script, "normal", OBS_CACHE_LAUNCH_TIMEOUT_SECONDS="45")
+    _wait_for(tmp_path / "descendant.pid")
+    controller_pid = int((tmp_path / "controller.pid").read_text())
+    descendant_pid = int((tmp_path / "descendant.pid").read_text())
+    os.killpg(proc.pid, signal.SIGTERM)
+    assert proc.wait(timeout=8) == 143
+    assert (tmp_path / "sentinel").exists()
+    assert not (tmp_path / "out/child.pid").exists()
+    assert not _alive(controller_pid)
+    assert not _alive(descendant_pid)
 
 
 def test_start_clears_shutdown_latch_but_stop_preserves_new_latch(tmp_path, health_server):
