@@ -61,6 +61,12 @@ real break mechanisms in live traffic; none was caught by a unit test:
    about 11 live Opus sessions re-billed ~3.7M tokens (fixed 2026-10-16: added
    to `VOLATILE_SYSTEM_SECTIONS`, kept as first seen per conversation; bead
    `ops-30`).
+10. A mid-session API-error row the session had already recovered from made
+   every later row a "poison descendant", because the real CLI chains the next
+   row to the synthetic error row; a run-start recovery then rolled a route
+   back about 5 days (fixed 2026-10-17, vault-1bc2: only an error row with no
+   complete real answer after it on its chain poisons its descendants; live
+   scenario `recovered_poison`).
 
 Not a mechanism (checked 2026-10-16, bead `vault-1r7n.9`): the "Continue from
 where you left off." block the CLI adds to the last user message when a fork or

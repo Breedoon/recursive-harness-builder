@@ -265,3 +265,70 @@ def test_replay_explicit_target_must_be_complete_boundary(tmp_path: Path, monkey
     source.write_text("\n".join(_raw[:2]) + "\n", encoding="utf-8")  # target's own round is incomplete
     with pytest.raises(ValueError, match="incomplete tool round"):
         prepare_session_replay(session_id="s", cwd=tmp_path, source_path=source, target_uuid="a1")
+
+
+def _branch_entries() -> list[dict]:
+    def row(kind: str, uid: str, parent: str | None, content, stop: str | None = None) -> dict:
+        message: dict = {"role": kind, "content": content}
+        if stop:
+            message["stop_reason"] = stop
+        return {"type": kind, "uuid": uid, "parentUuid": parent, "sessionId": "sid-root", "message": message}
+
+    return [
+        row("user", "u1", None, "start"),
+        row("assistant", "a1", "u1", [{"type": "text", "text": "one"}], "end_turn"),
+        row("user", "u2", "a1", "branch a"),
+        row("assistant", "a2", "u2", [{"type": "text", "text": "two"}], "end_turn"),
+        row("user", "u2b", "a2", "branch a again"),
+        row("assistant", "a2b", "u2b", [{"type": "text", "text": "partial"}]),
+        row("user", "u-dead", "a1", "later branch"),
+        row("assistant", "a-dead", "u-dead", [{"type": "text", "text": "dead"}], "end_turn"),
+    ]
+
+
+def test_inactive_branch_target_resolves_on_its_own_branch(tmp_path: Path) -> None:
+    from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+    source_path = tmp_path / "sid-root.jsonl"
+    _write_lines(source_path, _branch_entries())
+
+    finished = resolve_safe_jsonl_target(session_id="sid-root", cwd=tmp_path, source_path=source_path,
+                                         preferred_uuid="a2")
+    assert finished is not None
+    assert (finished.target_uuid, finished.changed, finished.reason) == ("a2", False, None)
+    assert finished.branch_health is not None
+    assert "a-dead" in finished.health.chain_uuids
+
+    # An in-flight row on the inactive branch moves to that branch's own last
+    # boundary (R1: u2b), never onto the active chain.
+    in_flight = resolve_safe_jsonl_target(session_id="sid-root", cwd=tmp_path, source_path=source_path,
+                                          preferred_uuid="a2b")
+    assert in_flight is not None
+    assert (in_flight.target_uuid, in_flight.reason) == ("u2b", "complete_message_boundary")
+
+    fork_id = fork_session_jsonl(session_id="sid-root", target_uuid="a2b", cwd=tmp_path,
+                                 source_path=source_path, new_session_id="sid-fork")
+    assert [e["uuid"] for e in _read_lines(tmp_path / f"{fork_id}.jsonl")] == ["u1", "a1", "u2", "a2", "u2b"]
+
+
+def test_active_chain_target_is_unchanged_by_branch_rule(tmp_path: Path) -> None:
+    from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+    source_path = tmp_path / "sid-root.jsonl"
+    _write_lines(source_path, _branch_entries())
+
+    target = resolve_safe_jsonl_target(session_id="sid-root", cwd=tmp_path, source_path=source_path,
+                                       preferred_uuid="a-dead")
+    assert target is not None
+    assert (target.target_uuid, target.changed, target.branch_health) == ("a-dead", False, None)
+
+
+def test_fork_session_jsonl_unknown_uuid_writes_no_fork(tmp_path: Path) -> None:
+    source_path = tmp_path / "sid-root.jsonl"
+    _write_lines(source_path, _branch_entries())
+    before = sorted(p.name for p in tmp_path.iterdir())
+
+    with pytest.raises(KeyError, match="UUID not found"):
+        fork_session_jsonl(session_id="sid-root", target_uuid="missing", cwd=tmp_path,
+                           source_path=source_path, new_session_id="sid-fork")
+    assert sorted(p.name for p in tmp_path.iterdir()) == before

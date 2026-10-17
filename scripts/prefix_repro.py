@@ -538,6 +538,55 @@ async def sc_poisoned_recovery(args):
                          "original_source_sha256": before, "synthetic_row_is_test_injection": True}
 
 
+async def sc_recovered_poison(args):
+    """vault-1bc2: a mid-session API-error row the session already recovered
+    from must not pull a later tail recovery back before it. A turn capped by
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS makes the real CLI write a synthetic
+    "exceeded the output token maximum" row and continue the same turn with a
+    real answer chained to it (as prod a00b512b line 79 chains to a timeout).
+    A test-injected tail poison then forces a recovery. The old analyzer
+    recovered to the row before the first poison (history-changed, re-bill);
+    the fixed one keeps the continuation (append)."""
+    import hashlib
+    from datetime import datetime, timezone
+    from obs_agent.context_jsonl import find_session_jsonl
+    from obs_agent.jsonl_fork import fork_session_jsonl
+    from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+    sid = str(uuid.uuid4())
+    cwd = WORK_ROOT / "cwd"
+    await _session(args, ["Reply with the single word: ready."], session_id=sid)
+    await _session(args, ["Write the numbers from one to four hundred in English words, comma separated, nothing else.",
+                          "Reply with the single word: three."],
+                   resume=sid, env_extra={"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "1500"})
+    # An uncapped process for the last parent request, so the recovery pair
+    # compares like with like (the cap changes the request's thinking budget).
+    await _session(args, ["Reply with the single word: four."], resume=sid)
+    path = find_session_jsonl(session_id=sid, cwd=cwd)
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    poisons = [r["uuid"] for r in rows if r.get("isApiErrorMessage") and r.get("uuid")]
+    if not poisons:
+        raise RuntimeError("recovered_poison: the capped turn produced no synthetic error row")
+    first_poison = poisons[0]
+    chained = [r.get("type") for r in rows if r.get("parentUuid") == first_poison]
+    head = resolve_safe_jsonl_target(session_id=sid, cwd=cwd).target_uuid
+    tail = {"type": "assistant", "uuid": str(uuid.uuid4()), "parentUuid": head,
+            "sessionId": sid, "timestamp": datetime.now(timezone.utc).isoformat(), "isApiErrorMessage": True,
+            "message": {"role": "assistant", "model": "<synthetic>", "content": [{"type": "text", "text": "Request timed out"}]}}
+    with path.open("a") as handle:
+        handle.write(json.dumps(tail) + "\n")
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    target = resolve_safe_jsonl_target(session_id=sid, cwd=cwd)
+    lines = target.health.uuid_line_numbers
+    child = fork_session_jsonl(session_id=sid, target_uuid=target.target_uuid, cwd=cwd)
+    await _session(args, ["Reply with the single word: recovered."], resume=child)
+    return [sid, child], {"parent": sid, "child": child, "reason": target.health.unsafe_tail_reason,
+                         "cli_rows_chained_to_poison": chained,
+                         "recovery_kept_continuation": lines.get(target.target_uuid, 0) > lines[first_poison],
+                         "source_unchanged": hashlib.sha256(path.read_bytes()).hexdigest() == before,
+                         "original_source_sha256": before, "tail_poison_is_test_injection": True}
+
+
 async def sc_utility_route(args):
     sid = str(uuid.uuid4())
     cwd = WORK_ROOT / "cwd"
@@ -748,6 +797,7 @@ SCENARIOS = {
     "parallel_resume": (sc_parallel_resume, "parallel tool calls then new-process resume; expect FAIL"),
     "parallel_fork": (sc_parallel_fork, "parallel same-ID resume then verbatim-source fork"),
     "poisoned_recovery": (sc_poisoned_recovery, "test-injected synthetic API-error tail excluded on recovery"),
+    "recovered_poison": (sc_recovered_poison, "mid-session API error already recovered from; tail recovery keeps the continuation (vault-1bc2)"),
     "ws_resume": (sc_ws_resume, "whitespace-edged tool output + spliced reminder, then new-process resume"),
     "volatile_flip": (sc_volatile_flip, "server flag flips system section/context_management mid-conversation (Anthropic)"),
 }
@@ -777,7 +827,7 @@ def run(args, name):
                 "error": f"{type(e).__name__}: {e}",
                 "provider_errors": errs[:20]}
     pairs = None
-    if name in ("recovery", "recovery_multi", "parallel_fork", "poisoned_recovery"):
+    if name in ("recovery", "recovery_multi", "parallel_fork", "poisoned_recovery", "recovered_poison"):
         rows_p = _rows(args.log_dir, [meta["parent"]], since)
         time.sleep(3)
         rows_c = _rows(args.log_dir, [meta["child"]], since)

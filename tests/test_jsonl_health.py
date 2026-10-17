@@ -489,3 +489,111 @@ def test_in_flight_text_row_is_not_a_boundary_until_terminal_evidence(tmp_path: 
     assert target is not None
     assert target.target_uuid == "a2"
     assert target.changed is False
+
+
+# vault-1bc2: the real CLI chains the next user row to a synthetic API-error
+# row (session a00b512b line 79 -> 9142d3fe). A poison row is inherited history
+# once a real complete answer descends from it; only unrecovered poison rows
+# poison their descendants.
+def _timeout(uuid: str, parent: str) -> str:
+    obj = json.loads(_entry(
+        "assistant", uuid, parent, role="assistant", model="<synthetic>",
+        content=[{"type": "text", "text": "Request timed out"}], is_api_error=True,
+        stop_reason="stop_sequence",
+    ))
+    obj["error"] = "unknown"
+    return json.dumps(obj, separators=(",", ":"))
+
+
+def test_recovered_poison_then_new_tail_poison_recovers_to_latest_boundary(tmp_path: Path) -> None:
+    path = tmp_path / ".claude" / "projects" / "-workspace" / "sid-root.jsonl"
+    raw = [
+        _entry("user", "u1", None, role="user", content="start"),
+        _assistant_text("a1", "u1"),
+        _entry("user", "u2", "a1", role="user", content="ask"),
+        _timeout("err1", "u2"),
+        _entry("user", "u3", "err1", role="user", content="Continue"),
+        _assistant_text("a2", "u3", "recovered"),
+        _entry("user", "u4", "a2", role="user", content="next"),
+        _assistant_text("a3", "u4", "more work"),
+        _entry("user", "u5", "a3", role="user", content="last"),
+        _timeout("err2", "u5"),
+    ]
+    _write_raw(path, raw)
+
+    health = analyze_jsonl_path(path=path, session_id="sid-root")
+
+    assert health.needs_recovery is True
+    assert health.unsafe_tail_reason == "poisoned_tail"
+    # R1: the persisted user row before the tail poison, not the row before err1.
+    assert health.safe_recovery_uuid == "u5"
+    assert health.first_poison_uuid == "err2"
+    assert health.is_uuid_safe("a3") is True
+    assert health.is_uuid_safe("err1") is False
+    assert health.is_uuid_safe("err2") is False
+
+    fork_id = fork_session_jsonl(session_id="sid-root", target_uuid=health.safe_recovery_uuid,
+                                 cwd=Path("/workspace"), source_path=path, new_session_id="sid-fork")
+    forked = (path.parent / f"{fork_id}.jsonl").read_text(encoding="utf-8").splitlines()
+    # The recovered err1 stays verbatim (the CLI resumed and cached it); err2 is dropped.
+    assert forked == raw[:9]
+
+
+def test_poison_followed_only_by_dangling_user_is_not_recovered(tmp_path: Path) -> None:
+    path = tmp_path / ".claude" / "projects" / "-workspace" / "sid-root.jsonl"
+    _write_raw(path, [
+        _entry("user", "u1", None, role="user", content="start"),
+        _assistant_text("a1", "u1"),
+        _entry("user", "u2", "a1", role="user", content="ask"),
+        _timeout("err1", "u2"),
+        _entry("user", "u3", "err1", role="user", content="Continue"),
+    ])
+
+    health = analyze_jsonl_path(path=path, session_id="sid-root")
+
+    assert health.needs_recovery is True
+    assert health.safe_recovery_uuid == "u2"
+    assert health.is_uuid_safe("u3") is False
+
+
+def test_poison_followed_by_in_flight_answer_is_not_recovered(tmp_path: Path) -> None:
+    path = tmp_path / ".claude" / "projects" / "-workspace" / "sid-root.jsonl"
+    _write_raw(path, [
+        _entry("user", "u1", None, role="user", content="start"),
+        _assistant_text("a1", "u1"),
+        _entry("user", "u2", "a1", role="user", content="ask"),
+        _timeout("err1", "u2"),
+        _entry("user", "u3", "err1", role="user", content="Continue"),
+        # Streaming text row: no stop_reason, no later group, no receipt (R2).
+        _entry("assistant", "a2", "u3", role="assistant", model="claude-opus-4-7",
+               content=[{"type": "text", "text": "partial"}]),
+    ])
+
+    health = analyze_jsonl_path(path=path, session_id="sid-root")
+
+    assert health.needs_recovery is True
+    assert health.safe_recovery_uuid == "u2"
+    assert health.is_uuid_safe("a2") is False
+
+
+def test_poison_recovered_by_completed_tool_round(tmp_path: Path) -> None:
+    path = tmp_path / ".claude" / "projects" / "-workspace" / "sid-root.jsonl"
+    _write_raw(path, [
+        _entry("user", "u1", None, role="user", content="start"),
+        _assistant_text("a1", "u1"),
+        _entry("user", "u2", "a1", role="user", content="ask"),
+        _timeout("err1", "u2"),
+        _entry("user", "u3", "err1", role="user", content="Continue"),
+        _entry("assistant", "a2", "u3", role="assistant", model="claude-opus-4-7",
+               content=[{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}],
+               stop_reason="tool_use"),
+        _entry("user", "r1", "a2", role="user",
+               content=[{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]),
+        _assistant_text("a3", "r1", "done"),
+    ])
+
+    health = analyze_jsonl_path(path=path, session_id="sid-root")
+
+    assert health.needs_recovery is False
+    assert health.is_uuid_safe("a3") is True
+    assert health.is_uuid_safe("err1") is False

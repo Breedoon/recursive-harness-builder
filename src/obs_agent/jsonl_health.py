@@ -43,6 +43,9 @@ class JsonlSessionHealth:
     first_unsafe_tail_line: int | None = None
     unsafe_tail_reason: str | None = None
     complete_message_targets: Mapping[str, str] = field(default_factory=dict)
+    # UUIDs of the analyzed chain: the CLI's active chain, or the branch named
+    # by ``branch_uuid``.
+    chain_uuids: frozenset[str] = frozenset()
 
     @property
     def needs_recovery(self) -> bool:
@@ -66,6 +69,10 @@ class SafeJsonlTarget:
     target_uuid: str | None
     changed: bool
     reason: str | None = None
+    # Set when the preferred UUID lies off the active chain: the analysis of
+    # that UUID's own branch, on which the target was resolved (vault-w0eg).
+    # ``health`` stays the active-chain analysis the CLI would resume.
+    branch_health: JsonlSessionHealth | None = None
 
 
 @dataclass(frozen=True)
@@ -275,7 +282,43 @@ def analyze_session_jsonl(
     return analyze_jsonl_path(path=path, session_id=session_id)
 
 
-def analyze_jsonl_path(*, path: Path, session_id: str | None = None) -> JsonlSessionHealth:
+def _recovered_poison_uuids(
+    *,
+    entries: list[_ParsedEntry],
+    by_uuid: dict[str, _ParsedEntry],
+    poison_uuids: set[str],
+) -> set[str]:
+    """Poison rows the API has already accepted as history (vault-1bc2).
+
+    The real CLI chains the next user row to a synthetic API-error row, so a
+    session that went on working after a "Request timed out" has every later
+    row as a descendant of that row. A poison row is recovered once a real,
+    complete assistant answer descends from it: that answer was produced from
+    a prefix containing the poison row, which the CLI resumes and the API has
+    cached. Only unrecovered poison rows poison their descendants.
+    """
+    if not poison_uuids:
+        return set()
+    targets: dict[str, str] = {}
+    _completed_boundaries(entries, targets)
+    ancestry: set[str] = set()
+    for entry in entries:
+        if not (_is_real_assistant(entry) and entry.uuid in targets):
+            continue
+        seen: set[str] = set()
+        cursor = entry.parent_uuid
+        while cursor and cursor not in ancestry and cursor not in seen:
+            seen.add(cursor)
+            ancestry.add(cursor)
+            parent = by_uuid.get(cursor)
+            cursor = parent.parent_uuid if parent is not None else None
+    return poison_uuids & ancestry
+
+
+def analyze_jsonl_path(
+    *, path: Path, session_id: str | None = None, branch_uuid: str | None = None,
+) -> JsonlSessionHealth:
+    """Analyze the chain the CLI resumes, or the branch ending at ``branch_uuid``."""
     entries: list[_ParsedEntry] = []
     by_uuid: dict[str, _ParsedEntry] = {}
     uuid_lines: dict[str, int] = {}
@@ -304,7 +347,8 @@ def analyze_jsonl_path(*, path: Path, session_id: str | None = None) -> JsonlSes
             effective[entry.uuid] = replace(entry, line_no=first_lines[entry.uuid])
     from obs_agent.jsonl_replay import select_replay_entries
 
-    selected = select_replay_entries([(entry.obj, "") for entry in effective.values()], require_complete=False)
+    selected = select_replay_entries([(entry.obj, "") for entry in effective.values()], branch_uuid,
+                                     require_complete=False)
     active_uuids = {obj["uuid"] for obj, _raw in selected}
     entries = [entry for uid, entry in effective.items() if uid in active_uuids]
     by_uuid = dict(effective)
@@ -313,7 +357,10 @@ def analyze_jsonl_path(*, path: Path, session_id: str | None = None) -> JsonlSes
     real_assistant_entries = [entry for entry in entries if _is_real_assistant(entry)]
     last_real_assistant = real_assistant_entries[-1] if real_assistant_entries else None
     all_poison_uuids = {entry.uuid for entry in entries if _is_poison(entry) and entry.uuid}
-    poison_descendants = _collect_chain_unsafe(by_uuid=by_uuid, poison_uuids=all_poison_uuids)
+    unrecovered_poison_uuids = all_poison_uuids - _recovered_poison_uuids(
+        entries=entries, by_uuid=by_uuid, poison_uuids=all_poison_uuids,
+    )
+    poison_descendants = _collect_chain_unsafe(by_uuid=by_uuid, poison_uuids=unrecovered_poison_uuids)
     complete_message_targets: dict[str, str] = {}
     complete_assistant_entries = _completed_boundaries(
         [entry for entry in entries if entry.uuid not in poison_descendants], complete_message_targets,
@@ -406,6 +453,7 @@ def analyze_jsonl_path(*, path: Path, session_id: str | None = None) -> JsonlSes
         ),
         unsafe_tail_reason=unsafe_tail_reason,
         complete_message_targets=MappingProxyType(complete_message_targets),
+        chain_uuids=frozenset(active_uuids),
     )
 
 
@@ -413,7 +461,7 @@ def analyze_jsonl_path(*, path: Path, session_id: str | None = None) -> JsonlSes
 # not merely its text row. Grouped tools/results must remain replay-equivalent,
 # with side effects reconciled before any retry. Original histories stay intact.
 # A break is silent: no error, the API just re-bills the whole conversation.
-# Live check: scripts/cache_regression.py recovery recovery_multi poisoned_recovery (docs/cache-proxy-safety.md).
+# Live check: scripts/cache_regression.py recovery recovery_multi poisoned_recovery recovered_poison (docs/cache-proxy-safety.md).
 def resolve_safe_jsonl_target(
     *,
     session_id: str,
@@ -438,6 +486,33 @@ def resolve_safe_jsonl_target(
         )
     if health is None:
         return None
+
+    if preferred_uuid and health.has_uuid(preferred_uuid) and preferred_uuid not in health.chain_uuids:
+        # vault-w0eg: an explicitly requested row on a non-active branch is
+        # resolved on its own branch, never moved onto the active chain. An
+        # unsafe row there falls through to the active-chain rules below.
+        try:
+            branch = analyze_jsonl_path(path=health.path, session_id=health.session_id,
+                                        branch_uuid=preferred_uuid)
+        except (KeyError, ValueError):
+            # A branch with a missing ancestor or a parent cycle keeps the
+            # pre-vault-w0eg active-chain resolution below.
+            branch = None
+        if branch is not None and branch.is_uuid_safe(preferred_uuid):
+            branch_target = branch.complete_message_targets.get(preferred_uuid)
+            if branch_target is None:
+                limit = branch.uuid_line_numbers[preferred_uuid]
+                candidates = {value for value in branch.complete_message_targets.values()
+                              if branch.uuid_line_numbers[value] <= limit and branch.is_uuid_safe(value)}
+                branch_target = max(candidates, key=branch.uuid_line_numbers.get, default=None)
+            if branch_target is not None:
+                return SafeJsonlTarget(
+                    health=health,
+                    target_uuid=branch_target,
+                    changed=branch_target != preferred_uuid,
+                    reason="complete_message_boundary" if branch_target != preferred_uuid else None,
+                    branch_health=branch,
+                )
 
     if preferred_uuid and health.is_uuid_safe(preferred_uuid):
         completed_target = health.complete_message_targets.get(preferred_uuid)

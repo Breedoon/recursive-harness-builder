@@ -54,6 +54,13 @@ finished answer must therefore carry `type`, `message.role` and `stop_reason`
 like real CLI rows; without them the row is treated as possibly still streaming
 and the fork or recovery target moves to an earlier row. Real CLI rows after a
 synthetic API-error row have that row as `parentUuid`.
+Since vault-1bc2, a synthetic error row from which a real complete answer
+descends is inherited history: it stays unsafe as a target itself, but it no
+longer poisons its descendants, so recovery keeps the continuation. Only an
+error row with no complete answer after it on its chain is a poisoned tail.
+Since vault-w0eg, `fork_session_jsonl` raises `KeyError` for a target UUID that
+is not in the file, and `resolve_safe_jsonl_target` resolves a row on a
+non-active branch on that branch's own chain (`SafeJsonlTarget.branch_health`).
 
 ## Repository-owned surfaces
 

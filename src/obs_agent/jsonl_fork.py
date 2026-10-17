@@ -200,8 +200,12 @@ def fork_session_jsonl(
 
     resolved = resolve_safe_jsonl_target(session_id=session_id, cwd=cwd, source_path=source_path,
                                         preferred_uuid=target_uuid)
+    if resolved is not None and not resolved.health.has_uuid(target_uuid):
+        # vault-w0eg: an unknown target must never fork somewhere else silently.
+        raise KeyError(f"Fork target UUID not found in {source_path}: {target_uuid}")
     if resolved is None or resolved.target_uuid is None:
         raise ValueError("Fork has no confirmed complete history boundary")
+    target_health = resolved.branch_health or resolved.health
     requested_target_uuid = target_uuid
     target_uuid = resolved.target_uuid
     source_bytes = source_path.read_bytes()
@@ -220,7 +224,7 @@ def fork_session_jsonl(
         # verbatim, same rows as the strict path would select, and never drop or
         # rewrite it: removing it would change the API prefix and break the cache.
         if str(exc) not in LEGACY_REPLAY_ERRORS or target_uuid not in set(
-            resolved.health.complete_message_targets.values()
+            target_health.complete_message_targets.values()
         ):
             raise
         selected = select_replay_entries(entries, target_uuid, require_complete=False)
@@ -246,6 +250,7 @@ def fork_session_jsonl(
     (provenance / f"{fork_session_id}.json").write_text(json.dumps({
         "fork_session_id": fork_session_id, "source_path": str(source_path),
         "requested_target_uuid": requested_target_uuid, "target_uuid": target_uuid,
+        "target_reason": resolved.reason, "target_on_inactive_branch": resolved.branch_health is not None,
         "source_prefix_bytes": len(source_bytes), "source_prefix_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "source_prefix_unchanged": source_prefix_unchanged, "replay": replay,
         "loaded_fork_source_sha256": LOADED_SOURCE_SHA256,
