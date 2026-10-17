@@ -198,6 +198,19 @@ def test_report_missing_external_digest_is_not_exact_evidence(repo, state, tmp_p
     assert "different CLIProxyAPI" in result["reason"]
 
 
+def test_removed_external_files_invalidate_previous_report(repo, state, tmp_path, monkeypatch):
+    external = tmp_path / "cliproxy"
+    external.mkdir()
+    config = external / "config.yaml"
+    config.write_text("present when tested")
+    monkeypatch.setattr(cache_gate, "CLIPROXY_DIR", external)
+    _report(tmp_path / "reports", repo)
+    config.unlink()
+    result = select(repo, state, tmp_path)
+    assert result["decision"] == "emergency-current"
+    assert "different CLIProxyAPI" in result["reason"]
+
+
 def test_explicit_restart_override_does_not_replace_gated_baseline(repo, state, tmp_path):
     _report(tmp_path / "reports", repo)
     first = select(repo, state, tmp_path)

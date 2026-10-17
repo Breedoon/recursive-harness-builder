@@ -177,7 +177,8 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
    `src/cache_proxy.py`). Sensitive = files with a `CACHE-PREFIX` marker plus `tools.py`,
    `pyproject.toml`, `uv.lock` and the CLIProxyAPI binary/config. When the target has an external
    CLIProxyAPI digest the report must contain exactly that digest; a missing/null legacy
-   value is inconclusive, not a match. Check any time with
+   value is inconclusive, not a match. The comparison is symmetric: removing previously
+   tested external files also invalidates their old report. Check any time with
    `.venv/bin/python scripts/cache_gate.py check`. Emergency override:
    `--skip-cache-gate "<reason>"`, `/restart skip-cache-gate <reason>` or
    `OBS_CACHE_GATE_SKIP=<reason> git push`; every bypass (and every plain restart that skipped a
