@@ -60,7 +60,12 @@ longer poisons its descendants, so recovery keeps the continuation. Only an
 error row with no complete answer after it on its chain is a poisoned tail.
 Since vault-w0eg, `fork_session_jsonl` raises `KeyError` for a target UUID that
 is not in the file, and `resolve_safe_jsonl_target` resolves a row on a
-non-active branch on that branch's own chain (`SafeJsonlTarget.branch_health`).
+non-active branch on that branch's own chain (`SafeJsonlTarget.branch_health`),
+also when the row is unsafe there: it then recovers to that branch's last safe
+boundary (reason `preferred_uuid_unsafe`). Only a branch that cannot be analyzed
+(missing ancestor, parent cycle) falls back to the active chain. Route recovery
+passes the session head, so a head on a non-active branch recovers on that
+branch (0 of 400 production heads were off-chain on 2026-10-17).
 
 ## Repository-owned surfaces
 

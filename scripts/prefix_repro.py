@@ -549,7 +549,7 @@ async def sc_recovered_poison(args):
     the fixed one keeps the continuation (append). Anthropic only: on the GPT
     route the cap produces no synthetic row (2026-10-17 gate run), and the
     analyzer under test is provider-independent; GPT recovery forks stay
-    covered by recovery, recovery_multi and poisoned_recovery."""
+    covered by recovery, recovery_multi, poisoned_recovery and resumed_poison."""
     import hashlib
     from datetime import datetime, timezone
     from obs_agent.context_jsonl import find_session_jsonl
@@ -588,6 +588,64 @@ async def sc_recovered_poison(args):
                          "recovery_kept_continuation": lines.get(target.target_uuid, 0) > lines[first_poison],
                          "source_unchanged": hashlib.sha256(path.read_bytes()).hexdigest() == before,
                          "original_source_sha256": before, "tail_poison_is_test_injection": True}
+
+
+async def sc_resumed_poison(args):
+    """vault-1bc2 on both routes (G1 verifier F2): the production shape of
+    a00b512b line 79 / be9169ea, where a persistent client's next turn chained
+    to a synthetic "Request timed out" row and was answered. No trigger makes
+    the GPT route write such a row on demand (the output cap does not, and
+    API_TIMEOUT_MS=6000 did not time out on either route, 2026-10-17), so the
+    three rows of that shape are test injections: the synthetic row, the user
+    row chained to it and its answer. Everything after is real: resumed turns
+    whose history carries the synthetic row through the route's translation,
+    a test-injected tail poison, the recovery fork and its resumed turn. The
+    recovery must keep the continuation (append); the old analyzer refuses the
+    resume (poisoned tail) or recovers before the first poison."""
+    import hashlib
+    from datetime import datetime, timezone
+    from obs_agent.context_jsonl import find_session_jsonl
+    from obs_agent.jsonl_fork import fork_session_jsonl
+    from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+    sid = str(uuid.uuid4())
+    cwd = WORK_ROOT / "cwd"
+
+    def row(kind, parent, content, **extra):
+        now = datetime.now(timezone.utc).isoformat()
+        out = {"type": kind, "uuid": str(uuid.uuid4()), "parentUuid": parent, "sessionId": sid,
+               "timestamp": now, "message": {"role": kind, "content": content}}
+        for key, value in extra.items():
+            (out["message"] if key in ("model", "stop_reason", "id") else out)[key] = value
+        return out
+
+    def synthetic(parent):
+        return row("assistant", parent, [{"type": "text", "text": "Request timed out"}],
+                   isApiErrorMessage=True, model="<synthetic>", stop_reason="stop_sequence")
+
+    await _session(args, ["Reply with the single word: ready.", "Reply with the single word: two."], session_id=sid)
+    path = find_session_jsonl(session_id=sid, cwd=cwd)
+    mid = synthetic(resolve_safe_jsonl_target(session_id=sid, cwd=cwd).target_uuid)
+    asked = row("user", mid["uuid"], "Reply with the single word: again.")
+    answered = row("assistant", asked["uuid"], [{"type": "text", "text": "again"}],
+                   model=args.model or "claude-haiku-4-5", stop_reason="end_turn", id=f"msg_{uuid.uuid4().hex}")
+    with path.open("a") as handle:
+        for injected in (mid, asked, answered):
+            handle.write(json.dumps(injected) + "\n")
+    await _session(args, ["Reply with the single word: three.", "Reply with the single word: four."], resume=sid)
+    tail = synthetic(resolve_safe_jsonl_target(session_id=sid, cwd=cwd).target_uuid)
+    with path.open("a") as handle:
+        handle.write(json.dumps(tail) + "\n")
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    target = resolve_safe_jsonl_target(session_id=sid, cwd=cwd)
+    lines = target.health.uuid_line_numbers
+    child = fork_session_jsonl(session_id=sid, target_uuid=target.target_uuid, cwd=cwd)
+    await _session(args, ["Reply with the single word: recovered."], resume=child)
+    return [sid, child], {"parent": sid, "child": child, "reason": target.health.unsafe_tail_reason,
+                         "recovery_kept_continuation": lines.get(target.target_uuid, 0) > lines[mid["uuid"]],
+                         "source_unchanged": hashlib.sha256(path.read_bytes()).hexdigest() == before,
+                         "original_source_sha256": before,
+                         "test_injections": ["mid synthetic row", "user row chained to it", "its answer", "tail poison"]}
 
 
 async def sc_utility_route(args):
@@ -801,6 +859,7 @@ SCENARIOS = {
     "parallel_fork": (sc_parallel_fork, "parallel same-ID resume then verbatim-source fork"),
     "poisoned_recovery": (sc_poisoned_recovery, "test-injected synthetic API-error tail excluded on recovery"),
     "recovered_poison": (sc_recovered_poison, "mid-session API error already recovered from; tail recovery keeps the continuation (vault-1bc2)"),
+    "resumed_poison": (sc_resumed_poison, "resumed turn chained to an injected API-error row; tail recovery keeps it, both routes (vault-1bc2)"),
     "ws_resume": (sc_ws_resume, "whitespace-edged tool output + spliced reminder, then new-process resume"),
     "volatile_flip": (sc_volatile_flip, "server flag flips system section/context_management mid-conversation (Anthropic)"),
 }
@@ -830,7 +889,8 @@ def run(args, name):
                 "error": f"{type(e).__name__}: {e}",
                 "provider_errors": errs[:20]}
     pairs = None
-    if name in ("recovery", "recovery_multi", "parallel_fork", "poisoned_recovery", "recovered_poison"):
+    if name in ("recovery", "recovery_multi", "parallel_fork", "poisoned_recovery", "recovered_poison",
+                "resumed_poison"):
         rows_p = _rows(args.log_dir, [meta["parent"]], since)
         time.sleep(3)
         rows_c = _rows(args.log_dir, [meta["child"]], since)

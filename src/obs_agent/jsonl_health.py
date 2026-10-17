@@ -461,7 +461,7 @@ def analyze_jsonl_path(
 # not merely its text row. Grouped tools/results must remain replay-equivalent,
 # with side effects reconciled before any retry. Original histories stay intact.
 # A break is silent: no error, the API just re-bills the whole conversation.
-# Live check: scripts/cache_regression.py recovery recovery_multi poisoned_recovery recovered_poison (docs/cache-proxy-safety.md).
+# Live check: scripts/cache_regression.py recovery recovery_multi poisoned_recovery recovered_poison resumed_poison (docs/cache-proxy-safety.md).
 def resolve_safe_jsonl_target(
     *,
     session_id: str,
@@ -489,30 +489,39 @@ def resolve_safe_jsonl_target(
 
     if preferred_uuid and health.has_uuid(preferred_uuid) and preferred_uuid not in health.chain_uuids:
         # vault-w0eg: an explicitly requested row on a non-active branch is
-        # resolved on its own branch, never moved onto the active chain. An
-        # unsafe row there falls through to the active-chain rules below.
+        # resolved on its own branch, never moved onto the active chain, also
+        # when it is unsafe there (pending tool round, synthetic error): then it
+        # recovers to that branch's last safe boundary. A None target makes
+        # fork_session_jsonl raise. Only a branch that cannot be analyzed
+        # (missing ancestor, parent cycle) falls through to the active chain.
         try:
             branch = analyze_jsonl_path(path=health.path, session_id=health.session_id,
                                         branch_uuid=preferred_uuid)
         except (KeyError, ValueError):
-            # A branch with a missing ancestor or a parent cycle keeps the
-            # pre-vault-w0eg active-chain resolution below.
             branch = None
-        if branch is not None and branch.is_uuid_safe(preferred_uuid):
-            branch_target = branch.complete_message_targets.get(preferred_uuid)
+        if branch is not None:
+            reason = None
+            branch_target = None
+            if branch.is_uuid_safe(preferred_uuid):
+                branch_target = branch.complete_message_targets.get(preferred_uuid)
+            else:
+                reason = "preferred_uuid_unsafe"
+                if branch.needs_recovery:
+                    branch_target = branch.safe_recovery_uuid
             if branch_target is None:
                 limit = branch.uuid_line_numbers[preferred_uuid]
                 candidates = {value for value in branch.complete_message_targets.values()
                               if branch.uuid_line_numbers[value] <= limit and branch.is_uuid_safe(value)}
                 branch_target = max(candidates, key=branch.uuid_line_numbers.get, default=None)
-            if branch_target is not None:
-                return SafeJsonlTarget(
-                    health=health,
-                    target_uuid=branch_target,
-                    changed=branch_target != preferred_uuid,
-                    reason="complete_message_boundary" if branch_target != preferred_uuid else None,
-                    branch_health=branch,
-                )
+            if reason is None and branch_target != preferred_uuid:
+                reason = "complete_message_boundary"
+            return SafeJsonlTarget(
+                health=health,
+                target_uuid=branch_target,
+                changed=branch_target != preferred_uuid,
+                reason=reason,
+                branch_health=branch,
+            )
 
     if preferred_uuid and health.is_uuid_safe(preferred_uuid):
         completed_target = health.complete_message_targets.get(preferred_uuid)

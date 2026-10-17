@@ -311,6 +311,43 @@ def test_inactive_branch_target_resolves_on_its_own_branch(tmp_path: Path) -> No
     assert [e["uuid"] for e in _read_lines(tmp_path / f"{fork_id}.jsonl")] == ["u1", "a1", "u2", "a2", "u2b"]
 
 
+@pytest.mark.parametrize(
+    "unsafe_row",
+    [
+        # pending tool round
+        {"type": "assistant", "uuid": "x2b", "parentUuid": "u2b", "sessionId": "sid-root",
+         "message": {"role": "assistant", "stop_reason": "tool_use",
+                     "content": [{"type": "tool_use", "id": "t9", "name": "Bash", "input": {}}]}},
+        # synthetic API-error row
+        {"type": "assistant", "uuid": "x2b", "parentUuid": "u2b", "sessionId": "sid-root",
+         "isApiErrorMessage": True,
+         "message": {"role": "assistant", "model": "<synthetic>", "stop_reason": "stop_sequence",
+                     "content": [{"type": "text", "text": "Request timed out"}]}},
+    ],
+    ids=["pending_tool_use", "synthetic_error"],
+)
+def test_unsafe_inactive_branch_target_recovers_on_its_own_branch(tmp_path: Path, unsafe_row: dict) -> None:
+    # vault-w0eg (G1 verifier F1): an off-chain row that is unsafe on its own
+    # branch recovers to that branch's last boundary (u2b), keeping the finished
+    # branch turn a2, and is never moved onto the active chain (a1).
+    from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+    entries = [e for e in _branch_entries() if e["uuid"] != "a2b"]
+    entries.insert(5, unsafe_row)
+    source_path = tmp_path / "sid-root.jsonl"
+    _write_lines(source_path, entries)
+
+    target = resolve_safe_jsonl_target(session_id="sid-root", cwd=tmp_path, source_path=source_path,
+                                       preferred_uuid="x2b")
+    assert target is not None
+    assert (target.target_uuid, target.changed, target.reason) == ("u2b", True, "preferred_uuid_unsafe")
+    assert target.branch_health is not None
+
+    fork_id = fork_session_jsonl(session_id="sid-root", target_uuid="x2b", cwd=tmp_path,
+                                 source_path=source_path, new_session_id="sid-fork")
+    assert [e["uuid"] for e in _read_lines(tmp_path / f"{fork_id}.jsonl")] == ["u1", "a1", "u2", "a2", "u2b"]
+
+
 def test_active_chain_target_is_unchanged_by_branch_rule(tmp_path: Path) -> None:
     from obs_agent.jsonl_health import resolve_safe_jsonl_target
 
