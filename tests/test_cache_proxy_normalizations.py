@@ -27,6 +27,8 @@ if _tests_dir not in sys.path:
 
 import pytest
 
+from cache_proxy import CC_VERSION as _PINNED_CC_VERSION
+
 from conftest_cache_proxy import (
     BULK_TEXT,
     TEST_LOG_DIR,
@@ -1262,7 +1264,9 @@ def test_billing_header_normalization_via_raw_http(proxy_with_bodies: int):
         sys0 = body["system"][0]["text"]
         sys0_texts.append(sys0)
         assert "cch=0" in sys0, f"{pf.name}: billing header not normalized: {sys0[:100]}"
-        assert "cc_version=0" in sys0, f"{pf.name}: cc_version not normalized: {sys0[:100]}"
+        # cc_version is pinned to one constant (not 0: newer models reject it as
+        # claude_code_version_too_old; see CC_VERSION in src/cache_proxy.py).
+        assert f"cc_version={_PINNED_CC_VERSION};" in sys0, f"{pf.name}: cc_version not normalized: {sys0[:100]}"
         # Original values should be gone
         assert "abc123hash" not in sys0, f"{pf.name}: still contains original cch"
         assert "deadbeef" not in sys0, f"{pf.name}: still contains original cc_version"

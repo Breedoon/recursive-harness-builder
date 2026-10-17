@@ -476,4 +476,12 @@ def test_health_does_not_depend_on_any_upstream(proxy_server, monkeypatch):
                         f"http://127.0.0.1:{_free_port()}")
     resp = httpx.get(proxy_server + "/health", timeout=10)
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    payload = resp.json()
+    assert payload["status"] == "ok"
+    # Loaded-code identity (bb2cca3) lets the cache gate prove which source is
+    # serving; it must come from the process itself, not from an upstream.
+    assert set(payload) == {"status", "pid", "loaded_at", "source_sha256"}
+    assert isinstance(payload["pid"], int) and payload["pid"] > 1
+    assert isinstance(payload["loaded_at"], (int, float))
+    assert len(payload["source_sha256"]) == 64
+    int(payload["source_sha256"], 16)

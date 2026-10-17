@@ -92,6 +92,18 @@ def _isolate_control_channel(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_session_effort(monkeypatch):
+    """Tests run from agent shells, which export the agent's own CLI effort.
+
+    ``resolve_effort`` reads ``CLAUDE_CODE_EFFORT_LEVEL`` from the process
+    environment, so an inherited value (e.g. ``high``) silently replaced the
+    model default under test (obs-5). Tests that need it set it explicitly.
+    """
+    monkeypatch.delenv("CLAUDE_CODE_EFFORT_LEVEL", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_cache_gate(request, tmp_path_factory, monkeypatch):
     """Keep the cache-prefix gate (vault-3px5) off production state in unit tests.
 

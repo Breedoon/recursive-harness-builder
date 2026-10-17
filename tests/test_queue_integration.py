@@ -1,7 +1,10 @@
 """Integration tests for message queuing, interrupt, and hook pipeline.
 
 Layer 1: Endpoint + state (TestClient) — verifies HTTP endpoints populate shared state
-Layer 2: Hook pipeline with real queue — verifies hooks drain queue / check interrupt
+Layer 2: Hook pipeline with real queue — verifies hooks NEVER drain the queue
+         (dda767d: queued delivery is runner-owned, persisted queries only; hook
+         additionalContext is not in JSONL and breaks fork/cache prefixes) and
+         that the interrupt check still stops the turn
 Layer 3: Live HTTP — covered in test_http_integration.py extensions
 
 See plan Step 5 for full test matrix.
@@ -17,7 +20,7 @@ from claude_agent_sdk import TextBlock
 from fastapi.testclient import TestClient
 
 from obs_agent.daemon import create_app
-from obs_agent.hooks import HookState, HookPipeline, _make_interrupt_check, _make_queue_check, create_hook_matchers
+from obs_agent.hooks import HookState, HookPipeline, _make_interrupt_check, create_hook_matchers
 
 
 # ---------------------------------------------------------------------------
@@ -123,20 +126,11 @@ class TestPipelineWithRealQueue:
     """Hook pipeline integration with real asyncio.Queue and interrupt flag."""
 
     @pytest.mark.asyncio
-    async def test_queue_check_drains_into_context(self):
-        """Queue check drains real queue into additionalContext."""
-        state = HookState()
-        state.message_queue.put_nowait("message 1")
-        state.message_queue.put_nowait("message 2")
+    async def test_hook_module_has_no_queue_drain_check(self):
+        """The old PostToolUse queue drain was removed on purpose (dda767d)."""
+        import obs_agent.hooks as hooks
 
-        check = _make_queue_check(state)
-        result = await check(_make_pre_tool_use_input(), "tu-1", _EMPTY_CONTEXT)
-
-        assert result is not None
-        ctx = result["hookSpecificOutput"]["additionalContext"]
-        assert "message 1" in ctx
-        assert "message 2" in ctx
-        assert state.message_queue.empty()
+        assert not hasattr(hooks, "_make_queue_check")
 
     @pytest.mark.asyncio
     async def test_interrupt_check_returns_stop(self):
@@ -148,28 +142,28 @@ class TestPipelineWithRealQueue:
 
         assert result is not None
         assert result["continue_"] is False
-        assert result["stopReason"] == "Interrupted by user"
+        # Neutral wording since the 2026-10-01 stop-policy fix: a stop ends the
+        # turn, it does not declare the task cancelled.
+        assert result["stopReason"] == "Turn interrupted"
         assert state.interrupt_flag is False
+        assert state.interrupt_notice_pending is True
 
     @pytest.mark.asyncio
-    async def test_interrupt_short_circuits_queue(self):
-        """When interrupt is set, pipeline stops before draining queue."""
+    async def test_interrupt_short_circuits_and_leaves_queue(self):
+        """When interrupt is set, the pipeline stops and the queue is untouched."""
         state = HookState(interrupt_flag=True)
         state.message_queue.put_nowait("should not be drained")
 
-        interrupt_check = _make_interrupt_check(state)
-        queue_check = _make_queue_check(state)
-        pipeline = HookPipeline([interrupt_check, queue_check])
+        pipeline = HookPipeline([_make_interrupt_check(state)])
 
         result = await pipeline(_make_pre_tool_use_input(), "tu-1", _EMPTY_CONTEXT)
 
         assert result["continue_"] is False
-        # Queue should still have the message (not drained)
         assert state.message_queue.qsize() == 1
 
     @pytest.mark.asyncio
-    async def test_full_pipeline_enqueue_then_drain(self, config):
-        """The registered pipeline delivers queued messages after a successful tool."""
+    async def test_full_pipeline_leaves_queue_for_the_runner(self, config):
+        """Registered Pre/PostToolUse pipelines never inject or drain queued messages."""
         state = HookState()
         state.message_queue.put_nowait("user follow-up")
 
@@ -185,9 +179,9 @@ class TestPipelineWithRealQueue:
         post_input["hook_event_name"] = "PostToolUse"
         result = await post_pipeline(post_input, "tu-1", _EMPTY_CONTEXT)
 
-        ctx = result.get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert "user follow-up" in ctx
-        assert state.message_queue.empty()
+        ctx = (result or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+        assert "user follow-up" not in ctx
+        assert state.message_queue.qsize() == 1
 
     @pytest.mark.asyncio
     async def test_full_pipeline_interrupt_priority(self, config):
@@ -210,8 +204,8 @@ class TestSharedStateBetweenEndpointAndPipeline:
     """Verify that daemon endpoints and hook pipelines share the same state."""
 
     @pytest.mark.asyncio
-    async def test_enqueue_endpoint_feeds_pipeline(self, config):
-        """Message enqueued via HTTP is delivered after a successful tool."""
+    async def test_enqueue_endpoint_feeds_shared_runner_queue(self, config):
+        """A message enqueued via HTTP lands in the shared queue and survives the hooks."""
         app = create_app(config)
         client = TestClient(app)
 
@@ -223,13 +217,14 @@ class TestSharedStateBetweenEndpointAndPipeline:
         post_pipeline = matchers["PostToolUse"][0].hooks[0]
 
         await pre_pipeline(_make_pre_tool_use_input(), "tu-1", _EMPTY_CONTEXT)
-        assert state.message_queue.qsize() == 1
         post_input = _make_pre_tool_use_input()
         post_input["hook_event_name"] = "PostToolUse"
         result = await post_pipeline(post_input, "tu-1", _EMPTY_CONTEXT)
 
-        ctx = result.get("hookSpecificOutput", {}).get("additionalContext", "")
-        assert "via http" in ctx
+        ctx = (result or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+        assert "via http" not in ctx
+        assert state.message_queue.qsize() == 1
+        assert state.message_queue.get_nowait() == "via http"
 
     @pytest.mark.asyncio
     async def test_interrupt_endpoint_feeds_pipeline(self, config):

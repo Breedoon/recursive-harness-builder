@@ -132,14 +132,23 @@ def telegram_scenario_ids() -> list[str]:
 # CLI evals
 # ---------------------------------------------------------------------------
 
+# The placeholder is skipped at collection, before the eval_vault fixture would
+# try to build a vault (obs-5: the skip used to run only after fixture setup,
+# so a disabled lane errored wherever the fixture vault could not be built).
+_NO_CLI_SCENARIOS = pytest.param(
+    "_no_scenarios_found",
+    marks=pytest.mark.skip(
+        reason="CLI evals disabled. Set OBS_EVAL_ENABLE_CLI=1 to run."
+        if not _CLI_EVALS_ENABLED
+        else "No CLI scenario files found in tests/evals/scenarios/"
+    ),
+)
+
+
 @pytest.mark.eval
-@pytest.mark.parametrize("scenario_name", cli_scenario_ids() or ["_no_scenarios_found"])
+@pytest.mark.parametrize("scenario_name", cli_scenario_ids() or [_NO_CLI_SCENARIOS])
 async def test_eval(scenario_name: str, eval_vault: Path, eval_config) -> None:
     """Run a single CLI eval scenario via its configured lane."""
-    if scenario_name == "_no_scenarios_found":
-        if not _CLI_EVALS_ENABLED:
-            pytest.skip("CLI evals disabled. Set OBS_EVAL_ENABLE_CLI=1 to run.")
-        pytest.skip("No CLI scenario files found in tests/evals/scenarios/")
 
     scenario_path = SCENARIO_DIR / f"{scenario_name}.md"
     scenario = parse_scenario(scenario_path)

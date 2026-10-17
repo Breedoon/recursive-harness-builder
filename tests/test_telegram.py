@@ -4279,7 +4279,16 @@ class TestCommands:
                             "uuid": "foreign-a1",
                             "parentUuid": "foreign-u1",
                             "sessionId": "foreign-sid",
-                            "message": {"role": "assistant", "content": [{"type": "text", "text": "seeded"}]},
+                            # A session_source fork runs on its source's model (014caa5),
+                            # read from the transcript's assistant record.
+                            "message": {
+                                "role": "assistant",
+                                "model": config.model,
+                                # A finished turn: without terminal evidence a final
+                                # text-only row is in-flight and is not forked (3ae5ea1).
+                                "stop_reason": "end_turn",
+                                "content": [{"type": "text", "text": "seeded"}],
+                            },
                         }
                     ),
                 ]
