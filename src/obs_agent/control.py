@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 MAX_REQUEST_BYTES = 1024 * 1024
-OPS = ("ping", "message", "launch", "new_tree")
+OPS = ("ping", "message", "launch", "stop", "new_tree")
 _CALLER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
@@ -111,6 +111,7 @@ def validate_request(request: Any) -> str | None:
     required = {
         "message": ("team_name", "recipient", "content"),
         "launch": ("parent_team", "parent_agent", "display_name"),
+        "stop": ("parent_team", "parent_agent", "team_name", "agent_name", "expected_task_id", "expected_launch_parent_message_id"),
         "new_tree": ("title", "prompt"),
     }.get(op, ())
     missing = [key for key in required if not str(args.get(key) or "").strip()]
@@ -186,14 +187,15 @@ class ControlServer:
         caller = caller.strip().lower()
         args = dict(request.get("args") or {})
         key = str(request.get("idempotency_key") or "").strip()
-        if key and key in self._results:
+        # Stop receipts are live cleanup observations, not cached acknowledgements.
+        if key and op != "stop" and key in self._results:
             _audit({"op": op, "caller": caller, "idempotency_key": key, "outcome": "replayed"})
             return {**self._results[key], "replayed": True}
         if op == "ping":
             result: dict[str, Any] = {"ok": True, "pong": True, "pid": os.getpid()}
         else:
             result = await self._dispatch(op, caller, args)
-        if key:
+        if key and op != "stop":
             self._results[key] = result
         _audit({
             "op": op, "caller": caller, "idempotency_key": key or None,
@@ -297,6 +299,14 @@ def _parser() -> argparse.ArgumentParser:
     la.add_argument("--hooks", default=None, help="JSON hook map, as for AgentTask")
     la.add_argument("--session-source", default=None)
     la.add_argument("--allow-cold-wake", action="store_true")
+    st = sub.add_parser("stop", parents=[common], help="stop an exact native child generation as PARENT; report cleanup separately")
+    st.add_argument("--parent-team", required=True)
+    st.add_argument("--parent", dest="parent_agent", required=True)
+    st.add_argument("--team", dest="team_name", required=True)
+    st.add_argument("--agent", dest="agent_name", required=True)
+    st.add_argument("--expected-task-id", required=True)
+    st.add_argument("--expected-launch-parent-message-id", required=True, type=int)
+    st.add_argument("--observe-only", action="store_true", help="observe this generation's runtime/owned-tool cleanup without requesting a stop")
     nt = sub.add_parser("new-tree", parents=[common], help="new root topic whose first turn is PROMPT")
     nt.add_argument("--title", required=True)
     nt.add_argument("--prompt", required=True)

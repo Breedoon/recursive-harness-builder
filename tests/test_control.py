@@ -271,3 +271,239 @@ class TestCliFlagPlacementAndAuditOutcome:
         assert control._audit_outcome({"ok": False, "result": {"outcome": "cold_blocked"}}) == "cold_blocked"
         assert control._audit_outcome({"ok": False, "result": {"outcome": "underdelivered"}}) == "failed"
         assert control._audit_outcome({"ok": False, "error": "boom"}) == "failed"
+
+
+class TestScopedStop:
+    def _setup(self, config, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        from obs_agent.telegram import _ForkTaskRecord
+        monkeypatch.setenv("OBS_CONTROL_DIR", str(tmp_path / "control"))
+        monkeypatch.setenv("OBS_STOP_KILL_GRACE_SECONDS", "0")
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        parent = TestBotDispatchReusesAgentTools()._parent(bot)
+        parent.session_manager.set_sdk_env_overrides({"CLAUDE_CODE_TEAM_NAME": TEAM})
+        child = _state(bot, thread_id=58)
+        child.session_manager.set_session_id("sid-child")
+        child.session_manager._client = SimpleNamespace(_transport=SimpleNamespace(_process=SimpleNamespace(pid=123456)))
+        child.busy = True
+        record = _ForkTaskRecord(task_id="exact-task", parent_route=parent.route,
+            parent_session_id_at_launch="sid-parent", parent_source_uuid="parent-head",
+            child_route=child.route, child_session_id="sid-child", prompt="check", description="item1",
+            team_name=TEAM, agent_name="0123456789-check-child", is_fork=False,
+            launch_child_message_id=901, launch_parent_message_id=900)
+        bot._fork_tasks_by_id[record.task_id] = record
+        bot._fork_task_by_child_route[child.route] = record.task_id
+        bot._team_worker_records[(TEAM, record.agent_name)] = record.task_id
+        monkeypatch.setattr("obs_agent.telegram._maint.capture_process_tree", lambda pid: {123456: 100, 123457: 101})
+        monkeypatch.setattr("obs_agent.telegram._maint.process_identity_matches", lambda pid, start: True)
+        bot._interrupt_live_client = AsyncMock()
+        args = dict(parent_team=TEAM, parent_agent="parent-agent", team_name=TEAM,
+                    agent_name="0123456789-check-child", expected_task_id="exact-task", expected_launch_parent_message_id=900)
+        return bot, child, record, args
+
+    async def test_native_stop_once_then_cleanup_not_status_alone(self, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        first = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert first["ok"] and not first["result"]["cleanup_complete"], first
+        assert record.terminal_request == "stopped"
+        assert first["result"]["owned"] == {123456: 100, 123457: 101}
+        bot._interrupt_live_client.assert_awaited_once()
+        child.busy = False
+        record.status = "stopped"
+        second = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert not second["result"]["cleanup_complete"]  # retained tool identity still lives
+        assert second["result"]["survivors"] == [123457]  # idle CLI itself is not working
+        monkeypatch.setattr("obs_agent.telegram._maint.process_identity_matches", lambda pid, start: False)
+        third = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert third["result"]["cleanup_complete"]
+        assert bot._interrupt_live_client.await_count == 1  # no reset of the native grace
+
+    @pytest.mark.parametrize("change", ["wrong-team", "wrong-parent", "new-generation", "inbox-new-turn"])
+    async def test_stale_timer_does_not_stop_unowned_generation(self, change, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        if change == "wrong-team":
+            args["team_name"] = "other-team"
+        elif change == "wrong-parent":
+            record.parent_route = TelegramRoute(chat_id=1, thread_id=999)
+        elif change == "new-generation":
+            record.launch_parent_message_id = 902
+        else:
+            record.parent_route = child.route
+        result = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert not result["ok"]
+        bot._interrupt_live_client.assert_not_awaited()
+        assert record.terminal_request is None
+
+    @pytest.mark.parametrize("parent_sid", ["sid-parent", None])
+    async def test_maintenance_session_change_does_not_reset_generation(self, config, monkeypatch, tmp_path, parent_sid):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        bot._control_agent_state(TEAM, "parent-agent").session_manager.set_session_id(parent_sid)
+        child.session_manager.set_session_id("maintenance-new-sid")
+        record.child_session_id = "maintenance-new-sid"
+        record.launch_child_message_id = 903
+        record.emit_parent_callback = False  # restored handles default false; not a generation token
+        assert (await bot._control_dispatch("stop", "rounds-watchdog", args))["ok"]
+        assert record.terminal_request == "stopped"
+
+    async def test_restart_after_intent_before_stop_merges_resumed_cli_ownership(self, config, monkeypatch, tmp_path):
+        old_bot, old_child, old_record, args = self._setup(config, monkeypatch, tmp_path)
+        # First instance durably captures OLD ownership but crashes before any native stop.
+        await old_bot._control_dispatch("stop", "rounds-watchdog", {**args, "observe_only": True})
+        old_bot._interrupt_live_client.assert_not_awaited()
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        record.created_at = old_record.created_at
+        child.session_manager._client._transport._process.pid = 234567
+        monkeypatch.setattr("obs_agent.telegram._maint.capture_process_tree", lambda pid: {234567: 200, 234568: 201})
+        monkeypatch.setattr("obs_agent.telegram._maint.process_identity_matches", lambda pid, start: pid == 234568)
+        async def stop_new_route(state):
+            child.busy = False
+            record.status = "stopped"
+            record.terminal_request = "stopped"
+        bot._interrupt_live_client.side_effect = stop_new_route
+        result = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert not result["result"]["cleanup_complete"], result
+        assert result["result"]["survivors"] == [234568]
+        owned = {int(pid): start for pid, start in result["result"]["owned"].items()}
+        assert owned == {123456: 100, 123457: 101, 234567: 200, 234568: 201}
+        bot._interrupt_live_client.assert_awaited_once()
+
+    async def test_retry_merge_preserves_unknown_capture_and_pid_reuse_history(self, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        await bot._control_dispatch("stop", "rounds-watchdog", {**args, "observe_only": True})
+        path = next(control.control_dir().glob("stop-*.json"))
+        receipt = json.loads(path.read_text())
+        receipt.update(capture_known=False, capture_error="prior-unknown")
+        path.write_text(json.dumps(receipt))
+        monkeypatch.setattr("obs_agent.telegram._maint.capture_process_tree", lambda pid: {123456: 200, 234568: 201})
+        result = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert not result["result"]["capture_known"]
+        assert result["result"]["capture_error"] == "prior-unknown"
+        assert [123456, 100] in result["result"]["retired_owned_identities"]
+        assert len(result["result"]["ownership_snapshots"]) == 2
+        assert not result["result"]["cleanup_complete"]
+
+    async def test_generation_is_rechecked_at_actual_async_stop_dispatch(self, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        create = asyncio.create_task
+        def changed_before_dispatch(coro, *a, **kw):
+            record.launch_parent_message_id = 902
+            return create(coro, *a, **kw)
+        monkeypatch.setattr(asyncio, "create_task", changed_before_dispatch)
+        result = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert not result["ok"] and "generation changed" in result["error"]
+        bot._interrupt_live_client.assert_not_awaited()
+        assert record.terminal_request is None
+
+    async def test_lost_ack_restart_keeps_owned_identities_and_does_not_relatch(self, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        await bot._control_dispatch("stop", "rounds-watchdog", args)
+        path = next(control.control_dir().glob("stop-*.json"))
+        receipt = json.loads(path.read_text())
+        receipt["stop_requested_at"] = None  # crash after native latch, before durable ack
+        path.write_text(json.dumps(receipt))
+        bot.__dict__.pop("_control_stop_locks")
+        monkeypatch.setattr("obs_agent.telegram._maint.capture_process_tree", lambda pid: {})
+        child.busy = False
+        record.status = "stopped"
+        result = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert not result["result"]["cleanup_complete"]
+        assert result["result"]["survivors"] == [123457]
+        assert bot._interrupt_live_client.await_count == 1
+        assert result["result"]["request_timestamp_basis"] == "native_latch"
+
+    async def test_concurrent_stop_calls_share_one_native_latch(self, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        async def interrupt(state):
+            await asyncio.sleep(0)
+        bot._interrupt_live_client.side_effect = interrupt
+        result = await asyncio.gather(*(bot._control_dispatch("stop", "rounds-watchdog", args) for _ in range(2)))
+        assert all(r["ok"] for r in result)
+        assert bot._interrupt_live_client.await_count == 1
+
+    @pytest.mark.parametrize("pid", [0, 1, True, "123", os.getpid()])
+    async def test_invalid_or_self_pid_never_becomes_capture_authority(self, pid, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        child.session_manager._client._transport._process.pid = pid
+        capture = __import__("unittest.mock", fromlist=["Mock"]).Mock()
+        monkeypatch.setattr("obs_agent.telegram._maint.capture_process_tree", capture)
+        first = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        capture.assert_not_called()
+        child.busy = False
+        record.status = "stopped"
+        second = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert not second["result"]["cleanup_complete"]  # missing capture is unknown, never empty-tree proof
+        assert not first["result"]["capture_known"]
+
+    @pytest.mark.parametrize("native_status", ["completed", "stopped"])
+    async def test_observation_requires_runtime_and_tool_cleanup_not_native_flag(self, native_status, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        record.status = native_status
+        record.terminal_request = "stopped" if native_status == "stopped" else None
+        args["observe_only"] = True
+        first = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert not first["result"]["cleanup_complete"] and first["result"]["route_active"]
+        bot._interrupt_live_client.assert_not_awaited()
+        child.busy = False
+        assert not (await bot._control_dispatch("stop", "rounds-watchdog", args))["result"]["cleanup_complete"]
+        monkeypatch.setattr("obs_agent.telegram._maint.process_identity_matches", lambda *a: False)
+        assert (await bot._control_dispatch("stop", "rounds-watchdog", args))["result"]["cleanup_complete"]
+        bot._interrupt_live_client.assert_not_awaited()
+
+    async def test_external_stop_without_retained_capture_is_unknown_not_empty_tree_proof(self, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        record.status = "stopped"
+        record.terminal_request = "stopped"
+        child.busy = False
+        child.session_manager._client = None
+        args["observe_only"] = True
+        result = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert not result["result"]["capture_known"] and not result["result"]["cleanup_complete"]
+
+    @pytest.mark.parametrize("error", [OSError("process exited"), ValueError("process identity vanished")])
+    async def test_capture_exit_race_still_stops_logical_child_without_claiming_cleanup(self, error, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        def vanished(pid):
+            raise error
+        monkeypatch.setattr("obs_agent.telegram._maint.capture_process_tree", vanished)
+        result = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert result["ok"] and record.terminal_request == "stopped"
+        assert result["result"]["capture_error"] == type(error).__name__
+        assert not result["result"]["capture_known"] and not result["result"]["cleanup_complete"]
+        bot._interrupt_live_client.assert_awaited_once()
+
+    async def test_slow_native_interrupt_cannot_monopolize_deadline_watchdog(self, config, monkeypatch, tmp_path):
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        release = asyncio.Event()
+        async def interrupt(state):
+            await release.wait()
+        bot._interrupt_live_client.side_effect = interrupt
+        first = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert first["result"]["request_timestamp_basis"] == "native_latch"
+        assert not first["result"]["cleanup_complete"]
+        callback = next(iter(bot._control_stop_callbacks.values()))
+        assert not callback.done()
+        release.set()
+        await callback
+        assert record.terminal_request == "stopped"
+        assert bot._interrupt_live_client.await_count == 1
+
+    async def test_stop_observation_bypasses_generic_cached_ack(self, ctl_dir):
+        args = dict(parent_team=TEAM, parent_agent="p", team_name=TEAM, agent_name="c",
+                    expected_task_id="task", expected_launch_parent_message_id=1)
+        dispatch = AsyncMock(side_effect=[{"ok": True, "result": {"cleanup_complete": False}},
+                                         {"ok": True, "result": {"cleanup_complete": True}}])
+        async def run():
+            first = await _client("stop", "rounds-watchdog", args, idempotency_key="same-stop")
+            second = await _client("stop", "rounds-watchdog", args, idempotency_key="same-stop")
+            return first, second
+        first, second = await _with_server(dispatch, run)
+        assert not first[1]["result"]["cleanup_complete"] and second[1]["result"]["cleanup_complete"]
+        assert dispatch.await_count == 2
+
+    def test_cli_stop_preserves_generation(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(control, "send_request", lambda op, caller, args, **kw: (seen.update(op=op, args=args) or (0, {"ok": True})))
+        assert control.main(["--as", "rounds-watchdog", "stop", "--parent-team", TEAM, "--parent", "p",
+                             "--team", TEAM, "--agent", "c", "--expected-task-id", "task",
+                             "--expected-launch-parent-message-id", "900"]) == 0
+        assert seen["op"] == "stop" and seen["args"]["expected_launch_parent_message_id"] == 900

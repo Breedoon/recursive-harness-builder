@@ -6383,6 +6383,8 @@ class TelegramBot:
                 "allow_cold_wake": bool(args.get("allow_cold_wake")),
             })
             return tool_result_to_control(result)
+        if op == "stop":
+            return await self._control_stop_child(args)
         if op == "launch":
             parent = self._control_agent_state(str(args["parent_team"]).strip(), str(args["parent_agent"]).strip())
             if parent is None:
@@ -6421,6 +6423,119 @@ class TelegramBot:
         if op == "new_tree":
             return await self._control_new_tree(caller=caller, args=args)
         return {"ok": False, "error": f"unsupported op {op}"}
+
+    async def _control_stop_child(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Stop one pinned child generation without waking a model; retain cleanup evidence."""
+        from obs_agent.control import control_dir, tool_result_to_control
+
+        parent = self._control_agent_state(str(args["parent_team"]).strip(), str(args["parent_agent"]).strip())
+        if parent is None:
+            return {"ok": False, "error": "parent agent has no current route binding"}
+        task_id = str(args["expected_task_id"])
+        generation = int(args["expected_launch_parent_message_id"])
+        key = hashlib.sha256(json.dumps([args["parent_team"], args["parent_agent"], task_id, generation]).encode()).hexdigest()
+        locks = self.__dict__.setdefault("_control_stop_locks", {})
+        async with locks.setdefault(key, asyncio.Lock()):
+            record = self._resolve_task_lookup(route=parent.route, task_id=task_id, team_name=None, agent_name=None)
+            if (record is None or record.parent_route != parent.route
+                    or record.team_name != args["team_name"] or record.agent_name != args["agent_name"]):
+                return {"ok": False, "error": "stop target does not match the recorded direct child of this parent"}
+            # Owed maintenance wakes keep the original PARENT launch binding even while
+            # their session/child-message/callback flags change. Explicit resume replaces
+            # that binding; unrelated inbox turns reparent the record to its own route.
+            if record.launch_parent_message_id != generation:
+                return {"ok": False, "error": "stop generation mismatch; the old timer does not own this turn"}
+            child = self._get_state(record.child_route, create=False)
+            def capture_current():
+                client = child.session_manager._client if child is not None else None
+                pid = getattr(getattr(client, "_transport", None), "_process", None)
+                pid = getattr(pid, "pid", None)
+                error = None
+                try:
+                    owned = _maint.capture_process_tree(pid) if _is_killable_cli_pid(pid) else {}
+                except (OSError, ValueError) as exc:
+                    owned, error = {}, type(exc).__name__
+                active = child is not None and bool(child.busy or child.hook_state.execution_active)
+                return {"root_pid": pid, "owned": owned, "capture_error": error,
+                        "capture_known": error is None and (bool(owned) or
+                            (child is not None and not active and record.terminal_request != "stopped"))}
+
+            path = control_dir() / f"stop-{key}.json"
+            try:
+                receipt = json.loads(path.read_text())
+            except FileNotFoundError:
+                receipt = {"task_id": task_id, "launch_parent_message_id": generation,
+                           **capture_current(), "intent_at": time.time(), "stop_requested_at": None}
+
+            def persist():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(receipt))
+                tmp.replace(path)
+
+            # A crash between intent and callback is retried; a confirmed native stop is not
+            # repeated (relatching it would restart the existing escalation grace).
+            persist()
+            if not args.get("observe_only"):
+                latch = child.hook_state.stop_latched_at if child is not None else None
+                if record.terminal_request != "stopped" and latch is None:
+                    callbacks = self.__dict__.setdefault("_control_stop_callbacks", {})
+                    callback = callbacks.get(key)
+                    if callback is None:
+                        async def stop_current_generation():
+                            current = self._resolve_task_lookup(route=parent.route, task_id=task_id, team_name=None, agent_name=None)
+                            if (current is not record or current.parent_route != parent.route
+                                    or current.launch_parent_message_id != generation
+                                    or current.team_name != args["team_name"] or current.agent_name != args["agent_name"]):
+                                return self._task_lookup_error_result("stop generation changed before native dispatch")
+                            # No yield between generation validation, latest ownership capture,
+                            # durable merge and the native callback's latch. A pre-stop intent
+                            # may have survived maintenance onto another CLI of this SAME item.
+                            fresh = capture_current()
+                            history = receipt.setdefault("ownership_snapshots", [{
+                                "at": receipt["intent_at"], "root_pid": receipt["root_pid"],
+                                "owned": dict(receipt["owned"]), "capture_known": receipt["capture_known"],
+                                "capture_error": receipt.get("capture_error")}])
+                            history.append({"at": time.time(), **fresh})
+                            merged = {int(pid): int(start) for pid, start in receipt["owned"].items()}
+                            for pid, start in fresh["owned"].items():
+                                if pid in merged and merged[pid] != start:
+                                    receipt.setdefault("retired_owned_identities", []).append([pid, merged[pid]])
+                                merged[pid] = start
+                            receipt["owned"] = merged
+                            receipt["root_pid"] = fresh["root_pid"]
+                            receipt["capture_known"] = receipt["capture_known"] and fresh["capture_known"]
+                            receipt["capture_error"] = receipt.get("capture_error") or fresh["capture_error"]
+                            receipt["dispatch_at"] = time.time()
+                            persist()
+                            return await self._make_fork_task_stopper(parent.route)({"task_id": task_id})
+                        callback = asyncio.create_task(stop_current_generation())
+                        callbacks[key] = callback
+                    # The native callback latches before its first interrupt await. Preserve
+                    # that callback if a slow CLI cannot acknowledge promptly; don't let IPC
+                    # monopolize the deterministic watchdog or restart the escalation grace.
+                    try:
+                        result = tool_result_to_control(await asyncio.wait_for(asyncio.shield(callback), 1.0))
+                    except TimeoutError:
+                        result = {"ok": True, "pending": True}
+                    if not result["ok"]:
+                        return result
+                    latch = child.hook_state.stop_latched_at if child is not None else None
+                if receipt["stop_requested_at"] is None:
+                    receipt["stop_requested_at"] = latch or receipt.get("dispatch_at") or receipt["intent_at"]
+                    receipt["request_timestamp_basis"] = "native_latch" if latch else "dispatch_or_intent_lower_bound_native_time_unknown"
+                    receipt["acknowledged_at"] = time.time()
+                    persist()
+            active = child is not None and bool(child.busy or child.hook_state.execution_active)
+            survivors = [int(pid) for pid, start in receipt["owned"].items()
+                         if (active or int(pid) != receipt["root_pid"])
+                         and _maint.process_identity_matches(int(pid), int(start))]
+            cleanup = receipt["capture_known"] and not active and not survivors and record.status in {"stopped", "failed", "completed"}
+            receipt.update(cleanup_complete=cleanup, observed_at=time.time(), survivors=survivors, route_active=active,
+                           native_status=record.status, native_completed_at=record.completed_at)
+            persist()
+            return {"ok": True, "text": "stopped and cleanup observed" if cleanup else "stop requested; cleanup pending",
+                    "result": receipt}
 
     async def _control_new_tree(self, *, caller: str, args: dict[str, Any]) -> dict[str, Any]:
         bot = self._primary_bot
