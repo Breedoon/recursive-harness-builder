@@ -767,6 +767,8 @@ class TelegramBot:
         # inbox messages are ignored after daemon restart.
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
+        self._pending_schedule_owners: dict[str, tuple[_TopicScheduleRecord, Any]] = {}
+        self._schedule_owner_repair_task: asyncio.Task | None = None
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
         self._schedule_execution_tasks: dict[str, asyncio.Task] = {}
         self._schedule_running_by_route: set[TelegramRoute] = set()
@@ -3772,6 +3774,32 @@ class TelegramBot:
         )
 
     def _ensure_topic_schedule_owner(self, record: _TopicScheduleRecord, *, inherited_from=None):
+        try:
+            return self._resolve_topic_schedule_owner(record, inherited_from=inherited_from, background=False)
+        except Exception:
+            logger.warning("Schedule owner deferred; registration continues schedule_id=%s",
+                           record.schedule_id, exc_info=True)
+            if not hasattr(self, "_pending_schedule_owners"):
+                self._pending_schedule_owners = {}
+            self._pending_schedule_owners[record.schedule_id] = (record, inherited_from)
+            return {"bead": None, "source": "pending", "pending": True,
+                    "note": "Schedule registered; ownership repair queued off the event loop"}
+
+    async def _repair_pending_schedule_owners(self):
+        for sid, (record, inherited_from) in list(self._pending_schedule_owners.items()):
+            if not self._owns_topic_schedule_record(record):
+                self._pending_schedule_owners.pop(sid, None)
+                continue
+            try:
+                await asyncio.to_thread(self._resolve_topic_schedule_owner, record,
+                                        inherited_from=inherited_from, background=True)
+            except Exception:
+                logger.warning("Schedule ownership repair remains pending schedule_id=%s", sid, exc_info=True)
+            else:
+                self._pending_schedule_owners.pop(sid, None)
+
+    def _resolve_topic_schedule_owner(self, record: _TopicScheduleRecord, *, inherited_from=None,
+                                      background=False):
         if _schedule_scope._PREFIX.match(record.description or ""):
             return None
         owners = _schedule_scope.ScheduleOwnership.load(self._config.vault_path)
@@ -3802,7 +3830,8 @@ class TelegramBot:
         contexts.append({"agent": agent, "texts": texts, "source": "schedule-prompt"})
         return _schedule_scope.assign_creation_owner(
             vault=self._config.vault_path, schedule_id=record.schedule_id, description=record.description,
-            team=team, agent=agent, session_id=state.session_id if state is not None else None, contexts=contexts)
+            team=team, agent=agent, session_id=state.session_id if state is not None else None, contexts=contexts,
+            allow_create=background, blocking=background)
 
     def _register_topic_schedule(self, record: _TopicScheduleRecord) -> None:
         previous = self._topic_schedules_by_id.get(record.schedule_id)
@@ -9974,6 +10003,10 @@ class TelegramBot:
                 await asyncio.sleep(self._background_poll_seconds)
                 await self._process_stop_schedule_events()
                 await self._run_due_interval_schedules()
+                if self._pending_schedule_owners and (
+                    self._schedule_owner_repair_task is None or self._schedule_owner_repair_task.done()
+                ):
+                    self._schedule_owner_repair_task = asyncio.create_task(self._repair_pending_schedule_owners())
             except asyncio.CancelledError:
                 break
             except Exception:

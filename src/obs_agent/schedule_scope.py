@@ -225,15 +225,17 @@ def _ensure_orphan_check(vault: Path, owners: ScheduleOwnership, *, team: str,
 
 def assign_creation_owner(*, vault: Path, schedule_id: str, description: str | None,
                           team: str, agent: str, session_id: str | None,
-                          contexts: list[dict]) -> dict | None:
-    """Assign before schedule registration; no policy refusal or confirmation gate."""
+                          contexts: list[dict], allow_create: bool = True,
+                          blocking: bool = True) -> dict | None:
+    """Resolve ownership; callers queue failures without making registration depend on it."""
     if _PREFIX.match(description or ""):
         return None
     path = Path(os.environ.get("OBS_SCHEDULE_OWNERS_FILE") or (vault / OWNERS_RELATIVE_PATH))
     lock_name = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
     # Empty, ephemeral mutex only; durable evidence remains in Beads and the owners map.
     with open(Path(tempfile.gettempdir()) / f"obs-schedule-owner-{lock_name}.lock", "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        data = json.loads(path.read_text()) if path.exists() else {"schedules": {}}
         owners = ScheduleOwnership.load(vault)
         bid = None
         source = "orphan-check"
@@ -264,8 +266,14 @@ def assign_creation_owner(*, vault: Path, schedule_id: str, description: str | N
                           else context.get("source") or ("session-task" if name == agent else "ancestor-task"))
                 break
         if not bid:
+            scope = f"{team}/{agent}"
+            bid = next((key for key, row in owners.beads.items()
+                        if row.get("status") != "closed"
+                        and (row.get("metadata") or {}).get("schedule_owner_scope") == scope), None)
+        if not bid:
+            if not allow_create:
+                raise RuntimeError("schedule ownership requires asynchronous orphan-check publication")
             bid = _ensure_orphan_check(vault, owners, team=team, agent=agent, session_id=session_id)
-        data = json.loads(path.read_text()) if path.exists() else {"schedules": {}}
         note = f"Schedule ownership automatically assigned {bid} from {source} ({owner_agent})"
         data.setdefault("schedules", {})[schedule_id] = {
             "bead": bid, "owner_team": team, "owner_agent": owner_agent, "note": note,

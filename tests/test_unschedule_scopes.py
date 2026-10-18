@@ -14,6 +14,103 @@ from tests.test_telegram import _TEST_GAP, _make_context, _make_update, _state
 
 TEAM = "2026-08-12-08-05-root"
 OTHER_TEAM = "2026-08-13-09-00-other"
+_REAL_ORPHAN_CHECK = schedule_scope._ensure_orphan_check
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["corrupt-map", "backend-failure", "backend-timeout"])
+async def test_owner_failure_never_blocks_creation_or_restore(config, ownership_files, monkeypatch, failure):
+    import threading
+    import subprocess
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    bot._state_store.initialize()
+    state = _state(bot, thread_id=119)
+    calls = []
+    main_thread = threading.get_ident()
+    original_run = schedule_scope.subprocess.run
+    def failed_backend(command, **kwargs):
+        if not str(command[0]).endswith("/bd-safe"):
+            return original_run(command, **kwargs)
+        calls.append(threading.get_ident())
+        if failure == "backend-timeout":
+            raise subprocess.TimeoutExpired(command, 60)
+        raise subprocess.CalledProcessError(1, command)
+    monkeypatch.setattr(schedule_scope.subprocess, "run", failed_backend)
+    monkeypatch.setattr(schedule_scope, "_ensure_orphan_check", _REAL_ORPHAN_CHECK)
+    if failure == "corrupt-map":
+        ownership_files[1].write_text("{not json")
+    result = await bot._cron_create(route=state.route, args={
+        "schedule_mode": "interval", "interval_seconds": 3600,
+        "description": "degraded creation", "prompt": "continue",
+    })
+    sid = result["tool_use_result"]["schedule"]["id"]
+    assert sid in bot._topic_schedules_by_id and sid in bot._pending_schedule_owners
+    assert result["tool_use_result"]["owner_assignment"]["pending"]
+    assert calls == [], "CronCreate must not wait for Beads, even in a worker thread"
+    restored = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    restored._state_store.initialize()
+    restored._restore_state_from_store()
+    assert sid in restored._topic_schedules_by_id and sid in restored._pending_schedule_owners
+    assert calls == [], "startup restore must not run a blocking Beads command"
+    await restored._repair_pending_schedule_owners()
+    assert sid in restored._topic_schedules_by_id and sid in restored._pending_schedule_owners
+    assert all(thread != main_thread for thread in calls)
+    if failure == "corrupt-map":
+        ownership_files[1].write_text('{"schedules": {}}')
+        restored._topic_schedules_by_id[sid].prompt = "Task bead: ops-1"
+        await restored._repair_pending_schedule_owners()
+        assert sid not in restored._pending_schedule_owners
+        assert schedule_scope.ScheduleOwnership.load(config.vault_path).owners[sid]["bead"] == "ops-1"
+    else:
+        assert calls, "the deferred backend path must actually be exercised"
+
+
+@pytest.mark.parametrize("failure", ["corrupt-map", "backend-failure", "backend-timeout"])
+def test_inheritance_continues_when_ownership_is_unavailable(config, ownership_files, monkeypatch, failure):
+    import subprocess
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    parent, child = _state(bot, thread_id=123), _state(bot, thread_id=124)
+    parent.inflight_user_text = "Task bead: ops-1"
+    _sched(bot, "inherit-errors", parent.route)
+    bot._topic_schedules_by_id["inherit-errors"].inherit_mode = "all"
+    if failure == "corrupt-map":
+        ownership_files[1].write_text("{not json")
+    else:
+        ownership_files[1].write_text('{"schedules": {}}')
+        parent.inflight_user_text = "continue"
+        error = subprocess.TimeoutExpired("bd-safe", 60) if failure == "backend-timeout" else subprocess.CalledProcessError(1, "bd-safe")
+        monkeypatch.setattr(schedule_scope, "_ensure_orphan_check", MagicMock(side_effect=error))
+    bot._inherit_topic_schedules(parent_route=parent.route, child_route=child.route, is_fork=True)
+    sid = next(iter(bot._schedule_ids_by_route[child.route]))
+    assert sid in bot._topic_schedules_by_id and sid in bot._pending_schedule_owners
+
+
+@pytest.mark.asyncio
+async def test_pending_backend_and_busy_map_do_not_block_event_loop(config, ownership_files, monkeypatch):
+    import asyncio
+    import threading
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    state = _state(bot, thread_id=122)
+    _sched(bot, "slow-owner", state.route)
+    entered, release = threading.Event(), threading.Event()
+    def backend(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        raise RuntimeError("Beads unavailable")
+    monkeypatch.setattr(schedule_scope, "_ensure_orphan_check", backend)
+    repair = asyncio.create_task(bot._repair_pending_schedule_owners())
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        result = await asyncio.wait_for(bot._cron_create(route=state.route, args={
+            "schedule_mode": "interval", "interval_seconds": 3600, "prompt": "continue",
+        }), timeout=0.5)
+        assert result["tool_use_result"]["schedule"]["id"] in bot._topic_schedules_by_id
+        assert not repair.done()
+    finally:
+        release.set()
+        await repair
+    assert "slow-owner" in bot._topic_schedules_by_id
+    assert "slow-owner" in bot._pending_schedule_owners
 
 
 def test_creation_ownership_is_warning_only_prefix_or_mapping():
@@ -420,12 +517,11 @@ class TestScopedUnschedule:
     async def test_unreadable_owner_data_degrades_to_report(self, config, monkeypatch, tmp_path):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         root, *_ = _tree(bot)
-        _sched(bot, "s-root", root.route)
-        # Corrupt after normal registration: this tests unschedule's read-error fallback.
         bad = tmp_path / "owners.json"
         bad.write_text("{not json")
         monkeypatch.setenv("OBS_SCHEDULE_OWNERS_FILE", str(bad))
         monkeypatch.setenv("OBS_BEADS_ISSUES_FILE", str(tmp_path / "missing.jsonl"))
+        _sched(bot, "s-root", root.route)
         with patch.object(bot, "_load_tree_members", return_value=_members()):
             ctx = _make_context()
             ctx.args = ["tree"]
