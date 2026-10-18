@@ -37,6 +37,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import uuid
@@ -332,6 +333,29 @@ class Sparks:
             event("lease", owner=owner, action="released")
 
 
+def restart_publishing(sparks, reason: str, **extra) -> tuple[bool, str]:
+    """Run the restart while re-publishing "restarting" every POLL_SECONDS.
+
+    The proxy ignores a verdict older than 120 s, and a paired restart takes
+    minutes; without this refresh it would forward held requests to the dead
+    upstream halfway through. One writer only: the restart runs in a thread.
+    """
+    result: dict = {}
+
+    def work():
+        try:
+            result["r"] = sparks.restart(reason)
+        except Exception as exc:          # never leave the verdict stuck
+            result["r"] = (False, f"restart raised {type(exc).__name__}: {exc}")
+    write_state("restarting", reason, **extra)
+    t = threading.Thread(target=work, daemon=True, name="spark-restart")
+    t.start()
+    while t.is_alive():
+        write_state("restarting", reason, **extra)
+        t.join(POLL_SECONDS)
+    return result.get("r", (False, "restart thread ended without a result"))
+
+
 def run_forever(sparks: Sparks | None = None, detector: Detector | None = None,
                 *, act: bool = True, iterations: int | None = None,
                 clock=time.time, sleep=time.sleep, health=None) -> None:
@@ -359,7 +383,7 @@ def run_forever(sparks: Sparks | None = None, detector: Detector | None = None,
                                       f"{gap - (now - recent[-1]['t']):.0f}s", restarts=recent)
             else:
                 write_state("restarting", verdict.reason, restarts=recent)
-                ok, detail = sparks.restart(verdict.reason)
+                ok, detail = restart_publishing(sparks, verdict.reason, restarts=recent)
                 recent.append({"t": clock(), "utc": _utc(), "ok": ok, "trigger": verdict.reason,
                                "detail": detail})
                 restarts = recent[-20:]
@@ -384,7 +408,7 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     if a.restart_now:
         write_state("restarting", "manual: " + a.restart_now)
-        ok, detail = Sparks().restart("manual: " + a.restart_now)
+        ok, detail = restart_publishing(Sparks(), "manual: " + a.restart_now)
         event("restart_result", ok=ok, detail=detail, manual=True)
         write_state("healthy" if ok else "failed", detail, last_restart=_utc(), last_restart_result=detail)
         print(json.dumps({"ok": ok, "detail": detail}))

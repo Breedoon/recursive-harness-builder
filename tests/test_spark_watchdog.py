@@ -154,3 +154,27 @@ def test_recycle_triggers_a_restart(state_dir):
     sparks = LowMem()
     _run(sparks, lambda: _health(rounds=1, running=0), 30)
     assert len(sparks.restarts) == 1 and "MemAvailable" in sparks.restarts[0]
+
+
+def test_restart_keeps_the_verdict_fresh(state_dir, monkeypatch):
+    import time as _t
+    monkeypatch.setattr(wd, "POLL_SECONDS", 0.05)
+    seen = []
+
+    class Slow(FakeSparks):
+        def restart(self, reason):
+            for _ in range(6):
+                seen.append(json.loads((state_dir / "state.json").read_text())["updated"])
+                _t.sleep(0.05)
+            return True, "slow"
+    ok, detail = wd.restart_publishing(Slow(), "drill")
+    assert ok and detail == "slow"
+    assert len(set(seen)) >= 3          # refreshed while the restart ran
+
+
+def test_restart_exception_is_reported_not_raised(state_dir):
+    class Boom(FakeSparks):
+        def restart(self, reason):
+            raise RuntimeError("ssh died")
+    ok, detail = wd.restart_publishing(Boom(), "x")
+    assert not ok and "ssh died" in detail
