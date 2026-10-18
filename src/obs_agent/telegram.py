@@ -5861,13 +5861,20 @@ class TelegramBot:
         logger.warning("[stop_escalation] disconnecting stopped CLI pid=%s route=%s", pid, state.route)
         session_mgr = state.session_manager
         try:
-            await asyncio.wait_for(session_mgr.disconnect_idle_client(direct_kill=True), timeout=10.0)
+            async with asyncio.timeout(10.0):
+                async with session_mgr._lock:
+                    # Lock acquisition can outlive this turn. Revalidate at
+                    # actuation, including a new turn reusing the SAME client.
+                    if (
+                        state.hook_state.stop_requested_at == stamp
+                        and bool(state.busy or state.hook_state.execution_active)
+                        and session_mgr._client is client
+                    ):
+                        await session_mgr._direct_kill_client_process_unlocked()
         except Exception:
-            logger.warning("[stop_escalation] locked kill failed; killing without the session lock", exc_info=True)
-            try:
-                await session_mgr._direct_kill_client_process_unlocked()
-            except Exception:
-                logger.warning("[stop_escalation] direct kill failed route=%s", state.route, exc_info=True)
+            # The owned OS tree was already reaped above. Bypassing this lock
+            # could instead kill a replacement client or clobber its reference.
+            logger.warning("[stop_escalation] stopped client teardown unavailable route=%s", state.route, exc_info=True)
 
     async def _request_route_interrupt(self, state: TelegramSessionState) -> bool:
         """Set interrupt intent and attempt SDK interrupt for one route."""

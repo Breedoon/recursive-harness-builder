@@ -373,11 +373,11 @@ async def test_stop_escalation_kills_cli_that_ignores_interrupt(config, monkeypa
     bot = _bot(config)
     state = _busy(bot, TelegramRoute(chat_id=67890, thread_id=51), sid="sid-51")
     kill = AsyncMock(return_value=True)
-    monkeypatch.setattr(state.session_manager, "disconnect_idle_client", kill)
+    monkeypatch.setattr(state.session_manager, "_direct_kill_client_process_unlocked", kill)
     bot._mark_stop_requested(state)
     assert state.hook_state.stop_requested_at is not None
     await asyncio.sleep(0.15)
-    kill.assert_awaited_once_with(direct_kill=True)
+    kill.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -386,7 +386,7 @@ async def test_stop_escalation_spares_turn_that_already_ended(config, monkeypatc
     bot = _bot(config)
     state = _busy(bot, TelegramRoute(chat_id=67890, thread_id=52), sid="sid-52")
     kill = AsyncMock(return_value=True)
-    monkeypatch.setattr(state.session_manager, "disconnect_idle_client", kill)
+    monkeypatch.setattr(state.session_manager, "_direct_kill_client_process_unlocked", kill)
     bot._mark_stop_requested(state)
     state.busy = False  # the interrupt worked
     await asyncio.sleep(0.15)
@@ -485,7 +485,7 @@ async def test_stop_reaps_captured_tools_after_early_cli_exit(config, monkeypatc
     monkeypatch.setattr(maint, "process_identity_matches", lambda pid, start: False, raising=False)
     monkeypatch.setattr(maint, "kill_process_identities", lambda targets: killed.append(dict(targets)) or list(targets), raising=False)
     disconnect = AsyncMock(return_value=True)
-    monkeypatch.setattr(state.session_manager, "disconnect_idle_client", disconnect)
+    monkeypatch.setattr(state.session_manager, "_direct_kill_client_process_unlocked", disconnect)
     bot._latch_task_stop(state)
     if turn_state == "ended":
         state.busy = False
@@ -501,6 +501,68 @@ async def test_stop_reaps_captured_tools_after_early_cli_exit(config, monkeypatc
         assert 424242 not in killed[0]
     if turn_state == "new-turn":
         disconnect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_stop_revalidates_turn_under_disconnect_lock(config, monkeypatch, replacement):
+    """An old escalation waiting on the lock may not tear down a new turn."""
+    monkeypatch.setenv("OBS_STOP_KILL_GRACE_SECONDS", "0.01")
+    bot = _bot(config)
+    state = _busy(bot, TelegramRoute(chat_id=67890, thread_id=57), sid="sid-57")
+    manager = state.session_manager
+    client = MagicMock()
+    client._transport._process.pid = 424242
+    manager._client = client
+    reaped = asyncio.Event()
+    monkeypatch.setattr(maint, "capture_process_tree", lambda pid: {pid: 100})
+    monkeypatch.setattr(maint, "refresh_process_tree", lambda owned: owned)
+    monkeypatch.setattr(maint, "process_identity_matches", lambda pid, start: True)
+    monkeypatch.setattr(maint, "kill_process_identities", lambda owned: reaped.set() or list(owned))
+    direct = AsyncMock()
+    monkeypatch.setattr(manager, "_direct_kill_client_process_unlocked", direct)
+    await manager._lock.acquire()
+    bot._mark_stop_requested(state)
+    tasks = list(bot._stop_escalation_tasks)
+    try:
+        await asyncio.wait_for(reaped.wait(), timeout=1)
+        while not manager._lock._waiters:
+            await asyncio.sleep(0)
+        state.hook_state.reset()  # explicit new input starts another turn
+        if replacement:
+            manager._client = MagicMock()
+    finally:
+        manager._lock.release()
+    await asyncio.gather(*tasks)
+    direct.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_lock_timeout_never_bypasses_lock_after_owned_reap(config, monkeypatch):
+    monkeypatch.setenv("OBS_STOP_KILL_GRACE_SECONDS", "0.01")
+    bot = _bot(config)
+    state = _busy(bot, TelegramRoute(chat_id=67890, thread_id=58), sid="sid-58")
+    manager = state.session_manager
+    client = MagicMock()
+    client._transport._process.pid = 424242
+    manager._client = client
+    reaped = []
+    monkeypatch.setattr(maint, "capture_process_tree", lambda pid: {pid: 100})
+    monkeypatch.setattr(maint, "refresh_process_tree", lambda owned: owned)
+    monkeypatch.setattr(maint, "process_identity_matches", lambda pid, start: True)
+    monkeypatch.setattr(maint, "kill_process_identities", lambda owned: reaped.append(dict(owned)) or list(owned))
+    timeout = asyncio.timeout
+    monkeypatch.setattr(tg.asyncio, "timeout", lambda seconds: timeout(0.01))
+    direct = AsyncMock()
+    monkeypatch.setattr(manager, "_direct_kill_client_process_unlocked", direct)
+    await manager._lock.acquire()
+    try:
+        bot._mark_stop_requested(state)
+        await asyncio.wait_for(asyncio.gather(*list(bot._stop_escalation_tasks)), timeout=1)
+    finally:
+        manager._lock.release()
+    assert reaped == [{424242: 100}]
+    direct.assert_not_awaited()
 
 
 # --- orphaned CLIs (vault-u3b.66) ----------------------------------------------------------
@@ -630,7 +692,7 @@ async def test_stop_escalation_kills_process_tree_when_pid_known(config, monkeyp
     client = MagicMock()
     client._transport._process.pid = 424242
     state.session_manager._client = client
-    monkeypatch.setattr(state.session_manager, "disconnect_idle_client", AsyncMock(return_value=True))
+    monkeypatch.setattr(state.session_manager, "_direct_kill_client_process_unlocked", AsyncMock(return_value=True))
     trees: list[dict[int, int]] = []
     monkeypatch.setattr(maint, "capture_process_tree", lambda pid: {pid: 100})
     monkeypatch.setattr(maint, "refresh_process_tree", lambda owned: owned)
@@ -648,7 +710,7 @@ async def test_stop_escalation_with_mock_client_signals_nothing(config, monkeypa
     bot = _bot(config)
     state = _busy(bot, TelegramRoute(chat_id=67890, thread_id=55), sid="sid-55")
     state.session_manager._client = MagicMock()
-    monkeypatch.setattr(state.session_manager, "disconnect_idle_client", AsyncMock(return_value=True))
+    monkeypatch.setattr(state.session_manager, "_direct_kill_client_process_unlocked", AsyncMock(return_value=True))
     sent: list[tuple[int, int]] = []
     monkeypatch.setattr(maint.os, "kill", lambda pid, sig: sent.append((pid, sig)))
     real = maint.kill_process_tree

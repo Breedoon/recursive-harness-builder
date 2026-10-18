@@ -299,12 +299,12 @@ async def test_latched_stop_escalates_to_kill_when_turn_ignores_interrupt(config
     bot = _bot(config)
     state, _client = _child(bot, 71, busy=True)
     kill = AsyncMock(return_value=True)
-    monkeypatch.setattr(state.session_manager, "disconnect_idle_client", kill)
+    monkeypatch.setattr(state.session_manager, "_direct_kill_client_process_unlocked", kill)
     rec = _record(state.route, task_id="t-71", status="completed", idle_ready=True)
     _register(bot, monkeypatch, rec, running=False)
     await _stop(bot, rec)
     await asyncio.sleep(0.15)
-    kill.assert_awaited_once_with(direct_kill=True)
+    kill.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
