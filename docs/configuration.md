@@ -189,7 +189,19 @@ For `local-*` models only (hosted routes are unchanged), the proxy:
   disconnect within seconds; measured 2026-10-16);
 - after `OBS_LOCAL_UPSTREAM_SILENCE_SECONDS` (default 1800) without one upstream
   byte, ends the response with a retryable `overloaded_error` (an SSE `error`
-  event if headers were already sent) instead of hanging.
+  event if headers were already sent) instead of hanging;
+- frames every committed non-streaming response with HTTP/1.1 chunked encoding
+  (that connection only, `Connection: close`). A failure after commit (silence
+  limit, late upstream error, upstream exception) drops the connection before
+  the final chunk, so the CLI records a visible API error. It never writes an
+  error JSON into a 200 body: the CLI persists that as an assistant message of
+  type `error` with no content, which OBS reported as `SilentResponseError`
+  (2026-10-18, bead obs-8; counter `local_nonstream_aborts`). The CLI does not
+  retry this body-read failure (measured with the bundled 2.1.59), and it falls
+  back from a failed stream to non-streaming without retrying, so a dead
+  upstream costs two silence windows (2 x 1800 s) before the error appears.
+  OBS also surfaces any such error-object JSONL tail as `API Error: <type>:
+  <message>` instead of raising `SilentResponseError`.
 
 The request sent upstream is not changed, so this cannot affect prompt caching.
 Each case is logged in the proxy's stderr with a `LOCAL:` prefix. In-process

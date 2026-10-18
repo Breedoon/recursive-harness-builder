@@ -240,6 +240,7 @@ stats = {
     "local_early_commits": 0,
     "local_client_gone": 0,
     "local_upstream_silence": 0,
+    "local_nonstream_aborts": 0,
 }
 
 
@@ -2409,7 +2410,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         status = None
 
         def commit(code: int, resp_headers=None):
+            # Non-streaming responses are chunk-framed (HTTP/1.1, this connection
+            # only) so a failure after commit can end the body WITHOUT its final
+            # chunk: the CLI sees a dropped connection and retries. Under the
+            # handler's HTTP/1.0 close-delimited framing any bytes we write are a
+            # complete body, and an error JSON on a 200 is persisted by the CLI as
+            # an empty assistant message -> OBS SilentResponseError (2026-10-18).
             nonlocal committed
+            if not is_streaming:
+                self.protocol_version = "HTTP/1.1"
+                self.close_connection = True
             self.send_response(code)
             if resp_headers is not None:
                 for k, v in resp_headers.multi_items():
@@ -2419,6 +2429,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 self.send_header("content-type", "text/event-stream" if is_streaming
                                  else "application/json")
+            if not is_streaming:
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.flush()
             committed = True
@@ -2437,7 +2450,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     return
                 self.wfile.write(SSE_PING)
             else:
-                self.wfile.write(b" ")
+                self.wfile.write(b"1\r\n \r\n")
             self.wfile.flush()
             stats["local_keepalives"] += 1
 
@@ -2458,7 +2471,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 prefix = b"" if at_boundary else b"\n\n"
                 self.wfile.write(prefix + b"event: error\ndata: " + payload.encode() + b"\n\n")
             else:
-                self.wfile.write(payload.encode())
+                # Never a body: drop the connection before the final chunk.
+                stats["local_nonstream_aborts"] += 1
+                log(f"LOCAL: aborting committed non-streaming response so the "
+                    f"CLI retries ({message[:200]})")
+                self.wfile.flush()
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
             self.wfile.flush()
 
         try:
@@ -2552,7 +2574,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     log(f"STREAM: no usage in {len(chunks)} chunks. Preview: {raw_preview[:200]}")
             else:
                 content = b"".join(chunks)
-                self.wfile.write(content)
+                if content:
+                    self.wfile.write(b"%x\r\n" % len(content) + content + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
                 try:
                     usage = json.loads(content).get("usage", {})

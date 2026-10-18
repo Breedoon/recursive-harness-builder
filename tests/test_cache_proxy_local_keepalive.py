@@ -275,6 +275,53 @@ def test_late_upstream_error_after_early_commit_becomes_sse_error(proxy, monkeyp
     assert err["error"] == {"type": "overloaded_error", "message": "busy"}
 
 
+@pytest.mark.parametrize("before_headers", [True, False])
+def test_nonstream_failure_after_commit_drops_connection_not_200_error(
+        proxy, monkeypatch, before_headers):
+    """2026-10-18 SilentResponseError: an error JSON written into a committed
+    200 was persisted by the CLI as an assistant message with no content. A
+    committed non-streaming failure must instead break the chunked body, which
+    the CLI treats as a retryable connection error."""
+    monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM_SILENCE_SECONDS", 1.0)
+
+    def behave(h, stub):
+        if not before_headers:
+            h.send_response(200)
+            h.send_header("content-type", "application/json")
+            h.end_headers()
+            h.wfile.flush()
+        stub.wait_for_close(h, 10)
+    stub = Stub(behave)
+    monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", stub.url)
+    try:
+        with pytest.raises(httpx.RemoteProtocolError):
+            httpx.post(f"{proxy}/v1/messages", json=_body(False), timeout=10)
+    finally:
+        stub.stop()
+    assert cache_proxy.stats["local_upstream_silence"] == 1
+    assert cache_proxy.stats["local_nonstream_aborts"] == 1
+
+
+def test_late_nonstream_upstream_error_after_early_commit_drops_connection(proxy, monkeypatch):
+    other = b'{"type":"error","error":{"type":"overloaded_error","message":"busy"}}'
+
+    def behave(h, stub):
+        time.sleep(1.0)
+        h.send_response(503)
+        h.send_header("content-type", "application/json")
+        h.send_header("Content-Length", str(len(other)))
+        h.end_headers()
+        h.wfile.write(other)
+    stub = Stub(behave)
+    monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", stub.url)
+    try:
+        with pytest.raises(httpx.RemoteProtocolError):
+            httpx.post(f"{proxy}/v1/messages", json=_body(False), timeout=10)
+    finally:
+        stub.stop()
+    assert cache_proxy.stats["local_nonstream_aborts"] == 1
+
+
 def test_hosted_route_is_untouched(proxy, monkeypatch):
     def behave(h, stub):
         _sse_headers(h)

@@ -329,6 +329,20 @@ class SessionManager:
                     continue
                 if obj.get("type") != "assistant":
                     continue
+                # An error object served as a 200 body is persisted by the CLI as
+                # an "assistant message" of type error with no content (Spark
+                # proxy before 2026-10-18); surface it instead of a silent turn.
+                raw_message = obj.get("message")
+                if (
+                    isinstance(raw_message, dict)
+                    and raw_message.get("type") == "error"
+                    and isinstance(raw_message.get("error"), dict)
+                ):
+                    err = raw_message["error"]
+                    return (
+                        f"API Error: {err.get('type') or 'error'}: "
+                        f"{err.get('message') or 'upstream returned an error'}"
+                    )
                 if not obj.get("isApiErrorMessage") and not obj.get("error"):
                     continue
                 message = obj.get("message")

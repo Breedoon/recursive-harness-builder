@@ -186,6 +186,39 @@ class TestCreateOptions:
                 == "You've hit your limit - resets 6:30pm"
             )
 
+    def test_latest_jsonl_api_error_text_reads_error_object_served_as_200(
+        self, config, tmp_path
+    ):
+        # Verbatim shape from session aef0fcc2 (2026-10-18): the Spark proxy
+        # wrote an error JSON into a committed 200 and the CLI persisted it.
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": "47c08efa",
+                    "sessionId": "sess-1",
+                    "message": {
+                        "type": "error",
+                        "error": {
+                            "type": "overloaded_error",
+                            "message": "local upstream sent nothing for 1800s",
+                        },
+                        "content": [],
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        mgr = SessionManager(config=config)
+        mgr.set_session_id("sess-1")
+
+        with patch("obs_agent.context_jsonl.find_session_jsonl", return_value=jsonl):
+            assert mgr.latest_jsonl_api_error_text() == (
+                "API Error: overloaded_error: local upstream sent nothing for 1800s"
+            )
+
     def test_includes_hooks(self, config):
         mgr = SessionManager(config=config)
         options = mgr.create_options()
