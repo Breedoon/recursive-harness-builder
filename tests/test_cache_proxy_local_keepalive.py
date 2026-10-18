@@ -337,3 +337,116 @@ def test_hosted_route_is_untouched(proxy, monkeypatch):
         stub.stop()
     assert resp.content == MESSAGE_START + REST
     assert cache_proxy.stats["local_keepalives"] == 0
+
+
+# --- Upstream liveness verdict from the Spark watchdog (bead obs-8, 2026-10-18) ---
+
+@pytest.fixture
+def liveness(monkeypatch, tmp_path):
+    path = tmp_path / "liveness.json"
+    monkeypatch.setattr(cache_proxy, "LOCAL_LIVENESS_FILE", str(path))
+    monkeypatch.setattr(cache_proxy, "LOCAL_LIVENESS_POLL_SECONDS", 0.05)
+
+    def set_state(state, *, age=0.0, reason="test"):
+        path.write_text(json.dumps({"state": state, "reason": reason, "since": time.time(),
+                                    "updated": time.time() - age}))
+    return set_state
+
+
+def test_inflight_request_fails_retryably_when_watchdog_declares_wedge(proxy, monkeypatch, liveness):
+    liveness("healthy")
+
+    def behave(h, stub):
+        _sse_headers(h)
+        h.wfile.write(MESSAGE_START); h.wfile.flush()
+        stub.wait_for_close(h, 10)
+    stub = Stub(behave)
+    monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", stub.url)
+    threading.Timer(0.5, lambda: liveness("wedged", reason="no engine progress")).start()
+    t0 = time.monotonic()
+    try:
+        resp = httpx.post(f"{proxy}/v1/messages", json=_body(True), timeout=10)
+    finally:
+        stub.stop()
+    assert time.monotonic() - t0 < 3
+    events = _events(resp.content)
+    assert events[0] == "message_start" and events[-1] == "error"
+    assert b"overloaded_error" in resp.content and b"no engine progress" in resp.content
+    assert stub.closed_at is not None
+    assert cache_proxy.stats["local_wedge_aborts"] == 1
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_new_request_is_held_until_recovery_then_forwarded_unchanged(proxy, monkeypatch, liveness, stream):
+    liveness("restarting")
+    arrived = []
+
+    def behave(h, stub):
+        arrived.append(time.monotonic())
+        if stream:
+            _sse_headers(h)
+            h.wfile.write(MESSAGE_START + REST)
+        else:
+            h.send_response(200)
+            h.send_header("content-type", "application/json")
+            h.send_header("Content-Length", str(len(NONSTREAM_BODY)))
+            h.end_headers()
+            h.wfile.write(NONSTREAM_BODY)
+    stub = Stub(behave)
+    monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", stub.url)
+    t0 = time.monotonic()
+    threading.Timer(1.2, lambda: liveness("healthy")).start()
+    try:
+        resp = httpx.post(f"{proxy}/v1/messages", json=_body(stream), timeout=10)
+    finally:
+        stub.stop()
+    assert resp.status_code == 200
+    assert arrived and arrived[0] - t0 >= 1.1          # upstream saw nothing while bad
+    if stream:
+        assert resp.content.replace(cache_proxy.SSE_PING, b"") == MESSAGE_START + REST
+    else:
+        assert resp.json() == json.loads(NONSTREAM_BODY)
+    assert cache_proxy.stats["local_recovery_holds"] == 1
+    assert cache_proxy.stats["local_keepalives"] >= 2
+
+
+def test_held_request_gives_up_with_retryable_error(proxy, monkeypatch, liveness):
+    liveness("failed", reason="restart failed")
+    monkeypatch.setattr(cache_proxy, "LOCAL_RECOVERY_WAIT_SECONDS", 0.8)
+    stub = Stub(lambda h, s: pytest.fail("upstream must not be called"))
+    monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", stub.url)
+    # keep the verdict fresh while held
+    stop = threading.Event()
+    threading.Thread(target=lambda: [liveness("failed", reason="restart failed")
+                                     for _ in iter(lambda: stop.wait(0.1), True)], daemon=True).start()
+    try:
+        resp = httpx.post(f"{proxy}/v1/messages", json=_body(True), timeout=10)
+        with pytest.raises(httpx.RemoteProtocolError):
+            httpx.post(f"{proxy}/v1/messages", json=_body(False), timeout=10)
+    finally:
+        stop.set()
+        stub.stop()
+    assert _events(resp.content)[-1] == "error" and b"restart failed" in resp.content
+
+
+def test_stale_or_missing_verdict_has_no_effect(proxy, monkeypatch, liveness):
+    liveness("wedged", age=600)
+    def behave(h, stub):
+        _sse_headers(h)
+        h.wfile.write(MESSAGE_START + REST)
+    stub = Stub(behave)
+    monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", stub.url)
+    try:
+        resp = httpx.post(f"{proxy}/v1/messages", json=_body(True), timeout=10)
+    finally:
+        stub.stop()
+    assert resp.content == MESSAGE_START + REST
+    assert cache_proxy.stats["local_recovery_holds"] == 0
+
+
+def test_health_reports_the_upstream_verdict(proxy, liveness):
+    liveness("wedged", reason="frozen head")
+    doc = httpx.get(f"{proxy}/health", timeout=5).json()
+    assert doc["status"] == "ok"
+    assert doc["local_upstream"]["state"] == "wedged"
+    assert doc["local_upstream"]["reason"] == "frozen head"

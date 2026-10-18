@@ -210,6 +210,63 @@ Each case is logged in the proxy's stderr with a `LOCAL:` prefix. In-process
 `tests/test_cache_proxy_local_keepalive.py`; end-to-end reproduction with the
 real CLI: `scripts/local_stall_repro.py`.
 
+### Spark self-recovery (bead obs-8, attempt obs-8.3)
+
+The silence limit above only makes a dead upstream *visible*. On 2026-10-17 and
+2026-10-18 the Sparks were dead for about seven hours each. In both cases a
+kernel OOM on one Spark started a crash loop, and the native `/health` still
+reported `ok: true` with frozen `requests_running`. Three parts now recover
+without a human:
+
+- **Watchdog** (`obs_agent.spark_watchdog`, supervisor program `spark-watchdog`;
+  config block in the vault `DGX Sparks/Runtime/supervisord-spark-cache-proxy.conf`).
+  Every 15 s it reads native `/health`, and every 60 s it reads each rank's Docker
+  `RestartCount` and `MemAvailable`. Verdicts:
+  - **wedged:** requests are running but the engine progress counters (decode
+    rounds, finished requests, prompt-chunk fetches, grouped prefill rows, spill
+    writes and loads) have not moved for 600 s. Telemetry never showed more than
+    225 s still while healthy, including during a 935k cold prefill. Replayed over
+    34 h of telemetry, it gave no false positives and flagged the 10-18 wedge at
+    02:33:45Z.
+  - **down:** native `/health` unreachable or not ok for 300 s, or a rank
+    restarting at least twice in 10 minutes.
+  - **recycle:** `MemAvailable` on either Spark below 3 GiB with the engine idle,
+    or below 1 GiB at any time. Both OOMs followed a slow erosion from about
+    7 GiB to 0 over 30–40 h.
+
+  On wedged, down or recycle it runs the Runbook's leased paired restart:
+  - exact-owner no-clobber `/data/runtime/spark.lock`;
+  - external-spill check;
+  - current recipe, `start.sh restart --spill-keep-builds 0` with the three
+    aliases;
+  - `unless-stopped` on both ranks.
+
+  Safeguards:
+  - It does nothing while another owner holds the lease or a controller
+    transition is running.
+  - Restarts within 6 h back off: 0, 10, 20, 40, then 60 min.
+  - It writes its verdict to `/workspace/runtime/state/spark-liveness/state.json`
+    and every transition to `events.jsonl` beside it.
+  - `--observe-only` publishes verdicts without acting; `--once` prints one probe.
+- **Proxy** (`OBS_LOCAL_LIVENESS_FILE`, set for `spark-cache-proxy` only). While
+  the verdict is fresh (`OBS_LOCAL_LIVENESS_MAX_AGE`, 120 s) and bad (wedged,
+  down, restarting or failed):
+  - Requests in flight fail at the next keepalive tick with a retryable
+    `overloaded_error`. Streaming responses get an SSE `error`, so the CLI falls
+    back to a non-streaming request; non-streaming responses get a broken
+    chunked body. Counter: `local_wedge_aborts`.
+  - New requests are held with keepalives until the verdict is healthy again,
+    then forwarded unchanged. After `OBS_LOCAL_RECOVERY_WAIT_SECONDS` (2400 s)
+    they fail with the same error instead. Counter: `local_recovery_holds`.
+  - The proxy's `/health` shows the verdict as `local_upstream`.
+- **OBS runner.** When a `local-*` turn ends with a transient backend error,
+  OBS waits until the route's `/health` reports `local_upstream.state ==
+  "healthy"` (at least 60 s, at most 1 h), then resumes the turn. Transient
+  covers connection errors, 5xx/529 and overloaded errors; prompt-too-long and
+  4xx do not count. On routes without a verdict, reachable counts as healthy.
+  The resume prompt is `(System: The local model backend failed … continue …)`,
+  at most 3 times per turn. Hosted models are unchanged.
+
 ### Request log (prompt-cache diagnosis)
 
 Since 2026-10-08 the proxy keeps a standing, session-keyed pool of recent

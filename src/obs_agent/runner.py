@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import re
+import urllib.request
 from pathlib import Path
 import logging
 from dataclasses import dataclass
@@ -47,6 +50,37 @@ _RECOVERY_PROMPT = (
     "Resume the interrupted response only. "
     "Do not treat this as a new user message or as part of the conversation history."
 )
+# Local-model backend failures (bead obs-8, 2026-10-18). When a local model's
+# backend dies mid-turn the CLI ends the turn with a synthetic "API Error: ..."
+# message and the agent sits idle until someone writes to it. For local-* models
+# OBS instead waits until the backend is healthy again (the Spark proxy's /health
+# carries the watchdog's verdict) and resumes the turn itself, a bounded number
+# of times. Hosted models are unchanged (their limits have their own handling).
+_LOCAL_RESUME_MAX = 3
+_LOCAL_RESUME_WAIT_SECONDS = 3600.0
+_LOCAL_RESUME_POLL_SECONDS = 30.0
+_LOCAL_RESUME_MIN_DELAY_SECONDS = 60.0
+_LOCAL_RESUME_PROMPT = (
+    "The local model backend failed during your last step ({error}). It is available "
+    "again. Continue the task from where you left off; do not repeat completed tool calls."
+)
+_LOCAL_TRANSIENT_ERROR_RE = re.compile(
+    r"overloaded|\b5\d\d\b|socket connection was closed|unable to connect|connection (?:error|refused|reset)"
+    r"|econn|timed? ?out|failed to parse json|local upstream|proxy upstream|fetch failed|terminated",
+    re.IGNORECASE,
+)
+_LOCAL_PERMANENT_ERROR_RE = re.compile(
+    r"prompt is too long|context (?:window|length)|invalid_request|authentication|permission|\b40[0134]\b",
+    re.IGNORECASE,
+)
+
+
+def _is_transient_local_error(text: str | None) -> bool:
+    if not text:
+        return False
+    return bool(_LOCAL_TRANSIENT_ERROR_RE.search(text)) and not _LOCAL_PERMANENT_ERROR_RE.search(text)
+
+
 _SILENT_RESPONSE_PROMPT = (
     "Your previous turn ended without any visible assistant text. "
     "Answer the previous user request now. Do not say that you produced an empty response."
@@ -510,7 +544,103 @@ class ConversationRunner:
         self._sync_session_id_from_client()
         return "forked" if recovered is not None else "reconnected"
 
+    def _local_backend_health_url(self) -> str | None:
+        from obs_agent.config import resolve_model_context
+        from obs_agent.spark import is_spark_model, spark_base_url
+
+        try:
+            model = resolve_model_context(self._session_mgr.effective_model).model
+        except Exception:
+            return None
+        if not model.lower().startswith("local-"):
+            return None
+        if is_spark_model(model):
+            return spark_base_url() + "/health"
+        port = getattr(self._config, "cache_proxy_port", None)
+        return f"http://127.0.0.1:{port}/health" if port else ""
+
+    async def _wait_for_local_backend(self, url: str) -> bool:
+        """Wait until the local route reports a healthy upstream (bounded)."""
+        def probe() -> bool | None:
+            try:
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    doc = json.loads(resp.read())
+            except Exception:
+                return False
+            verdict = doc.get("local_upstream") if isinstance(doc, dict) else None
+            if isinstance(verdict, dict):
+                return verdict.get("state") == "healthy"
+            return None          # no watchdog verdict on this route: reachable is all we know
+
+        await asyncio.sleep(_LOCAL_RESUME_MIN_DELAY_SECONDS)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _LOCAL_RESUME_WAIT_SECONDS
+        while True:
+            if self._hook_state.stop_requested_at is not None or not self._queue_delivery_enabled():
+                return False
+            ok = await asyncio.to_thread(probe) if url else None
+            if ok is None or ok:
+                return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(_LOCAL_RESUME_POLL_SECONDS)
+
     async def _stream_with_silent_recovery(
+        self,
+        *,
+        original_prompt: str,
+        retry_prompt: str,
+        stage: str,
+    ) -> AsyncIterator[RunnerEvent]:
+        """Stream a response; resume local-model turns that end in a backend error."""
+        prompt = original_prompt
+        resumes = 0
+        while True:
+            last_error: str | None = None
+            async for event in self._stream_with_silent_recovery_once(
+                original_prompt=prompt, retry_prompt=retry_prompt, stage=stage,
+            ):
+                if isinstance(event, TurnEndEvent):
+                    last_error = event.error_text if event.is_error else None
+                elif isinstance(event, TextEvent) and event.text.strip():
+                    text = event.text.strip()
+                    last_error = text if text.startswith("API Error") else None
+                yield event
+            if (
+                resumes >= _LOCAL_RESUME_MAX
+                or not _is_transient_local_error(last_error)
+                or self._hook_state.stop_requested_at is not None
+                or self._hook_state.compaction_intercepted
+                or not self._queue_delivery_enabled()
+            ):
+                return
+            url = self._local_backend_health_url()
+            if url is None:
+                return
+            resumes += 1
+            logger.warning(
+                "Local backend error ended %s (%s); waiting for recovery, resume %d/%d",
+                stage, last_error, resumes, _LOCAL_RESUME_MAX,
+            )
+            yield StatusEvent(
+                type="notification",
+                summary=(f"local model backend error; waiting for it to recover, then "
+                         f"resuming ({resumes}/{_LOCAL_RESUME_MAX})"),
+            )
+            if not await self._wait_for_local_backend(url):
+                logger.warning("Local backend did not recover in time; leaving the turn ended")
+                return
+            prompt = f"(System: {_LOCAL_RESUME_PROMPT.format(error=(last_error or '')[:300])})"
+            try:
+                await self._client.query(prompt)
+            except Exception as exc:
+                if not _is_recoverable(exc):
+                    raise
+                self._client = await self._session_mgr.reconnect()
+                await self._client.query(prompt)
+            self._sync_session_id_from_client()
+
+    async def _stream_with_silent_recovery_once(
         self,
         *,
         original_prompt: str,

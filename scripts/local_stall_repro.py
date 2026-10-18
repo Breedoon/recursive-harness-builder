@@ -101,13 +101,38 @@ SCENARIOS = {
                               nonstream_silence=420, nonstream_trickle=15),
     # A stall far beyond the proxy's 600 s read timeout, with pings: proves
     # pings also keep the proxy->upstream read alive.
+    # Spark watchdog recovery (bead obs-8): the streaming request hangs (a wedged
+    # head), the watchdog verdict turns "wedged" at 40 s and "healthy" at 100 s.
+    # The proxy must fail the stream retryably, hold the CLI's non-streaming
+    # fallback until the verdict is healthy, then forward it: the turn
+    # completes with text instead of dying.
+    "wedge_recovery": dict(stream_mode="silent-after-start", silence=600,
+                           nonstream_mode="ok", liveness="0:healthy,40:wedged,70:restarting,100:healthy"),
     "long_stall_pings": dict(stream_mode="silent-after-start", silence=780,
                              ping_interval=15, ping_kind="event",
                              nonstream_mode="silent", nonstream_silence=780),
 }
 
 DEFAULTS = dict(stream_mode="ok", silence=0, ping_interval=0, ping_kind="event",
-                nonstream_mode="ok", nonstream_silence=0, nonstream_trickle=15)
+                nonstream_mode="ok", nonstream_silence=0, nonstream_trickle=15, liveness="")
+
+
+def _liveness_writer(path: str, timeline: str, stop: threading.Event, t0: float, log) -> None:
+    """Write a watchdog verdict file following "SECONDS:STATE,..." (refreshed every 2 s)."""
+    plan = sorted((float(a), b) for a, b in (x.split(":", 1) for x in timeline.split(",") if x))
+    current = None
+    while not stop.is_set():
+        elapsed = time.time() - t0
+        state = [st for at, st in plan if at <= elapsed][-1:] or ["healthy"]
+        if state[0] != current:
+            current = state[0]
+            log(event="liveness", state=current, at=round(elapsed, 1))
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"state": current, "reason": "local_stall_repro timeline", "since": t0,
+                       "updated": time.time()}, f)
+        os.replace(tmp, path)
+        stop.wait(2.0)
 
 
 # ── fake upstream ────────────────────────────────────────────────────────
@@ -344,7 +369,8 @@ def wait_health(url: str, timeout: float = 20) -> bool:
     return False
 
 
-def start_proxy(proxy_src: str, port: int, fake_url: str, log_dir: str, stdout):
+def start_proxy(proxy_src: str, port: int, fake_url: str, log_dir: str, stdout,
+                liveness_file: str = ""):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("CACHE_PROXY_", "OBS_LOCAL_LLM_", "ANTHROPIC_"))}
     env.update({
@@ -356,6 +382,8 @@ def start_proxy(proxy_src: str, port: int, fake_url: str, log_dir: str, stdout):
         "OBS_LOCAL_LLM_AUTH_TOKEN": FAKE_TOKEN,
         "PYTHONUNBUFFERED": "1",
     })
+    if liveness_file:
+        env["OBS_LOCAL_LIVENESS_FILE"] = liveness_file
     p = subprocess.Popen([PYTHON, proxy_src, str(port)], env=env, stdout=stdout,
                          stderr=subprocess.STDOUT, start_new_session=True)
     if not wait_health(f"http://127.0.0.1:{port}/health"):
@@ -418,12 +446,17 @@ def run_scenario(args) -> dict:
     proxy = None
     proxy_log = open(os.path.join(out, "proxy.log"), "w")
     proxy_src = os.path.abspath(args.proxy_src)
+    liveness_file = os.path.join(out, "liveness.json") if cfg.get("liveness") else ""
+    stop_liveness = threading.Event()
+    if liveness_file:
+        with open(liveness_file, "w") as f:
+            json.dump({"state": "healthy", "since": time.time(), "updated": time.time()}, f)
     if args.direct:
         base = fake_url
     else:
         pport = free_port()
         proxy = start_proxy(proxy_src, pport, fake_url, os.path.join(out, "proxy-logs"),
-                            proxy_log)
+                            proxy_log, liveness_file)
         base = f"http://127.0.0.1:{pport}"
     home = os.path.join(out, "home")
     os.makedirs(home, exist_ok=True)
@@ -452,6 +485,9 @@ def run_scenario(args) -> dict:
             "max_retries": args.max_retries, "cmd": " ".join(cmd), "out": out,
             "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     t0 = time.time()
+    if liveness_file:
+        threading.Thread(target=_liveness_writer, daemon=True,
+                         args=(liveness_file, cfg["liveness"], stop_liveness, t0, state.log)).start()
     # stdin must be closed: `claude -p` otherwise waits for piped stdin.
     cli = subprocess.Popen(cmd, env=env, cwd=home, stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE,
@@ -464,6 +500,7 @@ def run_scenario(args) -> dict:
         stdout, _ = cli.communicate()
         rc = "killed_max_wall"
     elapsed = time.time() - t0
+    stop_liveness.set()
     time.sleep(1.0)
     if proxy is not None:
         # Keep the proxy a little longer so the fake sees whether the proxy

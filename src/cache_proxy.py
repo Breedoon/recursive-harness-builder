@@ -132,6 +132,43 @@ LOCAL_KEEPALIVE_SECONDS = _env_seconds("OBS_LOCAL_KEEPALIVE_SECONDS", 15.0)
 LOCAL_HEADER_WAIT_SECONDS = _env_seconds("OBS_LOCAL_HEADER_WAIT_SECONDS", 20.0)
 LOCAL_UPSTREAM_SILENCE_SECONDS = _env_seconds("OBS_LOCAL_UPSTREAM_SILENCE_SECONDS", 1800.0)
 SSE_PING = b'event: ping\ndata: {"type": "ping"}\n\n'
+
+# Upstream liveness verdict (bead obs-8, 2026-10-18). A wedged Spark head keeps
+# answering /health ok while sending nothing, so every request waited the full
+# LOCAL_UPSTREAM_SILENCE_SECONDS (twice, with the CLI's non-stream fallback).
+# The Spark watchdog (obs_agent.spark_watchdog) judges liveness by engine
+# progress and writes its verdict to this file; when it is fresh and bad:
+#   - requests already in flight are failed at the next keepalive tick with a
+#     retryable overloaded_error (streaming: SSE error, so the CLI falls back to
+#     a non-streaming request; non-streaming: the chunked body is broken);
+#   - new requests are held with keepalives until the verdict is healthy again
+#     (the watchdog's paired restart), then forwarded unchanged, so the
+#     agent's turn continues instead of failing; after
+#     LOCAL_RECOVERY_WAIT_SECONDS they fail with the same retryable error.
+# Unset, missing or stale (older than LOCAL_LIVENESS_MAX_AGE) = no effect.
+LOCAL_LIVENESS_FILE = os.environ.get("OBS_LOCAL_LIVENESS_FILE", "").strip()
+LOCAL_LIVENESS_MAX_AGE = _env_seconds("OBS_LOCAL_LIVENESS_MAX_AGE", 120.0)
+LOCAL_RECOVERY_WAIT_SECONDS = _env_seconds("OBS_LOCAL_RECOVERY_WAIT_SECONDS", 2400.0)
+LOCAL_LIVENESS_POLL_SECONDS = 5.0
+_LOCAL_BAD_STATES = ("wedged", "down", "restarting", "failed")
+
+
+def _local_liveness() -> dict | None:
+    """The watchdog's fresh verdict, or None (unconfigured, unreadable or stale)."""
+    if not LOCAL_LIVENESS_FILE:
+        return None
+    try:
+        with open(LOCAL_LIVENESS_FILE, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        if time.time() - float(doc.get("updated", 0)) > LOCAL_LIVENESS_MAX_AGE:
+            return None
+        return doc if isinstance(doc, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _local_upstream_bad(doc: dict | None) -> bool:
+    return isinstance(doc, dict) and doc.get("state") in _LOCAL_BAD_STATES
 DEFAULT_PORT = 18923
 # The port the production instance listens on; a different port means this is a
 # test/private instance (used only for a startup hygiene warning).
@@ -241,6 +278,8 @@ stats = {
     "local_client_gone": 0,
     "local_upstream_silence": 0,
     "local_nonstream_aborts": 0,
+    "local_recovery_holds": 0,
+    "local_wedge_aborts": 0,
 }
 
 
@@ -2047,9 +2086,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_health(self):
         """Respond to /health with a simple status check."""
-        body = json.dumps({"status": "ok", "pid": os.getpid(),
-                           "loaded_at": _LOADED_AT,
-                           "source_sha256": _LOADED_SOURCE_SHA256}).encode()
+        payload = {"status": "ok", "pid": os.getpid(),
+                   "loaded_at": _LOADED_AT,
+                   "source_sha256": _LOADED_SOURCE_SHA256}
+        if LOCAL_LIVENESS_FILE:
+            doc = _local_liveness()
+            payload["local_upstream"] = (
+                {k: doc.get(k) for k in ("state", "reason", "since_utc", "updated_utc",
+                                         "last_restart", "last_restart_result")}
+                if doc else {"state": "unknown", "reason": "no fresh watchdog verdict"})
+        body = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -2402,7 +2448,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             rl = self._rl = {}
         events: queue.Queue = queue.Queue()
         upstream = _LocalUpstreamCall(url, body, headers, events, bool(is_streaming))
-        upstream.start()
         committed = False      # we have sent response headers to the client
         at_boundary = True     # streaming output so far ends at an SSE event boundary
         chunks: list[bytes] = []
@@ -2485,12 +2530,46 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         try:
             deadline = time.monotonic() + LOCAL_HEADER_WAIT_SECONDS
+            doc = _local_liveness()
+            if _local_upstream_bad(doc):
+                stats["local_recovery_holds"] += 1
+                log(f"LOCAL: upstream {doc.get('state')} ({str(doc.get('reason'))[:200]}); "
+                    f"holding request until the watchdog reports it healthy")
+                hold_until = time.monotonic() + LOCAL_RECOVERY_WAIT_SECONDS
+                last_ka = time.monotonic()
+                while _local_upstream_bad(doc):
+                    now = time.monotonic()
+                    if now >= hold_until:
+                        fail(f"local upstream {doc.get('state')}: {doc.get('reason')}; not "
+                             f"recovered after {LOCAL_RECOVERY_WAIT_SECONDS:.0f}s")
+                        return
+                    if not committed and now >= deadline:
+                        commit(200)
+                        stats["local_early_commits"] += 1
+                        last_ka = now
+                    elif committed and now - last_ka >= LOCAL_KEEPALIVE_SECONDS:
+                        keepalive()
+                        last_ka = now
+                    time.sleep(LOCAL_LIVENESS_POLL_SECONDS)
+                    doc = _local_liveness()
+                log("LOCAL: upstream recovered; forwarding held request")
+                deadline = time.monotonic() + LOCAL_HEADER_WAIT_SECONDS
+            upstream.start()
             while True:
                 wait = (LOCAL_KEEPALIVE_SECONDS if committed
                         else max(0.0, deadline - time.monotonic()))
                 try:
                     ev = events.get(timeout=wait)
                 except queue.Empty:
+                    doc = _local_liveness()
+                    if _local_upstream_bad(doc):
+                        stats["local_wedge_aborts"] += 1
+                        msg = (f"local upstream {doc.get('state')}: {doc.get('reason')} "
+                               f"(watchdog recovering; retry)")
+                        log(f"LOCAL: failing in-flight request: {msg[:300]}")
+                        upstream.cancel()
+                        fail(msg, code=529)
+                        return
                     if not committed:
                         commit(200)
                         stats["local_early_commits"] += 1
