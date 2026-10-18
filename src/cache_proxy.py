@@ -1372,6 +1372,126 @@ def normalize_dynamic_boundary(body: dict) -> int:
     return count
 
 
+# ── Local compaction prefix sharing (obs-9, 2026-10-18) ───────────────────
+#
+# The CLI's auto/manual compaction request reuses the conversation's messages
+# but swaps the last system block for a one-line summarizer prompt, cuts the
+# tools to [Read] and disables thinking (its cache-sharing variant sits behind
+# the server flag tengu_compact_cache_prefix, which is off). On a local model
+# the chat template renders tools and system ahead of the messages, so that
+# request shares NO prefix with the conversation: the Work Registry's 974k
+# compaction on 2026-10-18 09:30-09:55Z was a full 26-minute prefill
+# (0 cached tokens) that stalled the whole Spark pair, although the
+# conversation's KV sat in GPU/SSD. For local-* routes only, this rewrites a
+# compaction request to the conversation's own last system/tools/thinking/
+# max_tokens, which is what the CLI's cache-sharing compaction sends. The
+# messages, including the CLI's summary instruction and its "Respond with
+# TEXT ONLY. Do NOT call any tools" wording, stay as the CLI built them.
+# Hosted routes are never touched (their bytes and billing are unchanged).
+# The last main-request shape is kept per Claude session on disk, because a
+# resumed CLI usually compacts BEFORE its first ordinary request.
+# CACHE-PREFIX WARNING: local-only; the hosted request pipeline is unchanged.
+# Live check: /workspace/runtime/spark-compact-test (see TensorFold CHANGELOG).
+LOCAL_COMPACT_SYSTEM_TEXT = "You are a helpful AI assistant tasked with summarizing conversations."
+LOCAL_COMPACT_FILE = os.path.join(LOG_DIR, "local-compact-shapes.json")
+LOCAL_COMPACT_MAX = 64
+LOCAL_COMPACT_TTL = 7 * 86400
+_LOCAL_SHAPE_KEYS = ("system", "tools", "thinking", "max_tokens")
+
+
+def _is_compaction_request(body: dict) -> bool:
+    system = body.get("system")
+    if not isinstance(system, list) or not system:
+        return False
+    last = system[-1]
+    return isinstance(last, dict) and last.get("text") == LOCAL_COMPACT_SYSTEM_TEXT
+
+
+class LocalCompactShapes:
+    def __init__(self, path: str | None):
+        import threading
+        self.path = path
+        self.lock = threading.Lock()
+        self.shapes: dict[str, list] = {}  # session -> [shape, digest, last_used]
+        if path and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    self.shapes = json.load(f)
+            except Exception as e:
+                log(f"local compact shapes unreadable, starting empty: {e}")
+
+    def remember(self, session: str, body: dict) -> None:
+        shape = {k: body[k] for k in _LOCAL_SHAPE_KEYS if k in body}
+        digest = hashlib.sha256(json.dumps(shape, sort_keys=True).encode()).hexdigest()
+        with self.lock:
+            old = self.shapes.get(session)
+            now = time.time()
+            if old and old[1] == digest:
+                old[2] = now  # unchanged; refresh in memory, no disk write
+                return
+            self.shapes[session] = [shape, digest, now]
+            self._save(now)
+
+    def get(self, session: str) -> dict | None:
+        with self.lock:
+            entry = self.shapes.get(session)
+            return entry[0] if entry else None
+
+    def _save(self, now: float) -> None:
+        stale = [k for k, v in self.shapes.items() if now - v[2] > LOCAL_COMPACT_TTL]
+        for k in stale:
+            del self.shapes[k]
+        if len(self.shapes) > LOCAL_COMPACT_MAX:
+            for k, _ in sorted(self.shapes.items(), key=lambda kv: kv[1][2])[
+                    : len(self.shapes) - LOCAL_COMPACT_MAX]:
+                del self.shapes[k]
+        if not self.path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.shapes, f, separators=(",", ":"))
+            os.replace(tmp, self.path)
+        except Exception as e:
+            log(f"local compact shapes not saved: {e}")
+
+
+_local_compact: LocalCompactShapes | None = None
+
+
+def _get_local_compact() -> LocalCompactShapes:
+    global _local_compact
+    if _local_compact is None:
+        _local_compact = LocalCompactShapes(LOCAL_COMPACT_FILE)
+    return _local_compact
+
+
+def share_local_compaction_prefix(body: dict, session: str,
+                                  store: LocalCompactShapes | None = None) -> str:
+    """Local routes only. Remember a main request's shape; rewrite a compaction
+    request onto it. Returns "remembered", "rewritten", "no-shape" or "".
+    Call after normalize_request so both shapes are in their normalized form."""
+    if not session:
+        return ""
+    store = store or _get_local_compact()
+    if not _is_compaction_request(body):
+        if body.get("tools"):
+            store.remember(session, body)
+            return "remembered"
+        return ""
+    shape = store.get(session)
+    if not shape:
+        return "no-shape"
+    for k in _LOCAL_SHAPE_KEYS:
+        if k in shape:
+            body[k] = json.loads(json.dumps(shape[k]))
+        else:
+            body.pop(k, None)
+    body.pop("temperature", None)  # thinking-enabled requests carry none
+    return "rewritten"
+
+
 def normalize_request(body: dict) -> tuple[dict, dict]:
     """Apply all normalizations to a request body in spec order.
 
@@ -2234,6 +2354,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # norm.* field in the request index and a prefix_repro scenario.
             # Live check: scripts/cache_regression.py (docs/cache-proxy-safety.md).
             data, info = normalize_request(data)
+            if is_local:
+                try:
+                    info["local_compact"] = share_local_compaction_prefix(
+                        data, self._rl.get("session_id", ""))
+                    if info["local_compact"] in ("rewritten", "no-shape"):
+                        log(f"local compaction request: {info['local_compact']}")
+                except Exception as e:
+                    log(f"local compaction share error, sending as-is: {e}")
             if not is_local:
                 try:
                     info["volatile_pin"] = pin_volatile_config(data)
@@ -2370,7 +2498,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "norm": {k: info.get(k) for k in
                      ("action", "billing", "strings", "reminders", "git_status",
                       "tools", "metadata", "effort_stripped", "schema_sanitized",
-                      "dynamic_boundary", "ws_trimmed", "volatile_pin", "cache_key")
+                      "dynamic_boundary", "ws_trimmed", "volatile_pin", "cache_key", "local_compact")
                      if isinstance(info, dict) and k in info},
             # which proxy code produced these bytes (load-time hash, short)
             "proxy_source": _LOADED_SOURCE_SHA256[:12],
