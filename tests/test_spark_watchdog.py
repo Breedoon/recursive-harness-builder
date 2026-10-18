@@ -178,3 +178,48 @@ def test_restart_exception_is_reported_not_raised(state_dir):
             raise RuntimeError("ssh died")
     ok, detail = wd.restart_publishing(Boom(), "x")
     assert not ok and "ssh died" in detail
+
+
+# spark-doctor-derived host checks (obs-9): kernel OOM kills, hardware Xids, temperature.
+
+def test_new_kernel_oom_kill_recycles_but_history_does_not(state_dir):
+    d = wd.Detector()
+    d.reset(0)
+    d.observe_ranks(0, {"spark-2d31": {"oom_kills": 9, "xids": [], "mem_available_gib": 8.0}})
+    assert d.observe(0, _health(running=0)).state == "healthy"          # 9 kills from earlier: baseline
+    d.observe_ranks(60, {"spark-2d31": {"oom_kills": 10, "xids": [], "mem_available_gib": 8.0}})
+    v = d.observe(60, _health(running=0))
+    assert v.state == "recycle" and "OOM killer" in v.reason
+    d.reset(70)                                                 # the restart
+    d.observe_ranks(80, {"spark-2d31": {"oom_kills": 10, "xids": [], "mem_available_gib": 9.0}})
+    assert d.observe(80, _health(running=0)).state == "healthy"          # same kill must not re-trigger
+
+
+def test_new_hardware_xid_is_down_application_xid_is_not(state_dir):
+    d = wd.Detector()
+    d.reset(0)
+    d.observe_ranks(0, {"spark-20ad": {"oom_kills": 0, "xids": [79]}})
+    assert d.observe(0, _health(running=0)).state == "healthy"          # pre-existing Xid: baseline
+    d.observe_ranks(60, {"spark-20ad": {"oom_kills": 0, "xids": [79, 13]}})
+    assert d.observe(60, _health(running=0)).state == "healthy"         # Xid 13 = application class
+    d.observe_ranks(120, {"spark-20ad": {"oom_kills": 0, "xids": [79, 13, 79]}})
+    v = d.observe(120, _health(running=0))
+    assert v.state == "down" and "Xid [79]" in v.reason
+
+
+def test_hot_gpu_logs_one_event_and_is_published(state_dir):
+    d = wd.Detector()
+    d.reset(0)
+    for t in (0, 60, 120):
+        d.observe_ranks(t, {"spark-20ad": {"gpu_temp_c": 91.0, "psi_full_avg10": 0.3}})
+    events = [json.loads(l) for l in wd.EVENTS_FILE.read_text().splitlines()]
+    assert [e["event"] for e in events] == ["gpu_temperature"]
+    assert d.hosts["spark-20ad"]["hot"] and d.hosts["spark-20ad"]["psi_full_avg10"] == 0.3
+
+
+def test_rank_probe_runs_on_this_host():
+    """The probe script is valid Python and degrades without journalctl/docker."""
+    import subprocess
+    out = subprocess.run([sys.executable, "-c", wd._RANK_INFO], capture_output=True, text=True, timeout=60)
+    doc = json.loads(out.stdout)
+    assert "mem_available_gib" in doc

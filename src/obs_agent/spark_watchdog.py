@@ -24,7 +24,16 @@ This daemon (supervisor program ``spark-watchdog`` on obs-test) therefore:
   ``/data/runtime/spark.lock``, external-spill check, current recipe,
   ``--spill-keep-builds 0``, all three aliases, ``unless-stopped`` on both
   ranks) and never acts while another owner holds the lease or a controller
-  transition is in progress.
+  transition is in progress;
+- (obs-9) also watches the host signals that joeynyc/spark-doctor v0.3.1
+  diagnoses: a NEW kernel OOM kill this boot means unified memory ran out, so it
+  recycles at once (a 60 s MemAvailable sample can miss a fast drain; the
+  2026-10-18 02:23Z worker OOM killed Xorg/gnome-shell before TensorFold died);
+  a NEW hardware-class NVRM Xid is "down" (one paired restart, then backoff;
+  if it recurs the host needs a reboot). Memory PSI and GPU temperature are
+  published per host in ``STATE_FILE`` (``hosts``); >= 90 C logs an event.
+  spark-doctor itself is read-only diagnosis with no remediation, so its
+  checks are ported here instead of running it as a service.
 """
 
 from __future__ import annotations
@@ -71,6 +80,10 @@ ALIASES = ("local-sparks-glm-5.3-flash-exl3-abliterated",
            "local-sparks-glm-5.3-flash-uncensored",
            "local-sparks-glm-5.3-flash-exl3-4bpw")
 BAD_STATES = ("wedged", "down", "restarting", "failed")
+# NVIDIA documents these Xids as driver/firmware/hardware faults (list from
+# spark-doctor's kernel rule); the others are usually an application crash.
+HARDWARE_XIDS = {48, 61, 62, 63, 64, 74, 79, 92, 94, 95, 119, 120}
+GPU_TEMP_WARN_C = 90.0
 
 
 def _utc(ts: float | None = None) -> str:
@@ -109,6 +122,12 @@ class Detector:
     _down_since: float | None = None
     _rank_history: dict = field(default_factory=dict)   # host -> [(t, count)]
     _mem: dict = field(default_factory=dict)            # host -> MemAvailable GiB
+    # host -> counts seen at the first probe after (re)start; growth = new event
+    _oom_base: dict = field(default_factory=dict)
+    _xid_base: dict = field(default_factory=dict)
+    _new_oom: dict = field(default_factory=dict)        # host -> new OOM kills
+    _new_hw_xid: dict = field(default_factory=dict)     # host -> new hardware Xid codes
+    hosts: dict = field(default_factory=dict)           # host -> last probe summary (published)
 
     def reset(self, now: float) -> None:
         self._vector = None
@@ -116,11 +135,39 @@ class Detector:
         self._down_since = None
         self._rank_history.clear()
         self._mem.clear()
+        # keep the per-boot baselines: events already handled by this restart
+        # must not trigger another one; only growth after the reset counts
+        self._new_oom.clear()
+        self._new_hw_xid.clear()
 
     def observe_ranks(self, now: float, ranks: dict[str, dict | None]) -> None:
         for host, info in ranks.items():
+            if info:
+                summary = {k: info.get(k) for k in ("mem_available_gib", "psi_full_avg10", "oom_kills",
+                                                     "gpu_temp_c", "restart_count", "status")}
+                summary["xids"] = len(info.get("xids") or [])
+                hot = (info.get("gpu_temp_c") or 0) >= GPU_TEMP_WARN_C
+                if hot and not (self.hosts.get(host) or {}).get("hot"):
+                    event("gpu_temperature", host=host, gpu_temp_c=info.get("gpu_temp_c"))
+                summary["hot"] = hot
+                self.hosts[host] = summary
             if info and isinstance(info.get("mem_available_gib"), (int, float)):
                 self._mem[host] = float(info["mem_available_gib"])
+            if info and isinstance(info.get("oom_kills"), int):
+                base = self._oom_base.setdefault(host, info["oom_kills"])
+                if info["oom_kills"] < base:            # host rebooted
+                    base = self._oom_base[host] = info["oom_kills"]
+                if info["oom_kills"] > base:
+                    self._new_oom[host] = info["oom_kills"] - base
+                    self._oom_base[host] = info["oom_kills"]
+            if info and isinstance(info.get("xids"), list):
+                seen = self._xid_base.setdefault(host, len(info["xids"]))
+                if len(info["xids"]) < seen:
+                    seen = self._xid_base[host] = len(info["xids"])
+                new = [x for x in info["xids"][seen:] if x in HARDWARE_XIDS]
+                self._xid_base[host] = len(info["xids"])
+                if new:
+                    self._new_hw_xid[host] = sorted(set(new))
             if not info or not isinstance(info.get("restart_count"), int):
                 continue
             hist = self._rank_history.setdefault(host, [])
@@ -154,6 +201,16 @@ class Detector:
         self._down_since = None
         vector = progress_vector(health)
         running = health.get("requests_running")
+        if self._new_hw_xid:
+            host, codes = next(iter(self._new_hw_xid.items()))
+            self._new_hw_xid.clear()
+            return Verdict("down", f"{host} NVRM hardware-class Xid {codes} (driver/firmware/GPU fault); "
+                                   f"restarting the pair; if it recurs the host needs a reboot")
+        if self._new_oom:
+            host, n = next(iter(self._new_oom.items()))
+            self._new_oom.clear()
+            return Verdict("recycle", f"{host} kernel OOM killer fired ({n} kill(s)); "
+                                      f"unified memory exhausted, recycling now")
         if self._mem:
             host, low = min(self._mem.items(), key=lambda kv: kv[1])
             if low < MEM_FORCE_GIB:
@@ -225,13 +282,34 @@ def native_health(timeout: float = 10.0) -> dict | None:
         return None
 
 
-_RANK_INFO = ("import subprocess,json\n"
+# Rank probe. Besides Docker/MemAvailable it ports the host checks of
+# joeynyc/spark-doctor v0.3.1 (e50a14f, rules memory/kernel/thermal) that bear
+# on serving: memory PSI, kernel OOM kills and NVRM Xid errors this boot, GPU
+# temperature. spark-doctor itself is read-only diagnosis (no remediation).
+_RANK_INFO = ("import subprocess,json,re\n"
               "m=next((int(l.split()[1])/1048576 for l in open('/proc/meminfo') if l.startswith('MemAvailable:')),None)\n"
+              "d={'mem_available_gib':m}\n"
+              "try:\n"
+              " f=[l for l in open('/proc/pressure/memory') if l.startswith('full')][0]\n"
+              " d['psi_full_avg10']=float(re.search(r'avg10=([0-9.]+)',f).group(1))\n"
+              "except Exception:pass\n"
+              "try:\n"
+              " k=subprocess.run(['journalctl','-k','-b','--no-pager','-q','-o','cat','--grep',"
+              "'NVRM: Xid|Out of memory: Killed process'],capture_output=True,text=True,timeout=20).stdout\n"
+              " d['oom_kills']=len(re.findall(r'(?<!cgroup )[Oo]ut of memory: Killed process',k))\n"
+              " d['xids']=[int(x) for x in re.findall(r'NVRM: Xid \\([^)]*\\): (\\d+)',k)]\n"
+              "except Exception:pass\n"
+              "try:\n"
+              " t=subprocess.run(['nvidia-smi','--query-gpu=temperature.gpu','--format=csv,noheader,nounits'],"
+              "capture_output=True,text=True,timeout=20).stdout.split()\n"
+              " d['gpu_temp_c']=float(t[0])\n"
+              "except Exception:pass\n"
               "try:\n"
               " x=json.loads(subprocess.check_output(['docker','inspect','glm53-flash-tf']))[0]\n"
-              " print(json.dumps({'restart_count':x.get('RestartCount'),'status':x['State'].get('Status'),"
-              "'restarting':x['State'].get('Restarting'),'mem_available_gib':m}))\n"
-              "except Exception as e:\n print(json.dumps({'error':type(e).__name__,'mem_available_gib':m}))\n")
+              " d.update(restart_count=x.get('RestartCount'),status=x['State'].get('Status'),"
+              "restarting=x['State'].get('Restarting'),started_at=x['State'].get('StartedAt'))\n"
+              "except Exception as e:\n d['error']=type(e).__name__\n"
+              "print(json.dumps(d))\n")
 _LEASE_INFO = ("import json,pathlib,time\n"
                "p=pathlib.Path('/data/runtime/spark.lock')\n"
                "print(json.dumps({'held':p.exists(),'age':time.time()-p.stat().st_mtime if p.exists() else None,"
@@ -394,7 +472,7 @@ def run_forever(sparks: Sparks | None = None, detector: Detector | None = None,
                 last_rank_poll = float("-inf")
                 continue
         else:
-            write_state(verdict.state, verdict.reason)
+            write_state(verdict.state, verdict.reason, hosts=det.hosts)
         sleep(POLL_SECONDS)
 
 
