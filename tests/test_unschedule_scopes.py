@@ -201,16 +201,13 @@ def test_auto_owner_fallback_is_published_lineage_scoped_and_reused(ownership_fi
     def backend(command, **kwargs):
         calls.append(command)
         rows = [json.loads(line) for line in ownership_files[0].read_text().splitlines()]
-        if command[1] == "create":
-            bid = command[command.index("--id") + 1]
-            metadata = json.loads(command[command.index("--metadata") + 1])
-            assert metadata["check"]["of"] is None and metadata["check"]["source_session"] == "session"
-            assert "orphan-check" in command[command.index("--labels") + 1]
-            assert "--priority" not in command and "--force" in command
-            rows.append({"id": bid, "status": "open", "metadata": metadata})
-        else:
-            assert command[1] == "reopen"
-            next(row for row in rows if row["id"] == command[2])["status"] = "open"
+        assert command[1] == "create", "Closed checks must never be reopened or overwritten"
+        bid = command[command.index("--id") + 1]
+        metadata = json.loads(command[command.index("--metadata") + 1])
+        assert metadata["check"]["of"] is None and metadata["check"]["source_session"] == "session"
+        assert "orphan-check" in command[command.index("--labels") + 1]
+        assert "--priority" not in command and "--force" in command
+        rows.append({"id": bid, "status": "open", "metadata": metadata})
         ownership_files[0].write_text("\n".join(json.dumps(row) for row in rows) + "\n")
     monkeypatch.setattr(schedule_scope.subprocess, "run", backend)
     def assign(sid, agent="worker"):
@@ -220,12 +217,17 @@ def test_auto_owner_fallback_is_published_lineage_scoped_and_reused(ownership_fi
     second = assign("b")
     assert first["source"] == "orphan-check" and first["bead"] == second["bead"] and len(calls) == 1
     rows = [json.loads(line) for line in ownership_files[0].read_text().splitlines()]
-    next(row for row in rows if row["id"] == first["bead"])["status"] = "closed"
+    closed = next(row for row in rows if row["id"] == first["bead"])
+    closed.update({"status": "closed", "closed_at": "2026-10-17T21:38:14Z", "close_reason": "prior work done"})
     ownership_files[0].write_text("\n".join(json.dumps(row) for row in rows) + "\n")
-    assert assign("c")["bead"] == first["bead"] and calls[-1][1] == "reopen"
-    assert assign("d", "other")["bead"] != first["bead"]
+    fresh = assign("c")
+    assert fresh["bead"] != first["bead"] and calls[-1][1] == "create"
+    assert assign("c-again")["bead"] == fresh["bead"] and len(calls) == 2
+    assert assign("d", "other")["bead"] not in (first["bead"], fresh["bead"])
     owners = schedule_scope.ScheduleOwnership.load(tmp_path)
-    assert not owners.creation_warnings(schedule_id="a", description=None)
+    assert owners.beads[first["bead"]] == closed
+    assert owners.beads[fresh["bead"]]["metadata"]["prior_schedule_owner_checks"] == [first["bead"]]
+    assert not owners.creation_warnings(schedule_id="c", description=None)
     assert owners.owners["s-adopted"]["bead"] == "reg-1"
 
 

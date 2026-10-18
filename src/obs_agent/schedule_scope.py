@@ -187,30 +187,35 @@ def _owner_from_text(text: str, beads: dict[str, dict]) -> str | None:
 def _ensure_orphan_check(vault: Path, owners: ScheduleOwnership, *, team: str,
                          agent: str, session_id: str | None) -> str:
     scope = f"{team}/{agent}"
-    bid = "ops-" + hashlib.sha256(scope.encode()).hexdigest()[:8]
-    row = owners.beads.get(bid)
-    if row and (row.get("metadata") or {}).get("schedule_owner_scope") != scope:
-        raise ValueError("schedule owner check id collision")
-    command = [str(vault / ".beads" / "bd-safe")]
-    if row:
+    prior = {bid: row for bid, row in owners.beads.items()
+             if (row.get("metadata") or {}).get("schedule_owner_scope") == scope}
+    for bid, row in prior.items():
         if row.get("status") != "closed":
             return bid
-        command += ["reopen", bid, "--reason", "New prefix-less schedule needs this lineage ownership check"]
-    else:
-        due = dt.datetime.now(dt.timezone.utc).date().isoformat()
-        what = f"Resolve schedule ownership for {agent} in lineage tree {team}"
-        metadata = {"owner_team": team, "schedule_owner_scope": scope,
-                    "check": {"kind": "delayed-verification", "of": None, "class": "script",
-                              "series": 1, "n": 1, "of_n": 1, "due": due, "methods": [],
-                              "what": what, "source_agent": agent, "source_session": session_id}}
-        description = (f"Schedule registration automatically created this lineage-scoped orphan check because "
-                       f"no open task owner was found for agent {agent} or its ancestors in tree {team}. "
-                       f"Source session: {session_id}. Inspect its schedules and assign a substantive "
-                       "task/responsibility owner; do not delete useful work just for missing registration.\n"
-                       "priority-authority: none — tooling default, do not trust")
-        command += ["create", "--force", "--id", bid, "--title", what, "--type", "chore",
-                    "--labels", "check,check-class:script,orphan-check,schedule-owner",
-                    "--defer", due, "--description", description, "--metadata", json.dumps(metadata), "--json"]
+    generation = 0
+    while True:
+        seed = scope if generation == 0 else f"{scope}/generation/{generation}"
+        bid = "ops-" + hashlib.sha256(seed.encode()).hexdigest()[:8]
+        if bid not in owners.beads:
+            break
+        generation += 1
+    due = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    what = f"Resolve schedule ownership for {agent} in lineage tree {team}"
+    metadata = {"owner_team": team, "schedule_owner_scope": scope,
+                "schedule_owner_generation": generation, "prior_schedule_owner_checks": list(prior),
+                "check": {"kind": "delayed-verification", "of": None, "class": "script",
+                          "series": 1, "n": 1, "of_n": 1, "due": due, "methods": [],
+                          "what": what, "source_agent": agent, "source_session": session_id}}
+    description = (f"Schedule registration automatically created this lineage-scoped orphan check because "
+                   f"no open task owner was found for agent {agent} or its ancestors in tree {team}. "
+                   f"Source session: {session_id}. Inspect its schedules and assign a substantive "
+                   "task/responsibility owner; do not delete useful work just for missing registration. "
+                   "Prior closed checks retain their exact history; new work gets a fresh generation.\n"
+                   "priority-authority: none — tooling default, do not trust")
+    command = [str(vault / ".beads" / "bd-safe"), "create", "--force", "--id", bid,
+               "--title", what[:200], "--type", "chore",
+               "--labels", "check,check-class:script,orphan-check,schedule-owner",
+               "--defer", due, "--description", description, "--metadata", json.dumps(metadata), "--json"]
     subprocess.run(command, cwd=vault, check=True, capture_output=True, text=True, timeout=60)
     persisted = ScheduleOwnership.load(vault).beads.get(bid)
     if not persisted or persisted.get("status") == "closed":
