@@ -467,6 +467,42 @@ def test_cli_oom_score_raised_on_child_process(monkeypatch):
         child.wait()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_state", ["ended", "new-turn", "cli-gone"])
+async def test_stop_reaps_captured_tools_after_early_cli_exit(config, monkeypatch, turn_state):
+    """ops-9.10: cleanup must not depend on the stopped turn or CLI staying alive."""
+    monkeypatch.setenv("OBS_STOP_KILL_GRACE_SECONDS", "0.05")
+    bot = _bot(config)
+    state = _busy(bot, TelegramRoute(chat_id=67890, thread_id=56), sid="sid-56")
+    client = MagicMock()
+    client._transport._process.pid = 424242
+    state.session_manager._client = client
+    tree = {424242: 100, 424243: 101, 424244: 102}
+    captured = []
+    killed = []
+    monkeypatch.setattr(maint, "capture_process_tree", lambda pid: captured.append(pid) or dict(tree), raising=False)
+    monkeypatch.setattr(maint, "refresh_process_tree", lambda targets: targets, raising=False)
+    monkeypatch.setattr(maint, "process_identity_matches", lambda pid, start: False, raising=False)
+    monkeypatch.setattr(maint, "kill_process_identities", lambda targets: killed.append(dict(targets)) or list(targets), raising=False)
+    disconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(state.session_manager, "disconnect_idle_client", disconnect)
+    bot._latch_task_stop(state)
+    if turn_state == "ended":
+        state.busy = False
+    elif turn_state == "new-turn":
+        state.hook_state.reset()
+        state.session_manager._client = MagicMock()  # never tear down a replacement
+    else:
+        state.session_manager._client = None
+    await asyncio.sleep(0.15)
+    assert captured == [424242]
+    assert killed and {424243, 424244} <= killed[0].keys()
+    if turn_state != "cli-gone":
+        assert 424242 not in killed[0]
+    if turn_state == "new-turn":
+        disconnect.assert_not_awaited()
+
+
 # --- orphaned CLIs (vault-u3b.66) ----------------------------------------------------------
 
 
@@ -477,7 +513,7 @@ def _proc(root: Path, pid: int, argv: list[str], *, ppid: int, pgid: int) -> Non
     d = root / str(pid)
     d.mkdir()
     (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
-    (d / "stat").write_text(f"{pid} (claude spin) R {ppid} {pgid} {pgid} 0 -1\n")
+    (d / "stat").write_text(f"{pid} (claude spin) R {ppid} {pgid} {pgid} " + "0 " * 15 + f"{pid * 10}\n")
 
 
 def test_orphan_finder_matches_only_dead_group_sdk_clis(tmp_path: Path):
@@ -489,6 +525,61 @@ def test_orphan_finder_matches_only_dead_group_sdk_clis(tmp_path: Path):
     _proc(tmp_path, 505, [CLI], ppid=1, pgid=700)  # other live group leader
     _proc(tmp_path, 700, ["/bin/bash", "other.sh"], ppid=1, pgid=700)
     assert maint.find_orphaned_agent_clis(own_pgid=500, proc_root=tmp_path) == [501]
+
+
+def test_retained_tree_reaps_reparented_tools_and_late_children(tmp_path: Path):
+    _proc(tmp_path, 600, ["python"], ppid=1, pgid=500)
+    _proc(tmp_path, 601, [CLI], ppid=600, pgid=500)
+    _proc(tmp_path, 602, ["bash"], ppid=601, pgid=500)
+    _proc(tmp_path, 603, ["python"], ppid=602, pgid=500)
+    _proc(tmp_path, 604, [CLI], ppid=600, pgid=500)  # unrelated sibling
+    owned = maint.capture_process_tree(601, proc_root=tmp_path)
+    assert owned == {601: 6010, 602: 6020, 603: 6030}
+    shutil.rmtree(tmp_path / "601")  # original CLI exits before escalation
+    path = tmp_path / "602" / "stat"
+    path.write_text(path.read_text().replace(" R 601 ", " R 1 "))
+    _proc(tmp_path, 605, ["python"], ppid=602, pgid=500)
+    owned = maint.refresh_process_tree(owned, proc_root=tmp_path)
+    sent = []
+    killed = maint.kill_process_identities(owned, proc_root=tmp_path, kill=lambda p, s: sent.append((p, s)))
+    assert set(killed) == {602, 603, 605}
+    assert all(sig == signal.SIGKILL for _, sig in sent)
+    assert killed.index(605) < killed.index(602)
+
+
+def test_retained_tree_refuses_reused_pids_and_their_children(tmp_path: Path):
+    _proc(tmp_path, 601, [CLI], ppid=600, pgid=500)
+    _proc(tmp_path, 602, ["bash"], ppid=601, pgid=500)
+    owned = maint.capture_process_tree(601, proc_root=tmp_path)
+    shutil.rmtree(tmp_path / "601")
+    path = tmp_path / "602" / "stat"
+    path.write_text(path.read_text().replace("6020", "99999"))
+    _proc(tmp_path, 603, ["python"], ppid=602, pgid=500)
+    assert maint.refresh_process_tree(owned, proc_root=tmp_path) == owned
+    sent = []
+    assert maint.kill_process_identities(owned, proc_root=tmp_path, kill=lambda p, s: sent.append((p, s))) == []
+    assert sent == []
+
+
+@pytest.mark.parametrize("bad", [1, 0, -1, True, MagicMock(), "601", 600])
+def test_capture_process_tree_preserves_cli_root_guard(tmp_path: Path, bad):
+    _proc(tmp_path, 600, ["python"], ppid=1, pgid=500)
+    _proc(tmp_path, 601, [CLI], ppid=600, pgid=500)
+    with pytest.raises(ValueError):
+        maint.capture_process_tree(bad, proc_root=tmp_path)
+
+
+def test_retained_tree_never_signals_own_pid_or_pid_one(tmp_path: Path):
+    import os
+
+    _proc(tmp_path, 1, [CLI], ppid=0, pgid=1)
+    _proc(tmp_path, os.getpid(), [CLI], ppid=1, pgid=500)
+    sent = []
+    assert maint.kill_process_identities(
+        {1: 10, os.getpid(): os.getpid() * 10, True: 10}, proc_root=tmp_path,
+        kill=lambda p, s: sent.append((p, s)),
+    ) == []
+    assert sent == []
 
 
 def test_kill_process_tree_kills_cli_and_its_tool_children(tmp_path: Path):
@@ -540,11 +631,14 @@ async def test_stop_escalation_kills_process_tree_when_pid_known(config, monkeyp
     client._transport._process.pid = 424242
     state.session_manager._client = client
     monkeypatch.setattr(state.session_manager, "disconnect_idle_client", AsyncMock(return_value=True))
-    trees: list[int] = []
-    monkeypatch.setattr(maint, "kill_process_tree", lambda pid: trees.append(pid) or [pid])
+    trees: list[dict[int, int]] = []
+    monkeypatch.setattr(maint, "capture_process_tree", lambda pid: {pid: 100})
+    monkeypatch.setattr(maint, "refresh_process_tree", lambda owned: owned)
+    monkeypatch.setattr(maint, "process_identity_matches", lambda pid, start: True)
+    monkeypatch.setattr(maint, "kill_process_identities", lambda owned: trees.append(dict(owned)) or list(owned))
     bot._mark_stop_requested(state)
     await asyncio.sleep(0.15)
-    assert trees == [424242]
+    assert trees == [{424242: 100}]
 
 
 @pytest.mark.asyncio

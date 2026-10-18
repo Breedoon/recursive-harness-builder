@@ -5760,7 +5760,22 @@ class TelegramBot:
         grace = _stop_kill_grace_seconds()
         if grace <= 0:
             return
-        task = asyncio.create_task(self._escalate_stop(state, stamp=stamp, grace=grace))
+        client = state.session_manager._client
+        process = getattr(getattr(client, "_transport", None), "_process", None)
+        pid = getattr(process, "pid", None)
+        owned: dict[int, int] = {}
+        if _is_killable_cli_pid(pid):
+            try:
+                # Capture before yielding or publishing the active-stop receipt: the
+                # CLI can exit immediately on interrupt/SIGTERM and lose its ancestry.
+                owned = _maint.capture_process_tree(pid)
+            except (OSError, ValueError):
+                logger.debug("Stop tree capture unavailable pid=%s", pid, exc_info=True)
+        else:
+            pid = None
+        task = asyncio.create_task(
+            self._escalate_stop(state, stamp=stamp, grace=grace, client=client, pid=pid, owned=owned)
+        )
         self._stop_escalation_tasks.add(task)
         task.add_done_callback(self._stop_escalation_tasks.discard)
 
@@ -5785,13 +5800,13 @@ class TelegramBot:
         discarded = len(_drain_queue(hook_state.message_queue)) + len(state.pending_messages)
         state.pending_messages = []
         state.inbox_wake_pending = False  # a wake queued before the stop
+        self._mark_stop_requested(state, stamp=stamp)
         logger.info(
             "[task_stop] latched route=%s active=%s discarded_queued=%d",
             state.route,
             active,
             discarded,
         )
-        self._mark_stop_requested(state, stamp=stamp)
 
     @staticmethod
     def _clear_stop_latch(state: TelegramSessionState | None, reason: str) -> None:
@@ -5811,34 +5826,40 @@ class TelegramBot:
         except Exception:
             logger.debug("Task stop interrupt failed route=%s", state.route, exc_info=True)
 
-    async def _escalate_stop(self, state: TelegramSessionState, *, stamp: float, grace: float) -> None:
-        await asyncio.sleep(grace)
-        if state.hook_state.stop_requested_at != stamp:
-            return  # the stopped turn ended and a new one started
-        if not (state.busy or state.hook_state.execution_active):
-            return
-        session_mgr = state.session_manager
-        client = session_mgr._client
-        process = getattr(getattr(client, "_transport", None), "_process", None)
-        pid = getattr(process, "pid", None)
-        # Only a real child pid is killable; a mock or bogus value (int(MagicMock())
-        # == 1) once made this SIGKILL every descendant of PID 1 and took down the fleet.
-        if not _is_killable_cli_pid(pid):
-            pid = None
-        logger.warning(
-            "[stop_escalation] turn still running %.0fs after stop; killing Claude CLI pid=%s route=%s",
-            grace,
-            pid,
-            state.route,
-        )
-        if pid:
-            # Kill the CLI's tool subprocesses too; they would otherwise be
-            # reparented to PID 1 and keep running after the stop.
+    async def _escalate_stop(
+        self, state: TelegramSessionState, *, stamp: float, grace: float,
+        client: Any, pid: object, owned: dict[int, int],
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + grace
+        while True:
+            stopped_turn_active = (
+                state.hook_state.stop_requested_at == stamp
+                and bool(state.busy or state.hook_state.execution_active)
+                and state.session_manager._client is client
+            )
+            if not stopped_turn_active:
+                # A new turn may reuse this CLI; only the old tool identities
+                # remain ours to reap, not that CLI or its new tool children.
+                owned.pop(pid, None)
+            if owned:
+                # Do not yield between the turn check, ancestry refresh and reap:
+                # a replacement turn must not donate its new tools to this stop.
+                owned = _maint.refresh_process_tree(owned)
+            remaining = deadline - asyncio.get_running_loop().time()
+            root_alive = pid in owned and _maint.process_identity_matches(pid, owned[pid])
+            if not stopped_turn_active or (owned and not root_alive) or remaining <= 0:
+                break
+            await asyncio.sleep(min(0.1, remaining))
+        if owned:
             try:
-                killed = await asyncio.to_thread(_maint.kill_process_tree, pid)
-                logger.warning("[stop_escalation] killed pids=%s route=%s", killed, state.route)
+                killed = _maint.kill_process_identities(owned)
+                logger.warning("[stop_escalation] killed retained pids=%s route=%s", killed, state.route)
             except Exception:
-                logger.warning("[stop_escalation] process-tree kill failed pid=%s", pid, exc_info=True)
+                logger.warning("[stop_escalation] retained tree kill failed route=%s", state.route, exc_info=True)
+        if not stopped_turn_active:
+            return
+        logger.warning("[stop_escalation] disconnecting stopped CLI pid=%s route=%s", pid, state.route)
+        session_mgr = state.session_manager
         try:
             await asyncio.wait_for(session_mgr.disconnect_idle_client(direct_kill=True), timeout=10.0)
         except Exception:

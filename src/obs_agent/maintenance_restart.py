@@ -521,6 +521,82 @@ def descendant_pids(root_pid: int, *, proc_root: Path = Path("/proc")) -> list[i
     return found
 
 
+def _process_identity(pid: int, proc_root: Path) -> tuple[int, int] | None:
+    """Return (parent pid, kernel start ticks); a zombie is no longer running."""
+    if type(pid) is not int or pid <= 1 or pid == os.getpid():
+        return None
+    try:
+        raw = (proc_root / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+        fields = raw[raw.rindex(")") + 2 :].split()
+        if fields[0] in {"Z", "X"}:
+            return None
+        return int(fields[1]), int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def process_identity_matches(pid: int, start: int, *, proc_root: Path = Path("/proc")) -> bool:
+    identity = _process_identity(pid, proc_root)
+    return type(start) is int and start > 0 and identity is not None and identity[1] == start
+
+
+def refresh_process_tree(owned: dict[int, int], *, proc_root: Path = Path("/proc")) -> dict[int, int]:
+    """Retain owned identities and discover children of their still-live members.
+
+    Retained tool shells remain roots after the CLI exits and they reparent to
+    PID 1. Neither a recycled pid nor the daemon's shared group establishes ownership.
+    """
+    found = dict(owned)
+    records: dict[int, tuple[int, int]] = {}
+    children: dict[int, list[int]] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if entry.name.isdigit():
+            pid = int(entry.name)
+            identity = _process_identity(pid, proc_root)
+            if identity is not None:
+                records[pid] = identity
+                children.setdefault(identity[0], []).append(pid)
+    stack = [pid for pid, start in owned.items() if records.get(pid, (None, None))[1] == start]
+    seen = set(stack)
+    while stack:
+        parent = stack.pop()
+        for child in children.get(parent, []):
+            if child not in seen and records[child][1] >= records[parent][1]:
+                seen.add(child)
+                found[child] = records[child][1]
+                stack.append(child)
+    return found
+
+
+def capture_process_tree(root_pid: int, *, proc_root: Path = Path("/proc")) -> dict[int, int]:
+    """Capture kill authority only from a plain-int, live SDK CLI root."""
+    if type(root_pid) is not int or root_pid <= 1 or root_pid == os.getpid():
+        raise ValueError(f"capture_process_tree refused root pid {root_pid!r}")
+    identity = _process_identity(root_pid, proc_root)
+    argv = _proc_argv(root_pid, proc_root)
+    if identity is None or not argv or AGENT_CLI_MARKER not in argv[0]:
+        raise ValueError(f"capture_process_tree refused pid {root_pid}: not a live agent CLI")
+    return refresh_process_tree({root_pid: identity[1]}, proc_root=proc_root)
+
+
+def kill_process_identities(owned: dict[int, int], *, proc_root: Path = Path("/proc"), kill=os.kill) -> list[int]:
+    """Reap retained tools even after their original CLI vanished; never a reused pid."""
+    killed = []
+    for pid, start in reversed(list(owned.items())):
+        if not process_identity_matches(pid, start, proc_root=proc_root):
+            continue
+        try:
+            kill(pid, signal.SIGKILL)
+            killed.append(pid)
+        except OSError:
+            pass
+    return killed
+
+
 def kill_process_tree(root_pid: int, *, proc_root: Path = Path("/proc"), kill=os.kill) -> list[int]:
     """SIGKILL a Claude CLI and every process it started (tool shells etc.).
 
