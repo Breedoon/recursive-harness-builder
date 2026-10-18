@@ -568,7 +568,7 @@ class ConversationRunner:
             except Exception:
                 return False
             verdict = doc.get("local_upstream") if isinstance(doc, dict) else None
-            if isinstance(verdict, dict):
+            if isinstance(verdict, dict) and verdict.get("state") != "unknown":
                 return verdict.get("state") == "healthy"
             return None          # no watchdog verdict on this route: reachable is all we know
 

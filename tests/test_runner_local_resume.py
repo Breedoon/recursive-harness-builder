@@ -117,3 +117,37 @@ async def test_permanent_local_error_is_not_resumed(config):
     events, client, waits = await _run(
         config, "local-sparks-glm-5.3-flash-uncensored", [[_api_error("Prompt is too long")]])
     assert waits == [] and client.query.await_count == 1
+
+
+@pytest.mark.parametrize("doc,expected", [
+    ({"status": "ok", "local_upstream": {"state": "healthy"}}, True),
+    ({"status": "ok", "local_upstream": {"state": "unknown"}}, True),   # watchdog absent
+    ({"status": "ok"}, True),                                           # route without a watchdog
+])
+async def test_wait_for_local_backend_reads_the_verdict(config, monkeypatch, doc, expected):
+    import io
+    import json as _json
+    hook_state = HookState()
+    from obs_agent.session import SessionManager
+
+    r = ConversationRunner(SessionManager(config=config, hook_state=hook_state), hook_state, config)
+    monkeypatch.setattr(runner_mod, "_LOCAL_RESUME_MIN_DELAY_SECONDS", 0)
+    monkeypatch.setattr(runner_mod.urllib.request, "urlopen",
+                        lambda url, timeout: io.BytesIO(_json.dumps(doc).encode()))
+    assert await r._wait_for_local_backend("http://x/health") is expected
+
+
+async def test_wait_for_local_backend_gives_up_while_unhealthy(config, monkeypatch):
+    import io
+    import json as _json
+    hook_state = HookState()
+    from obs_agent.session import SessionManager
+
+    r = ConversationRunner(SessionManager(config=config, hook_state=hook_state), hook_state, config)
+    monkeypatch.setattr(runner_mod, "_LOCAL_RESUME_MIN_DELAY_SECONDS", 0)
+    monkeypatch.setattr(runner_mod, "_LOCAL_RESUME_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(runner_mod, "_LOCAL_RESUME_POLL_SECONDS", 0.01)
+    doc = {"local_upstream": {"state": "restarting"}}
+    monkeypatch.setattr(runner_mod.urllib.request, "urlopen",
+                        lambda url, timeout: io.BytesIO(_json.dumps(doc).encode()))
+    assert await r._wait_for_local_backend("http://x/health") is False

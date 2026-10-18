@@ -379,7 +379,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--observe-only", action="store_true",
                    help="publish verdicts but never restart")
     p.add_argument("--once", action="store_true", help="print one probe and exit")
+    p.add_argument("--restart-now", metavar="REASON",
+                   help="run the automatic leased paired restart once (a drill), publishing states")
     a = p.parse_args(argv)
+    if a.restart_now:
+        write_state("restarting", "manual: " + a.restart_now)
+        ok, detail = Sparks().restart("manual: " + a.restart_now)
+        event("restart_result", ok=ok, detail=detail, manual=True)
+        write_state("healthy" if ok else "failed", detail, last_restart=_utc(), last_restart_result=detail)
+        print(json.dumps({"ok": ok, "detail": detail}))
+        return 0 if ok else 1
     if a.once:
         s = Sparks()
         print(json.dumps({"health": native_health(), "ranks": s.ranks(),
