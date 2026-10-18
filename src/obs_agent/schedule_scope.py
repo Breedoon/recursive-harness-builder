@@ -100,6 +100,7 @@ class ScheduleOwnership:
 
     beads: dict[str, dict] = field(default_factory=dict)
     owners: dict[str, dict] = field(default_factory=dict)
+    retired: dict[str, dict] = field(default_factory=dict)
     load_errors: list[str] = field(default_factory=list)
 
     @classmethod
@@ -114,6 +115,7 @@ class ScheduleOwnership:
             if owners_path.exists():
                 data = json.loads(owners_path.read_text(encoding="utf-8"))
                 result.owners = dict(data.get("schedules") or {})
+                result.retired = dict(data.get("_retired") or {})
         except Exception as exc:  # malformed map must not break the command
             result.load_errors.append(f"owners map unreadable: {exc}")
             logger.warning("schedule owners map unreadable path=%s", owners_path, exc_info=True)
@@ -139,9 +141,11 @@ class ScheduleOwnership:
         match = _PREFIX.match(description or "")
         adoption = self.owners.get(schedule_id) or {}
         bead = adoption.get("bead")
-        if match and (match.group(1) in self.beads or not bead):
-            return match.group(1), adoption
-        # Match schedules.py: a non-bead route tag cannot defeat a real adoption.
+        if match:
+            row = self.beads.get(match.group(1))
+            if (row and row.get("status") != "closed") or not bead:
+                return match.group(1), adoption
+        # Missing or closed prefixes cannot defeat a valid automatic adoption.
         return (str(bead) if bead else None), adoption
 
     def creation_warnings(self, *, schedule_id: str, description: str | None) -> list[str]:
@@ -228,7 +232,9 @@ def assign_creation_owner(*, vault: Path, schedule_id: str, description: str | N
                           contexts: list[dict], allow_create: bool = True,
                           blocking: bool = True) -> dict | None:
     """Resolve ownership; callers queue failures without making registration depend on it."""
-    if _PREFIX.match(description or ""):
+    prefix = _PREFIX.match(description or "")
+    explicit = ScheduleOwnership.load(vault).beads.get(prefix.group(1)) if prefix else None
+    if explicit and explicit.get("status") != "closed":
         return None
     path = Path(os.environ.get("OBS_SCHEDULE_OWNERS_FILE") or (vault / OWNERS_RELATIVE_PATH))
     lock_name = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
@@ -278,28 +284,50 @@ def assign_creation_owner(*, vault: Path, schedule_id: str, description: str | N
         data.setdefault("schedules", {})[schedule_id] = {
             "bead": bid, "owner_team": team, "owner_agent": owner_agent, "note": note,
         }
-        # Preserve register.py's one-entry-per-line owners-map representation.
-        blocks = []
-        for key, value in data.items():
-            if isinstance(value, dict):
-                items = [f"    {json.dumps(k)}: {json.dumps(v, ensure_ascii=False)}" for k, v in value.items()]
-                blocks.append(f"  {json.dumps(key)}: {{\n" + ",\n".join(items) + ("\n" if items else "") + "  }")
-            else:
-                blocks.append(f"  {json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}")
-        text = "{\n" + ",\n".join(blocks) + "\n}\n"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        pending_path = None
-        try:
-            with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as pending:
-                pending_path = Path(pending.name)
-                pending.write(text)
-                pending.flush()
-                os.fsync(pending.fileno())
-            os.replace(pending_path, path)
-        finally:
-            if pending_path is not None:
-                pending_path.unlink(missing_ok=True)
+        _write_owners_map(path, data)
         return {"bead": bid, "source": source, "agent": owner_agent, "note": note}
+
+
+def _write_owners_map(path: Path, data: dict) -> None:
+    # Assignment and retirement preserve the canonical one-entry-per-line format.
+    blocks = []
+    for key, value in data.items():
+        if isinstance(value, dict):
+            items = [f"    {json.dumps(k)}: {json.dumps(v, ensure_ascii=False)}" for k, v in value.items()]
+            blocks.append(f"  {json.dumps(key)}: {{\n" + ",\n".join(items) + ("\n" if items else "") + "  }")
+        else:
+            blocks.append(f"  {json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}")
+    text = "{\n" + ",\n".join(blocks) + "\n}\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as pending:
+            pending_path = Path(pending.name)
+            pending.write(text)
+            pending.flush()
+            os.fsync(pending.fileno())
+        os.replace(pending_path, path)
+    finally:
+        if pending_path is not None:
+            pending_path.unlink(missing_ok=True)
+
+
+def retire_schedule_owner(*, vault: Path, schedule_id: str, blocking: bool = False) -> None:
+    path = Path(os.environ.get("OBS_SCHEDULE_OWNERS_FILE") or (vault / OWNERS_RELATIVE_PATH))
+    lock_name = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
+    with open(Path(tempfile.gettempdir()) / f"obs-schedule-owner-{lock_name}.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        if not path.exists():
+            return
+        data = json.loads(path.read_text())
+        entry = data.get("schedules", {}).pop(schedule_id, None)
+        if entry is None:
+            return
+        data.setdefault("_retired", {}).setdefault(schedule_id, {
+            **entry, "retired_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "disposition": "schedule deleted; automatic ownership entry retired",
+        })
+        _write_owners_map(path, data)
 
 
 def format_unschedule_report(

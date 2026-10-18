@@ -113,6 +113,131 @@ async def test_pending_backend_and_busy_map_do_not_block_event_loop(config, owne
     assert "slow-owner" in bot._pending_schedule_owners
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("description", ["[ops-missing] work", "[old-1] work"])
+async def test_invalid_prefix_cron_resolves_open_task(config, ownership_files, description):
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    state = _state(bot, thread_id=120)
+    state.inflight_user_text = "Task bead: ops-1"
+    result = await bot._cron_create(route=state.route, args={
+        "schedule_mode": "interval", "interval_seconds": 3600,
+        "description": description, "prompt": "continue",
+    })
+    assert result["tool_use_result"]["owner_assignment"]["bead"] == "ops-1"
+    assert not result["tool_use_result"]["warnings"]
+
+
+def test_delete_and_route_delete_retire_automatic_owners(config, ownership_files):
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    state = _state(bot, thread_id=121)
+    state.inflight_user_text = "Task bead: ops-1"
+    for sid in ("retire-one", "retire-two"):
+        _sched(bot, sid, state.route)
+    original = json.loads(ownership_files[1].read_text())["schedules"]["retire-one"]
+    bot._delete_topic_schedule("retire-one")
+    bot._delete_topic_schedules_for_route(state.route)
+    data = json.loads(ownership_files[1].read_text())
+    for sid in ("retire-one", "retire-two"):
+        assert sid not in data["schedules"]
+        assert data["_retired"][sid]["bead"] == "ops-1"
+        assert data["_retired"][sid]["retired_at"]
+    assert data["_retired"]["retire-one"]["note"] == original["note"]
+
+
+def test_restore_retires_previously_deleted_proof_mapping(config, ownership_files):
+    data = json.loads(ownership_files[1].read_text())
+    data["schedules"]["9bd7f535"] = {"bead": "old-1", "note": "stale prior proof"}
+    ownership_files[1].write_text(json.dumps(data))
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    bot._state_store.initialize()
+    bot._restore_state_from_store()
+    final = json.loads(ownership_files[1].read_text())
+    assert "9bd7f535" not in final["schedules"]
+    assert final["_retired"]["9bd7f535"]["note"] == "stale prior proof"
+
+
+@pytest.mark.asyncio
+async def test_deferred_assignment_cannot_resurrect_deleted_mapping(config, ownership_files, monkeypatch):
+    import asyncio
+    import threading
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    state = _state(bot, thread_id=125)
+    _sched(bot, "slow-owner", state.route)
+    entered, release = threading.Event(), threading.Event()
+    def backend(vault, owners, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        rows = [json.loads(line) for line in ownership_files[0].read_text().splitlines()]
+        rows.append({"id": "ops-slow", "status": "open", "metadata": {}})
+        ownership_files[0].write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        return "ops-slow"
+    monkeypatch.setattr(schedule_scope, "_ensure_orphan_check", backend)
+    repair = asyncio.create_task(bot._repair_pending_schedule_owners())
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        bot._delete_topic_schedule("slow-owner")
+        assert "slow-owner" not in bot._topic_schedules_by_id
+    finally:
+        release.set()
+        await repair
+    data = json.loads(ownership_files[1].read_text())
+    assert "slow-owner" not in data["schedules"]
+    assert data["_retired"]["slow-owner"]["bead"] == "ops-slow"
+
+
+@pytest.mark.asyncio
+async def test_pending_inheritance_keeps_owner_after_parent_delete(config, ownership_files, monkeypatch):
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    parent, child = _state(bot, thread_id=126), _state(bot, thread_id=127)
+    parent.inflight_user_text = "Task bead: ops-1"
+    child.inflight_user_text = "Task bead: reg-1"
+    _sched(bot, "retired-parent", parent.route)
+    bot._topic_schedules_by_id["retired-parent"].inherit_mode = "all"
+    with monkeypatch.context() as scoped:
+        scoped.setattr(schedule_scope.os, "replace", MagicMock(side_effect=OSError("map write failed")))
+        bot._inherit_topic_schedules(parent_route=parent.route, child_route=child.route, is_fork=True)
+    sid = next(iter(bot._schedule_ids_by_route[child.route]))
+    assert bot._pending_schedule_owners[sid][1].schedule_id == "retired-parent"
+    bot._delete_topic_schedule("retired-parent")
+    await bot._repair_pending_schedule_owners()
+    owners = schedule_scope.ScheduleOwnership.load(config.vault_path)
+    assert owners.owners[sid]["bead"] == "ops-1"
+    assert "retired-parent" in owners.retired
+
+
+@pytest.mark.asyncio
+async def test_retirement_failure_keeps_delete_available_and_retries(config, ownership_files, monkeypatch):
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    state = _state(bot, thread_id=128)
+    state.inflight_user_text = "Task bead: ops-1"
+    _sched(bot, "retire-error", state.route)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(schedule_scope.os, "replace", MagicMock(side_effect=OSError("write unavailable")))
+        bot._delete_topic_schedule("retire-error")
+    assert "retire-error" not in bot._topic_schedules_by_id
+    assert "retire-error" in bot._pending_schedule_owner_retirements
+    await bot._repair_pending_schedule_owners()
+    data = json.loads(ownership_files[1].read_text())
+    assert "retire-error" not in data["schedules"]
+    assert data["_retired"]["retire-error"]["bead"] == "ops-1"
+
+
+@pytest.mark.asyncio
+async def test_restore_sweep_survives_corrupt_map_then_retires_after_recovery(config, ownership_files):
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    bot._state_store.initialize()
+    ownership_files[1].write_text("{not json")
+    restored = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    restored._state_store.initialize()
+    restored._restore_state_from_store()
+    assert restored._schedule_owner_sweep_pending
+    ownership_files[1].write_text('{"schedules": {"stale": {"bead": "ops-1"}}}')
+    await restored._repair_pending_schedule_owners()
+    data = json.loads(ownership_files[1].read_text())
+    assert "stale" not in data["schedules"] and "stale" in data["_retired"]
+    assert not restored._schedule_owner_sweep_pending
+
+
 def test_creation_ownership_is_warning_only_prefix_or_mapping():
     owners = schedule_scope.ScheduleOwnership(
         beads={"ops-1": {"status": "open"}, "ops-2": {"status": "closed"}},
@@ -134,9 +259,8 @@ def test_adopted_nonbead_route_tag_matches_inventory_and_stays_protected():
     assert owners.owner_of(schedule_id="mapped", description="[deckpress-phase2] legacy")[0] == "ops-1"
     assert not owners.creation_warnings(schedule_id="mapped", description="[deckpress-phase2] legacy")
     assert owners.protection(schedule_id="mapped", description="[deckpress-phase2] legacy", tree=TEAM).protected
-    # A real bead prefix still wins, including a closed one: do not silently reparent it.
-    assert owners.owner_of(schedule_id="mapped", description="[ops-2] closed")[0] == "ops-2"
-    assert "orphaned" in owners.creation_warnings(schedule_id="mapped", description="[ops-2] closed")[0]
+    assert owners.owner_of(schedule_id="mapped", description="[ops-2] closed")[0] == "ops-1"
+    assert not owners.creation_warnings(schedule_id="mapped", description="[ops-2] closed")
 
 
 @pytest.mark.asyncio
@@ -237,9 +361,16 @@ def test_restored_ownerless_schedule_is_owned_from_card_or_prompt_file(config, o
 @pytest.mark.parametrize("description", ["[ops-1] explicit", "[old-1] closed", "[ops-missing] explicit"])
 def test_auto_owner_explicit_prefix_wins(ownership_files, tmp_path, description):
     before = ownership_files[1].read_bytes()
-    assert schedule_scope.assign_creation_owner(vault=tmp_path, schedule_id="new", description=description,
-        team=TEAM, agent="worker", session_id=None, contexts=[{"agent": "worker", "texts": ["Task bead: reg-1"]}]) is None
-    assert ownership_files[1].read_bytes() == before
+    result = schedule_scope.assign_creation_owner(vault=tmp_path, schedule_id="new", description=description,
+        team=TEAM, agent="worker", session_id=None, contexts=[{"agent": "worker", "texts": ["Task bead: reg-1"]}])
+    if description.startswith("[ops-1]"):
+        assert result is None
+        assert ownership_files[1].read_bytes() == before
+    else:
+        assert result["bead"] == "reg-1"
+        owners = schedule_scope.ScheduleOwnership.load(tmp_path)
+        assert owners.owner_of(schedule_id="new", description=description)[0] == "reg-1"
+        assert not owners.creation_warnings(schedule_id="new", description=description)
 
 
 def test_auto_owner_prefers_lane_and_understands_brief(ownership_files):

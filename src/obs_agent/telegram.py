@@ -768,6 +768,8 @@ class TelegramBot:
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._pending_schedule_owners: dict[str, tuple[_TopicScheduleRecord, Any]] = {}
+        self._pending_schedule_owner_retirements: set[str] = set()
+        self._schedule_owner_sweep_pending = False
         self._schedule_owner_repair_task: asyncio.Task | None = None
         self._schedule_ids_by_route: dict[TelegramRoute, set[str]] = {}
         self._schedule_execution_tasks: dict[str, asyncio.Task] = {}
@@ -1840,6 +1842,16 @@ class TelegramBot:
                 self._ensure_topic_schedule_owner(record)
             self._topic_schedules_by_id[record.schedule_id] = record
             self._schedule_ids_by_route.setdefault(route, set()).add(record.schedule_id)
+
+        try:
+            ownership = _schedule_scope.ScheduleOwnership.load(self._config.vault_path)
+            self._schedule_owner_sweep_pending = any("owners map unreadable" in error for error in ownership.load_errors)
+        except Exception:
+            self._schedule_owner_sweep_pending = True
+            logger.warning("Unable to inspect stale schedule ownership during restore", exc_info=True)
+        else:
+            for sid in ownership.owners.keys() - self._topic_schedules_by_id.keys():
+                self._retire_topic_schedule_owner(sid)
 
         for entry in snapshot.task_handle_states:
             child_route = TelegramRoute(
@@ -3781,14 +3793,39 @@ class TelegramBot:
                            record.schedule_id, exc_info=True)
             if not hasattr(self, "_pending_schedule_owners"):
                 self._pending_schedule_owners = {}
-            self._pending_schedule_owners[record.schedule_id] = (record, inherited_from)
+            prior_parent = self._pending_schedule_owners.get(record.schedule_id, (None, None))[1]
+            self._pending_schedule_owners[record.schedule_id] = (record, inherited_from or prior_parent)
             return {"bead": None, "source": "pending", "pending": True,
                     "note": "Schedule registered; ownership repair queued off the event loop"}
 
+    def _retire_topic_schedule_owner(self, sid):
+        try:
+            _schedule_scope.retire_schedule_owner(vault=self._config.vault_path, schedule_id=sid)
+        except Exception:
+            logger.warning("Schedule owner retirement deferred schedule_id=%s", sid, exc_info=True)
+            if not hasattr(self, "_pending_schedule_owner_retirements"):
+                self._pending_schedule_owner_retirements = set()
+            self._pending_schedule_owner_retirements.add(sid)
+
     async def _repair_pending_schedule_owners(self):
+        if self._schedule_owner_sweep_pending:
+            ownership = await asyncio.to_thread(_schedule_scope.ScheduleOwnership.load, self._config.vault_path)
+            if not any("owners map unreadable" in error for error in ownership.load_errors):
+                self._pending_schedule_owner_retirements.update(
+                    ownership.owners.keys() - self._topic_schedules_by_id.keys())
+                self._schedule_owner_sweep_pending = False
+        for sid in list(getattr(self, "_pending_schedule_owner_retirements", ())):
+            try:
+                await asyncio.to_thread(_schedule_scope.retire_schedule_owner,
+                                        vault=self._config.vault_path, schedule_id=sid, blocking=True)
+            except Exception:
+                logger.warning("Schedule owner retirement remains pending schedule_id=%s", sid, exc_info=True)
+            else:
+                self._pending_schedule_owner_retirements.discard(sid)
         for sid, (record, inherited_from) in list(self._pending_schedule_owners.items()):
             if not self._owns_topic_schedule_record(record):
                 self._pending_schedule_owners.pop(sid, None)
+                self._retire_topic_schedule_owner(sid)
                 continue
             try:
                 await asyncio.to_thread(self._resolve_topic_schedule_owner, record,
@@ -3797,11 +3834,12 @@ class TelegramBot:
                 logger.warning("Schedule ownership repair remains pending schedule_id=%s", sid, exc_info=True)
             else:
                 self._pending_schedule_owners.pop(sid, None)
+            finally:
+                if not self._owns_topic_schedule_record(record):
+                    self._retire_topic_schedule_owner(sid)
 
     def _resolve_topic_schedule_owner(self, record: _TopicScheduleRecord, *, inherited_from=None,
                                       background=False):
-        if _schedule_scope._PREFIX.match(record.description or ""):
-            return None
         owners = _schedule_scope.ScheduleOwnership.load(self._config.vault_path)
         bead, _ = owners.owner_of(schedule_id=record.schedule_id, description=record.description)
         if bead in owners.beads and owners.beads[bead].get("status") != "closed":
@@ -3816,6 +3854,10 @@ class TelegramBot:
         if inherited_from is not None:
             parent_bead, parent_entry = owners.owner_of(
                 schedule_id=inherited_from.schedule_id, description=inherited_from.description)
+            if not parent_entry:
+                parent_entry = owners.retired.get(inherited_from.schedule_id) or {}
+                if parent_bead not in owners.beads or owners.beads[parent_bead].get("status") == "closed":
+                    parent_bead = parent_entry.get("bead")
             if parent_bead in owners.beads and owners.beads[parent_bead].get("status") != "closed":
                 contexts.insert(0, {"agent": parent_entry.get("owner_agent") or agent,
                                    "texts": [f"Task bead: {parent_bead}"], "source": "inherited-owner"})
@@ -3856,6 +3898,8 @@ class TelegramBot:
                 if not schedule_ids:
                     self._schedule_ids_by_route.pop(record.route, None)
         self._state_store.delete_topic_schedule(schedule_id=schedule_id)
+        getattr(self, "_pending_schedule_owners", {}).pop(schedule_id, None)
+        self._retire_topic_schedule_owner(schedule_id)
 
     def _owns_topic_schedule_record(self, record: _TopicScheduleRecord) -> bool:
         """Return True when *record* is still the registered schedule instance."""
@@ -3863,8 +3907,7 @@ class TelegramBot:
 
     def _delete_topic_schedules_for_route(self, route: TelegramRoute) -> None:
         for schedule_id in list(self._schedule_ids_by_route.get(route, set())):
-            self._topic_schedules_by_id.pop(schedule_id, None)
-            self._state_store.delete_topic_schedule(schedule_id=schedule_id)
+            self._delete_topic_schedule(schedule_id)
         self._schedule_ids_by_route.pop(route, None)
         self._state_store.delete_topic_schedules_for_route(
             chat_id=route.chat_id,
@@ -10003,7 +10046,8 @@ class TelegramBot:
                 await asyncio.sleep(self._background_poll_seconds)
                 await self._process_stop_schedule_events()
                 await self._run_due_interval_schedules()
-                if self._pending_schedule_owners and (
+                if (self._pending_schedule_owners or self._pending_schedule_owner_retirements
+                    or self._schedule_owner_sweep_pending) and (
                     self._schedule_owner_repair_task is None or self._schedule_owner_repair_task.done()
                 ):
                     self._schedule_owner_repair_task = asyncio.create_task(self._repair_pending_schedule_owners())
