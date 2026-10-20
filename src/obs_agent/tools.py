@@ -57,6 +57,64 @@ _SAFE_AGENT_IDENTITY_RE = re.compile(
 )
 
 
+_EXTERNAL_SENDER_PREFIX = "external:"
+_EXTERNAL_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _external_outbox_path(name: str) -> Path:
+    from obs_agent.control import control_dir
+
+    safe = _EXTERNAL_NAME_UNSAFE.sub("-", name).strip(".-") or "unnamed"
+    return control_dir() / "external-replies" / f"{safe}.jsonl"
+
+
+def _deliver_external_reply(
+    *, name: str, team_name: str, sender: str, content: str, summary: str | None
+) -> dict:
+    """Append an agent's reply to an ``external:NAME`` sender's outbox (obs-12)."""
+    path = _external_outbox_path(name)
+    row = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "team_name": team_name,
+        "from": sender,
+        "to": f"{_EXTERNAL_SENDER_PREFIX}{name}",
+        "summary": summary or "",
+        "text": content,
+    }
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+    except OSError as exc:
+        logger.warning("external reply outbox write failed path=%s", path, exc_info=True)
+        reason = f"external reply could not be stored: {exc}"
+        return {
+            "content": [{"type": "text", "text": f"message underdelivered: {reason}"}],
+            "tool_use_result": {
+                "success": False,
+                "delivered": False,
+                "outcome": "underdelivered",
+                "reason": reason,
+                "recipient": row["to"],
+                "team_name": team_name,
+            },
+            "is_error": True,
+        }
+    logger.info("[external_reply] stored team=%s from=%s to=%s path=%s", team_name, sender, row["to"], path)
+    response = {
+        "success": True,
+        "delivered": True,
+        "outcome": "external_reply",
+        "team_name": team_name,
+        "recipient": row["to"],
+        "note": "external senders are scripts; the reply is stored in their outbox, no agent is woken",
+    }
+    return {
+        "content": [{"type": "text", "text": json.dumps(response, ensure_ascii=True)}],
+        "tool_use_result": response,
+    }
+
+
 def _error_result(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "is_error": True}
 
@@ -1409,6 +1467,19 @@ def create_obs_tools(
             allow_cold_wake = _coerce_bool_arg(args.get("allow_cold_wake", False), name="allow_cold_wake")
         except ValueError:
             return _error_result("Cannot use SendInboxMessage: allow_cold_wake must be true or false")
+
+        if recipient.startswith(_EXTERNAL_SENDER_PREFIX):
+            # obs-12: messages from scripts (obs-agentctl message) arrive "from external:NAME".
+            # External callers have no route, so a reply used to fail with "recipient has no
+            # current route binding". Append it to the caller's outbox instead; no agent path
+            # changes. See docs/external-control.md.
+            return _deliver_external_reply(
+                name=recipient[len(_EXTERNAL_SENDER_PREFIX):],
+                team_name=team_name,
+                sender=sender,
+                content=content,
+                summary=summary,
+            )
 
         async def _validate_recipient(target: str) -> dict[str, Any] | None:
             if hook_state is None or hook_state.inbox_recipient_validator is None:
