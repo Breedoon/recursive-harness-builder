@@ -242,3 +242,49 @@ class TestAgentTaskToolArgs:
         tools = create_obs_tools(config, lambda: "sid", hook_state=HookState(), return_tools=True)
         schema = {tool.name: tool.input_schema for tool in tools}["AgentTask"]
         assert "new_tree_chat" not in schema["properties"]
+
+
+class TestNewTreeModelFamilies:
+    """P5-7 (obs-15 V1 re-check): Sol/Codex and local-model aliases through new-tree."""
+
+    async def _create(self, bot, tmp_path, **kw):
+        with patch("obs_agent.telegram.Path.home", return_value=tmp_path):
+            return await bot._create_new_tree(
+                trigger_label="t", notice_text="n", chat="procedures", title="Fam",
+                prompt="go", **kw,
+            )
+
+    def _state(self, bot):
+        return bot._get_state(TelegramRoute(chat_id=PROC_CHAT, thread_id=4242), create=False)
+
+    async def test_sol_shorthand_resolves_to_gpt_family(self, bot, tmp_path):
+        result = await self._create(bot, tmp_path, model="sol")
+        assert result["ok"] is True
+        override = self._state(bot).session_manager.model_override
+        assert override and override.startswith("gpt-") and "sol" in override
+
+    async def test_local_alias_checks_spark_then_sets_model(self, bot, tmp_path):
+        with patch("obs_agent.spark.check_spark_available", return_value=None) as check:
+            result = await self._create(bot, tmp_path, model="glm")
+        assert result["ok"] is True
+        resolved = check.call_args.args[0]
+        assert resolved.startswith("local-sparks-glm")
+        assert self._state(bot).session_manager.model_override == resolved
+
+    async def test_local_alias_unavailable_refused_before_any_topic(self, bot, tmp_path):
+        with patch("obs_agent.spark.check_spark_available", side_effect=RuntimeError("spark pair down")):
+            result = await self._create(bot, tmp_path, model="local-sparks-glm-5.3-flash")
+        assert result["ok"] is False and "spark pair down" in result["error"]
+        bot._enqueue_create_topic.assert_not_awaited()
+
+    async def test_sol_caller_without_model_gets_default_not_callers_model(self, bot, tmp_path):
+        # A Sol-model caller (here: an origin agent on a GPT route) launching via the
+        # CLI without --model: the new root uses the default model; nothing leaks.
+        caller = _state(bot, chat_id=PROC_CHAT, thread_id=77)
+        caller.session_manager.model_override = "gpt-6.1-sol"
+        result = await self._create(
+            bot, tmp_path,
+            origin={"kind": "agent", "origin_team": "t", "origin_agent": "sol-caller"},
+        )
+        assert result["ok"] is True
+        assert self._state(bot).session_manager.model_override in (None, "")
