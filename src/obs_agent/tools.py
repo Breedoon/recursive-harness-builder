@@ -717,12 +717,28 @@ def create_obs_tools(
         run_in_background = args.get("run_in_background")
         team_name = str(args.get("team_name", "")).strip() or None
         agent_name = str(args.get("agent_name") or "").strip() or None
+        new_tree_chat = args.get("new_tree_chat")
+        if isinstance(new_tree_chat, str):
+            new_tree_chat = new_tree_chat.strip() or None
         fork = default_fork
         if "fork" in args:
             try:
                 fork = _coerce_bool_arg(args.get("fork"), name="fork")
             except ValueError:
                 return _error_result(f"Cannot launch {tool_name}: fork must be true or false")
+        if new_tree_chat is not None:
+            # A new tree is a fresh root in another chat: it never copies this session's history.
+            if "fork" in args and fork:
+                return _error_result(
+                    f"Cannot launch {tool_name}: new_tree_chat starts a fresh root; omit fork or pass fork=false"
+                )
+            if resume or session_source:
+                return _error_result(
+                    f"Cannot launch {tool_name}: new_tree_chat cannot be combined with resume or session_source"
+                )
+            if not display_name:
+                return _error_result(f"Cannot launch {tool_name}: display_name (the new topic's title) is required")
+            fork = False
         if session_source and not fork:
             return _error_result(
                 f"Cannot launch {tool_name}: session_source is only supported with fork=true"
@@ -888,6 +904,8 @@ def create_obs_tools(
                 "inherit_hooks": inherit_hooks,
                 "allow_cold_wake": allow_cold_wake,
             }
+            if new_tree_chat is not None:
+                payload["new_tree_chat"] = new_tree_chat
             if prompt_file:
                 payload["prompt_file"] = prompt_file
                 payload["prompt_file_content"] = prompt_file_content
@@ -1054,6 +1072,20 @@ def create_obs_tools(
                     "Whether the child agent inherits its parent's hooks. "
                     "Default 'false'. Set to 'true' to propagate the parent session's "
                     "hooks to the child."
+                ),
+            },
+            # CACHE-PREFIX WARNING: this schema is part of every session's tool list. Adding a
+            # property (new_tree_chat, obs-15.5) breaks each live session's cache once, on its
+            # first turn after the deploy; undeclared arguments are dropped before they reach
+            # _launch_task (probed 2026-10-20: max_turns arrived as None), so it must be declared.
+            "new_tree_chat": {
+                "type": "string",
+                "description": (
+                    "Start a NEW root tree (its own team, not your child) as a new topic in an "
+                    "existing group chat: a chat id or a chat-registry name. display_name is the "
+                    "topic title; prompt, prompt_file, hooks, model, effort and env apply to the "
+                    "new root. Fresh session only (no fork, resume or session_source). Never creates "
+                    "a chat. Returns the topic link, root_team_key and agent_name."
                 ),
             },
             },

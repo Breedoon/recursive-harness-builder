@@ -6542,16 +6542,146 @@ class TelegramBot:
                     "result": receipt}
 
     async def _control_new_tree(self, *, caller: str, args: dict[str, Any]) -> dict[str, Any]:
+        prompt_file = str(args.get("prompt_file") or "").strip() or None
+        prompt_file_content: str | None = None
+        if prompt_file:
+            try:
+                prompt_file_content = self._read_vault_prompt_file(prompt_file)
+            except Exception as exc:
+                return {"ok": False, "error": f"cannot read prompt_file: {exc}"}
+        hooks = args.get("hooks")
+        if isinstance(hooks, str) and hooks.strip():
+            try:
+                hooks = json.loads(hooks)
+            except json.JSONDecodeError as exc:
+                return {"ok": False, "error": f"hooks must be a JSON object: {exc}"}
+        env = args.get("env")
+        if isinstance(env, str) and env.strip():
+            try:
+                env = json.loads(env)
+            except json.JSONDecodeError as exc:
+                return {"ok": False, "error": f"env must be a JSON object: {exc}"}
+        chat = args.get("chat")
+        if chat is None:
+            chat = args.get("chat_id")
+        return await self._create_new_tree(
+            trigger_label=f"external trigger: {caller}",
+            notice_text=f"new tree started by external:{caller}",
+            chat=chat,
+            title=str(args["title"]),
+            prompt=str(args.get("prompt") or ""),
+            prompt_file=prompt_file,
+            prompt_file_content=prompt_file_content,
+            hooks=hooks or None,
+            model=str(args.get("model") or "").strip() or None,
+            effort=str(args.get("effort") or "").strip() or None,
+            env=env or None,
+            origin={"kind": "external", "caller": caller},
+        )
+
+    def _read_vault_prompt_file(self, prompt_file: str) -> str:
+        file_path = Path(prompt_file)
+        if prompt_file.startswith("~"):
+            file_path = file_path.expanduser()
+        elif not file_path.is_absolute():
+            file_path = self._config.vault_path / file_path
+        return file_path.read_text(encoding="utf-8").strip()
+
+    def _known_forum_chat_ids(self) -> set[int]:
+        return {route.chat_id for route in self._states_by_route if route.thread_id is not None}
+
+    def _record_tree_origin(self, *, team_name: str | None, origin: dict[str, Any]) -> None:
+        """Remember who launched a new root tree, beside its team config (ops-61 provenance).
+
+        The launcher is not the tree's lineage parent: report-back and attribution read this
+        record instead. Best effort: a write failure never fails the launch.
+        """
+        normalized = (team_name or "").strip()
+        if not normalized:
+            return
+        try:
+            team_dir = Path.home() / ".claude" / "teams" / normalized
+            team_dir.mkdir(parents=True, exist_ok=True)
+            record = {**origin, "recorded_at": datetime.now(timezone.utc).isoformat()}
+            (team_dir / "origin.json").write_text(json.dumps(record, ensure_ascii=True, indent=2), encoding="utf-8")
+        except Exception:
+            logger.warning("Failed recording tree origin team=%s", normalized, exc_info=True)
+
+    # CACHE-PREFIX NOTE: a new tree is a fresh root session (no copied history), so nothing is
+    # shared with the launcher's cache. The launch only sets the root's model/effort/env/hooks
+    # before its first turn, as a fresh AgentTask child does.
+    async def _create_new_tree(
+        self,
+        *,
+        trigger_label: str,
+        notice_text: str,
+        chat: Any,
+        title: str,
+        prompt: str,
+        prompt_file: str | None = None,
+        prompt_file_content: str | None = None,
+        hooks: dict[str, str] | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        env: dict[str, str] | None = None,
+        origin: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a new root tree as a new topic in an EXISTING group chat (vault-h667, ops-61).
+
+        Never creates a chat. Returns chat_id, thread_id, link and the new root's
+        root_team_key/agent_name (ops-1.11.6).
+        """
+        from obs_agent import chat_registry
+
         bot = self._primary_bot
         if bot is None:
             return {"ok": False, "error": "bot is not connected yet"}
-        chat_id = args.get("chat_id")
-        if chat_id is None:
-            chats = {route.chat_id for route in self._states_by_route if route.thread_id is not None}
-            if len(chats) != 1:
-                return {"ok": False, "error": f"pass --chat-id; forum chats known: {sorted(chats)}"}
-            chat_id = next(iter(chats))
-        title = str(args["title"]).strip()[:120]
+        resolution = chat_registry.resolve_chat(
+            chat,
+            known_chat_ids=self._known_forum_chat_ids(),
+            entries=chat_registry.load_registry(chat_registry.registry_path(self._config.vault_path)),
+        )
+        if resolution.chat_id is None:
+            return {"ok": False, "error": resolution.error or "no chat resolved"}
+        chat_id = resolution.chat_id
+        title = title.strip()[:120]
+        if not title:
+            return {"ok": False, "error": "title is required"}
+        if not prompt.strip() and not prompt_file_content:
+            return {"ok": False, "error": "prompt or prompt_file is required"}
+        if hooks is not None:
+            if not isinstance(hooks, dict) or not all(
+                isinstance(spec, str) and "::" in spec for spec in hooks.values()
+            ):
+                return {"ok": False, "error": "hooks must map event names to 'file_path::function_name'"}
+            from obs_agent.tools import _resolve_hook_spec_path
+
+            hooks = {
+                str(event): _resolve_hook_spec_path(spec, self._config.vault_path)
+                for event, spec in hooks.items()
+            }
+        if env is not None and not isinstance(env, dict):
+            return {"ok": False, "error": "env must be a JSON object"}
+        resolved_model: str | None = None
+        if model and model.lower() not in ("inherit", "source"):
+            resolved_model = resolve_model(model)
+            from obs_agent.spark import check_spark_available, is_spark_model
+
+            if is_spark_model(resolved_model):
+                try:
+                    await asyncio.to_thread(
+                        check_spark_available, resolved_model, parse_context_suffix(resolved_model)[1]
+                    )
+                except Exception as exc:
+                    return {"ok": False, "error": str(exc)}
+        selected_effort: str | None = None
+        if effort and effort.lower() != "inherit":
+            from obs_agent.effort import normalize_effort
+
+            try:
+                selected_effort = normalize_effort(effort)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
         topic = await self._enqueue_create_topic(
             route=TelegramRoute(chat_id=int(chat_id), thread_id=None),
             topic_name=title,
@@ -6562,14 +6692,39 @@ class TelegramBot:
         if not isinstance(thread_id, int):
             return {"ok": False, "error": "create_forum_topic returned no message_thread_id"}
         route = TelegramRoute(chat_id=int(chat_id), thread_id=thread_id)
-        state = self._get_state(route, topic_title=title)
+        # Explicit hooks replace the default new-chat hooks; none given keeps the defaults.
+        state = self._get_state(route, topic_title=title, apply_default_new_chat_hooks=hooks is None)
         assert state is not None
         state.last_bot = bot
         self._set_topic_metadata(route=route, title=title, icon_custom_emoji_id=None)
-        self._prime_obs_bootstrap(state, lineage=(title,), origin="new_trunk", is_fork=False)
-        text = f"[external trigger: {caller}]\n{str(args['prompt'])}"
+        if hooks is not None:
+            state.session_manager.user_hooks = hooks
+        if resolved_model:
+            state.session_manager.model_override = resolved_model
+        if selected_effort:
+            state.session_manager.effort_override = selected_effort
+        bootstrap_xml = self._prime_obs_bootstrap(state, lineage=(title,), origin="new_trunk", is_fork=False)
+        if env:
+            extra_env = {str(k): str(v) for k, v in env.items()}
+            state.session_manager.set_sdk_env_overrides({**state.session_manager.sdk_env_overrides, **extra_env})
+            state.session_manager.explicit_env_overrides = extra_env
+        root_team_key: str | None = None
+        root_agent_name: str | None = None
+        try:
+            bootstrap = parse_obs_bootstrap_xml(bootstrap_xml)
+            root_team_key = bootstrap.root_team_key
+            root_agent_name = bootstrap.agent_name
+        except Exception:
+            logger.debug("new tree bootstrap parse failed route=%s", route, exc_info=True)
+        if origin:
+            self._record_tree_origin(team_name=root_team_key, origin=origin)
+        self._persist_state_for_route(route)
+        body = self._compose_prompt_file_context(
+            prompt=prompt.strip(), prompt_file=prompt_file, prompt_file_content=prompt_file_content,
+        )
+        text = f"[{trigger_label}]\n{body}"
         notice = await self._send_system_message(
-            route=route, bot=bot, text=f"new tree started by external:{caller}", disable_notification=True,
+            route=route, bot=bot, text=notice_text, disable_notification=True,
         )
         notice_id = self._sent_message_id(notice) if notice is not None else None
         task = asyncio.create_task(self._run_and_send(
@@ -6579,8 +6734,23 @@ class TelegramBot:
         self._detached_wake_tasks.add(task)
         task.add_done_callback(self._on_detached_wake_done)
         link = self._build_message_link(route, thread_id)
-        return {"ok": True, "text": f"new tree '{title}' started: {link or thread_id}",
-                "result": {"chat_id": int(chat_id), "thread_id": thread_id, "link": link}}
+        chat_name = resolution.entry.name if resolution.entry is not None else None
+        return {
+            "ok": True,
+            "text": (
+                f"new tree '{title}' started in chat {chat_name or chat_id}: {link or thread_id}"
+                f" (root_team_key={root_team_key}, agent_name={root_agent_name})"
+            ),
+            "result": {
+                "chat_id": int(chat_id),
+                "chat_name": chat_name,
+                "thread_id": thread_id,
+                "link": link,
+                "root_team_key": root_team_key,
+                "team_name": root_team_key,
+                "agent_name": root_agent_name,
+            },
+        }
 
     async def _idle_evict_loop(self, interval: float = 60.0) -> None:
         """Periodic idle-CLI sweep so eviction does not wait for a fork completion."""
@@ -12256,6 +12426,54 @@ class TelegramBot:
             ]
         }
 
+    async def _launch_new_tree_task(
+        self,
+        *,
+        state: TelegramSessionState,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """AgentTask(new_tree_chat=...): start a NEW root tree in an existing chat (ops-61).
+
+        The tree is not the caller's lineage child. The caller is recorded as its origin so
+        report-back and attribution can reach it, and the prompt says who launched it.
+        """
+        projection = self._state_inbox_projection(state)
+        origin_team, origin_agent = projection if projection is not None else (None, None)
+        origin = {
+            "kind": "agent",
+            "origin_team": origin_team,
+            "origin_agent": origin_agent,
+            "origin_session_id": state.session_id,
+            "origin_chat_id": state.route.chat_id,
+            "origin_thread_id": state.route.thread_id,
+        }
+        launcher = origin_agent or "an agent"
+        trigger = f"new tree launched by {launcher}"
+        if origin_team and origin_agent:
+            trigger += f" (team {origin_team}); report completion to it with SendInboxMessage team_name={origin_team}"
+        result = await self._create_new_tree(
+            trigger_label=trigger,
+            notice_text=f"new tree started by {launcher}",
+            chat=args.get("new_tree_chat"),
+            title=str(args.get("description") or "").strip(),
+            prompt=str(args.get("prompt") or ""),
+            prompt_file=str(args.get("prompt_file") or "").strip() or None,
+            prompt_file_content=str(args.get("prompt_file_content") or "").strip() or None,
+            hooks=args.get("hooks"),
+            # Like AgentTask fork=false: an omitted model means the launcher's own model.
+            model=args.get("model") or state.session_manager.effective_model,
+            effort=args.get("effort") if args.get("effort") not in (None, "inherit") else None,
+            env=args.get("env"),
+            origin=origin,
+        )
+        if not result.get("ok"):
+            text = f"AgentTask new tree failed: {result.get('error')}"
+            return {"content": [{"type": "text", "text": text}], "tool_use_result": {"error": text}, "is_error": True}
+        return {
+            "content": [{"type": "text", "text": result["text"]}],
+            "tool_use_result": result["result"],
+        }
+
     async def _launch_fork_task(
         self,
         *,
@@ -12265,6 +12483,9 @@ class TelegramBot:
         state = self._get_state(route, create=False)
         if state is None or state.last_bot is None:
             raise RuntimeError("ForkTask is only available inside an active Telegram topic")
+
+        if args.get("new_tree_chat") is not None:
+            return await self._launch_new_tree_task(state=state, args=args)
 
         resume_task_id = self._normalize_resume_task_id(args.get("resume"))
         session_source_raw = str(args.get("session_source") or "").strip() or None

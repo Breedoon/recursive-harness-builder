@@ -21,8 +21,11 @@ Design
   topics and session_source model rules all apply exactly as for an agent. ``launch`` runs as if
   the named PARENT agent had called AgentTask; forking a parent whose cache has gone cold is
   refused like any cold wake unless ``allow_cold_wake`` is set. ``new-tree`` creates a new root
-  topic the same way a person starting a topic does (default new-chat hooks, ``new_trunk``
-  bootstrap) and runs the prompt as its first turn.
+  tree as a new topic in an EXISTING group chat (``--chat`` id or chat-registry name; never a new
+  chat), the same way a person starting a topic does (``new_trunk`` bootstrap; default new-chat
+  hooks unless ``--hooks``), with AgentTask launch parity (prompt_file, model, effort, env), and
+  returns the new root's root_team_key/agent_name and link (obs-15.5, ops-61, ops-1.11.6).
+  Agents reach the same path with ``AgentTask(new_tree_chat=...)``.
 * **Identity:** every request names its caller (``--as NAME``); messages are sent from
   ``external:NAME`` and launched prompts start with an ``[external trigger: NAME]`` line.
 * **Audit:** every request, accepted or refused, is appended to ``{OBS_CONTROL_DIR}/audit.jsonl``.
@@ -112,13 +115,15 @@ def validate_request(request: Any) -> str | None:
         "message": ("team_name", "recipient", "content"),
         "launch": ("parent_team", "parent_agent", "display_name"),
         "stop": ("parent_team", "parent_agent", "team_name", "agent_name", "expected_task_id", "expected_launch_parent_message_id"),
-        "new_tree": ("title", "prompt"),
+        "new_tree": ("title",),
     }.get(op, ())
     missing = [key for key in required if not str(args.get(key) or "").strip()]
     if missing:
         return f"{op} needs {', '.join(missing)}"
-    if op == "launch" and not (str(args.get("prompt") or "").strip() or str(args.get("prompt_file") or "").strip()):
-        return "launch needs prompt or prompt_file"
+    if op in ("launch", "new_tree") and not (
+        str(args.get("prompt") or "").strip() or str(args.get("prompt_file") or "").strip()
+    ):
+        return f"{'new-tree' if op == 'new_tree' else op} needs prompt or prompt_file"
     return None
 
 
@@ -307,10 +312,19 @@ def _parser() -> argparse.ArgumentParser:
     st.add_argument("--expected-task-id", required=True)
     st.add_argument("--expected-launch-parent-message-id", required=True, type=int)
     st.add_argument("--observe-only", action="store_true", help="observe this generation's runtime/owned-tool cleanup without requesting a stop")
-    nt = sub.add_parser("new-tree", parents=[common], help="new root topic whose first turn is PROMPT")
+    nt = sub.add_parser(
+        "new-tree", parents=[common],
+        help="new root tree: a new topic in an EXISTING group chat whose first turn is PROMPT",
+    )
     nt.add_argument("--title", required=True)
-    nt.add_argument("--prompt", required=True)
-    nt.add_argument("--chat-id", type=int, default=None)
+    nt.add_argument("--prompt", default="")
+    nt.add_argument("--prompt-file", default="")
+    nt.add_argument("--chat-id", type=int, default=None, help="existing forum chat id")
+    nt.add_argument("--chat", default=None, help="chat id or chat-registry name (Agent Operations/chat-registry.json)")
+    nt.add_argument("--model", default=None)
+    nt.add_argument("--effort", default=None)
+    nt.add_argument("--hooks", default=None, help="JSON hook map for the new root; default: new-chat hooks")
+    nt.add_argument("--env", default=None, help="JSON env overrides for the new root")
     return ap
 
 

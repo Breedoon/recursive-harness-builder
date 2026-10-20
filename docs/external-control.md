@@ -7,7 +7,7 @@ the reflection watcher) can wake or launch agents without an agent in the loop.
 obs-agentctl --as error-monitor ping
 obs-agentctl --as error-monitor message --team <root_team_key> --to <agent_name> --text "..." [--summary ..] [--allow-cold-wake]
 obs-agentctl --as nightly-check launch --parent-team <team> --parent <agent> --name "Fix X" --prompt "..." [--fresh] [--model ..] [--prompt-file ..] [--hooks '{..}'] [--session-source ..] [--allow-cold-wake]
-obs-agentctl --as nightly-check new-tree --title "Disk alert" --prompt "..." [--chat-id N]
+obs-agentctl --as nightly-check new-tree --title "Disk alert" (--prompt "..." | --prompt-file P) [--chat NAME|ID | --chat-id N] [--model ..] [--effort ..] [--hooks '{..}'] [--env '{..}']
 ```
 
 - Wrapper: `/workspace/runtime/bin/obs-agentctl` = `/workspace/obs/.venv/bin/python -m obs_agent.control`.
@@ -59,6 +59,27 @@ obs-agentctl --as nightly-check new-tree --title "Disk alert" --prompt "..." [--
 - `launch` acts as the named parent agent calling AgentTask; the child appears under that parent.
   Forking a parent whose prompt cache has gone cold is refused like any cold wake unless
   `--allow-cold-wake`.
-- `new-tree` creates a new root topic like a person starting a topic (default new-chat hooks,
-  `new_trunk` bootstrap) and runs the prompt as its first turn. With one forum chat known it is used;
-  otherwise pass `--chat-id`.
+- `new-tree` creates a new root tree: a new topic in an **existing** group chat, like a person
+  starting a topic (`new_trunk` bootstrap, a fresh `root_team_key`), and runs the prompt as its
+  first turn (obs-15.5 / ops-61 / ops-1.11.6).
+  - Chat: `--chat` takes a chat id or a name from the chat registry
+    (`Projects/Personal Projects/Agentic/Agent Operations/chat-registry.json` in the vault; override
+    the path with `OBS_CHAT_REGISTRY`; re-read on every call). `--chat-id N` still works. With no
+    chat given, the only forum chat OBS knows is used, otherwise the call is refused with the list.
+    A chat must be one OBS already has topics in or one the registry declares. **OBS never creates
+    a chat**; an unknown chat is refused before any topic is created.
+  - Launch parity with AgentTask: `--prompt-file` (wrapped in `<prompt_file_context>` as for
+    AgentTask), `--model`, `--effort`, `--hooks` (replace the default new-chat hooks; omitted keeps
+    them; the launch guard's role-hook rules are the caller's to follow), `--env`.
+  - Result (`--json`): `chat_id`, `chat_name`, `thread_id`, `link`, `root_team_key` (= `team_name`)
+    and `agent_name` of the new root, so the caller can message it directly.
+  - Provenance: the launcher is recorded in `~/.claude/teams/<root_team_key>/origin.json`
+    (`kind: external, caller`). The new tree is not a lineage child of anyone.
+- Agents can do the same without Bash: `AgentTask(new_tree_chat="<chat name or id>",
+  display_name="<topic title>", prompt=..., prompt_file=..., hooks=..., model=..., effort=..., env=...)`.
+  It is always a fresh root (fork, resume and session_source are refused); an omitted model means
+  the caller's own model. The caller is recorded as `origin_team`/`origin_agent` in `origin.json`,
+  and the first turn names it with the `SendInboxMessage team_name=…` to report completion to.
+  Adding `new_tree_chat` to the AgentTask schema changed every session's tool list, so the deploy
+  that ships it breaks each live session's cache once (docs/cache-proxy-safety.md); undeclared
+  AgentTask arguments are dropped before OBS sees them (probed 2026-10-20), so it had to be declared.
