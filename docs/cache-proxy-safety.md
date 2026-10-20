@@ -72,6 +72,22 @@ real break mechanisms in live traffic; none was caught by a unit test:
    real CLI ignores its hand-injected rows on resume, so they never reach the
    model (bead vault-02qw); the kept continuation through the Telegram entry
    point was proven live on 2026-10-17 with CLI-written rows).
+11. The CLI picks the breakpoint TTL (`ttl: "1h"` vs the 5m default) once per
+   process: CLI 2.1.59 sends 1h only when the OAuth subscriber's `sdk` query
+   source is in the GrowthBook allowlist `tengu_prompt_cache_1h_config`, read
+   from the cached features in the shared `~/.claude.json` and latched for the
+   process's life. That file is bind-mounted, so CLI writes fall back to a
+   non-atomic rewrite and other processes can read it torn or reset; a process
+   that starts at that moment runs every request at 5m. A 1h request cannot
+   read 5m entries, so the conversation's next process (usually after a
+   restart) re-billed its whole prefix on a pure byte append (2026-10-20 08:10Z,
+   ~0.72M; 3-5 such flips per day on 10-18..10-20). Deterministic CLI repro:
+   with the cached feature present the first request is 1h, without it (or
+   with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`) it is 5m (obs-15 E8
+   artifacts, `repro2.py`). Fixed 2026-10-20 (vault-h6yt, `pin_cache_ttl`): a
+   conversation sent at 1h stays 1h; a warm 5m conversation stays 5m until it
+   idles past the 5m entry life. Live scenarios `ttl_flip` / `ttl_flip_down`.
+   Never "fix" this by upgrading Claude Code (Daniel's standing decision).
 
 Not a mechanism (checked 2026-10-16, bead `vault-1r7n.9`): the "Continue from
 where you left off." block the CLI adds to the last user message when a fork or
@@ -419,6 +435,13 @@ These are deliberate tradeoffs. Re-decide them if they start to hurt.
   server feature flag (`tengu_swann_brevity`) is cached in the fleet's shared
   `~/.claude.json` and refreshed every few hours, so one process's refresh
   changes it for every running agent. The pin works whatever the cause.
+- **The breakpoint TTL is pinned per conversation (2026-10-20, vault-h6yt).**
+  Once a conversation has been sent at 1h, `pin_cache_ttl` upgrades later 5m
+  requests to 1h. That also overrides the CLI's own 5m choice when it is
+  paying overage, for those conversations (1h writes cost more than 5m
+  writes; accepted, because a flip re-bills the whole prefix). The pin is keyed
+  like the other pins (model plus first message), so same-first-message
+  conversations share it. Tool-less side calls are never pinned.
 
 ## More detail
 
