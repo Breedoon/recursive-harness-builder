@@ -157,3 +157,76 @@ class TestInlineForkIsSameAgent:
             )
         assert proceed is False
         mock_fork.assert_not_called()
+
+
+class TestInlineForkSurvivesRestart:
+    """P5-3 (obs-15 V1 re-check): restart/restore with a reply-fork active.
+
+    A daemon restart restores routes from the state store. The restored route
+    must keep the inline fork's team key, agent name and inbox target, and the
+    rewind binding to the original branch must still exist.
+    """
+
+    async def _fork_then_restore(self, config, *, lineage, team, agent, copied_bootstrap=True):
+        bot, state = _bot_and_state(config)
+        state.agent_lineage = lineage
+        state.session_manager.set_sdk_env_overrides(
+            bot._build_team_worker_env(team_name=team, agent_name=agent)
+        )
+        _bind(bot, state, 5, session_id="sid-root", uuid="assistant-1")
+        _bind(bot, state, 9, session_id="sid-root", uuid="assistant-latest")
+        bot._session_heads["sid-root"] = "assistant-latest"
+        with patch("obs_agent.telegram.fork_session_jsonl", return_value="sid-fork"):
+            proceed, _ = await bot._resolve_session_for_trigger(
+                state=state, trigger_message=_trigger(5), bot=_fake_bot(),
+            )
+        assert proceed is True and state.session_id == "sid-fork"
+        bot._persist_state_for_route(state.route)
+        # Restart: a new daemon restores from the same store, days later. The
+        # forked session JSONL's copied history carries the agent's own bootstrap
+        # (the real fork copies the transcript prefix; see report evidence).
+        own = _bootstrap(team, agent, lineage)
+        lookups: list[str | None] = []
+
+        def _lookup(*, session_id, cwd):
+            lookups.append(session_id)
+            return own if (copied_bootstrap and session_id == "sid-fork") else None
+
+        with patch("obs_agent.lineage.time.time", return_value=1_792_000_000.0), \
+                patch("obs_agent.telegram.find_latest_obs_bootstrap_for_session", side_effect=_lookup):
+            restored = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+            restored._restore_state_from_store()
+        self.lookups = lookups
+        return restored, restored._states_by_route[state.route]
+
+    async def test_trunk_fork_keeps_team_after_restart(self, config):
+        restored, rstate = await self._fork_then_restore(
+            config, lineage=("Proc work",), team=TEAM, agent=TEAM,
+        )
+        assert rstate.session_id == "sid-fork"
+        env = rstate.session_manager.sdk_env_overrides
+        assert env.get("CLAUDE_CODE_TEAM_NAME") == TEAM
+        assert env.get("CLAUDE_CODE_AGENT_NAME") == TEAM
+        assert restored._route_inbox_target_keys_by_route[rstate.route] == (TEAM, TEAM)
+
+    async def test_child_fork_keeps_identity_after_restart(self, config):
+        restored, rstate = await self._fork_then_restore(
+            config, lineage=("Proc work", "Child X"), team=TEAM, agent="b41d7e9d27-child-x",
+        )
+        env = rstate.session_manager.sdk_env_overrides
+        assert env.get("CLAUDE_CODE_TEAM_NAME") == TEAM
+        assert env.get("CLAUDE_CODE_AGENT_NAME") == "b41d7e9d27-child-x"
+        assert rstate.agent_lineage == ("Proc work", "Child X")
+        assert restored._route_inbox_target_keys_by_route[rstate.route] == (TEAM, "b41d7e9d27-child-x")
+
+    async def test_restore_lookup_scoped_to_the_forked_session(self, config):
+        await self._fork_then_restore(config, lineage=("Proc work",), team=TEAM, agent=TEAM)
+        assert self.lookups == ["sid-fork"], "restore must scan only the forked route's own session"
+
+    async def test_restore_without_copied_bootstrap_keeps_legacy_projection(self, config):
+        # Nothing recoverable in the JSONL: behaviour is the pre-fix default projection.
+        restored, rstate = await self._fork_then_restore(
+            config, lineage=("Proc work",), team=TEAM, agent=TEAM, copied_bootstrap=False,
+        )
+        env = rstate.session_manager.sdk_env_overrides
+        assert env.get("CLAUDE_CODE_TEAM_NAME", "").endswith("-proc-work")

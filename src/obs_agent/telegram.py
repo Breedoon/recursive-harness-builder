@@ -1748,11 +1748,27 @@ class TelegramBot:
 
             # Rebuild stable team identity from persisted bootstrap, environment,
             # or lineage without scanning thousands of historical JSONLs.
-            projection = self._state_inbox_projection(
-                state,
-                allow_jsonl_lookup=False,
-                allow_default_projection=True,
-            )
+            projection = None
+            if entry.pending_obs_bootstrap is None and state.agent_lineage and entry.session_id:
+                # vault-mngu / obs-15 P5-3: an inline reply-fork adopts the agent's
+                # identity without priming a bootstrap, so nothing identity-bearing
+                # is persisted for the route. Recover it from the active session's
+                # JSONL (its copied history carries the agent's own bootstrap)
+                # instead of defaulting to a fresh, current-time root team key.
+                # Scoped to these routes only, so restore still avoids scanning
+                # every historical JSONL.
+                state.session_manager.set_session_id(entry.session_id)
+                projection = self._state_inbox_projection(
+                    state,
+                    allow_jsonl_lookup=True,
+                    allow_default_projection=False,
+                )
+            if projection is None:
+                projection = self._state_inbox_projection(
+                    state,
+                    allow_jsonl_lookup=False,
+                    allow_default_projection=True,
+                )
             if projection is not None:
                 state.session_manager.set_sdk_env_overrides(
                     self._with_explicit_env(
