@@ -59,6 +59,8 @@ from obs_agent.jsonl_health import (
 from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
 from obs_agent import maintenance_restart as _maint
 from obs_agent.lineage import (
+    AgentIdentity,
+    ConversationBranch,
     agent_name_for_lineage,
     build_obs_bootstrap_xml,
     find_latest_obs_bootstrap_for_session,
@@ -7568,7 +7570,27 @@ class TelegramBot:
             session_id=fork_session_id,
             jsonl_uuid=safe_uuid,
         )
+        # vault-mngu: identity is read BEFORE the session switch, while the route's
+        # env still describes the agent that owns the replied-to message.
+        identity = self._resolve_agent_identity(state, source_session_id=binding.session_id)
         await self._activate_route_session(state, fork_session_id)
+        if identity is not None:
+            self._adopt_conversation_branch(
+                state,
+                ConversationBranch(
+                    session_id=fork_session_id,
+                    parent_session_id=binding.session_id,
+                    fork_point_uuid=safe_uuid,
+                    identity=identity,
+                ),
+            )
+            return True, reply_to_user_message_id
+        # No identity is recoverable (no env team, no bootstrap in the source
+        # JSONL): the agent never had one, so the legacy priming is the only path.
+        logger.warning(
+            "[inline_fork] no recoverable identity route=%s source_session=%s; priming new bootstrap",
+            state.route, binding.session_id,
+        )
         lineage = self._ensure_state_lineage(state, session_id=binding.session_id)
         self._prime_obs_bootstrap(
             state,
@@ -7579,6 +7601,72 @@ class TelegramBot:
             session_id=fork_session_id,
         )
         return True, reply_to_user_message_id
+
+    def _resolve_agent_identity(
+        self,
+        state: TelegramSessionState,
+        *,
+        source_session_id: str | None,
+    ) -> AgentIdentity | None:
+        """Recover the existing identity of the agent on this route (vault-mngu).
+
+        Order: the route's team env (the live identity), then the latest
+        bootstrap recorded in the source session JSONL. Never derives a new
+        root team key: ``root_team_key_for_lineage`` stamps the current time,
+        which is exactly how inline forks used to mint new trees.
+        """
+        env = state.session_manager.sdk_env_overrides
+        team_name = env.get("CLAUDE_CODE_TEAM_NAME", "").strip()
+        agent_name = env.get("CLAUDE_CODE_AGENT_NAME", "").strip()
+        lineage = tuple(state.agent_lineage or ())
+        bootstrap = None
+        if not (team_name and agent_name and lineage):
+            bootstrap = find_latest_obs_bootstrap_for_session(
+                session_id=source_session_id or state.session_id,
+                cwd=self._config.vault_path,
+            )
+        if bootstrap is not None:
+            team_name = team_name or (bootstrap.root_team_key or "").strip()
+            agent_name = agent_name or (bootstrap.agent_name or "").strip()
+            lineage = lineage or tuple(bootstrap.lineage or ())
+        if not team_name or not lineage:
+            return None
+        if not agent_name:
+            agent_name = team_name if len(lineage) <= 1 else agent_name_for_lineage(
+                lineage, team_key=team_name,
+            )
+        return AgentIdentity(root_team_key=team_name, agent_name=agent_name, lineage=lineage)
+
+    def _adopt_conversation_branch(
+        self,
+        state: TelegramSessionState,
+        branch: ConversationBranch,
+    ) -> None:
+        """Make *branch* the route's active conversation without a new identity.
+
+        No bootstrap is primed: the forked JSONL already carries the agent's own
+        bootstrap in its copied history, so the agent sees nothing new and its
+        team, agent name and inbox stay the same. The original session and its
+        message bindings are untouched, so replying to a message on the original
+        branch rewinds to it.
+        """
+        identity = branch.identity
+        state.agent_lineage = identity.lineage
+        state.session_manager.set_sdk_env_overrides({
+            **state.session_manager.sdk_env_overrides,
+            **self._build_team_worker_env(
+                team_name=identity.root_team_key,
+                agent_name=identity.agent_name,
+            ),
+        })
+        state.pending_obs_bootstrap = None
+        self._upsert_route_inbox_target(state)
+        self._persist_state_for_route(state.route)
+        logger.info(
+            "[inline_fork] branch adopted route=%s team=%s agent=%s session=%s parent=%s fork_point=%s",
+            state.route, identity.root_team_key, identity.agent_name,
+            branch.session_id, branch.parent_session_id, branch.fork_point_uuid,
+        )
 
     async def handle_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

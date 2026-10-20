@@ -3698,7 +3698,9 @@ class TestTelegramLiveSmoke:
             lineage_after["agent_name"] == lineage_before["agent_name"]
         ), live_tg_forum.failure_context()
         assert lineage_after["root_team_key"] == lineage_before["root_team_key"], live_tg_forum.failure_context()
-        assert lineage_after["origin"] == "inline_fork", live_tg_forum.failure_context()
+        # vault-mngu: an inline reply-fork is the same agent; no fork bootstrap is primed,
+        # so the visible origin stays the agent's own.
+        assert lineage_after["origin"] == lineage_before["origin"], live_tg_forum.failure_context()
         assert lineage_after["session_id"] != lineage_before["session_id"], live_tg_forum.failure_context()
 
         inbox_seen = await _send_and_wait_for_token(

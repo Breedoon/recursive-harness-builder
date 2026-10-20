@@ -1913,6 +1913,10 @@ def create_obs_tools(
             session_id=current_session_id,
             include_xml=include_xml,
         )
+        if current_session_id:
+            # vault-mngu: an inline reply-fork carries its agent's bootstrap only in
+            # copied history, so the bootstrap's session_id names the parent branch.
+            payload["session_id"] = current_session_id
         return {
             "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=True)}],
             "tool_use_result": payload,

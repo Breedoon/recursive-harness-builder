@@ -59,6 +59,32 @@ class ObsBootstrap:
         raise AttributeError(name)
 
 
+@dataclass(frozen=True)
+class AgentIdentity:
+    """Who an agent is: stable across every conversation branch it owns.
+
+    vault-mngu ADR (2026-10-20): an agent's identity (root team key, agent
+    name, lineage) is separate from the conversation branch (session JSONL)
+    currently carrying it. Replying to an earlier message in the same topic
+    starts a new *branch* of the same agent; it must never mint a new
+    identity. Only AgentTask/``/fork`` create new agents.
+    """
+
+    root_team_key: str
+    agent_name: str
+    lineage: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ConversationBranch:
+    """One conversation branch of an agent: a session JSONL forked at a point."""
+
+    session_id: str
+    parent_session_id: str | None
+    fork_point_uuid: str | None
+    identity: AgentIdentity
+
+
 def normalize_lineage_name(value: str | None) -> str:
     """Collapse whitespace and trim a lineage node label."""
     normalized = " ".join((value or "").split()).strip()
