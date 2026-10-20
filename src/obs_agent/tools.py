@@ -840,7 +840,9 @@ def create_obs_tools(
             except ValueError:
                 return _error_result(f"Cannot launch {tool_name}: inherit_hooks must be true or false")
 
-        # Kept for internal/future use — not exposed in MCP schema but still processed if passed
+        # Kept for internal/future use. Not declared in the MCP schema, so only in-process
+        # callers can pass them: the MCP layer drops undeclared arguments before they
+        # reach this handler (observed live 2026-10-20, obs-15 E3: max_turns arrived None).
         timeout_ms_raw = args.get("timeout_ms")
         max_turns_raw = args.get("max_turns")
         if not prompt and not prompt_file_content:
