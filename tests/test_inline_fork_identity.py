@@ -209,6 +209,15 @@ class TestInlineForkSurvivesRestart:
         assert env.get("CLAUDE_CODE_AGENT_NAME") == TEAM
         assert restored._route_inbox_target_keys_by_route[rstate.route] == (TEAM, TEAM)
 
+    async def test_restore_logs_attributable_line(self, config, caplog):
+        """vm-obs-1: the restore-from-transcript branch leaves an attributable INFO line."""
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="obs_agent.telegram"):
+            await self._fork_then_restore(config, lineage=("Proc work",), team=TEAM, agent=TEAM)
+        lines = [r.getMessage() for r in caplog.records if "[inline_fork] restore:" in r.getMessage()]
+        assert any("identity recovered from session jsonl" in ln and TEAM in ln for ln in lines), lines
+
     async def test_child_fork_keeps_identity_after_restart(self, config):
         restored, rstate = await self._fork_then_restore(
             config, lineage=("Proc work", "Child X"), team=TEAM, agent="b41d7e9d27-child-x",

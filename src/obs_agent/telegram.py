@@ -1763,6 +1763,22 @@ class TelegramBot:
                     allow_jsonl_lookup=True,
                     allow_default_projection=False,
                 )
+                if projection is not None:
+                    logger.info(
+                        "[inline_fork] restore: identity recovered from session jsonl "
+                        "(route=%s session=%s team=%s agent=%s)",
+                        route,
+                        entry.session_id,
+                        projection[0],
+                        projection[1],
+                    )
+                else:
+                    logger.info(
+                        "[inline_fork] restore: no identity in session jsonl; default projection "
+                        "(route=%s session=%s)",
+                        route,
+                        entry.session_id,
+                    )
             if projection is None:
                 projection = self._state_inbox_projection(
                     state,
