@@ -11,7 +11,34 @@ root) instead. The 2026-10-18 13:25Z gvnf swap below was made during a declared 
 invalidated another tree's qualification gate. `cliproxy-watchdog.sh` now skips its 429 and
 catalog-miss restarts during a freeze; it still revives a dead proxy, with an alert.
 
-## 8.0.11-gvnf1 (deployed 2026-10-18 ~13:25Z, bead vault-gvnf, P0)
+## 8.0.11-gvnf2 (deployed 2026-10-20 ~13:13Z, bead ops-65, P0) — RUNNING
+
+- Binary sha256: `7e6cb092bd13f9bdd3f2f4a942157787d3f6fd3bc0990b6aceeeed765a70b5c4`
+  (`cli-proxy-api` and `cli-proxy-api.8.0.11-gvnf2`; verified against `/proc/<pid>/exe` after the swap).
+  Rollback: `cli-proxy-api.8.0.11-gvnf1` (sha `0e791c16…`), then `supervisorctl restart cliproxyapi`.
+- Base: gvnf1 (below) plus source branch `ops65-replay-cap`, commit `44c62cb8`, in
+  /workspace/runtime/src-cache/CLIProxyAPI. Build exactly like gvnf1 with
+  `-X main.Version=8.0.11-gvnf2 -X main.Commit=44c62cb8`.
+- Bug: the Codex reasoning-replay store trimmed each agent's turns FIFO at 256 turns / 16 MiB.
+  Every completed response is a stored turn, so a long agent passed 256 within hours and the
+  oldest turns were evicted, INCLUDING orphan turns (reasoning + empty answer) that the client never
+  echoes back and that gvnf1 re-inserts at a fixed early index. The orphan then vanished from the
+  translated prompt and the provider cache missed for the whole rest of the conversation once
+  (2026-10-19: 0.28–0.57M-token re-bills, e.g. item 231 of 973).
+- Fix: caps raised to 8192 turns / 256 MiB per agent (the 1 h TTL and 10,240-entry cap still bound
+  memory). Test `TestCodexReasoningReplayOrphanSurvivesLongConversation` FAILs at 256 and PASSes
+  patched; all 100 packages pass.
+- Gate: key probe PASS (scratch candidate on port 18318, then live); full dual-route
+  `cache_regression.py` PASS 37/37 against a scratch cache proxy pointed at the candidate,
+  report `/workspace/runtime/cache-regression/20261020T1340Z-ops65-gvnf2-scratch` (CLIProxy
+  identity `53d965f5…` = this binary + the production config).
+- Known cost of ANY CLIProxyAPI restart: the replay store is in process memory, so live sessions
+  that depend on an inserted orphan lose it once (bead vault-j3ms tracks persisting it).
+- Diagnosis of what remains (provider routing misses, Claude Code tool-result persistence):
+  obs-artifacts `Drafts/Artifacts/2026-10-17-11-36-proc-work/b41d7e9d27-p0-sol-cache-re-bills-ops-65/report.md`.
+  Detector now reads the gz archive: `cliproxy_translation_drift.py --log-dir /workspace/runtime/backups/cliproxy-logs`.
+
+## 8.0.11-gvnf1 (deployed 2026-10-18 ~13:25Z, bead vault-gvnf, P0) — superseded by gvnf2
 
 - Binary sha256: `0e791c16fb04f97490719ebcd922fe8d40b3fffc933e7b4c79b3401e9bbfa85a`
   (`/workspace/runtime/cliproxy/cli-proxy-api` and `cli-proxy-api.8.0.11-gvnf1`; verified against the
