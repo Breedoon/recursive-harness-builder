@@ -325,6 +325,8 @@ def _parser() -> argparse.ArgumentParser:
     nt.add_argument("--effort", default=None)
     nt.add_argument("--hooks", default=None, help="JSON hook map for the new root; default: new-chat hooks")
     nt.add_argument("--env", default=None, help="JSON env overrides for the new root")
+    nt.add_argument("--origin-team", default=None, help="launching agent's root_team_key (report-back target)")
+    nt.add_argument("--origin-agent", default=None, help="launching agent's agent_name (report-back target)")
     return ap
 
 

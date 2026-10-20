@@ -1074,20 +1074,12 @@ def create_obs_tools(
                     "hooks to the child."
                 ),
             },
-            # CACHE-PREFIX WARNING: this schema is part of every session's tool list. Adding a
-            # property (new_tree_chat, obs-15.5) breaks each live session's cache once, on its
-            # first turn after the deploy; undeclared arguments are dropped before they reach
-            # _launch_task (probed 2026-10-20: max_turns arrived as None), so it must be declared.
-            "new_tree_chat": {
-                "type": "string",
-                "description": (
-                    "Start a NEW root tree (its own team, not your child) as a new topic in an "
-                    "existing group chat: a chat id or a chat-registry name. display_name is the "
-                    "topic title; prompt, prompt_file, hooks, model, effort and env apply to the "
-                    "new root. Fresh session only (no fork, resume or session_source). Never creates "
-                    "a chat. Returns the topic link, root_team_key and agent_name."
-                ),
-            },
+            # CACHE-PREFIX WARNING: this schema is part of every session's tool list; any added
+            # property breaks each live session's cache once, on its first turn after the deploy.
+            # new_tree_chat (obs-15.5) is therefore NOT declared yet: _launch_task and the bot
+            # already handle it, but model-issued calls drop undeclared arguments (probed
+            # 2026-10-20: max_turns arrived as None), so agents use `obs-agentctl new-tree` for
+            # now. Declare it here in the next deploy that changes a tool schema anyway.
             },
             "required": ["display_name"],
         },

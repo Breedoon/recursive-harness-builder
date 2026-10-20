@@ -7,7 +7,7 @@ the reflection watcher) can wake or launch agents without an agent in the loop.
 obs-agentctl --as error-monitor ping
 obs-agentctl --as error-monitor message --team <root_team_key> --to <agent_name> --text "..." [--summary ..] [--allow-cold-wake]
 obs-agentctl --as nightly-check launch --parent-team <team> --parent <agent> --name "Fix X" --prompt "..." [--fresh] [--model ..] [--prompt-file ..] [--hooks '{..}'] [--session-source ..] [--allow-cold-wake]
-obs-agentctl --as nightly-check new-tree --title "Disk alert" (--prompt "..." | --prompt-file P) [--chat NAME|ID | --chat-id N] [--model ..] [--effort ..] [--hooks '{..}'] [--env '{..}']
+obs-agentctl --as nightly-check new-tree --title "Disk alert" (--prompt "..." | --prompt-file P) [--chat NAME|ID | --chat-id N] [--model ..] [--effort ..] [--hooks '{..}'] [--env '{..}'] [--origin-team T --origin-agent A]
 ```
 
 - Wrapper: `/workspace/runtime/bin/obs-agentctl` = `/workspace/obs/.venv/bin/python -m obs_agent.control`.
@@ -75,11 +75,12 @@ obs-agentctl --as nightly-check new-tree --title "Disk alert" (--prompt "..." | 
     and `agent_name` of the new root, so the caller can message it directly.
   - Provenance: the launcher is recorded in `~/.claude/teams/<root_team_key>/origin.json`
     (`kind: external, caller`). The new tree is not a lineage child of anyone.
-- Agents can do the same without Bash: `AgentTask(new_tree_chat="<chat name or id>",
-  display_name="<topic title>", prompt=..., prompt_file=..., hooks=..., model=..., effort=..., env=...)`.
-  It is always a fresh root (fork, resume and session_source are refused); an omitted model means
-  the caller's own model. The caller is recorded as `origin_team`/`origin_agent` in `origin.json`,
-  and the first turn names it with the `SendInboxMessage team_name=…` to report completion to.
-  Adding `new_tree_chat` to the AgentTask schema changed every session's tool list, so the deploy
-  that ships it breaks each live session's cache once (docs/cache-proxy-safety.md); undeclared
-  AgentTask arguments are dropped before OBS sees them (probed 2026-10-20), so it had to be declared.
+- Agents without Bash (reasoning-only entry agents) start a new tree through a fork with executor
+  hooks that runs `obs-agentctl --as <entry agent> --json new-tree --chat <name> --title ... --prompt-file ...
+  --origin-team <its root_team_key> --origin-agent <its agent_name>` and returns the link and names. With
+  both origin flags the tree's `origin.json` records `kind: agent` and its first turn names the
+  `SendInboxMessage team_name=…` to report completion to (automatic report-back: bead obs-15.10). The bot also handles `AgentTask(new_tree_chat=...)` (always a fresh
+  root; caller recorded as `origin_team`/`origin_agent`), but the AgentTask schema does **not** declare
+  it yet: adding a schema property breaks every live session's cache once at the deploy that ships it
+  (docs/cache-proxy-safety.md), and model-issued calls drop undeclared arguments (probed 2026-10-20). It
+  will be declared in the next deploy that changes a tool schema anyway (bead obs-15.9).

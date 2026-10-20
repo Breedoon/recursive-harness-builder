@@ -149,6 +149,15 @@ class TestControlNewTree:
         assert kw["origin"] == {"kind": "external", "caller": "nightly"}
         assert kw["trigger_label"] == "external trigger: nightly"
 
+    async def test_cli_origin_names_report_back_target(self, bot):
+        bot._create_new_tree = AsyncMock(return_value={"ok": True, "text": "x", "result": {}})
+        await bot._control_dispatch("new_tree", "entry", {
+            "title": "T", "prompt": "p", "chat": "ac",
+            "origin_team": "2026-10-17-11-36-proc-work", "origin_agent": "entry-agent"})
+        kw = bot._create_new_tree.await_args.kwargs
+        assert kw["origin"]["kind"] == "agent" and kw["origin"]["origin_agent"] == "entry-agent"
+        assert "SendInboxMessage team_name=2026-10-17-11-36-proc-work" in kw["trigger_label"]
+
     async def test_chat_id_still_accepted(self, bot):
         bot._create_new_tree = AsyncMock(return_value={"ok": True, "text": "x", "result": {}})
         await bot._control_dispatch("new_tree", "nightly", {"title": "T", "prompt": "p", "chat_id": AC_CHAT})
@@ -159,9 +168,11 @@ class TestControlNewTree:
         monkeypatch.setattr(control, "send_request",
                             lambda op, caller, args, **kw: (sent.update(op=op, args=args) or (0, {"ok": True, "text": "x"})))
         assert control.main(["--as", "cron", "new-tree", "--title", "T", "--prompt-file", "p.md",
-                             "--chat", "procedures", "--model", "opus", "--hooks", "{}"]) == 0
+                             "--chat", "procedures", "--model", "opus", "--hooks", "{}",
+                             "--origin-team", "tm", "--origin-agent", "ag"]) == 0
         assert sent["op"] == "new_tree"
-        assert sent["args"] == {"title": "T", "prompt_file": "p.md", "chat": "procedures", "model": "opus", "hooks": "{}"}
+        assert sent["args"] == {"title": "T", "prompt_file": "p.md", "chat": "procedures", "model": "opus",
+                                "hooks": "{}", "origin_team": "tm", "origin_agent": "ag"}
 
     def test_validation_needs_prompt_or_file(self):
         assert "prompt or prompt_file" in control.validate_request(
@@ -223,10 +234,11 @@ class TestAgentTaskToolArgs:
         assert out.get("is_error") and "fresh root" in out["content"][0]["text"]
         launcher.assert_not_awaited()
 
-    def test_schema_declares_new_tree_chat(self, config):
+    def test_schema_does_not_declare_new_tree_chat_yet(self, config):
+        """Declaring it re-caches every live session once; it ships dormant (obs-15.5 ADR)."""
         from obs_agent.hooks import HookState
         from obs_agent.tools import create_obs_tools
 
         tools = create_obs_tools(config, lambda: "sid", hook_state=HookState(), return_tools=True)
         schema = {tool.name: tool.input_schema for tool in tools}["AgentTask"]
-        assert "new_tree_chat" in schema["properties"]
+        assert "new_tree_chat" not in schema["properties"]

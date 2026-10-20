@@ -6564,9 +6564,20 @@ class TelegramBot:
         chat = args.get("chat")
         if chat is None:
             chat = args.get("chat_id")
+        origin: dict[str, Any] = {"kind": "external", "caller": caller}
+        trigger = f"external trigger: {caller}"
+        # An agent launching through a fork names itself so the tree can report back (ops-61).
+        origin_team = str(args.get("origin_team") or "").strip() or None
+        origin_agent = str(args.get("origin_agent") or "").strip() or None
+        if origin_team and origin_agent:
+            origin.update(kind="agent", origin_team=origin_team, origin_agent=origin_agent)
+            trigger = (
+                f"new tree launched by {origin_agent} (team {origin_team}); report completion to it "
+                f"with SendInboxMessage team_name={origin_team}"
+            )
         return await self._create_new_tree(
-            trigger_label=f"external trigger: {caller}",
-            notice_text=f"new tree started by external:{caller}",
+            trigger_label=trigger,
+            notice_text=f"new tree started by {origin_agent or 'external:' + caller}",
             chat=chat,
             title=str(args["title"]),
             prompt=str(args.get("prompt") or ""),
@@ -6576,7 +6587,7 @@ class TelegramBot:
             model=str(args.get("model") or "").strip() or None,
             effort=str(args.get("effort") or "").strip() or None,
             env=env or None,
-            origin={"kind": "external", "caller": caller},
+            origin=origin,
         )
 
     def _read_vault_prompt_file(self, prompt_file: str) -> str:
