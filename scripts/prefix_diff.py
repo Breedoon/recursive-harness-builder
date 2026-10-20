@@ -22,6 +22,9 @@ Classification of B relative to A:
   thinking-changed  ...and that message's thinking-block count differs
                     (blocks dropped/added — compare thinking config too)
   shrunk            B has fewer messages than A and they agree up to len(B)
+  ttl-changed       bytes are identical/append, but the breakpoints' cache
+                    TTL differs (5m vs 1h). A 1h request cannot read entries
+                    written with 5m, so 5m -> 1h re-bills (2026-10-20, vault-h6yt)
 
 It also lists cache_control breakpoints of both requests and says whether
 B keeps a message breakpoint at or after A's last breakpoint (a request with
@@ -145,6 +148,21 @@ def breakpoints(req: dict) -> list[str]:
             if isinstance(b, dict) and "cache_control" in b:
                 out.append(f"messages[{mi}].content[{bi}]")
     return out
+
+
+def breakpoint_ttls(req: dict) -> list[str]:
+    """Sorted distinct TTLs of the request's breakpoints ("5m" when unset)."""
+    out = set()
+    blocks = list(req.get("tools") or [])
+    if isinstance(req.get("system"), list):
+        blocks += req["system"]
+    for m in req.get("messages") or []:
+        blocks += _as_blocks(m.get("content"))
+    for b in blocks:
+        cc = b.get("cache_control") if isinstance(b, dict) else None
+        if isinstance(cc, dict):
+            out.add(cc.get("ttl") or "5m")
+    return sorted(out)
 
 
 def _last_message_bp(bps: list[str]) -> int | None:
@@ -271,6 +289,10 @@ def diff_requests(a: dict, b: dict, a_beta: str | None = None, b_beta: str | Non
         result["classification"] = "append"
     if result["config_diffs"] and result["classification"] in ("append", "tail-block-append", "identical"):
         result["classification"] = "config-changed"
+    result["a_ttls"], result["b_ttls"] = breakpoint_ttls(a), breakpoint_ttls(b)
+    if (result["a_ttls"] and result["b_ttls"] and result["a_ttls"] != result["b_ttls"]
+            and result["classification"] in ("append", "tail-block-append", "identical")):
+        result["classification"] = "ttl-changed"
 
     a_bp = _last_message_bp(result["a_breakpoints"])
     b_bp = _last_message_bp(result["b_breakpoints"])
@@ -294,6 +316,8 @@ def format_result(r: dict, label: str = "") -> str:
                      f"(A total {r['a_thinking_blocks']}, B over A's span {r['b_thinking_blocks']})")
     for c in r["config_diffs"]:
         lines.append(f"  config {c['key']}: {json.dumps(c['a'])[:200]} → {json.dumps(c['b'])[:200]}")
+    if r.get("a_ttls") and r.get("b_ttls") and r["a_ttls"] != r["b_ttls"]:
+        lines.append(f"  breakpoint ttl {'/'.join(r['a_ttls'])} → {'/'.join(r['b_ttls'])}")
     d = r["first_divergence"]
     if d:
         lines.append(f"  first divergence: {d['path']} @byte {d['byte_offset']} "

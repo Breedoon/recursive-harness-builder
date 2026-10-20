@@ -673,7 +673,7 @@ async def sc_empty_result_resume(args):
 REMINDER_TAG = "system" + "-reminder"  # built at runtime: agents reading this file see it intact
 
 
-def _direct_probe(args, sid, since, variants):
+def _direct_probe(args, sid, since, variants, chain=False):
     """Send hand-built variants of one real CLI request through the proxy under test.
 
     The CLI cannot be made to produce some live shapes on demand (a reminder
@@ -681,9 +681,9 @@ def _direct_probe(args, sid, since, variants):
     drives the real CLI through the proxy, takes the exact body the CLI sent
     (the proxy's "pre" log), and then sends variants of that body directly with
     the CLI's own OAuth token. Every variant goes through the proxy exactly like
-    CLI traffic. Verdict per later variant vs the first: the bytes the proxy sent
-    upstream must be identical/append (prefix_diff) and the cache read must be
-    >= threshold of the first variant's prompt.
+    CLI traffic. Verdict per later variant vs the first (vs the previous one with
+    chain=True): the bytes the proxy sent upstream must be identical/append
+    (prefix_diff) and the cache read must be >= threshold of that variant's prompt.
     """
     import urllib.request
     time.sleep(3)
@@ -728,10 +728,14 @@ def _direct_probe(args, sid, since, variants):
                    and r.get("ts", 0) >= t_start], key=lambda r: r["ts"])
     if len(sent) < len(variants):
         raise RuntimeError(f"only {len(sent)} of {len(variants)} probe requests in the proxy log")
+    def prompt_total(usage):
+        return sum(usage.get(k) or 0 for k in
+                   ("cache_read_input_tokens", "cache_creation_input_tokens", "input_tokens"))
+
     first = sent[0]
     A = pd.load_request(first["req_id"], "wire", args.log_dir)
-    total_a = sum(usages[0][1].get(k) or 0 for k in
-                  ("cache_read_input_tokens", "cache_creation_input_tokens", "input_tokens"))
+    total_a = prompt_total(usages[0][1])
+    a_name = usages[0][0]
     verdicts = []
     for (name, usage), row in zip(usages[1:], sent[1:]):
         B = pd.load_request(row["req_id"], "wire", args.log_dir)
@@ -741,10 +745,12 @@ def _direct_probe(args, sid, since, variants):
         cr = usage.get("cache_read_input_tokens") or 0
         ratio = cr / total_a if total_a else 0.0
         ok = cls in ("identical", "append", "tail-block-append") and ratio >= args.threshold
-        verdicts.append({"a": f"{usages[0][0]} {first['req_id']}", "b": f"{name} {row['req_id']}",
+        verdicts.append({"a": f"{a_name} {first['req_id']}", "b": f"{name} {row['req_id']}",
                          "class": cls, "no_breakpoint": False, "cache_read": cr,
                          "prior_prompt": total_a, "ratio": round(ratio, 4), "ok": ok,
                          "diff": text if not ok else ""})
+        if chain:  # compare each variant with the one before it (a growing conversation)
+            first, A, total_a, a_name = row, B, prompt_total(usage), name
     return {"direct_usage": dict(usages), "direct_verdicts": verdicts}
 
 
@@ -842,6 +848,77 @@ async def sc_volatile_flip(args):
     return [sid], meta
 
 
+_TTL_PAD = "Padding so the conversation, not the system prompt, dominates the prompt. " * 120
+
+
+def _ttl_variant(ttl, turns):
+    """Build a variant: every breakpoint at ``ttl``; ``turns`` assistant/user
+    pairs (each user turn ~2k tokens) appended, breakpoint on the last block,
+    as the CLI places it."""
+    def build(b):
+        for m in b["messages"]:
+            for blk in (m["content"] if isinstance(m.get("content"), list) else []):
+                blk.pop("cache_control", None)
+        for k in range(turns):
+            b["messages"].append({"role": "assistant", "content": [{"type": "text", "text": f"ok {k}"}]})
+            b["messages"].append({"role": "user", "content": [
+                {"type": "text", "text": f"turn {k}. {_TTL_PAD}Reply with the single word: ok."}]})
+        last = b["messages"][-1]["content"]
+        if isinstance(last, str):
+            b["messages"][-1]["content"] = last = [{"type": "text", "text": last}]
+        last[-1]["cache_control"] = {"type": "ephemeral"}
+        for blk in (b.get("system") or []) + [x for m in b["messages"] for x in
+                                             (m["content"] if isinstance(m.get("content"), list) else [])]:
+            cc = blk.get("cache_control") if isinstance(blk, dict) else None
+            if isinstance(cc, dict):
+                rest = {k: v for k, v in cc.items() if k not in ("type", "ttl")}
+                cc.clear()
+                cc["type"] = "ephemeral"
+                if ttl == "1h":
+                    cc["ttl"] = "1h"
+                cc.update(rest)
+    return build
+
+
+async def sc_ttl_flip(args):
+    """The 2026-10-20 break (vault-h6yt, session 5eb20a42): the CLI chooses the
+    breakpoint TTL once per process (1h only when the GrowthBook allowlist it
+    latched lists the query source; it reads that from the fleet's shared,
+    non-atomically rewritten ~/.claude.json). After a restart one conversation
+    ran at 5m for a whole process, then at 1h again after the next restart. A
+    1h request cannot read 5m entries, and the old 1h entries were too far back
+    for the provider's ~20-block lookback, so a pure byte append re-billed
+    ~0.72M tokens. The probe replays that: A at 1h, twelve growing 5m requests,
+    then a 1h request; each compared with the one before. The proxy must send
+    every one upstream at 1h."""
+    if args.provider != "anthropic":
+        raise RuntimeError("ttl_flip is an Anthropic-route scenario")
+    sid = str(uuid.uuid4())
+    since = time.time() - 1
+    await _session(args, ["Reply with the single word: ready."], session_id=sid)
+    variants = [("A-1h", _ttl_variant("1h", 0))]
+    variants += [(f"B{k}-5m", _ttl_variant("5m", k)) for k in range(1, 13)]
+    variants += [("C-1h", _ttl_variant("1h", 13))]
+    meta = _direct_probe(args, sid, since, variants, chain=True)
+    return [sid], meta
+
+
+async def sc_ttl_flip_down(args):
+    """The other direction (vault-h6yt): a conversation running at 5m whose next
+    process asks for 1h while its 5m entries are still warm (the 08:10:53Z
+    request after a 118 s restart gap). A 1h request reads nothing written at
+    5m, so the proxy must keep it at 5m until the conversation goes idle."""
+    if args.provider != "anthropic":
+        raise RuntimeError("ttl_flip_down is an Anthropic-route scenario")
+    sid = str(uuid.uuid4())
+    since = time.time() - 1
+    await _session(args, ["Reply with the single word: ready."], session_id=sid)
+    meta = _direct_probe(args, sid, since, [("A-5m", _ttl_variant("5m", 1)),
+                                           ("B-1h", _ttl_variant("1h", 2)),
+                                           ("C-1h", _ttl_variant("1h", 3))], chain=True)
+    return [sid], meta
+
+
 SCENARIOS = {
     "baseline": (sc_baseline, "control; must pass"),
     "utility_route": (sc_utility_route, "Bash file-path utility remains on the explicit provider"),
@@ -862,6 +939,8 @@ SCENARIOS = {
     "resumed_poison": (sc_resumed_poison, "resumed turn chained to an injected API-error row; tail recovery keeps it, both routes (vault-1bc2)"),
     "ws_resume": (sc_ws_resume, "whitespace-edged tool output + spliced reminder, then new-process resume"),
     "volatile_flip": (sc_volatile_flip, "server flag flips system section/context_management mid-conversation (Anthropic)"),
+    "ttl_flip": (sc_ttl_flip, "CLI process at 5m inside a 1h conversation, then 1h again (Anthropic, vault-h6yt)"),
+    "ttl_flip_down": (sc_ttl_flip_down, "warm 5m conversation whose next process asks for 1h (Anthropic, vault-h6yt)"),
 }
 
 
@@ -872,7 +951,7 @@ def _provider_errors(log_dir, since):
             if r.get("ts", 0) >= since and (r.get("http_status") or 0) >= 500]
 
 
-ANTHROPIC_ONLY = {"volatile_flip", "ws_resume", "recovered_poison"}
+ANTHROPIC_ONLY = {"volatile_flip", "ws_resume", "recovered_poison", "ttl_flip", "ttl_flip_down"}
 
 
 def run(args, name):

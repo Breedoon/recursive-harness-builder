@@ -63,7 +63,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:28925"
 DEFAULT_LOG_DIR = os.environ.get("CACHE_PROXY_REQUEST_LOG_DIR",
                                   "/workspace/runtime/logs/cache-proxy/requests")
 OUT_ROOT = Path(os.environ.get("CACHE_REGRESSION_OUT", "/workspace/runtime/cache-regression"))
-ANTHROPIC_ONLY = {"volatile_flip", "ws_resume", "recovered_poison"}  # mirrors prefix_repro.ANTHROPIC_ONLY
+ANTHROPIC_ONLY = {"volatile_flip", "ws_resume", "recovered_poison", "ttl_flip", "ttl_flip_down"}  # mirrors prefix_repro.ANTHROPIC_ONLY
 
 
 def _sha256(data: bytes) -> str:

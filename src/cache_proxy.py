@@ -55,7 +55,9 @@ After normalization:
    each conversation (pin_volatile_config) — server-side flag refreshes and
    MCP servers (re)connecting with instructions otherwise flip them.
 9. GPT route only: per-conversation provider cache key (assign_conversation_cache_key).
-10. Anthropic route only: Haiku effort strip and mid-session effort pin.
+10. Anthropic route only: Haiku effort strip, breakpoint TTL pin
+    (pin_cache_ttl: a conversation once sent with 1h stays 1h; the CLI picks
+    5m/1h per process) and mid-session effort pin.
 
 Usage:
     python cache_proxy.py [port]  # default: 18923
@@ -265,6 +267,7 @@ stats = {
     "cch_restored": 0,
     "tool_results_trimmed": 0,
     "volatile_pins_applied": 0,
+    "ttl_pins_applied": 0,
     "git_status_normalized": 0,
     "tools_sorted": 0, "metadata_normalized": 0,
     "errors": 0,
@@ -895,6 +898,7 @@ class EffortPinStore:
         # key -> [{"sections": {...}, "cm": ...}, last_used]; see pin_volatile_config
         self.variants: dict[str, list] = {}
         self.texts: dict[str, str] = {}  # sha256 -> pinned section text (dedup)
+        self.ttls: dict[str, list] = {}  # key -> [ttl, last_used]; see pin_cache_ttl
         self._load()
 
     def _load(self):
@@ -907,6 +911,7 @@ class EffortPinStore:
             self.anchors = data.get("anchors", {})
             self.variants = data.get("variants", {})
             self.texts = data.get("texts", {})
+            self.ttls = data.get("ttls", {})
         except Exception as e:
             log(f"effort pins unreadable, starting empty: {e}")
 
@@ -915,7 +920,7 @@ class EffortPinStore:
             return
         now = time.time()
         for table, ttl in ((self.bases, EFFORT_PIN_TTL), (self.anchors, EFFORT_PIN_TTL),
-                           (self.variants, VARIANT_PIN_TTL)):
+                           (self.variants, VARIANT_PIN_TTL), (self.ttls, VARIANT_PIN_TTL)):
             stale = [k for k, v in table.items() if now - v[1] > ttl]
             for k in stale:
                 del table[k]
@@ -930,7 +935,8 @@ class EffortPinStore:
                           for h in (v[0].get("s") or {}).values() if h}
             self.texts = {h: t for h, t in self.texts.items() if h in live_texts}
             json.dump({"bases": self.bases, "anchors": self.anchors,
-                       "variants": self.variants, "texts": self.texts}, f)
+                       "variants": self.variants, "texts": self.texts,
+                       "ttls": self.ttls}, f)
         os.replace(tmp, self.path)
 
 
@@ -1245,6 +1251,117 @@ def pin_volatile_config(body: dict, store: "EffortPinStore | None" = None) -> di
                 log(f"variant pins save failed: {e}")
     if result["applied"]:
         stats["volatile_pins_applied"] += 1
+    return result
+
+
+# ── Per-conversation pinning of the cache_control TTL ───────────────────
+#
+# CACHE-PREFIX WARNING (2026-10-20, bead vault-h6yt): Claude Code picks the
+# breakpoint TTL once per PROCESS. It sends ``"ttl": "1h"`` only when its
+# GrowthBook value tengu_prompt_cache_1h_config lists the query source, and it
+# latches that list on the first request of the process (bundled CLI 2.1.59,
+# functions tx9/Og$). The value is read from the fleet's shared
+# ~/.claude.json, which concurrent CLI processes rewrite non-atomically (EBUSY
+# on rename, bind-mounted file); a process that starts while the file lacks
+# the features block latches an empty list and sends 5-minute breakpoints for
+# its whole life. A restart therefore can move one conversation 1h -> 5m and
+# the next restart 5m -> 1h. The provider does not let a 1h request read
+# entries written with 5m (live: 2026-10-20 08:10:53Z, session 5eb20a42, read
+# 37,610 of ~762k and re-billed 724,198 tokens on a pure byte append), while
+# a 5m request does read 1h entries.
+# Rule, per conversation (model + first message, like the other pins):
+#   * once it has been sent with 1h, every later request goes with 1h;
+#   * a conversation running at 5m that the CLI now sends with 1h stays at 5m
+#     while its 5m entries can still be warm (last request less than
+#     TTL_PIN_WARM_SECONDS ago); after a longer idle gap those entries have
+#     expired anyway, so the switch to 1h costs nothing and is pinned.
+# Every breakpoint of the request gets the effective TTL (the CLI uses one
+# TTL per request; a uniform TTL also satisfies the API's rule that 1h
+# breakpoints must precede 5m ones). Anthropic route only.
+# Live check: scripts/cache_regression.py ttl_flip ttl_flip_down.
+TTL_PIN_WARM_SECONDS = 300 + 60  # 5-minute entry lifetime + save granularity below
+TTL_PIN_SAVE_EVERY = 60  # persist last-use at most this stale (proxy restarts)
+
+
+def _cache_controls(body: dict) -> list[dict]:
+    out = []
+    for t in body.get("tools") or []:
+        if isinstance(t, dict) and isinstance(t.get("cache_control"), dict):
+            out.append(t["cache_control"])
+    system = body.get("system")
+    if isinstance(system, list):
+        for b in system:
+            if isinstance(b, dict) and isinstance(b.get("cache_control"), dict):
+                out.append(b["cache_control"])
+    for m in body.get("messages") or []:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and isinstance(b.get("cache_control"), dict):
+                    out.append(b["cache_control"])
+    return [cc for cc in out if cc.get("type") == "ephemeral"]
+
+
+def _set_ttl(cc: dict, ttl: str) -> None:
+    # same key order as the CLI builds it: type, ttl, then anything else
+    rest = {k: v for k, v in cc.items() if k not in ("type", "ttl")}
+    typ = cc.get("type")
+    cc.clear()
+    cc["type"] = typ
+    if ttl == "1h":
+        cc["ttl"] = "1h"
+    cc.update(rest)
+
+
+def pin_cache_ttl(body: dict, store: "EffortPinStore | None" = None,
+                  now: float | None = None) -> dict:
+    """Keep the breakpoint TTL stable within one conversation (see above).
+
+    Returns {"incoming", "effective", "applied", "recorded"}; applied is
+    "upgraded", "kept-5m" or None. Mutates body. Must run after
+    normalize_request so the key covers normalized history.
+    """
+    result = {"incoming": None, "effective": None, "applied": None, "recorded": False}
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or not msgs or not body.get("tools"):
+        return result  # tool-less side calls (titles, summaries): nothing worth pinning
+    ccs = _cache_controls(body)
+    if not ccs:
+        return result
+    incoming = "1h" if any(cc.get("ttl") == "1h" for cc in ccs) else "5m"
+    result["incoming"] = incoming
+    store = store or _get_effort_pins()
+    now = time.time() if now is None else now
+    model = str(body.get("model", ""))
+    key = hashlib.sha256(model.encode() + b"\0" + _msg_bytes(msgs[0]) + b"\0").hexdigest()
+    with store.lock:
+        entry = store.ttls.get(key)
+        if entry is None:
+            effective = incoming
+            result["recorded"] = True
+        elif entry[0] == "1h":
+            effective = "1h"
+            if incoming != "1h":
+                result["applied"] = "upgraded"
+        elif incoming == "1h" and now - entry[1] < TTL_PIN_WARM_SECONDS:
+            effective = "5m"
+            result["applied"] = "kept-5m"
+        else:
+            effective = incoming
+        dirty = (entry is None or entry[0] != effective
+                 or now - entry[1] >= TTL_PIN_SAVE_EVERY)
+        store.ttls[key] = [effective, now]
+        if dirty:
+            try:
+                store._save()
+            except Exception as e:
+                log(f"ttl pins save failed: {e}")
+    result["effective"] = effective
+    if any(cc.get("ttl", "5m") != effective for cc in ccs):
+        for cc in ccs:
+            _set_ttl(cc, effective)
+    if result["applied"]:
+        stats["ttl_pins_applied"] += 1
     return result
 
 
@@ -2347,7 +2464,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             # CACHE-PREFIX WARNING: from here to the json.dumps() below is the
             # whole request-byte pipeline (normalize -> variant pin -> GPT cache
-            # key -> route-specific schema/effort edits -> one compact
+            # key -> route-specific schema/ttl/effort edits -> one compact
             # re-serialization). Order, the compact separators and every step
             # must be deterministic for the same conversation, or each request
             # silently re-bills the conversation. Each new step needs a
@@ -2386,6 +2503,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 info["schema_sanitized"] = sanitize_tool_schemas_for_openai(data)
             elif upstream == ANTHROPIC_UPSTREAM:
                 info["effort_stripped"] = strip_unsupported_effort(data)
+                try:
+                    info["ttl_pin"] = pin_cache_ttl(data)
+                except Exception as e:
+                    log(f"ttl pin error, sending as-is: {e}")
                 try:
                     info["effort_pin"] = pin_effort(data)
                 except Exception as e:
@@ -2498,7 +2619,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "norm": {k: info.get(k) for k in
                      ("action", "billing", "strings", "reminders", "git_status",
                       "tools", "metadata", "effort_stripped", "schema_sanitized",
-                      "dynamic_boundary", "ws_trimmed", "volatile_pin", "cache_key", "local_compact")
+                      "dynamic_boundary", "ws_trimmed", "volatile_pin", "ttl_pin", "cache_key",
+                      "local_compact")
                      if isinstance(info, dict) and k in info},
             # which proxy code produced these bytes (load-time hash, short)
             "proxy_source": _LOADED_SOURCE_SHA256[:12],
