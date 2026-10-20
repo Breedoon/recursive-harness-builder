@@ -109,6 +109,30 @@ logs an emergency current-code start rather than creating an outage. The kill
 switch and snapshot/resume semantics below are unchanged. Restoring the old wrapper
 by atomic rename rolls back selection without touching the development checkout.
 
+## Shared-service freezes (ops-47.6)
+
+The Work Registry can declare a freeze with the vault tool
+`Projects/Personal Projects/Agentic/Agent Operations/scripts/ops/freeze.py` while
+something depends on OBS's exact running identity (procedure
+`Agent Operations/procedures/registry/freeze.md`). Its Bash hook only sees commands an
+agent types, so OBS's own restart and deploy entry points ask the tool themselves
+(`src/obs_agent/freeze_guard.py`, which runs `freeze.py check --command ...`):
+
+- `python -m obs_agent.maintenance_restart` (and `--plain`) refuses with exit 4 during
+  a freeze that covers it (`obs-restart`, `all-shared`; `supervisor` for `--plain`).
+  The freeze owner, or someone it cleared, sets `OPS_FREEZE_ACK=<freeze id>`.
+- The cache-gate pre-push hook refuses a push to main from a frozen checkout
+  (`obs-source`, i.e. `/workspace/obs`) with exit 3, before the cache gate runs.
+- Daniel's own Telegram `/restart`, `/restart plain` and `/maintenance_restart` are
+  never refused: OBS logs a warning and posts one line naming the freeze, then restarts.
+- Hand-sent `kill -USR1` to `telegram_main` is the same restart; the vault hook's
+  `obs-restart` scope covers it.
+- Every check fails open: a missing, crashing or slow (>10 s) freeze tool, or a corrupt
+  state file, lets the restart proceed and only logs the error.
+
+Tests: `tests/test_freeze_guard.py` runs the real vault tool against isolated state;
+`tests/conftest.py` keeps every test off the production freeze file.
+
 ## Restart and crash paths (unchanged five-minute window)
 
 - **Maintenance restart — the default for planned restarts.** Agents that are
