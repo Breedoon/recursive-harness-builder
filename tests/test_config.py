@@ -42,7 +42,9 @@ class TestVaultPathResolution:
 
     def test_default_vault_path(self):
         cfg = OBSConfig()
-        expected = Path.home() / "Documents" / "obs-vault"
+        # The default is resolved from the real home at import time; unit tests see a
+        # teams-isolated Path.home() (conftest _isolate_teams_home), so read the env home.
+        expected = Path(os.path.expanduser("~")) / "Documents" / "obs-vault"
         assert cfg.vault_path == expected
 
     def test_vault_path_from_constructor(self, tmp_path):

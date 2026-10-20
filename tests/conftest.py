@@ -83,6 +83,122 @@ def _mock_session_get_client(request):
         with patch("obs_agent.session.SessionManager.get_client", new_callable=AsyncMock):
             yield
 
+# ---------------------------------------------------------------------------
+# Unit tests must not mint real agent teams (obs-15 re-check 2, R-3/M6-2).
+#
+# OBS writes team state under ``Path.home() / ".claude" / "teams"``. Unit tests
+# that exercise topic routes, restore and inline forks ran against the real
+# home and created production root-team dirs: 15 per full non-live run, 2223
+# historical, each with ``config.json`` ``cwd`` under ``/tmp/pytest-of-...``.
+# Every non-live test now gets its own home for Path.home(); live, integration
+# and Telegram-smoke tests keep the real one. The env HOME is left alone so
+# subprocesses (git, CLI fakes) behave as before. A session guard fails the run
+# if a test still creates a pytest-made team dir under the real home.
+# ---------------------------------------------------------------------------
+_REAL_HOME = Path(os.path.expanduser("~"))
+_REAL_TEAMS = _REAL_HOME / ".claude" / "teams"
+_LIVE_MARKERS = ("live", "integration", "eval", "serial")
+
+
+def _uses_real_home(request) -> bool:
+    node = request.node
+    for mark in node.iter_markers():
+        if mark.name in _LIVE_MARKERS or mark.name.startswith("telegram_"):
+            return True
+    return "live" in Path(str(node.fspath)).name
+
+
+def _pytest_made_team_dirs(root: Path) -> set[str]:
+    """Team dirs whose config.json cwd is a pytest tmp dir (the only test-made signature)."""
+    found: set[str] = set()
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        cfg = entry / "config.json"
+        try:
+            text = cfg.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if '"/tmp/pytest-of-' in text or "/pytest-of-" in text:
+            found.add(entry.name)
+    return found
+
+
+@pytest.fixture(scope="session")
+def _teams_isolated_home(tmp_path_factory) -> Path:
+    """A home that mirrors the real one except ``.claude/teams``, which is private and empty.
+
+    Every other top-level entry of the real home, and of the real ``~/.claude``, is a
+    symlink, so tests that read real config or the CLI's ``.claude/projects`` transcripts
+    (real-subprocess tests) see exactly what they saw before. Only team state is isolated.
+    """
+    home = tmp_path_factory.mktemp("teams-isolated-home")
+    try:
+        real_entries = list(_REAL_HOME.iterdir())
+    except OSError:
+        real_entries = []
+    for entry in real_entries:
+        if entry.name == ".claude":
+            continue
+        try:
+            (home / entry.name).symlink_to(entry)
+        except OSError:
+            pass
+    claude = home / ".claude"
+    claude.mkdir()
+    real_claude = _REAL_HOME / ".claude"
+    try:
+        claude_entries = list(real_claude.iterdir())
+    except OSError:
+        claude_entries = []
+    for entry in claude_entries:
+        if entry.name == "teams":
+            continue
+        try:
+            (claude / entry.name).symlink_to(entry)
+        except OSError:
+            pass
+    (claude / "teams").mkdir()
+    return home
+
+
+@pytest.fixture(autouse=True)
+def _isolate_teams_home(request, _teams_isolated_home, monkeypatch):
+    """Point Path.home() at the teams-isolated home so team dirs never land in the real one.
+
+    A test that sets its own HOME (``monkeypatch.setenv("HOME", ...)``) keeps it: Path.home()
+    follows the env whenever it differs from the real home.
+    """
+    if _uses_real_home(request):
+        yield
+        return
+    real = str(_REAL_HOME)
+    isolated = _teams_isolated_home
+
+    def _home(cls):
+        env_home = os.environ.get("HOME")
+        if env_home and env_home != real:
+            return Path(env_home)
+        return isolated
+
+    monkeypatch.setattr(Path, "home", classmethod(_home))
+    yield
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _guard_no_real_test_teams():
+    """Fail the session if any test minted a pytest-made team dir in the real home."""
+    before = _pytest_made_team_dirs(_REAL_TEAMS)
+    yield
+    leaked = sorted(_pytest_made_team_dirs(_REAL_TEAMS) - before)
+    assert not leaked, (
+        f"tests created {len(leaked)} real team dir(s) under {_REAL_TEAMS}: {leaked[:10]} "
+        "-- isolate Path.home() (see _isolate_teams_home)"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _isolate_control_channel(tmp_path_factory, monkeypatch):
     """Never let a test bot replace the live bot's external control socket (vault-h667)."""
