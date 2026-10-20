@@ -413,6 +413,8 @@ class OBSConfig:
     telegram_group_folder_title: str | None = None
     telegram_group_addlist_url: str | None = None
     telegram_allowed_user_ids: list[int] = field(default_factory=list)
+    # The principal (Daniel). Only his own /restart overrides a shared-service freeze (ops-47.6, G1).
+    telegram_principal_user_id: int | None = 227177188
     telegram_notify_username: str | None = None
     telegram_temp_root: Path = field(default_factory=lambda: _DEFAULT_TELEGRAM_TEMP_ROOT)
     telegram_state_db_path: Path = field(default_factory=lambda: _DEFAULT_TELEGRAM_STATE_DB_PATH)
@@ -514,6 +516,8 @@ class OBSConfig:
             kwargs["telegram_allowed_user_ids"] = [
                 int(uid.strip()) for uid in tg_users.split(",") if uid.strip()
             ]
+        if tg_principal := os.environ.get("OBS_TELEGRAM_PRINCIPAL_USER_ID"):
+            kwargs["telegram_principal_user_id"] = int(tg_principal.strip()) if tg_principal.strip() else None
         if tg_username := os.environ.get("OBS_TELEGRAM_NOTIFY_USERNAME"):
             kwargs["telegram_notify_username"] = tg_username.lstrip("@").strip() or None
         if tg_temp_root := os.environ.get("OBS_TELEGRAM_TEMP_ROOT"):

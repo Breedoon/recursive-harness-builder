@@ -131,12 +131,15 @@ def test_cli_proceeds_when_guard_raises(monkeypatch):
     kill.assert_called_once()
 
 
-# --- Daniel's Telegram /restart: honoured with a warning ----------------------
+# --- Daniel's Telegram /restart: honoured with a warning; others refused ------
+
+DANIEL = 227177188
+TEST_IDENTITY = 5129431382  # authorized, agent-driven test account: NOT the principal
 
 
-def _update(args):
+def _update(args, user_id=DANIEL):
     update = MagicMock()
-    update.effective_user.id = 12345
+    update.effective_user.id = user_id
     update.effective_message.chat_id = 67890
     update.effective_message.message_thread_id = None
     context = MagicMock()
@@ -163,6 +166,67 @@ async def test_telegram_restart_warns_but_restarts_during_freeze(config):
     texts = [c.kwargs["text"] for c in send.await_args_list]
     warnings = [t for t in texts if t.startswith("warning: an active shared-service freeze")]
     assert len(warnings) == 2 and all("t-tg" in w for w in warnings)
+
+
+@needs_tool
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_id", [TEST_IDENTITY, 1350518665, 12345])
+async def test_telegram_restart_refused_during_freeze_for_non_principal(config, user_id):
+    """G1: the freeze override is Daniel's own, not every authorized user's."""
+    from tests.test_maintenance_restart import _bot
+
+    _declare("t-tg-np", "obs-restart")
+    bot = _bot(config)
+    assert config.telegram_principal_user_id == DANIEL
+    with patch.object(bot, "_is_authorized", return_value=True), patch.object(
+        bot, "request_maintenance_restart", AsyncMock()
+    ) as maint_req, patch.object(bot, "request_plain_restart", AsyncMock()) as plain, patch.object(
+        bot, "_collect_maintenance_entries", return_value=[]
+    ), patch.object(bot, "_send_system_message", AsyncMock()) as send:
+        await bot.handle_restart(*_update([], user_id=user_id))
+        await bot.handle_restart(*_update(["plain"], user_id=user_id))
+        await bot.handle_maintenance_restart(*_update([], user_id=user_id))
+    maint_req.assert_not_awaited()
+    plain.assert_not_awaited()
+    texts = [c.kwargs["text"] for c in send.await_args_list]
+    refusals = [t for t in texts if t.startswith("refused: an active shared-service freeze")]
+    assert len(refusals) == 3 and all("t-tg-np" in t for t in refusals)
+    assert not any(t.startswith("warning: an active shared-service freeze") for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_telegram_restart_non_principal_proceeds_without_freeze(config):
+    from tests.test_maintenance_restart import _bot
+
+    bot = _bot(config)
+    with patch.object(bot, "_is_authorized", return_value=True), patch.object(
+        bot, "request_maintenance_restart", AsyncMock()
+    ) as maint_req, patch.object(bot, "_collect_maintenance_entries", return_value=[]), patch.object(
+        bot, "_send_system_message", AsyncMock()
+    ):
+        await bot.handle_restart(*_update([], user_id=TEST_IDENTITY))
+    maint_req.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_telegram_restart_non_principal_fails_open_on_guard_crash(config):
+    from tests.test_maintenance_restart import _bot
+
+    bot = _bot(config)
+    with patch.object(freeze_guard, "check", side_effect=RuntimeError("boom")), patch.object(
+        bot, "_is_authorized", return_value=True
+    ), patch.object(bot, "request_maintenance_restart", AsyncMock()) as maint_req, patch.object(
+        bot, "_collect_maintenance_entries", return_value=[]
+    ), patch.object(bot, "_send_system_message", AsyncMock()):
+        await bot.handle_restart(*_update([], user_id=TEST_IDENTITY))
+    maint_req.assert_awaited_once()
+
+
+def test_principal_id_env_override(monkeypatch):
+    from obs_agent.config import OBSConfig
+
+    monkeypatch.setenv("OBS_TELEGRAM_PRINCIPAL_USER_ID", "42")
+    assert OBSConfig.from_env().telegram_principal_user_id == 42
 
 
 @pytest.mark.asyncio
