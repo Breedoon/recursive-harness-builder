@@ -54,6 +54,25 @@ a running wrapper in place):
 - `deploy/ensure-obs-test-running.sh` →
   `/home/breedoon/infrastructure/obs-test/ensure-obs-test-running.sh` on the host.
 
+Other runtime scripts versioned here (obs-15 U2, 2026-10-20; before that they lived only
+in the runtime, untracked). Install each atomically (`install -m 755 SRC DST.new && mv DST.new DST`,
+never `cp` over a running bash script, which reads its file incrementally), then restart only the
+program that runs it:
+
+- `deploy/cliproxy-watchdog.sh` → `/workspace/runtime/bin/cliproxy-watchdog.sh`
+  (supervisord `cliproxy-watchdog`). Its freeze branches are tested by
+  `tests/test_cliproxy_watchdog_freeze.py`, which sources it with `CLIPROXY_WATCHDOG_SOURCE_ONLY=1`.
+- `deploy/codex-reset-watcher.py` → `/workspace/runtime/bin/codex-reset-watcher.py`
+  (supervisord `codex-reset-watcher`, normally STOPPED). Its `supervisorctl stop|start
+  obs-telegram-prod` now asks the vault freeze tool first (`tests/test_codex_reset_watcher_freeze.py`).
+- `deploy/cliproxy/PATCHES.md` → `/workspace/runtime/cliproxy/PATCHES.md`: provenance and
+  rebuild steps for the local CLIProxyAPI build. The canonical copy is this one.
+
+Every caller that restarts a shared service consults the shared-service freeze tool
+(`scripts/ops/freeze.py` in the vault, `freeze.py check --command "<what it will run>"`, exit 3 =
+blocked) and fails open; see `src/obs_agent/freeze_guard.py` and the vault procedure
+`Agent Operations/procedures/registry/freeze.md`.
+
 The container latch defaults to `/workspace/runtime/state/obs-telegram-prod.shutdown`
 (`OBS_SHUTDOWN_SENTINEL`). Its bind-mounted host path defaults to
 `/data/scratch/obs-test/runtime/state/obs-telegram-prod.shutdown`

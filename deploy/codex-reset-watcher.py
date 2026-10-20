@@ -92,6 +92,35 @@ def snapshot(raw: dict) -> dict:
     }
 
 
+FREEZE_TOOL = os.environ.get(
+    "CODEX_RESET_FREEZE_TOOL",
+    "/workspace/runtime/git/obs-vault-active/Projects/Personal Projects/Agentic/Agent Operations/scripts/ops/freeze.py",
+)
+
+
+def freeze_blocks(command: str) -> str:
+    """Ask freeze.py whether a declared shared-service freeze covers *command* (obs-15 U1).
+
+    Returns the freeze message when blocked, "" when allowed. Fails open: a missing tool, a
+    timeout or any unexpected exit code allows the action. OPS_FREEZE_ACK=<id> in the
+    environment is forwarded so freeze.py's own ack rule decides.
+    """
+    if not os.path.isfile(FREEZE_TOOL):
+        return ""
+    text = command
+    ack = os.environ.get("OPS_FREEZE_ACK", "").strip()
+    if ack:
+        text = f"OPS_FREEZE_ACK={ack} {command}"
+    try:
+        r = subprocess.run([sys.executable or "python3", FREEZE_TOOL, "check", "--command", text],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:  # noqa: BLE001 - fail open
+        return ""
+    if r.returncode == 3:
+        return " ".join((r.stdout or "blocked").split())[:400]
+    return ""
+
+
 def act(action: str, label: str) -> str:
     if action in ("none", "", None):
         return f"({label}: no action)"
@@ -105,6 +134,9 @@ def act(action: str, label: str) -> str:
         return f"({label}: no action for {action})"
     if dry:
         return f"{label} DRY-RUN would exec: {' '.join(cmd)}"
+    blocked = freeze_blocks(" ".join(cmd))
+    if blocked:
+        return f"{label} SKIPPED {' '.join(cmd)}: active shared-service freeze — {blocked}"
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     return f"{label} executed {' '.join(cmd)} rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()}"
 

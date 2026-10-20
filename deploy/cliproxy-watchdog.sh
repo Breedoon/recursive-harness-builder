@@ -451,6 +451,11 @@ full_check() {
   handle_model_catalog "$ids"
 }
 
+# Tests source this file to exercise single functions (tests/test_cliproxy_watchdog_freeze.py).
+if [ "${CLIPROXY_WATCHDOG_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 log "watchdog started (model-agnostic; liveness=${LIVENESS_INTERVAL_SECS}s, full=${CHECK_INTERVAL_SECS}s, boot_fast=${BOOT_FAST_INTERVAL_SECS}s/${BOOT_FAST_WINDOW_SECS}s, extra_required='${EXTRA_REQUIRED_MODELS}', max_model_restarts=${MAX_MODEL_RESTARTS})"
 
 WATCHDOG_START=$(date +%s)

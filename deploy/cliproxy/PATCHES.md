@@ -30,5 +30,9 @@ catalog-miss restarts during a freeze; it still revives a dead proxy, with an al
 - Build: Go 1.27.2 at /workspace/runtime/toolchains/go, CGO_ENABLED=1,
   -ldflags "-s -w -X main.Version=8.0.11-gvnf1 -X main.Commit=7858f4be ...".
 - Rollback: cli-proxy-api.v8.0.11.bak (stock), then `supervisorctl restart cliproxyapi`.
+  Swapping the binary or restarting the proxy is blocked during an active `cliproxy`/`supervisor`/`all-shared`
+  freeze (vault `Agent Operations/scripts/ops/freeze.py status`); the freeze hook resolves `cd` chains,
+  relative paths and variables, so coordinate with the freeze owner instead of rephrasing the command.
+- Canonical copy: OBS repo `deploy/cliproxy/PATCHES.md` (installed to `/workspace/runtime/cliproxy/PATCHES.md`).
 - Detector for the translated side:
   /workspace/runtime/cliproxy/tools/cliproxy_translation_drift.py (run with /workspace/obs/.venv/bin/python; exit 1 = replay-caused breaks)
