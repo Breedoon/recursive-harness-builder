@@ -13,6 +13,11 @@ catalog-miss restarts during a freeze; it still revives a dead proxy, with an al
 
 ## 8.0.11-gvnf1 (deployed 2026-10-18 ~13:25Z, bead vault-gvnf, P0)
 
+- Binary sha256: `0e791c16fb04f97490719ebcd922fe8d40b3fffc933e7b4c79b3401e9bbfa85a`
+  (`/workspace/runtime/cliproxy/cli-proxy-api` and `cli-proxy-api.8.0.11-gvnf1`; verified against the
+  running process `/proc/<pid>/exe` on 2026-10-20, obs-15 re-check 2 N7). The stock rollback
+  `cli-proxy-api.v8.0.11.bak` is `69099598c2ee14ba…`. Check before trusting a running proxy:
+  `sha256sum /proc/$(pgrep -x cli-proxy-api)/exe`.
 - Base: upstream commit e2bff0107bb3 (v8.0.11), source clone
   /workspace/runtime/src-cache/CLIProxyAPI branch `gvnf-replay-anchor`, commit 7858f4be.
 - Patch: patches/0001-codex-replay-anchor-fingerprint-less-turns-after-the.patch
