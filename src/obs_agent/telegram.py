@@ -95,6 +95,8 @@ _TRANSPORT_BASE_CHAT_INTERVAL_SECONDS = 0.35
 _TRANSPORT_MAX_CHAT_INTERVAL_SECONDS = 5.0
 _TYPING_ACTION_INTERVAL_SECONDS = 4.0
 _OBSERVABILITY_COALESCE_SECONDS = 1.5
+# obs-13 instrumentation: an inline observability flush slower than this is logged.
+_OBSERVABILITY_SLOW_FLUSH_WARN_SECONDS = 30.0
 
 # Inbound batching quiet period. Hold delivery until no new same-chat/user
 # message arrives within this window so forwarded multi-message batches are
@@ -9180,7 +9182,21 @@ class TelegramBot:
             return False
         return True
 
-    async def _flush_observability_buffer(self, *, route: TelegramRoute, bot) -> None:
+    async def _flush_observability_buffer(
+        self,
+        *,
+        route: TelegramRoute,
+        bot,
+        priority: int = _PRIORITY_OBSERVABILITY,
+    ) -> None:
+        """Send this route's buffered tool-status chunks.
+
+        The background coalescing flush keeps the low observability priority. Callers inside
+        the run loop pass ``_PRIORITY_ASSISTANT``: they await this before the assistant text
+        (or DoneEvent) it precedes, so a low priority there starved the whole run loop behind
+        other routes' traffic on the single transport worker (obs-13, 2026-10-18: 17 minutes,
+        the route stayed "running" and its inbox wake was delayed).
+        """
         task = self._observability_flush_tasks.pop(route, None)
         if task is not None and not task.done():
             task.cancel()
@@ -9192,13 +9208,20 @@ class TelegramBot:
         ).strip()
         if not html_text:
             return
+        started = time.monotonic()
         sent_messages = await self._send_html(
             route=route,
             bot=bot,
             html_text=html_text,
             disable_notification=True,
-            priority=_PRIORITY_OBSERVABILITY,
+            priority=priority,
         )
+        waited = time.monotonic() - started
+        if waited >= _OBSERVABILITY_SLOW_FLUSH_WARN_SECONDS:
+            logger.warning(
+                "[observability_flush] slow send route=%s priority=%d waited=%.1fs pending_chat_ops=%d",
+                route, priority, waited, self._chat_pending_ops.get(route.chat_id, 0),
+            )
         latest_uuid: str | None = None
         latest_session_id: str | None = None
         for chunk in reversed(buffered):
@@ -9336,7 +9359,7 @@ class TelegramBot:
             )
             self._schedule_observability_flush(route=state.route)
             return
-        await self._flush_observability_buffer(route=state.route, bot=bot)
+        await self._flush_observability_buffer(route=state.route, bot=bot, priority=_PRIORITY_ASSISTANT)
         logger.info(
             "[flush_turn] sending %d chars (%d items) route=%s preview=%r",
             len(html_text), len(turn_items), state.route, html_text[:160],
@@ -9744,7 +9767,7 @@ class TelegramBot:
                         source="done_event",
                     )
                     _store_remaining_pending()
-                    await self._flush_observability_buffer(route=state.route, bot=bot)
+                    await self._flush_observability_buffer(route=state.route, bot=bot, priority=_PRIORITY_ASSISTANT)
                     if not suppress_completion_summary and self._should_emit_completion_summary(state):
                         if triggered_schedule_id is None:
                             self._reanchor_interval_schedules_for_route(
@@ -9800,7 +9823,7 @@ class TelegramBot:
                 latest_turn_uuid=latest_turn_uuid,
                 source="post_run",
             )
-            await self._flush_observability_buffer(route=state.route, bot=bot)
+            await self._flush_observability_buffer(route=state.route, bot=bot, priority=_PRIORITY_ASSISTANT)
 
             if (
                 not completion_sent
@@ -9888,7 +9911,7 @@ class TelegramBot:
             state.hook_state.execution_active = False
             state.hook_state.interrupt_requested = False
             try:
-                await self._flush_observability_buffer(route=state.route, bot=bot)
+                await self._flush_observability_buffer(route=state.route, bot=bot, priority=_PRIORITY_ASSISTANT)
             except Exception:
                 logger.debug("Failed flushing observability buffer in finally", exc_info=True)
             # Always send the final completion summary so Telegram collectors
