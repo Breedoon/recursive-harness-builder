@@ -143,6 +143,17 @@ def _isolate_cache_gate(request, tmp_path_factory, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_freeze_state(tmp_path_factory, monkeypatch):
+    """Keep the shared-service freeze guard (ops-47.6) off the production freeze state.
+
+    Restart tests must not pass or fail because a real freeze happens to be declared.
+    """
+    monkeypatch.setenv("OPS_FREEZE_STATE", str(tmp_path_factory.mktemp("freeze") / "freezes.json"))
+    monkeypatch.delenv("OPS_FREEZE_ACK", raising=False)
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Load .env file for credentials (Telegram API keys, session, etc.)
 # Only sets variables not already in the environment.

@@ -80,6 +80,7 @@ from obs_agent.telegram_format import md_to_telegram_html, split_message
 from obs_agent import schedule_scope as _schedule_scope
 from obs_agent import cache_readiness as _cache_readiness
 from obs_agent import cache_gate as _cache_gate
+from obs_agent import freeze_guard as _freeze_guard
 from obs_agent import credit_limit as _credit_limit
 from obs_agent import fork_model as _fork_model
 from obs_agent.telegram_ingest import TelegramInboundNormalizer
@@ -2534,6 +2535,10 @@ class TelegramBot:
         if not self._is_authorized(update.effective_user.id):
             return
         route = self._route_for_message(update.effective_message)
+        await self._warn_if_frozen(
+            route=route, bot=context.bot, plain=False,
+            source=f"telegram:/maintenance_restart user={update.effective_user.id}",
+        )
         entries = self._collect_maintenance_entries()
         local_count = sum(1 for entry in entries if entry.is_local)
         await self._send_system_message(
@@ -2546,6 +2551,41 @@ class TelegramBot:
             disable_notification=True,
         )
         await self.request_maintenance_restart(source=f"telegram:/maintenance_restart user={update.effective_user.id}")
+
+    async def _warn_if_frozen(self, *, route: TelegramRoute, bot: Any, plain: bool, source: str) -> bool:
+        """Freeze guard for the authorized user's own /restart (ops-47.6): warn, never refuse.
+
+        Agents and scripts restarting OBS go through ``maintenance_restart`` (refuses during a
+        covering freeze) or the Bash freeze hook. Daniel's command is honoured; it only logs a
+        warning and tells him which freeze is active. Fails open: any error is logged and ignored.
+        Returns True when an active freeze covered this restart.
+        """
+        try:
+            result = await asyncio.to_thread(_freeze_guard.check, _maint.freeze_check_command(plain=plain))
+        except Exception:
+            logger.warning("freeze check could not run for %s; restart not checked", source, exc_info=True)
+            return False
+        if result.error:
+            logger.warning("freeze check unavailable for %s: %s", source, result.error)
+        if not result.blocked:
+            return False
+        lines = (result.message or "").splitlines()
+        detail = lines[1] if len(lines) > 1 else (lines[0] if lines else "")
+        logger.warning("restart during an active shared-service freeze, honoured (user command): %s; %s",
+                       source, detail)
+        try:
+            await self._send_system_message(
+                route=route,
+                bot=bot,
+                text=(
+                    "warning: an active shared-service freeze covers this restart. Restarting anyway "
+                    f"because you asked.\n{detail}"
+                ),
+                disable_notification=True,
+            )
+        except Exception:
+            logger.warning("could not post the freeze warning", exc_info=True)
+        return True
 
     async def _run_cache_gate(self):
         """Cache-prefix gate for planned restarts (vault-3px5); None if it cannot run."""
@@ -2615,6 +2655,10 @@ class TelegramBot:
                 source=f"telegram:/restart plain user={update.effective_user.id}",
                 result=gate,
             )
+        await self._warn_if_frozen(
+            route=route, bot=context.bot, plain=True,
+            source=f"telegram:/restart plain user={update.effective_user.id}",
+        )
         await self.request_plain_restart(
             route=self._route_for_message(update.effective_message),
             bot=context.bot,

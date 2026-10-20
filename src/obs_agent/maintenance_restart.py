@@ -792,6 +792,37 @@ def plain_restart(*, popen=subprocess.Popen) -> int:
     return 0
 
 
+FREEZE_BLOCKED_RC = 4
+
+
+def freeze_check_command(*, plain: bool) -> str:
+    """The command text a CLI restart is about to perform, as freeze.py should judge it."""
+    if plain:
+        return f"python -m obs_agent.maintenance_restart --plain; supervisorctl restart {DAEMON_SUPERVISOR_PROCESS}"
+    return "python -m obs_agent.maintenance_restart"
+
+
+def _freeze_blocks(*, plain: bool) -> str | None:
+    """Refusal text when an active freeze covers this restart (ops-47.6); None = go ahead.
+
+    The CLI is how agents and scripts restart OBS, so it refuses during a covering freeze unless
+    ``OPS_FREEZE_ACK=<freeze id>`` is set. A freeze-tool failure never blocks (fail open).
+    Daniel's own Telegram ``/restart`` is not routed through here; it is honoured with a warning.
+    """
+    try:
+        from obs_agent import freeze_guard
+
+        result = freeze_guard.check(freeze_check_command(plain=plain))
+    except Exception as exc:  # noqa: BLE001 - fail open
+        print(f"freeze check could not run ({exc}); continuing", file=sys.stderr)
+        return None
+    if result.error:
+        print(f"freeze check unavailable ({result.error}); continuing", file=sys.stderr)
+    if result.blocked:
+        return result.message + f"\n(restart refused by the freeze guard, ops-47.6; exit {FREEZE_BLOCKED_RC})"
+    return None
+
+
 def _run_cache_gate(repo: Path):
     """The cache-prefix gate (vault-3px5); None if it cannot run (never blocks on its own bug)."""
     try:
@@ -849,6 +880,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"no marker in {args.status}")
             return 1
         return 0
+
+    blocked = _freeze_blocks(plain=args.plain)
+    if blocked is not None:
+        print(blocked, file=sys.stderr)
+        return FREEZE_BLOCKED_RC
 
     repo = Path(__file__).resolve().parents[2]
     gate = _run_cache_gate(repo)

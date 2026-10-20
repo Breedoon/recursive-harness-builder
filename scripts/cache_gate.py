@@ -23,6 +23,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from obs_agent import cache_gate  # noqa: E402
+from obs_agent import freeze_guard  # noqa: E402
 
 HOOK = """#!/bin/sh
 # Installed by scripts/cache_gate.py install-hook (vault-3px5).
@@ -42,6 +43,15 @@ def _pre_push(argv: list[str]) -> int:
         if remote_ref not in ("refs/heads/main", "refs/heads/master") or set(local_sha) == {"0"}:
             continue
         base = None if set(remote_sha) == {"0"} else remote_sha
+        # Freeze guard (ops-47.6): a push to main is a deploy step. Refuse during a freeze that
+        # covers this checkout (obs-source) unless OPS_FREEZE_ACK=<id>; fail open on tool errors.
+        frozen = freeze_guard.check(f"git push {remote_ref}", cwd=repo)
+        if frozen.error:
+            print(f"freeze check unavailable ({frozen.error}); continuing", file=sys.stderr)
+        if frozen.blocked:
+            print(frozen.message, file=sys.stderr)
+            rc = 3
+            continue
         result = cache_gate.check(repo, base=base, target_ref=local_sha)
         if result.ok:
             print(result.message, file=sys.stderr)
