@@ -51,6 +51,11 @@ obs-agentctl --as nightly-check new-tree --title "Disk alert" --prompt "..." [--
   start-step check (vault-a6qm), lineage, teams, Telegram topics and session_source model rules apply
   unchanged. Messages come from `external:<name>`; launched prompts start with
   `[external trigger: <name>]`.
+- An agent may reply to an `external:<name>` sender with SendInboxMessage. External callers have no
+  route, so the reply is appended to `<control dir>/external-replies/<name>.jsonl` (one JSON row:
+  `timestamp`, `team_name`, `from`, `to`, `summary`, `text`) and the tool returns
+  `outcome: external_reply`. No agent is woken. Before obs-12 such replies failed with "recipient has
+  no current route binding".
 - `launch` acts as the named parent agent calling AgentTask; the child appears under that parent.
   Forking a parent whose prompt cache has gone cold is refused like any cold wake unless
   `--allow-cold-wake`.
