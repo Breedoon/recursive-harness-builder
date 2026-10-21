@@ -49,6 +49,12 @@ REQUIRED = [
     ("in:control_response success", "a4", "framing", lambda o: ("in", "control_response", "success") in o["types"]),
     ("out:control_response success", "a4", "framing", lambda o: ("out", "control_response", "success") in o["types"]),
     ("in:user message", "a3", "SDK->CLI turn input", lambda o: ("in", "user", None) in o["types"]),
+    ("in:control rewind_files", "a4", "SDK->CLI (not P0)", lambda o: ("in", "control_request", "rewind_files") in o["types"]),
+    ("in:control_response error", "a4", "framing: SDK hook callback raised", lambda o: ("in", "control_response", "error") in o["types"]),
+    ("out:control_response error", "a4", "framing: CLI rejected a control request", lambda o: ("out", "control_response", "error") in o["types"]),
+    ("out:result/error_*", "a3", "result with is_error / error subtype", lambda o: any(d == "out" and t == "result" and str(s).startswith("error") for (d, t, s) in o["types"])),
+    ("in:hook decision deny", "a5", "PreToolUse permissionDecision=deny answer", lambda o: o["hook_deny"]),
+    ("in:hook decision block", "a5", "Stop decision=block answer", lambda o: o["hook_block"]),
 ] + [
     (f"hook:{ev}", "a5", "SDK callback hook", (lambda ev: lambda o: ev in o["sdk_hooks"])(ev))
     for ev in ("PreCompact", "PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "Stop")
@@ -78,7 +84,8 @@ def observe(cap: Path) -> dict:
     tool_uses_by_message: collections.Counter = collections.Counter()
     o = {"flags": set(), "flag_names": set(), "types": collections.Counter(), "assistant_blocks": set(),
          "parallel_tool_use": False, "user_tool_result": False, "user_tool_use_result": False,
-         "result_fields_ok": False, "uuid_on_messages": False, "bad_json": 0}
+         "result_fields_ok": False, "uuid_on_messages": False, "bad_json": 0,
+         "hook_deny": False, "hook_block": False}
     for inv in sorted((cap / "raw").iterdir()):
         argv = (inv / "argv.txt").read_text().splitlines() if (inv / "argv.txt").exists() else []
         for i, a in enumerate(argv):
@@ -103,6 +110,12 @@ def observe(cap: Path) -> dict:
                 t = m.get("type")
                 st = m.get("subtype") or (m.get("request") or {}).get("subtype") or (m.get("response") or {}).get("subtype")
                 o["types"][(d, t, st if t != "user" else None)] += 1
+                if d == "in" and t == "control_response":
+                    payload = (m.get("response") or {}).get("response") or {}
+                    if (payload.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny":
+                        o["hook_deny"] = True
+                    if payload.get("decision") == "block":
+                        o["hook_block"] = True
                 if d == "out" and t == "assistant":
                     blocks = (m.get("message") or {}).get("content") or []
                     kinds = [b.get("type") for b in blocks if isinstance(b, dict)]

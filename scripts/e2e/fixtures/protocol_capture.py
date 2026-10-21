@@ -16,6 +16,10 @@ scenarios cover the surface listed in the obs-22 scope (a1-a5, a10-a12):
   subagent     the Task tool -> SubagentStart / SubagentStop hooks
   compact      the /compact command -> PreCompact hook, compact_boundary
   resume       --resume of the "tools" session in a fresh process
+  decisions    hook decisions and error framing: a PreToolUse deny, a Stop
+               block, a PostToolUse callback that raises (the SDK answers
+               the CLI with control_response/error), rewind_files on an
+               unknown message (the CLI answers with control_response/error)
 
 Model calls go through the cache proxy given by --base-url (use a scratch
 proxy with its own log dir, never 28925) on a cheap model (Haiku by default).
@@ -118,7 +122,7 @@ class Run:
         self.scenarios: dict = _load("scenarios.json", {})
 
     def options(self, *, name, resume=None, permission_mode="bypassPermissions",
-                can_use_tool=None, extra_env=None, model=None):
+                can_use_tool=None, extra_env=None, model=None, hook_overrides=None):
         os.environ.pop("CLAUDECODE", None)
 
         def mk(event):
@@ -145,7 +149,8 @@ class Run:
             cwd=str(self.project),
             env=env,
             resume=resume,
-            hooks={ev: [HookMatcher(matcher=None, hooks=[mk(ev)])] for ev in HOOK_EVENTS},
+            hooks={ev: [HookMatcher(matcher=None, hooks=[(hook_overrides or {}).get(ev) or mk(ev)])]
+                   for ev in HOOK_EVENTS},
             mcp_servers={"obs-agent": make_mcp_server(self.mcp_calls)},
             permission_mode=permission_mode,
             can_use_tool=can_use_tool,
@@ -252,6 +257,50 @@ class Run:
             sid = await self.turn(c, "Reply with the single word: two.") or sid
         self.record("compact", before, sid)
 
+    async def sc_decisions(self):
+        state = {"stop_blocks": 0, "post_raised": 0, "denied": 0}
+
+        def note(event, inp, tool_use_id):
+            self.sdk_hook_events.append({"scenario": "decisions", "event": event, "tool_use_id": tool_use_id,
+                                         "keys": sorted(inp.keys()) if isinstance(inp, dict) else None})
+
+        async def pre(inp, tool_use_id, ctx):
+            note("PreToolUse", inp, tool_use_id)
+            if "denyme" in json.dumps(inp.get("tool_input") or {}):
+                state["denied"] += 1
+                return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                               "permissionDecisionReason": "protocol capture: denied"}}
+            return {}
+
+        async def post(inp, tool_use_id, ctx):
+            note("PostToolUse", inp, tool_use_id)
+            if not state["post_raised"]:
+                state["post_raised"] += 1
+                raise RuntimeError("protocol capture: deliberate hook callback error")
+            return {}
+
+        async def stop(inp, tool_use_id, ctx):
+            note("Stop", inp, tool_use_id)
+            if not state["stop_blocks"]:
+                state["stop_blocks"] += 1
+                return {"decision": "block", "reason": "Protocol capture: before stopping, reply with the word again."}
+            return {}
+
+        info = {}
+        before = self.snapshot()
+        async with ClaudeSDKClient(options=self.options(
+                name="decisions", hook_overrides={"PreToolUse": pre, "PostToolUse": post, "Stop": stop})) as c:
+            try:
+                await c.rewind_files(str(uuid.uuid4()))
+                info["rewind_files"] = "success"
+            except Exception as e:  # noqa: BLE001 -- the error response is what is captured
+                info["rewind_files"] = f"error: {type(e).__name__}"
+            sid = await self.turn(c, f"[capture {uuid.uuid4()}] Do these in order: (1) run `echo denyme` with the "
+                                     "Bash tool; (2) run `echo allowed` with the Bash tool; (3) reply: done.")
+        info.update(state)
+        (self.out / "decisions-results.json").write_text(json.dumps(info, indent=1))
+        self.record("decisions", before, sid, json.dumps(info))
+
     async def sc_resume(self, sid):
         before = self.snapshot()
         async with ClaudeSDKClient(options=self.options(name="resume", resume=sid)) as c:
@@ -261,7 +310,7 @@ class Run:
 
 async def amain(args):
     run = Run(args)
-    names = args.scenarios or ["tools", "background", "interrupt", "controls", "permission",
+    names = args.scenarios or ["tools", "decisions", "background", "interrupt", "controls", "permission",
                                "subagent", "compact", "resume"]
     tools_sid = None
     for n in names:
