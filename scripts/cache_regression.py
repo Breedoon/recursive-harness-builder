@@ -41,6 +41,9 @@ Examples
       --log-dir /workspace/runtime/cache-proxy-scratch/new/requests
   # one route, a few scenarios
   .venv/bin/python scripts/cache_regression.py --providers anthropic ws_resume volatile_flip
+  # every scenario against another CLI binary (obs-22: the OBS-owned replacement);
+  # the binary's path, sha256 and `-v` output are recorded in identity.json and gate.json
+  .venv/bin/python scripts/cache_regression.py --cli-path /workspace/runtime/bin/obs-cli
 """
 from __future__ import annotations
 
@@ -89,6 +92,34 @@ def identity(base_url: str) -> dict:
     return out
 
 
+def bundled_cli() -> Path | None:
+    try:
+        import claude_agent_sdk
+        p = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+        return p if p.is_file() else None
+    except Exception:
+        return None
+
+
+def cli_identity(cli_path: str | None) -> dict:
+    """Which CLI binary the scenarios drive (obs-22 E3).
+
+    A report made with a non-bundled binary proves that binary, not the
+    production configuration; consumers (scripts/cache_gate.py, E9/R1 gates)
+    must compare ``cli.sha256`` with the binary they are about to deploy.
+    """
+    path = Path(cli_path) if cli_path else bundled_cli()
+    out: dict = {"path": str(path) if path else None, "explicit": bool(cli_path)}
+    if path and path.is_file():
+        out["sha256"] = _sha256(path.read_bytes())
+        try:
+            out["version"] = subprocess.run([str(path), "-v"], capture_output=True, text=True,
+                                            timeout=60).stdout.strip()
+        except Exception as e:
+            out["version_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def scenario_names(provider: str) -> list[str]:
     listing = subprocess.run([sys.executable, str(PREFIX_REPRO), "--list"],
                              capture_output=True, text=True, check=True).stdout
@@ -104,6 +135,8 @@ def run_one(args, provider: str, name: str, out_dir: Path) -> dict:
            "--json-out", str(json_out)]
     if args.model and provider == "anthropic":
         cmd += ["--model", args.model]
+    if args.cli_path:
+        cmd += ["--cli-path", args.cli_path]
     t0 = time.time()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -168,6 +201,7 @@ def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, re
         "scenarios": "all" if not args.scenarios else list(args.scenarios),
         "code": code,
         "proxy_source": live,
+        "cli": ident.get("cli"),
         "base_url": args.base_url,
         "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
@@ -182,6 +216,9 @@ def main(argv=None) -> int:
     ap.add_argument("--log-dir", default=DEFAULT_LOG_DIR,
                     help="the request log dir OF THE PROXY UNDER TEST (scratch proxies have their own)")
     ap.add_argument("--model", default=None, help="Claude model for the anthropic route (default: harness Haiku)")
+    ap.add_argument("--cli-path", default=None,
+                    help="CLI binary every scenario's SDK session launches (default: the SDK's bundled "
+                         "Claude Code). Recorded with its sha256 and -v output in identity.json/gate.json.")
     ap.add_argument("--threshold", type=float, default=0.95)
     ap.add_argument("--scenario-timeout", type=int, default=600)
     ap.add_argument("--max-provider-errors", type=int, default=2,
@@ -193,14 +230,23 @@ def main(argv=None) -> int:
     out_dir = Path(args.out_dir) if args.out_dir else OUT_ROOT / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.cli_path:
+        cli = Path(args.cli_path)
+        if not (cli.is_file() and os.access(cli, os.X_OK)):
+            ap.error(f"--cli-path {cli} is not an executable file")
+        args.cli_path = str(cli.resolve())
     ident = identity(args.base_url)
     ident["code"] = _code_identity()
+    ident["cli"] = cli_identity(args.cli_path)
     (out_dir / "identity.json").write_text(json.dumps(ident, indent=1))
     live = (ident.get("health") or {}).get("source_sha256")
     print(f"proxy {args.base_url}: " + (f"pid {ident['health'].get('pid')} loaded {live[:12]}"
                                          if live else f"UNREACHABLE ({ident.get('health_error')})"))
     print(f"  src/cache_proxy.py on disk {ident['disk_sha256'][:12]}, at HEAD "
           f"{ident.get('head_commit', '?')} {ident.get('head_sha256', '?')[:12]}")
+    cli = ident["cli"]
+    print(f"  CLI {'(explicit) ' if cli.get('explicit') else '(bundled) '}{cli.get('path')} "
+          f"sha256 {str(cli.get('sha256'))[:12]} version {cli.get('version', '?')!r}")
     if not live:
         print("RESULT: FAIL -- proxy not reachable; nothing tested.")
         return 1

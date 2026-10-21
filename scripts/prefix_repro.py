@@ -128,6 +128,10 @@ def _options(args, *, session_id=None, resume=None, env_extra=None, hooks=None, 
         permission_mode="bypassPermissions",
         allowed_tools=["Bash", "Read"],
         hooks=hooks,
+        # obs-22 E3: run the scenario against any CLI binary (default: the SDK's
+        # bundled 2.1.59). The OBS-owned replacement binary is qualified by
+        # running this whole regression with --cli-path pointing at it.
+        **({"cli_path": args.cli_path} if getattr(args, "cli_path", None) else {}),
     )
 
 
@@ -1019,6 +1023,8 @@ def main(argv=None):
     ap.add_argument("--model", default=None)
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL)
     ap.add_argument("--log-dir", default=pd.DEFAULT_LOG_DIR)
+    ap.add_argument("--cli-path", default=None,
+                    help="CLI binary the SDK launches (default: the SDK's bundled Claude Code 2.1.59)")
     ap.add_argument("--gap", type=int, default=0, help="idle seconds before resume_new_proc's resume")
     ap.add_argument("--warm-turns", type=int, default=0, help="turns after parallel tools to put divergence beyond lookback")
     ap.add_argument("--threshold", type=float, default=0.95)
@@ -1030,6 +1036,11 @@ def main(argv=None):
                     help="seconds per scenario before it is stopped and reported "
                          "(PROVIDER-ERROR if the proxy logged 5xx upstream errors meanwhile)")
     args = ap.parse_args(argv)
+    if args.cli_path:
+        cli = Path(args.cli_path)
+        if not (cli.is_file() and os.access(cli, os.X_OK)):
+            ap.error(f"--cli-path {cli} is not an executable file")
+        args.cli_path = str(cli.resolve())
     if args.list or not args.scenarios:
         for k, (_, note) in SCENARIOS.items():
             print(f"{k:16s} {note}")
