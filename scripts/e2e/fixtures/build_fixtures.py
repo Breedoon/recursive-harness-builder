@@ -100,6 +100,10 @@ def cut_session(src: Path, dst: Path, end_ts: float) -> dict:
         if t is not None and t > end_ts:
             dropped += 1
             continue
+        # INVARIANT(session-format): kept rows are the original line bytes. A
+        # json round-trip reorders keys and re-escapes text; --resume then
+        # rebuilds different message bytes than the logged request.
+        # Doc: vault:Projects/Personal Projects/OBS Platform/CLI Runtime/Components/Fixtures and Byte Checker#Fixture format
         kept.append(raw)
         last_row = row
     dst.write_bytes(b"\n".join(kept) + b"\n")
@@ -121,6 +125,10 @@ def build_case(sel: dict, out_root: Path) -> dict:
         raise ValueError("index row session id does not match the selection")
     src_dir = FROZEN / "requests" / day
     wire_src = src_dir / f"{req_id}.wire.json.gz"
+    # INVARIANT(cache-bytes): the logged bodies are copied as files, never
+    # decoded and re-encoded. Re-serializing changes key order/escapes, and every
+    # comparison against the fixture then reports a break that did not happen.
+    # Doc: vault:Projects/Personal Projects/OBS Platform/CLI Runtime/Components/Fixtures and Byte Checker#Fixture format
     shutil.copyfile(wire_src, case / "last_request.json.gz")
     pre_src = src_dir / f"{req_id}.pre.json.gz"
     if pre_src.exists():

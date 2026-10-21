@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# obs-fixture-check: the C2 checker CLI name (obs-22 E3). See obs_fixture_check.py.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN /workspace/obs/.venv/bin/python "$HERE/obs_fixture_check.py" "$@"

@@ -290,6 +290,10 @@ def load_candidate(req_id: str, part: str, log_dir: str, config_dir: Path) -> di
     differs from production. Mapping it back is the one canonicalization the
     checker adds on top of prefix_diff; it is applied to the candidate only.
     """
+    # INVARIANT(cache-bytes): the scratch config-dir path is the only thing mapped
+    # back, and only on the candidate side. Adding any other rewrite here hides
+    # real prefix breaks from the checker (a false PASS).
+    # Doc: vault:Projects/Personal Projects/OBS Platform/CLI Runtime/Components/Fixtures and Byte Checker#Canonicalization
     path = pd.find_request_file(req_id, part, log_dir)
     text = pd._read_bytes(path).decode("utf-8")
     return json.loads(text.replace(str(config_dir), REAL_CONFIG_DIR))
@@ -300,7 +304,7 @@ def compare(logged: dict, logged_beta: str | None, cand: dict, cand_beta: str | 
     # the proxy-redacted bodies (same redaction on both sides). Do not
     # canonicalize anything here beyond what prefix_diff does (cache_control
     # positions only): every other difference is a real cache break.
-    # Doc: Projects/Personal Projects/OBS Platform/CLI Runtime/Components/Fixtures and Byte Checker.md
+    # Doc: vault:Projects/Personal Projects/OBS Platform/CLI Runtime/Components/Fixtures and Byte Checker#Verdict
     res = pd.diff_requests(logged, cand, logged_beta, cand_beta)
     cls = res.get("classification")
     return {"class": cls, "ok": cls in OK_CLASSES,
@@ -398,6 +402,8 @@ def unredacted_first_message_prime(env: Env, row: dict, case: Path) -> bytes | N
         if m.get("body_sha256") == want:
             cap = json.loads(meta_file.with_suffix(".body").read_bytes())
             logged = json.loads(gzip.decompress((case / "last_request.json.gz").read_bytes()))
+            # The re-serialized body is used ONLY to prime pins; it is never a
+            # comparison operand (compare() reads the proxy log's stored bytes).
             if cap.get("messages") and logged.get("messages"):
                 logged["messages"][0] = cap["messages"][0]
                 return json.dumps(logged).encode()

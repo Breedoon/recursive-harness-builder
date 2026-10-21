@@ -12,6 +12,9 @@
 # NAMES only, never values), stdin.ndjson, stdout.ndjson, exit.txt.
 # The streams can contain conversation text; read them through
 # scripts/redact.sh, and never commit them to a repository.
+# INVARIANT(protocol): tee copies the streams byte for byte and never reorders or
+# buffers lines; the capture is the reference sequence E4 diffs against.
+# Doc: vault:Projects/Personal Projects/OBS Platform/CLI Runtime/Components/Protocol Capture#Recording wrapper
 set -u
 REAL="${OBS_CLI_TEE_REAL:-/workspace/runtime/reference/claude-code-src/pinned-2.1.59/claude}"
 ROOT="${OBS_CLI_TEE_DIR:-/workspace/runtime/e2e/fixtures/protocol-capture/raw}"

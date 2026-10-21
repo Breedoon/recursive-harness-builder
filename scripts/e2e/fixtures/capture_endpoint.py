@@ -56,6 +56,10 @@ class Recorder:
             "body_sha256": hashlib.sha256(body).hexdigest(),
             "body_len": len(body),
         }
+        # INVARIANT(cache-bytes): the body is stored exactly as received, never
+        # parsed and re-serialized. Breaking it makes body_sha256 differ from the
+        # proxy index's wire_sha256, so the checker's capture join fails.
+        # Doc: vault:Projects/Personal Projects/OBS Platform/CLI Runtime/Components/Fixtures and Byte Checker#Capture endpoint
         (self.out / f"{n:06d}.body").write_bytes(body)
         (self.out / f"{n:06d}.json").write_text(json.dumps(meta, indent=1))
         return n
