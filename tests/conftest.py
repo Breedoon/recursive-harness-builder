@@ -357,6 +357,9 @@ def config(fixture_vault: Path, monkeypatch) -> OBSConfig:
         vault_path=fixture_vault,
         telegram_allowed_user_ids=[12345],
         telegram_state_db_path=fixture_vault / ".claude" / "telegram-state.sqlite3",
+        # Unit tests assert pre-existing effort semantics; the new-session
+        # default is covered explicitly in test_sender_team_and_effort.py.
+        new_session_effort_level=None,
     )
 
 

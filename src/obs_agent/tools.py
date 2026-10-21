@@ -1465,6 +1465,13 @@ def create_obs_tools(
         sender = str(args.get("sender", "")).strip() or (
             bootstrap.agent_name if bootstrap is not None and bootstrap.agent_name else "obs-worker"
         )
+        # vault-5lko: record the sender's own team so a recipient in another
+        # tree can reply. Data-only field; the tool schema is unchanged.
+        sender_team = (
+            bootstrap.root_team_key.strip()
+            if bootstrap is not None and bootstrap.root_team_key
+            else ""
+        ) or None
         # Backend-only optional reply flags stay accepted for internal callers,
         # but they are intentionally omitted from the MCP schema so agents cannot set them.
         # Use _coerce_bool_arg to handle string "false" correctly (bool("false") is True).
@@ -1582,6 +1589,7 @@ def create_obs_tools(
                     logger.warning("Failed reading inbox JSON: %s", inbox_path, exc_info=True)
             message: dict[str, Any] = {
                 "from": sender,
+                **({"from_team": sender_team} if sender_team else {}),
                 "text": content,
                 "summary": summary or "",
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -1645,6 +1653,8 @@ def create_obs_tools(
                     "summary": summary,
                     "_direct_send": True,
                 }
+                if sender_team:
+                    notification_payload["sender_team"] = sender_team
                 if must_reply:
                     notification_payload["_must_reply"] = True
                 raw_notifier_result = await hook_state.inbox_message_notifier(notification_payload)

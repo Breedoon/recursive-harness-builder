@@ -3132,6 +3132,10 @@ class TelegramBot:
             state = self._build_session_state(route, topic_title=topic_title)
             if apply_default_new_chat_hooks and self._default_new_chat_hooks is not None:
                 state.session_manager.user_hooks = dict(self._default_new_chat_hooks)
+            new_effort = getattr(self._config, "new_session_effort_level", None)
+            if new_effort and state.session_manager.effort_override is None:
+                # Saved per route: restored sessions never reach this branch.
+                state.session_manager.effort_override = new_effort
             self._states_by_route[route] = state
             self._persist_state_for_route(route)
             self._maybe_seed_default_schedule(route=route)
@@ -11118,6 +11122,16 @@ class TelegramBot:
             effort, parent_effort=parent_state.session_manager.effective_effort,
             model=model, session_env=env_override,
         )
+        new_effort = getattr(self._config, "new_session_effort_level", None)
+        if (
+            new_effort
+            and not is_fork
+            and (effort is None or not str(effort).strip())
+            and not (env_override or {}).get("CLAUDE_CODE_EFFORT_LEVEL")
+        ):
+            # Fresh sessions share no prompt cache with the parent, so they take
+            # the new-session default; forks keep inheriting (cache key).
+            selected_effort = new_effort
         # Check malformed extra-body JSON before creating the topic or forking JSONL.
         build_effort_env(child_model, resolve_effort(
             child_model, override=selected_effort,
@@ -11833,6 +11847,20 @@ class TelegramBot:
                     exc_info=True,
                 )
 
+    def _latest_unread_sender_team(self, *, team_name: str, agent_name: str) -> str | None:
+        """vault-5lko: the latest unread message's sender team, when recorded."""
+        inbox_path = self._team_inbox_path(team_name, agent_name)
+        try:
+            entries = json.loads(inbox_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(entries, list):
+            return None
+        for item in reversed(entries):
+            if isinstance(item, dict) and not bool(item.get("read", False)):
+                return str(item.get("from_team") or "").strip() or None
+        return None
+
     def _latest_unread_team_inbox_message(
         self,
         *,
@@ -11911,6 +11939,9 @@ class TelegramBot:
                     "team_name": team_name,
                     "recipient": agent_name,
                     "sender": sender,
+                    "sender_team": self._latest_unread_sender_team(
+                        team_name=team_name, agent_name=agent_name
+                    ),
                     "summary": summary,
                     "content": content,
                 },
@@ -11940,6 +11971,9 @@ class TelegramBot:
                     "team_name": key[0],
                     "recipient": key[1],
                     "sender": sender,
+                    "sender_team": self._latest_unread_sender_team(
+                        team_name=key[0], agent_name=key[1]
+                    ),
                     "summary": summary,
                     "content": content,
                 },
@@ -12222,6 +12256,13 @@ class TelegramBot:
         def _mark_direct_send_notified() -> None:
             if direct_notified_key is not None:
                 self._notified_inbox_keys.add(direct_notified_key)
+
+        # vault-5lko: name the sender's team when it differs from the
+        # recipient's, so the recipient can reply. Display only; dedup above
+        # uses the raw sender.
+        sender_team = str(payload.get("sender_team") or "").strip() or None
+        if sender and sender_team and sender_team != team_name:
+            sender = f"{sender} (team {sender_team})"
 
         # Handle reply_wake_clear signal: all must_reply messages replied
         if payload.get("_reply_wake_clear"):

@@ -379,6 +379,16 @@ the same call overrides. Human Telegram messages and scheduled wakes are never g
 - Code: `src/obs_agent/cache_readiness.py`; wiring in `telegram.py`
   (`_make_inbox_recipient_validator`, `_launch_fork_task`).
 
+### Sender team on inbox messages (vault-5lko)
+
+Every `SendInboxMessage` row records the sender's own tree as `from_team` (its root team key),
+next to `from`. When the sender is in another tree than the recipient, the wake notification
+reads `Latest sender: NAME (team TEAM).`, so the recipient replies with `team_name=TEAM`
+instead of guessing (the 2026-10-17..21 misrouting, vault-o271 / vault-0x00). Same-team wakes
+are unchanged. Data only: the MCP tool schemas and descriptions are untouched, so the deploy
+re-caches nothing. Code: `tools.py` `_send_inbox_message`; `telegram.py`
+`_handle_inbox_message_notification`, `_latest_unread_sender_team`.
+
 ### Start-step check on root AgentTask launches (vault-a6qm)
 
 A root agent (lineage length 1) that launches an `AgentTask` with no registered task bead in

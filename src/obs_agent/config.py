@@ -376,6 +376,13 @@ class OBSConfig:
     # Change this to e.g. "claude" to make root sessions default to Claude.
     default_model: str = "sol"
     effort_level: str | None = None
+    # Effort stamped onto sessions OBS creates from now on (new topics and
+    # fork=false children) when none is chosen. It is saved as that session's
+    # selection, so sessions that already exist keep their current effort and
+    # their prompt cache (effort is part of the cache key). Daniel 2026-10-21:
+    # default effort max for all models. OBS_NEW_SESSION_EFFORT_LEVEL=auto
+    # (or empty) turns it off.
+    new_session_effort_level: str | None = "max"
     user_timezone: str = "Europe/Warsaw"
     model_effort_levels: dict[str, str] = field(default_factory=dict)
     claude_dir: str = ".claude"
@@ -449,6 +456,10 @@ class OBSConfig:
 
         if effort := os.environ.get("OBS_EFFORT_LEVEL"):
             kwargs["effort_level"] = normalize_effort(effort)
+        if "OBS_NEW_SESSION_EFFORT_LEVEL" in os.environ:
+            raw_new = os.environ["OBS_NEW_SESSION_EFFORT_LEVEL"].strip()
+            new_effort = normalize_effort(raw_new) if raw_new else "auto"
+            kwargs["new_session_effort_level"] = None if new_effort == "auto" else new_effort
         if user_timezone := os.environ.get("OBS_USER_TIMEZONE"):
             kwargs["user_timezone"] = user_timezone.strip() or "Europe/Warsaw"
         if raw_defaults := os.environ.get("OBS_MODEL_EFFORT_LEVELS"):

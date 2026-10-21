@@ -73,6 +73,22 @@ OBS_MODEL_EFFORT_LEVELS='{"gpt":"xhigh","sonnet":"low"}'
 OBS_EFFORT_LEVEL=high
 ```
 
+### New-session default (2026-10-21)
+
+`OBSConfig.new_session_effort_level` (default `max`; env
+`OBS_NEW_SESSION_EFFORT_LEVEL`, `auto` or empty disables) is stamped as the
+saved selection on sessions OBS creates from then on: brand-new Telegram topics
+and `fork=false` AgentTask children launched without an explicit `effort` or
+`env.CLAUDE_CODE_EFFORT_LEVEL`. It is *not* a global override: sessions that
+already existed keep resolving exactly as before, because effort is part of the
+prompt-cache key and a changed level would silently re-bill their whole
+conversation. Forks keep inheriting the parent's effort for the same reason.
+Provider capability still clamps: CLIProxyAPI maps `max` to the nearest
+supported level (max → xhigh → high) for GPT/Codex; local Qwen maps every level
+above `low` to `medium`; GLM ignores it. Cost: max reasons longest, so new
+Claude and GPT sessions spend more tokens per turn than the old high/medium
+defaults.
+
 Precedence is: session `/effort` or AgentTask selection, per-session Claude env,
 `OBS_EFFORT_LEVEL`, process `CLAUDE_CODE_EFFORT_LEVEL`, then per-model defaults.
 An explicit `auto` skips lower-priority global/environment overrides and selects
