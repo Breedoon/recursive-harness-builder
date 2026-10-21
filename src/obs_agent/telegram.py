@@ -10669,6 +10669,7 @@ class TelegramBot:
             state.busy = True
             prior_failures = self._auto_delivery_backoff.get(state.route, (0, 0.0))[0]
             outcome = None
+            raised = True
             try:
                 outcome = await self._run_and_send(
                     state=state,
@@ -10678,10 +10679,12 @@ class TelegramBot:
                     # One visible error per failure streak, not one per retry.
                     quiet_error=prior_failures > 0,
                 )
+                raised = False
             finally:
                 state.busy = False
                 self._record_auto_delivery_outcome(
-                    state.route, failed=outcome is None or bool(getattr(outcome, "failed", False))
+                    state.route,
+                    failed=raised or (isinstance(outcome, _RunOutcome) and outcome.failed),
                 )
 
     def _record_auto_delivery_outcome(self, route: TelegramRoute, *, failed: bool) -> None:
