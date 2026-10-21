@@ -18,6 +18,8 @@ dependencies = [
     "markdown-it-py>=3.0",
     "croniter>=3.0.3",
     "telethon>=1.36.0",
+    # obs-21.2: floor on the CA bundle (fixes the 2026-10 trust-store incident class); lock-only bump.
+    "certifi>=2026.10.19",
 ]
 
 [project.optional-dependencies]
