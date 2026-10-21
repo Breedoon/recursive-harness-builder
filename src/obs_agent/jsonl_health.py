@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import json
 import hashlib
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -318,10 +320,57 @@ def _recovered_poison_uuids(
     return poison_uuids & ancestry
 
 
+# Event-loop stall fix (2026-10-21): the bot re-analyzed whole multi-MB session
+# JSONLs several times per turn on the asyncio loop. Results are a pure function
+# of the file bytes, so memoize them by file identity (dev, inode, size, mtime_ns)
+# and the call arguments. Any append or rewrite changes the key; a file that
+# changes while being read is never cached.
+_ANALYSIS_CACHE_MAX = 32
+_analysis_cache: "OrderedDict[tuple, JsonlSessionHealth]" = OrderedDict()
+_analysis_cache_lock = threading.Lock()
+
+
+def _file_identity(path: Path) -> tuple | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def clear_analysis_cache() -> None:
+    with _analysis_cache_lock:
+        _analysis_cache.clear()
+
+
 def analyze_jsonl_path(
     *, path: Path, session_id: str | None = None, branch_uuid: str | None = None,
 ) -> JsonlSessionHealth:
-    """Analyze the chain the CLI resumes, or the branch ending at ``branch_uuid``."""
+    """Analyze the chain the CLI resumes, or the branch ending at ``branch_uuid``.
+
+    Memoized by file identity; see ``_analysis_cache``.
+    """
+    before = _file_identity(path)
+    key = (str(path), before, session_id, branch_uuid) if before is not None else None
+    if key is not None:
+        with _analysis_cache_lock:
+            cached = _analysis_cache.get(key)
+            if cached is not None:
+                _analysis_cache.move_to_end(key)
+                return cached
+    health = _analyze_jsonl_path_uncached(path=path, session_id=session_id, branch_uuid=branch_uuid)
+    if key is not None and _file_identity(path) == before:
+        with _analysis_cache_lock:
+            _analysis_cache[key] = health
+            _analysis_cache.move_to_end(key)
+            while len(_analysis_cache) > _ANALYSIS_CACHE_MAX:
+                _analysis_cache.popitem(last=False)
+    return health
+
+
+def _analyze_jsonl_path_uncached(
+    *, path: Path, session_id: str | None = None, branch_uuid: str | None = None,
+) -> JsonlSessionHealth:
     entries: list[_ParsedEntry] = []
     by_uuid: dict[str, _ParsedEntry] = {}
     uuid_lines: dict[str, int] = {}

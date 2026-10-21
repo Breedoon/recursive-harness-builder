@@ -818,6 +818,9 @@ class TelegramBot:
         self._schedule_poller_task: asyncio.Task | None = None
         self._idle_evict_task: asyncio.Task | None = None
         self._cli_hang_task: asyncio.Task | None = None
+        # Loop-stall fix (2026-10-21): last head uuid validated by a per-stream-event
+        # refresh, per session. Turn/done/post_run refreshes always re-validate.
+        self._event_loop_head_checked: dict[str, str] = {}
         self._control_server: Any | None = None  # external control channel (control.py, vault-h667)
         self._control_start_task: asyncio.Task | None = None
         self._cli_hang_samples: dict[tuple[TelegramRoute, int], dict[str, float | None]] = {}
@@ -6418,6 +6421,12 @@ class TelegramBot:
     async def _ensure_background_poller(self, bot: Any | None) -> None:
         if bot is not None:
             self._primary_bot = bot
+        try:
+            from obs_agent.loop_monitor import ensure_loop_stall_monitor
+
+            ensure_loop_stall_monitor()
+        except Exception:
+            logger.debug("[loop_stall] monitor start failed", exc_info=True)
         if not self._enable_background_poller:
             return
         if self._background_task is None or self._background_task.done():
@@ -7699,6 +7708,14 @@ class TelegramBot:
         session_id = state.session_id
         if not session_id or not latest_turn_uuid:
             return
+        if source == "event_loop":
+            # 2026-10-21 Telegram freeze: this runs for every stream event and used
+            # to re-parse the whole session JSONL on the event loop each time
+            # (3-4 s per call on 8-16 MB sessions). Within a turn the head uuid is
+            # unchanged; user_turn/assistant_turn/done_event/post_run re-validate.
+            if self._event_loop_head_checked.get(session_id) == latest_turn_uuid:
+                return
+            self._event_loop_head_checked[session_id] = latest_turn_uuid
         resolved_uuid = latest_turn_uuid
         target = resolve_safe_jsonl_target(
             session_id=session_id,
