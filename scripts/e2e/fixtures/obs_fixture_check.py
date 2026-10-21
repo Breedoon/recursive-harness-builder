@@ -35,7 +35,7 @@ case it can not pass is a checker or fixture defect, not a binary defect.
 Example:
   .venv/bin/python scripts/e2e/fixtures/obs_fixture_check.py \\
       --cli-path /workspace/runtime/reference/claude-code-src/pinned-2.1.59/claude \\
-      --fixtures /workspace/runtime/e2e/fixtures/byte-resume --out /workspace/runtime/e2e/runs/fixture-check/X --reverse
+      --fixtures /workspace/runtime/e2e/fixtures/byte-resume --out /workspace/runtime/e2e/fixtures/_checks/X --reverse
 
 Nothing here spends model credit. Output under --out: report.json (per case),
 proxy/ (scratch proxy log), capture/ (raw upstream requests), cases/ (scratch
@@ -64,6 +64,7 @@ sys.path.insert(0, str(HERE))
 
 import prefix_diff as pd  # noqa: E402
 import capture_endpoint  # noqa: E402
+from obs_agent.jsonl_replay import prepare_session_replay  # noqa: E402  OBS's own resume preparation
 
 from claude_agent_sdk import (  # noqa: E402
     ClaudeAgentOptions,
@@ -75,6 +76,7 @@ from claude_agent_sdk import (  # noqa: E402
 
 from obs_agent.session import _DEFAULT_SDK_ENV as OBS_DEFAULT_SDK_ENV  # noqa: E402  the env every OBS session gets
 
+ORIG_SHELL = os.environ.get("SHELL")
 PINNED = "/workspace/runtime/reference/claude-code-src/pinned-2.1.59/claude"
 FROZEN_PINS = Path("/workspace/runtime/preserved/cache-proxy-request-log-freeze-20261020T200401Z/state/effort-pins.json")
 CONTINUATION = "Fixture continuation {case}: reply with the single word ok."
@@ -194,7 +196,9 @@ def launch_options(meta: dict, wire: dict, *, cli_path: str, base_url: str, conf
         os.environ.pop(k, None)
     kw: dict = {}
     if meta.get("profile") == "harness":
-        # scripts/prefix_repro.py _options()
+        # scripts/prefix_repro.py _options(), run from an agent shell (SHELL set)
+        if ORIG_SHELL:
+            os.environ["SHELL"] = ORIG_SHELL
         env.update({"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "CLAUDE_CODE_FORCE_GLOBAL_CACHE": "0"})
         if meta.get("route") == "cli-proxy":
             env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
@@ -306,7 +310,7 @@ def compare(logged: dict, logged_beta: str | None, cand: dict, cand_beta: str | 
             "summary": pd.format_result(res).splitlines()[0] if cls not in OK_CLASSES else cls}
 
 
-def prime_proxy(env: Env, meta: dict, case: Path) -> dict:
+def prime_proxy(env: Env, meta: dict, case: Path, body: bytes | None = None) -> dict:
     """Recreate the proxy's per-conversation pins from the logged request.
 
     The production proxy pins a conversation's volatile system sections,
@@ -320,7 +324,8 @@ def prime_proxy(env: Env, meta: dict, case: Path) -> dict:
     report shows a remaining config/system difference then).
     """
     import urllib.request
-    body = gzip.decompress((case / "last_request.json.gz").read_bytes())
+    if body is None:
+        body = gzip.decompress((case / "last_request.json.gz").read_bytes())
     headers = {"content-type": "application/json", "anthropic-version": "2023-06-01",
                "user-agent": "obs-fixture-check-prime", "authorization": "Bearer fixture-capture",
                "anthropic-beta": meta.get("anthropic_beta") or ""}
@@ -333,11 +338,8 @@ def prime_proxy(env: Env, meta: dict, case: Path) -> dict:
         return {"primed": False, "error": f"{type(e).__name__}: {e}"}
 
 
-async def check_case(case: Path, args, env: Env) -> dict:
-    meta = json.loads((case / "meta.json").read_text())
-    cid = meta["case_id"]
-    wire = json.loads(gzip.decompress((case / "last_request.json.gz").read_bytes()))
-    work = Path(args.out) / "cases" / cid
+def setup_case(case: Path, meta: dict, work: Path) -> tuple[Path, str, Path, object]:
+    """Scratch config dir with the fixture session, prepared the way OBS resumes."""
     if work.exists():
         shutil.rmtree(work)
     config = work / "config"
@@ -359,23 +361,84 @@ async def check_case(case: Path, args, env: Env) -> dict:
         shutil.copytree(real_memory, proj / "memory")
     sess = proj / f"{sid}.jsonl"
     shutil.copyfile(case / "session.jsonl", sess)
-    from obs_agent.jsonl_replay import prepare_session_replay
-    replay = None
     try:
         replay = prepare_session_replay(session_id=sid, cwd=Path(cwd), source_path=sess)
     except Exception as e:
         replay = {"error": f"{type(e).__name__}: {e}"}
-    rep = {"case_id": cid, "tags": meta.get("tags"), "profile": meta.get("profile"),
-           "model": meta.get("model"), "route": meta.get("route"), "cli_path": args.cli_path,
-           "prepare_session_replay": bool(replay)}
+    return config, cwd, sess, replay
+
+
+async def forward(case: Path, meta: dict, wire: dict, args, env: Env, work: Path,
+                  prime_body: bytes | None) -> tuple[dict, dict | None, Path, str, Path]:
+    config, cwd, sess, replay = setup_case(case, meta, work)
+    run = {"prepare_session_replay": bool(replay)}
     if not args.no_prime:
-        rep["prime"] = prime_proxy(env, meta, case)
+        run["prime"] = prime_proxy(env, meta, case, prime_body)
     t0 = time.time()
     opts = launch_options(meta, wire, cli_path=args.cli_path, base_url=env.base_url,
-                          config_dir=config, cwd=cwd, resume=sid)
-    rep["forward_run"] = await drive(opts, CONTINUATION.format(case=cid), args.case_timeout)
+                          config_dir=config, cwd=cwd, resume=meta["session_id"])
+    run["forward_run"] = await drive(opts, CONTINUATION.format(case=meta["case_id"]), args.case_timeout)
     time.sleep(1.5)  # the proxy's request log writes on a background thread
-    row = first_main_request(env.log_dir, sid, t0)
+    return run, first_main_request(env.log_dir, meta["session_id"], t0), config, cwd, sess
+
+
+def unredacted_first_message_prime(env: Env, row: dict, case: Path) -> bytes | None:
+    """Prime body whose first message is the candidate's own (unredacted) one.
+
+    The pins are keyed by model + first message of the NORMALIZED body; when
+    the stored logged body had something redacted in its first message the
+    logged-body prime lands on another key. The capture endpoint holds the
+    unredacted upstream bytes of the candidate's request (matched by the
+    index's wire_sha256); its first message gives the right key, the rest of
+    the logged body gives the values the conversation was pinned to.
+    """
+    want = row.get("wire_sha256")
+    for meta_file in sorted(env.capture_dir.glob("*.json")):
+        m = json.loads(meta_file.read_text())
+        if m.get("body_sha256") == want:
+            cap = json.loads(meta_file.with_suffix(".body").read_bytes())
+            logged = json.loads(gzip.decompress((case / "last_request.json.gz").read_bytes()))
+            if cap.get("messages") and logged.get("messages"):
+                logged["messages"][0] = cap["messages"][0]
+                return json.dumps(logged).encode()
+    return None
+
+
+async def check_case(case: Path, args, env: Env) -> dict:
+    extra_envs: list = []
+    try:
+        return await _check_case(case, args, env, extra_envs)
+    finally:
+        for e in extra_envs:
+            e.close()
+
+
+async def _check_case(case: Path, args, env: Env, extra_envs: list) -> dict:
+    meta = json.loads((case / "meta.json").read_text())
+    cid = meta["case_id"]
+    wire = json.loads(gzip.decompress((case / "last_request.json.gz").read_bytes()))
+    sid = meta["session_id"]
+    work = Path(args.out) / "cases" / cid
+    rep = {"case_id": cid, "tags": meta.get("tags"), "profile": meta.get("profile"),
+           "model": meta.get("model"), "route": meta.get("route"), "cli_path": args.cli_path}
+    run, row, config, cwd, sess = await forward(case, meta, wire, args, env, work, None)
+    rep.update(run)
+    if (row is not None and not args.no_prime
+            and ((row.get("norm") or {}).get("volatile_pin") or {}).get("recorded")):
+        # the logged-body prime missed the conversation's pin key: redo the case
+        # on a fresh scratch proxy primed with the candidate's own first message
+        body = unredacted_first_message_prime(env, row, case)
+        if body is not None:
+            env2 = Env(work.parent / f"{cid}.retry")
+            extra_envs.append(env2)  # closed by check_case after the comparison
+            run, row2, config, cwd, sess = await forward(case, meta, wire, args, env2, work, body)
+            rep.update(run)
+            rep["prime_retry"] = True
+            if row2 is not None:
+                env, row = env2, row2
+                rep["proxy_dir"] = str(env2.proxy_dir)
+        else:
+            rep["prime_retry"] = "no capture matched the candidate request"
     if row is None:
         rep.update(verdict="FAIL", reason="no model request captured from the candidate")
         return rep
@@ -472,7 +535,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     args.cli_path = str(Path(args.cli_path).resolve())
     if not args.out:
-        args.out = f"/workspace/runtime/e2e/runs/fixture-check/{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+        args.out = f"/workspace/runtime/e2e/fixtures/_checks/{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
     return asyncio.run(amain(args))
 
 

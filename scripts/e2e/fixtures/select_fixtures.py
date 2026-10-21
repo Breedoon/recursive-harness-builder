@@ -14,6 +14,13 @@ Rules (deterministic: same input -> same selection):
   is skipped, its launch config is not reproducible;
 - route "local" is skipped: local-model agents are outside the rollout
   population (design §3.1);
+- the logged request must be one the CLI itself sent: ``stream`` is true in
+  the stored body. scripts/prefix_repro.py's direct probes (cch_collision,
+  volatile_flip, ...) replay a CLI body with ``stream: false`` and edited
+  sections into the same session; no resume can reproduce them;
+- sessions listed in ``--exclude`` (EXCLUDED.json next to the fixtures) are
+  skipped: cases the pinned 2.1.59 itself can not resume byte-continuously,
+  each root-caused during calibration (rare request shapes, see that file);
 - per tag a quota, filled newest-first (the newest sessions are closest to
   today's CLI feature cache), anthropic and cli-proxy routes alternating;
   a session counts toward every tag it carries.
@@ -21,9 +28,12 @@ Rules (deterministic: same input -> same selection):
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import sys
 from pathlib import Path
+
+FROZEN = Path("/workspace/runtime/preserved/cache-proxy-request-log-freeze-20261020T200401Z")
 
 VAULT_PROJECT = "/-workspace-runtime-git-obs-vault-active/"
 QUOTA = {"compaction": 4, "fork": 4, "images": 4, "ext_mcp": 3, "subagent": 2, "parallel_tools": 4,
@@ -43,24 +53,42 @@ def profile(row: dict) -> str | None:
     return None
 
 
+def cli_made(row: dict) -> bool:
+    """The stored wire body has stream=true (every CLI main request streams)."""
+    path = FROZEN / "requests" / row["day"] / f"{row['req_id']}.wire.json.gz"
+    try:
+        return json.loads(gzip.decompress(path.read_bytes())).get("stream") is True
+    except (OSError, ValueError):
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("candidates")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--exclude", help="JSON object {session_id: reason} of calibration exclusions")
     args = ap.parse_args(argv)
+    excluded = json.loads(Path(args.exclude).read_text()) if args.exclude else {}
     rows = [json.loads(l) for l in Path(args.candidates).read_text().splitlines() if l.strip()]
-    pool = [r for r in rows if r.get("clean") and r.get("route") != "local" and profile(r)]
+    pool = [r for r in rows if r.get("clean") and r.get("route") != "local" and profile(r)
+            and r["session_id"] not in excluded]
     pool.sort(key=lambda r: (-float(r.get("ts") or 0), r["session_id"]))
     chosen: dict[str, dict] = {}
     counts = {t: 0 for t in QUOTA}
 
+    rejected: set[str] = set()
+
     def take(r):
-        if r["session_id"] in chosen:
-            return
+        if r["session_id"] in chosen or r["session_id"] in rejected:
+            return False
+        if not cli_made(r):
+            rejected.add(r["session_id"])
+            return False
         chosen[r["session_id"]] = r
         for t in r.get("tags") or []:
             if t in counts:
                 counts[t] += 1
+        return True
 
     for tag in ORDER:
         want = QUOTA[tag]
@@ -79,8 +107,8 @@ def main(argv=None):
         if len(prod_anthropic) >= ANTHROPIC_PRODUCTION_MIN:
             break
         if r["route"] == "anthropic" and profile(r) == "obs" and r["session_id"] not in chosen:
-            take(r)
-            prod_anthropic.append(r)
+            if take(r):
+                prod_anthropic.append(r)
     fill = {"anthropic": [r for r in pool if r["route"] == "anthropic" and profile(r) == "obs"],
             "cli-proxy": [r for r in pool if r["route"] == "cli-proxy" and profile(r) == "obs"]}
     i = 0
