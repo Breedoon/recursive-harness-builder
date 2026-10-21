@@ -34,7 +34,9 @@ For a maintenance restart the running daemon:
 On startup the new daemon renames the marker to ``*.consumed`` *before* acting
 on it and fsyncs the directory, so a crash loop cannot replay the same marker.
 It ignores ordinary maintenance markers and crash snapshots whose last write is older than
-:data:`DEFAULT_MAX_AGE_SECONDS` (5 minutes): a quick crash plus supervisord
+:data:`DEFAULT_MAX_AGE_SECONDS` (15 minutes, measured from the last write to
+this process's start, so time spent waiting for Telegram after boot does not
+count; vault-9tij): a quick crash plus supervisord
 autorestart resumes, while a server that stayed down longer (unplugged,
 stopped) resumes nothing. It then resumes each recorded
 route with a note saying the turn was cut off. Local-model routes are resumed
@@ -184,6 +186,33 @@ def consume_killswitch_sentinel(sentinel: str | os.PathLike[str] | None) -> bool
     return True
 
 
+# Wall-clock start of this OBS process (set by the daemon at import). A marker
+# or snapshot written *before* this process started is aged against the process
+# start, not against "now": the gap between process start and the resume step
+# is this process waiting for Telegram (network not back after a power cut) and
+# says nothing about how long OBS was down. Without this a 12.6-min power cut
+# plus a 2.8-min Wi-Fi wait read as 925 s > 900 s and resumed nothing
+# (2026-10-21 14:03Z cut, vault-9tij). Files written by this process itself
+# (requested_at after the start) keep using real now.
+_PROCESS_STARTED_AT: float | None = None
+
+
+def set_process_started_at(started_at: float | None) -> None:
+    """Record this process's start time for outage-age measurement (vault-9tij)."""
+    global _PROCESS_STARTED_AT
+    _PROCESS_STARTED_AT = started_at
+
+
+def _age_reference(requested_at: float, now: float | None) -> float:
+    """The instant a marker's age is measured at (see _PROCESS_STARTED_AT)."""
+    if now is not None:
+        return now
+    started = _PROCESS_STARTED_AT
+    if started is not None and requested_at <= started:
+        return started
+    return time.time()
+
+
 def _write_age_seconds(path: Path, requested_at: float, now: float) -> float:
     """Age of a marker/snapshot: time since its last write.
 
@@ -310,7 +339,7 @@ def _marker_from_raw(
         return None, "unreadable:requested_at"
     if not math.isfinite(requested_at):
         return None, "unreadable:requested_at"
-    current = time.time() if now is None else now
+    current = _age_reference(requested_at, now)
     age = _write_age_seconds(path, requested_at, current)
     if age < 0 or (max_age_seconds is not None and age > max_age_seconds):
         return None, f"stale:{int(age)}s"

@@ -14,6 +14,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -21,8 +22,52 @@ from typing import Any
 
 from obs_agent.context_jsonl import find_session_jsonl
 
+logger = logging.getLogger(__name__)
+
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
+
+
+def _torn_tail_start(original: bytes) -> int | None:
+    """Offset where a torn final record begins, or None if the file ends cleanly.
+
+    A power cut can leave a transcript ending in a never-flushed record: a run
+    of NUL bytes or a half-written JSON line after the last newline (2026-10-21
+    10:12Z cut, vault-qjit). Only the FINAL record may be torn; an unparsable
+    line in the middle of the file is real damage and still raises.
+    """
+    stripped = original.rstrip(b"\x00 \t\r\n")
+    if not stripped:
+        return 0 if original else None
+    cut = stripped.rfind(b"\n") + 1
+    last = stripped[cut:]
+    try:
+        json.loads(last.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return cut
+    rest = original[len(stripped):]
+    if rest.strip(b" \t\r\n"):
+        # Complete last record followed by NUL padding: keep its line ending.
+        return len(stripped) + (len(rest) - len(rest.lstrip(b" \t\r\n")))
+    return None
+
+
+def _backup_torn_tail(path: Path, tail: bytes) -> Path | None:
+    root = Path(os.environ.get("OBS_JSONL_TORN_BACKUP_DIR", "/workspace/runtime/state/jsonl-torn-repair"))
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        backup = root / f"{path.name}.{hashlib.sha256(tail).hexdigest()[:12]}.torn-tail"
+        backup.write_bytes(tail)
+        return backup
+    except OSError:
+        return None
+
+
+def _decode_complete_lines(original: bytes) -> list[str]:
+    """Raw JSONL lines with a torn final record (if any) left out (read-only)."""
+    cut = _torn_tail_start(original)
+    body = original if cut is None else original[:cut]
+    return body.decode("utf-8").split("\n")
 
 def _completion_path(message_id: str) -> Path:
     root = Path(os.environ.get("OBS_SESSION_REPLAY_PROVENANCE_DIR", "/workspace/runtime/state/session-replay"))
@@ -55,7 +100,7 @@ def record_terminal_completion(
     if path is None:
         return None
     raw = path.read_bytes()
-    entries = [(json.loads(line), line) for line in raw.decode().split("\n") if line.strip()]
+    entries = [(json.loads(line), line) for line in _decode_complete_lines(raw) if line.strip()]
     effective = {e["uuid"]: e for e, _line in entries if e.get("uuid")}
     if target_uuid is None:
         selected = select_replay_entries(entries, require_complete=False)
@@ -168,6 +213,22 @@ def prepare_session_replay(
     with path.open("r+b") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         original = handle.read()
+        torn_at = _torn_tail_start(original)
+        if torn_at is not None:
+            # Treat a torn final record as end of file: back it up, cut it off
+            # under the owner lock, and continue. The CLI could not use those
+            # bytes, and appending overlays after them would bury garbage
+            # mid-file (vault-qjit).
+            backup = _backup_torn_tail(path, original[torn_at:])
+            logger.warning(
+                "[jsonl_replay] torn final record truncated session=%s path=%s torn_bytes=%d backup=%s",
+                session_id, path, len(original) - torn_at, backup,
+            )
+            handle.truncate(torn_at)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.seek(0)
+            original = handle.read()
         raw_lines = original.decode("utf-8").split("\n")
         entries = [(json.loads(raw), raw) for raw in raw_lines if raw.strip()]
         effective_lines = {}

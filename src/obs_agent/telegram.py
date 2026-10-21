@@ -466,6 +466,10 @@ class _DefaultScheduleTemplate:
     retry_delay_seconds: int
 
 
+_AUTO_DELIVERY_BACKOFF_BASE_SECONDS = 30.0
+_AUTO_DELIVERY_BACKOFF_MAX_SECONDS = 30 * 60.0
+
+
 @dataclass(frozen=True)
 class _RunOutcome:
     """Observable outcome for one route run used by ForkTask bookkeeping."""
@@ -757,6 +761,10 @@ class TelegramBot:
         # /stop escalation (vault-u3b.65): kill a CLI that ignores the interrupt.
         self._stop_escalation_tasks: set[asyncio.Task] = set()
         self._background_delivery_tasks: dict[TelegramRoute, asyncio.Task] = {}
+        # Auto-delivery retry backoff per route: (consecutive failures, next
+        # attempt monotonic time). A run that fails the same way every time
+        # (torn transcript, vault-qjit) must not retry every poll tick.
+        self._auto_delivery_backoff: dict[TelegramRoute, tuple[int, float]] = {}
         self._inbox_wake_poll_task: asyncio.Task | None = None
         self._team_worker_records: dict[tuple[str, str], str] = {}
         self._route_inbox_targets: dict[tuple[str, str], TelegramRoute] = {}
@@ -9772,6 +9780,7 @@ class TelegramBot:
         trigger_status_message_ids: list[int] | None = None,
         triggered_schedule_id: str | None = None,
         suppress_completion_summary: bool = False,
+        quiet_error: bool = False,
     ) -> _RunOutcome:
         pending_messages = list(state.pending_messages)
         if extra_pending:
@@ -10239,16 +10248,19 @@ class TelegramBot:
             failed = True
             error_text = error_detail
 
-            try:
-                await self._send_system_message(
-                    route=state.route,
-                    bot=bot,
-                    text=f"error: {error_detail}",
-                    disable_notification=False,
-                    reply_to_message_id=reply_to_message_id,
-                )
-            except Exception:
-                logger.exception("Failed to send error reply")
+            if quiet_error:
+                logger.warning("[run_and_send] repeat failure, error message suppressed route=%s", state.route)
+            else:
+                try:
+                    await self._send_system_message(
+                        route=state.route,
+                        bot=bot,
+                        text=f"error: {error_detail}",
+                        disable_notification=False,
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                except Exception:
+                    logger.exception("Failed to send error reply")
 
             try:
                 await state.session_manager.soft_reset()
@@ -10615,6 +10627,9 @@ class TelegramBot:
                 continue
             if self._get_route_lock(state.route).locked():
                 continue
+            backoff = self._auto_delivery_backoff.get(state.route)
+            if backoff is not None and time.monotonic() < backoff[1]:
+                continue
             task = asyncio.create_task(self._deliver_background_queue(state))
             self._background_delivery_tasks[state.route] = task
             self._detached_wake_tasks.add(task)
@@ -10652,15 +10667,38 @@ class TelegramBot:
             trigger_message = state.pending_messages[-1]
             # Reserve this route before asynchronous session/transport startup.
             state.busy = True
+            prior_failures = self._auto_delivery_backoff.get(state.route, (0, 0.0))[0]
+            outcome = None
             try:
-                await self._run_and_send(
+                outcome = await self._run_and_send(
                     state=state,
                     user_text=_AUTO_DELIVERY_PROMPT,
                     bot=bot,
                     trigger_message=trigger_message,
+                    # One visible error per failure streak, not one per retry.
+                    quiet_error=prior_failures > 0,
                 )
             finally:
                 state.busy = False
+                self._record_auto_delivery_outcome(
+                    state.route, failed=outcome is None or bool(getattr(outcome, "failed", False))
+                )
+
+    def _record_auto_delivery_outcome(self, route: TelegramRoute, *, failed: bool) -> None:
+        """Exponential backoff for auto-delivery that keeps failing (vault-qjit)."""
+        if not failed:
+            self._auto_delivery_backoff.pop(route, None)
+            return
+        failures = self._auto_delivery_backoff.get(route, (0, 0.0))[0] + 1
+        delay = min(
+            _AUTO_DELIVERY_BACKOFF_BASE_SECONDS * (2 ** (failures - 1)),
+            _AUTO_DELIVERY_BACKOFF_MAX_SECONDS,
+        )
+        self._auto_delivery_backoff[route] = (failures, time.monotonic() + delay)
+        logger.warning(
+            "[auto_delivery] run failed route=%s consecutive=%d next_retry_in=%.0fs",
+            route, failures, delay,
+        )
 
     async def _background_poller_loop(self) -> None:
         """Poll for queued background messages and auto-deliver when idle."""
@@ -13932,6 +13970,9 @@ def _is_fatal_telegram_runtime_error(exc: Exception) -> bool:
 
 async def run_telegram_bot(config: OBSConfig) -> None:
     """Start Telegram bot with runtime supervision and bounded backoff restart."""
+    # Outage age is measured to this process's start, not to the moment the
+    # first Telegram runtime reaches the resume step (vault-9tij).
+    _maint.set_process_started_at(time.time())
     restart_count = 0
     while True:
         try:
