@@ -149,7 +149,7 @@ class Env:
         self.stub.shutdown()
 
 
-def replay_mcp_servers(logged_tools: list) -> dict:
+def replay_mcp_servers(logged_tools: list, only: set[str] | None = None) -> dict:
     """In-process MCP servers that list exactly the logged MCP tool definitions.
 
     The real servers (OBS's obs-agent tools, the remote exa server) may have
@@ -162,6 +162,8 @@ def replay_mcp_servers(logged_tools: list) -> dict:
         if not name.startswith("mcp__"):
             continue
         _, server, short = name.split("__", 2)
+        if only is not None and server not in only:
+            continue
         schema = t.get("input_schema") or {"type": "object", "properties": {}}
 
         def make(short=short, desc=t.get("description", ""), schema=schema):
@@ -188,7 +190,7 @@ def launch_options(meta: dict, wire: dict, *, cli_path: str, base_url: str, conf
         "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
         "CLAUDE_CODE_EAGER_FLUSH": "1",
     })
-    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
         os.environ.pop(k, None)
     kw: dict = {}
     if meta.get("profile") == "harness":
@@ -202,16 +204,32 @@ def launch_options(meta: dict, wire: dict, *, cli_path: str, base_url: str, conf
         # src/obs_agent/session.py ClaudeAgentOptions(): project settings, the
         # in-process obs-agent server (+ exa from the vault's .mcp.json),
         # effort/thinking env. MCP servers are replay servers (see above).
-        thinking = wire.get("thinking") or {}
-        if thinking.get("type") == "enabled" and thinking.get("budget_tokens"):
-            env["MAX_THINKING_TOKENS"] = str(thinking["budget_tokens"])
-            env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
-        effort = (wire.get("output_config") or {}).get("effort")
-        if effort:
-            env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+        from obs_agent.effort import build_effort_env
+        # OBS's own effort bridge (session.py), with the effort the logged body
+        # shows; "high" is the API default and leaves no output_config.
+        effort = (wire.get("output_config") or {}).get("effort") or "high"
+        env.update(build_effort_env(model, effort, {}))
+        if meta.get("route") == "cli-proxy":
+            # session.py: hosted non-Claude models authenticate with the
+            # CLIProxyAPI key (API-key mode, no oauth beta); a dummy suffices here
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            env["ANTHROPIC_API_KEY"] = "fixture-capture-not-a-credential"
+        else:
+            thinking = wire.get("thinking") or {}
+            if thinking.get("type") == "enabled" and thinking.get("budget_tokens"):
+                env["MAX_THINKING_TOKENS"] = str(thinking["budget_tokens"])
+                env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
+        # The OBS daemon runs without SHELL; the CLI then writes "Shell:
+        # unknown" into the system prompt's environment block.
+        os.environ.pop("SHELL", None)
         cli_model = model + ("[1m]" if "context-1m" in beta else "")
+        # Only OBS's in-process server is replayed (its tool set moves with OBS
+        # releases). Servers from the project's .mcp.json (exa) connect for real,
+        # exactly as for an OBS agent: replacing them with in-process replay
+        # servers drops the resources capability and with it 2.1.59's
+        # ListMcpResourcesTool/ReadMcpResourceTool, which changes the tool list.
         kw.update(setting_sources=["project"], cli_model=cli_model,
-                  mcp_servers=replay_mcp_servers(wire.get("tools") or []))
+                  mcp_servers=replay_mcp_servers(wire.get("tools") or [], only={"obs-agent"}))
     os.environ.pop("CLAUDECODE", None)
     return ClaudeAgentOptions(
         cli_path=cli_path,
@@ -221,7 +239,6 @@ def launch_options(meta: dict, wire: dict, *, cli_path: str, base_url: str, conf
         resume=resume,
         permission_mode="bypassPermissions",
         system_prompt={"type": "preset", "preset": "claude_code"},
-        extra_args={"strict-mcp-config": None} if meta.get("profile") != "harness" else {},
         **kw,
     )
 
@@ -289,6 +306,33 @@ def compare(logged: dict, logged_beta: str | None, cand: dict, cand_beta: str | 
             "summary": pd.format_result(res).splitlines()[0] if cls not in OK_CLASSES else cls}
 
 
+def prime_proxy(env: Env, meta: dict, case: Path) -> dict:
+    """Recreate the proxy's per-conversation pins from the logged request.
+
+    The production proxy pins a conversation's volatile system sections,
+    context_management, effort and breakpoint TTL as first seen, keyed by model
+    plus first message, and forgets them after 2 idle days -- so the frozen pin
+    store no longer holds pins for most fixture conversations. Sending the
+    logged post-proxy body once through the scratch proxy (it goes to the
+    capture endpoint) records exactly the values the conversation was pinned
+    to. Limits: the body is the redacted stored form, so the key matches only
+    when the first message holds nothing the redactor replaced (the case
+    report shows a remaining config/system difference then).
+    """
+    import urllib.request
+    body = gzip.decompress((case / "last_request.json.gz").read_bytes())
+    headers = {"content-type": "application/json", "anthropic-version": "2023-06-01",
+               "user-agent": "obs-fixture-check-prime", "authorization": "Bearer fixture-capture",
+               "anthropic-beta": meta.get("anthropic_beta") or ""}
+    req = urllib.request.Request(env.base_url + "/v1/messages?beta=true", data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            r.read()
+        return {"primed": True}
+    except Exception as e:
+        return {"primed": False, "error": f"{type(e).__name__}: {e}"}
+
+
 async def check_case(case: Path, args, env: Env) -> dict:
     meta = json.loads((case / "meta.json").read_text())
     cid = meta["case_id"]
@@ -324,6 +368,8 @@ async def check_case(case: Path, args, env: Env) -> dict:
     rep = {"case_id": cid, "tags": meta.get("tags"), "profile": meta.get("profile"),
            "model": meta.get("model"), "route": meta.get("route"), "cli_path": args.cli_path,
            "prepare_session_replay": bool(replay)}
+    if not args.no_prime:
+        rep["prime"] = prime_proxy(env, meta, case)
     t0 = time.time()
     opts = launch_options(meta, wire, cli_path=args.cli_path, base_url=env.base_url,
                           config_dir=config, cwd=cwd, resume=sid)
@@ -336,13 +382,17 @@ async def check_case(case: Path, args, env: Env) -> dict:
     rep["candidate_req_id"] = row["req_id"]
     rep["candidate_norm_action"] = (row.get("norm") or {}).get("action")
     cand_wire = load_candidate(row["req_id"], "wire", env.log_dir, config)
+    # wire is compared with the betas sent UPSTREAM on both sides (the proxy
+    # adds context-management when it restores a pinned setting); pre with the
+    # betas the CLI itself sent
+    logged_row = json.loads((case / "index_row.json").read_text())
     cand_beta = pd._beta(row)
-    logged_beta = meta.get("anthropic_beta")
-    rep["wire"] = compare(wire, logged_beta, cand_wire, cand_beta)
+    rep["wire"] = compare(wire, pd._beta(logged_row), cand_wire, cand_beta)
     ok = rep["wire"]["ok"]
     if args.require_pre or args.report_pre:
         cand_pre = load_candidate(row["req_id"], "pre", env.log_dir, config)
-        rep["pre"] = compare(wire, logged_beta, cand_pre, cand_beta)
+        rep["pre"] = compare(wire, (logged_row.get("client_headers") or {}).get("anthropic-beta"),
+                             cand_pre, (row.get("client_headers") or {}).get("anthropic-beta"))
         rep["proxy_normalized_nothing"] = rep["candidate_norm_action"] == "not_found"
         if args.require_pre:
             ok = ok and rep["pre"]["ok"] and rep["proxy_normalized_nothing"]
@@ -417,6 +467,8 @@ def main(argv=None):
     ap.add_argument("--reverse", action="store_true", help="also resume the candidate-written session under --reverse-cli")
     ap.add_argument("--reverse-cli", default=PINNED)
     ap.add_argument("--case-timeout", type=float, default=180)
+    ap.add_argument("--no-prime", action="store_true",
+                    help="do not recreate the conversation's proxy pins from the logged body first")
     args = ap.parse_args(argv)
     args.cli_path = str(Path(args.cli_path).resolve())
     if not args.out:
