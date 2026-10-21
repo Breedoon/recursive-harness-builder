@@ -6421,14 +6421,14 @@ class TelegramBot:
     async def _ensure_background_poller(self, bot: Any | None) -> None:
         if bot is not None:
             self._primary_bot = bot
+        if not self._enable_background_poller:
+            return
         try:
             from obs_agent.loop_monitor import ensure_loop_stall_monitor
 
             ensure_loop_stall_monitor()
         except Exception:
             logger.debug("[loop_stall] monitor start failed", exc_info=True)
-        if not self._enable_background_poller:
-            return
         if self._background_task is None or self._background_task.done():
             self._background_task = asyncio.create_task(self._background_poller_loop())
         if self._schedule_poller_task is None or self._schedule_poller_task.done():

@@ -21,6 +21,9 @@ import traceback
 
 logger = logging.getLogger(__name__)
 
+# Bound at import so a test that patches asyncio.sleep cannot turn the heartbeat
+# into a busy loop on a shared event loop.
+_real_sleep = asyncio.sleep
 _started_loops: set[int] = set()
 _lock = threading.Lock()
 
@@ -53,7 +56,7 @@ class LoopStallMonitor:
         self._loop_thread_id = threading.get_ident()
         while not self._stop.is_set():
             self._last_beat = time.monotonic()
-            await asyncio.sleep(self._interval)
+            await _real_sleep(self._interval)
 
     def _stack_of_loop_thread(self) -> str:
         if self._loop_thread_id is None:

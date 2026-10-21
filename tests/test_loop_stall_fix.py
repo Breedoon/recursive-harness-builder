@@ -85,3 +85,14 @@ def test_monitor_quiet_when_loop_is_healthy(caplog):
 
     assert asyncio.run(main()).stall_count == 0
     assert "loop_stall" not in caplog.text
+
+
+def test_heartbeat_ignores_patched_asyncio_sleep():
+    # A shared test loop plus a test that patches asyncio.sleep must not turn the
+    # heartbeat into a busy loop (that hung tests/test_telegram.py once).
+    import obs_agent.loop_monitor as lm
+    from unittest.mock import AsyncMock, patch
+
+    real = lm._real_sleep
+    with patch("asyncio.sleep", new=AsyncMock()):
+        assert lm._real_sleep is real and lm._real_sleep is not asyncio.sleep
