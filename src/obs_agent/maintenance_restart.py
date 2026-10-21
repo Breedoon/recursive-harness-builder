@@ -71,7 +71,9 @@ DEFAULT_CRASH_MAX_CONSECUTIVE = 2
 DEFAULT_ORPHAN_REAP_GRACE_SECONDS = 5.0
 AGENT_CLI_MARKER = "claude_agent_sdk/_bundled/claude"
 MARKER_VERSION = 1
-DEFAULT_MAX_AGE_SECONDS = 5 * 60
+# 15 min (was 5): a power cut plus host boot plus Wi-Fi return took ~5 min on
+# 2026-10-21; Daniel asked for 15 min headroom. Also the kill-switch horizon.
+DEFAULT_MAX_AGE_SECONDS = 15 * 60
 DEFAULT_HOSTED_STAGGER_SECONDS = 3.0
 MAINTENANCE_SIGNAL = signal.SIGUSR1
 TELEGRAM_MAIN_PATTERN = "obs_agent.telegram_main"

@@ -395,10 +395,10 @@ def _entry(task_id):
     return maint.ResumeEntry(chat_id=1, thread_id=2, session_id="sid", task_id=task_id, is_local=False, queued=[])
 
 
-def test_default_resume_window_is_five_minutes(monkeypatch):
+def test_default_resume_window_is_fifteen_minutes(monkeypatch):
     monkeypatch.delenv("OBS_MAINTENANCE_RESUME_MAX_AGE_SECONDS", raising=False)
-    assert maint.DEFAULT_MAX_AGE_SECONDS == 300
-    assert maint.max_age_from_env() == 300.0
+    assert maint.DEFAULT_MAX_AGE_SECONDS == 900
+    assert maint.max_age_from_env() == 900.0
     monkeypatch.setenv("OBS_MAINTENANCE_RESUME_MAX_AGE_SECONDS", "120")
     assert maint.max_age_from_env() == 120.0
 
@@ -410,10 +410,10 @@ def test_quick_crash_within_five_minutes_resumes(tmp_path: Path):
     assert marker is not None and reason == "ok"
 
 
-def test_long_outage_over_five_minutes_resumes_nothing(tmp_path: Path):
+def test_long_outage_over_fifteen_minutes_resumes_nothing(tmp_path: Path):
     for name in ("crash-resume.json", "maintenance-resume.json"):
         path = tmp_path / name
-        maint.write_marker(path, _marker([_entry("r1")], requested_at=time.time() - 301))
+        maint.write_marker(path, _marker([_entry("r1")], requested_at=time.time() - 901))
         marker, reason = maint.consume_marker(path)
         assert marker is None and reason.startswith("stale"), name
         assert not path.exists()
@@ -424,8 +424,8 @@ def test_old_file_write_is_stale_even_if_requested_at_is_fresh(tmp_path: Path):
 
     path = tmp_path / "crash-resume.json"
     maint.write_marker(path, _marker([_entry("r1")], requested_at=time.time()))
-    old = time.time() - 600
+    old = time.time() - 1200
     os.utime(path, (old, old))
-    assert maint.peek_requested_at(path, max_age_seconds=300) is None
+    assert maint.peek_requested_at(path, max_age_seconds=900) is None
     marker, reason = maint.consume_marker(path)
     assert marker is None and reason.startswith("stale")

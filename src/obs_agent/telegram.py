@@ -13769,6 +13769,10 @@ async def _shutdown_telegram_runtime(*, app: Application, tg_bot: TelegramBot) -
         logger.warning("Telegram application shutdown failed", exc_info=True)
 
 
+# Set once this process's first runtime reaches the resume step (see below).
+_PROCESS_CRASH_RESUME_ATTEMPTED = False
+
+
 async def _run_telegram_bot_once(config: OBSConfig, *, first_start: bool = True) -> None:
     """Run one Telegram runtime instance until cancellation or runtime failure."""
     app = create_telegram_app(config)
@@ -13797,11 +13801,20 @@ async def _run_telegram_bot_once(config: OBSConfig, *, first_start: bool = True)
             error_callback=_record_polling_error,
         )
         _install_maintenance_signal_handler(tg_bot)
-        # Crash snapshot and orphan reaping belong to process start only; an
-        # in-process runtime restart must not replay this process's own snapshot.
-        tg_bot.start_maintenance_resume(include_crash=first_start)
+        # Crash snapshot and orphan reaping belong to the FIRST runtime of this
+        # process that gets this far, not to restart_count == 0: when Telegram is
+        # unreachable at boot (power cut, Wi-Fi still down) the first runtime dies
+        # in app.initialize() before reaching this point, and keying on
+        # first_start skipped the previous process's snapshot forever while the
+        # new writer overwrote it (2026-10-21 10:17Z power cut, vault-scg2). An
+        # in-process restart after this point still must not replay this
+        # process's own snapshot, so the flag is set before anything acts.
+        global _PROCESS_CRASH_RESUME_ATTEMPTED
+        resume_crash = not _PROCESS_CRASH_RESUME_ATTEMPTED
+        _PROCESS_CRASH_RESUME_ATTEMPTED = True
+        tg_bot.start_maintenance_resume(include_crash=resume_crash)
         tg_bot.start_crash_snapshot_writer()
-        if first_start:
+        if resume_crash:
             _start_orphan_cli_reaper()
 
         while True:
