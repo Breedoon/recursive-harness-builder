@@ -18,10 +18,28 @@ Verdict per case (cache-prefix semantics, scripts/prefix_diff.py):
         every logged message identical, new messages only after them.
   FAIL  anything else; the report names the first divergence with a JSON path
         and byte offset (``first_divergence``) and the class.
-With ``--require-pre`` the candidate's own bytes ("pre", before the proxy) must
-also extend the logged wire body and the proxy must report it normalized
-nothing (index ``norm.action == "not_found"``): the gate for the OBS-owned
-binary, which must make the proxy's rewrites unnecessary (ADR-0015).
+With ``--require-pre`` (the gate for the OBS-owned binary, design-v2 §1.5.1,
+§1.12, §10.1), three more checks must pass:
+  serialization        the candidate's own bytes ("pre") are exactly Python's
+                       ``json.dumps(body, separators=(",", ":"))`` form
+                       (ensure_ascii): no raw UTF-8, no other spacing/escaping.
+                       2.1.59 fails this on every main request (its system
+                       prompt and tool texts hold non-ASCII); that is expected.
+  expected transforms  the scratch proxy's index row shows only the expected
+                       transforms (metadata suffix, GPT cache key): every other
+                       norm counter 0, no pin applied (§1.12 field list).
+  manifest             when the case has ``expected_manifest.json``, the
+                       candidate wrote a sidecar manifest that equals it under
+                       the §10.3 equality rules.
+``--report-pre`` reports all three (and the old pre-vs-wire prefix compare)
+without requiring them.
+
+Compaction (cases with ``meta.compaction``, tag ``compact-anthropic``): the
+case's ``session_precompact.jsonl`` is resumed with the capture's lowered
+auto-compact threshold and its exact next prompt. The candidate's compaction
+request must be byte-identical to the logged one, and its first
+post-compaction request may differ from the logged one only inside
+messages[0] (the summary text: the capture endpoint answers "ok").
 
 ``--reverse`` (ADR-0009): after the forward run the session file holds rows the
 candidate wrote. The reverse step resumes that file under ``--reverse-cli``
@@ -178,7 +196,7 @@ def replay_mcp_servers(logged_tools: list, only: set[str] | None = None) -> dict
 
 
 def launch_options(meta: dict, wire: dict, *, cli_path: str, base_url: str, config_dir: Path,
-                   cwd: str, resume: str) -> ClaudeAgentOptions:
+                   cwd: str, resume: str, extra_env: dict | None = None) -> ClaudeAgentOptions:
     model = meta["model"]
     beta = meta.get("anthropic_beta") or ""
     env = {} if meta.get("profile") == "harness" else dict(OBS_DEFAULT_SDK_ENV)
@@ -192,6 +210,12 @@ def launch_options(meta: dict, wire: dict, *, cli_path: str, base_url: str, conf
         "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
         "CLAUDE_CODE_EAGER_FLUSH": "1",
     })
+    bi = meta.get("bootstrap_inputs")
+    if bi:
+        # design-v2 §6.1: the binary under test bootstraps legacy manifests from
+        # these (read-only); 2.1.59 ignores them
+        env.update({"OBS_CLI_BOOTSTRAP_INDEX_DIRS": ":".join(bi["index_dirs"]),
+                    "OBS_CLI_BOOTSTRAP_PINS": bi["pins"], "OBS_CLI_CLOCK_OVERRIDE": str(bi["now"])})
     for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
         os.environ.pop(k, None)
     kw: dict = {}
@@ -235,6 +259,7 @@ def launch_options(meta: dict, wire: dict, *, cli_path: str, base_url: str, conf
         kw.update(setting_sources=["project"], cli_model=cli_model,
                   mcp_servers=replay_mcp_servers(wire.get("tools") or [], only={"obs-agent"}))
     os.environ.pop("CLAUDECODE", None)
+    env.update(extra_env or {})
     return ClaudeAgentOptions(
         cli_path=cli_path,
         model=kw.pop("cli_model"),
@@ -299,6 +324,79 @@ def load_candidate(req_id: str, part: str, log_dir: str, config_dir: Path) -> di
     return json.loads(text.replace(str(config_dir), REAL_CONFIG_DIR))
 
 
+def serialization_check(raw: bytes) -> dict:
+    """Is ``raw`` exactly the proxy's serialization of itself? (design-v2 §1.5.1, §10.1)
+
+    The stored ``pre`` is redacted, but the redactor substitutes ASCII
+    placeholders inside string values, which leaves this property unchanged.
+    """
+    # INVARIANT(cache-bytes): the reference form is json.dumps with
+    # separators=(",", ":") and the default ensure_ascii=True, the exact call at
+    # src/cache_proxy.py (body = json.dumps(data, separators=...)). Changing
+    # either side makes the gate accept raw UTF-8 or reject the binary's form.
+    # Doc: vault:Projects/Personal Projects/OBS Platform/CLI Runtime/Components/Fixtures and Byte Checker#Serialization gate
+    try:
+        canon_bytes = json.dumps(json.loads(raw), separators=(",", ":")).encode()
+    except ValueError as e:
+        return {"ok": False, "reason": f"unparseable: {e}"}
+    if canon_bytes == raw:
+        return {"ok": True}
+    off = next((i for i, (x, y) in enumerate(zip(raw, canon_bytes)) if x != y), min(len(raw), len(canon_bytes)))
+    return {"ok": False, "first_offset": off, "raw_utf8": any(b > 127 for b in raw),
+            "non_ascii_bytes": sum(1 for b in raw if b > 127), "raw_len": len(raw), "canonical_len": len(canon_bytes),
+            "raw_context": raw[max(0, off - 20):off + 20].decode("utf-8", "replace"),
+            "canonical_context": canon_bytes[max(0, off - 20):off + 20].decode("ascii", "replace")}
+
+
+# design-v2 §1.12: an index row passes "expected transforms only" when these
+# are all zero / empty (metadata and cache_key are the expected transforms)
+ZERO_NORM = ("billing", "strings", "reminders", "git_status", "tools", "dynamic_boundary", "ws_trimmed",
+             "effort_stripped", "schema_sanitized")
+
+
+def expected_transforms_only(row: dict) -> dict:
+    n = row.get("norm") or {}
+    bad = {k: n.get(k) for k in ZERO_NORM if n.get(k)}
+    if ((n.get("volatile_pin") or {}).get("applied") or []):
+        bad["volatile_pin.applied"] = n["volatile_pin"]["applied"]
+    if (n.get("ttl_pin") or {}).get("applied") is not None:
+        bad["ttl_pin.applied"] = n["ttl_pin"]["applied"]
+    ep = row.get("effort_pin") or n.get("effort_pin") or {}
+    if ep.get("inserted") or ep.get("changed"):
+        bad["effort_pin"] = {k: ep.get(k) for k in ("inserted", "changed")}
+    lc = n.get("local_compact")
+    if isinstance(lc, dict) and lc.get("action") == "rewritten":
+        bad["local_compact"] = "rewritten"
+    return {"ok": not bad, "non_expected": bad}
+
+
+MANIFEST_EXEMPT = ("created_at", "created_by")
+
+
+def manifest_check(expected_path: Path, config: Path, cwd: str, sid: str) -> dict:
+    """§10.3 equality: every field equal except created_at, created_by, bootstrap.reason."""
+    sidecar = config / "projects" / sanitize(cwd) / f"{sid}.obs-manifest.json"
+    if not expected_path.exists():
+        return {"status": "no-expected", "ok": True}
+    if not sidecar.exists():
+        return {"status": "absent", "ok": False, "looked_at": str(sidecar)}
+    exp = json.loads(expected_path.read_text())
+    got = json.loads(sidecar.read_text())
+    diffs = []
+    for k in sorted(set(exp) | set(got)):
+        if k in MANIFEST_EXEMPT or k.startswith("_"):
+            continue
+        a, b = exp.get(k), got.get(k)
+        if k == "bootstrap" and isinstance(a, dict) and isinstance(b, dict):
+            a = {x: y for x, y in a.items() if x != "reason"}
+            b = {x: y for x, y in b.items() if x != "reason"}
+        # INVARIANT(cache-bytes): tools_json is compared as exact text (bytes),
+        # system as exact JSON values; no normalization of either.
+        if a != b:
+            diffs.append(k)
+    return {"status": "match" if not diffs else "mismatch", "ok": not diffs, "fields": diffs}
+
+
 def compare(logged: dict, logged_beta: str | None, cand: dict, cand_beta: str | None) -> dict:
     # INVARIANT(cache-bytes): the verdict is prefix_diff's cache-prefix class on
     # the proxy-redacted bodies (same redaction on both sides). Do not
@@ -342,7 +440,8 @@ def prime_proxy(env: Env, meta: dict, case: Path, body: bytes | None = None) -> 
         return {"primed": False, "error": f"{type(e).__name__}: {e}"}
 
 
-def setup_case(case: Path, meta: dict, work: Path) -> tuple[Path, str, Path, object]:
+def setup_case(case: Path, meta: dict, work: Path,
+               session_file: str = "session.jsonl") -> tuple[Path, str, Path, object]:
     """Scratch config dir with the fixture session, prepared the way OBS resumes."""
     if work.exists():
         shutil.rmtree(work)
@@ -364,7 +463,7 @@ def setup_case(case: Path, meta: dict, work: Path) -> tuple[Path, str, Path, obj
         # index file; today's copy (the logged run saw the then-current one)
         shutil.copytree(real_memory, proj / "memory")
     sess = proj / f"{sid}.jsonl"
-    shutil.copyfile(case / "session.jsonl", sess)
+    shutil.copyfile(case / session_file, sess)
     try:
         replay = prepare_session_replay(session_id=sid, cwd=Path(cwd), source_path=sess)
     except Exception as e:
@@ -458,13 +557,19 @@ async def _check_case(case: Path, args, env: Env, extra_envs: list) -> dict:
     cand_beta = pd._beta(row)
     rep["wire"] = compare(wire, pd._beta(logged_row), cand_wire, cand_beta)
     ok = rep["wire"]["ok"]
-    if args.require_pre or args.report_pre:
+    if args.require_pre or args.report_pre or args.require_serialization:
         cand_pre = load_candidate(row["req_id"], "pre", env.log_dir, config)
         rep["pre"] = compare(wire, (logged_row.get("client_headers") or {}).get("anthropic-beta"),
                              cand_pre, (row.get("client_headers") or {}).get("anthropic-beta"))
-        rep["proxy_normalized_nothing"] = rep["candidate_norm_action"] == "not_found"
+        raw_pre = pd._read_bytes(pd.find_request_file(row["req_id"], "pre", env.log_dir))
+        rep["serialization"] = serialization_check(raw_pre)
+        rep["expected_transforms"] = expected_transforms_only(row)
+        rep["manifest"] = manifest_check(case / "expected_manifest.json", config, cwd, sid)
+        if args.require_serialization:
+            ok = ok and rep["serialization"]["ok"]
         if args.require_pre:
-            ok = ok and rep["pre"]["ok"] and rep["proxy_normalized_nothing"]
+            ok = (ok and rep["serialization"]["ok"] and rep["expected_transforms"]["ok"]
+                  and rep["manifest"]["ok"])
     if args.reverse and ok:
         t1 = time.time()
         ropts = launch_options(meta, wire, cli_path=args.reverse_cli, base_url=env.base_url,
@@ -484,8 +589,69 @@ async def _check_case(case: Path, args, env: Env, extra_envs: list) -> dict:
             rep["reverse"]["req_id"] = rrow["req_id"]
             rep["reverse"]["cli"] = args.reverse_cli
         ok = ok and rep["reverse"].get("ok", False)
+    if meta.get("compaction") and not args.no_compaction:
+        rep["compaction_check"] = await compaction_step(case, meta, wire, args, env, work)
+        ok = ok and rep["compaction_check"]["ok"]
     rep["verdict"] = "PASS" if ok else "FAIL"
     return rep
+
+
+async def compaction_step(case: Path, meta: dict, wire: dict, args, env: Env, work: Path) -> dict:
+    """Resume just before the logged compaction and require the same compaction request."""
+    comp = meta["compaction"]
+    cwork = work.parent / (work.name + ".compact")
+    config, cwd, sess, _ = setup_case(case, meta, cwork, "session_precompact.jsonl")
+    sid = meta["session_id"]
+    t0 = time.time()
+    opts = launch_options(meta, wire, cli_path=args.cli_path, base_url=env.base_url, config_dir=config,
+                          cwd=cwd, resume=sid, extra_env=comp.get("env"))
+    out = {"run": await drive(opts, comp["continuation"], args.case_timeout)}
+    time.sleep(1.5)
+    logged_c = json.loads(gzip.decompress((case / f"{comp['request']}.json.gz").read_bytes()))
+    logged_rows = json.loads((case / "extra_index_rows.json").read_text())
+    c_tools = [t.get("name") for t in logged_c.get("tools") or []]
+    rows = sorted((r for r in pd.read_index(env.log_dir) if r.get("session_id") == sid and r.get("ts", 0) >= t0
+                   and "count_tokens" not in str(r.get("path", ""))), key=lambda r: r["ts"])
+    cand_c = cand_post = None
+    for r in rows:
+        try:
+            w = load_candidate(r["req_id"], "wire", env.log_dir, config)
+        except Exception:
+            continue
+        names = [t.get("name") for t in w.get("tools") or []]
+        if cand_c is None and names == c_tools and w.get("max_tokens") == logged_c.get("max_tokens"):
+            cand_c = (r, w)
+        elif cand_c is not None and w.get("tools") and names != c_tools:
+            cand_post = (r, w)
+            break
+    if cand_c is None:
+        out.update(ok=False, reason="no compaction request captured from the candidate")
+        return out
+    r, w = cand_c
+    out["compaction"] = compare(logged_c, pd._beta(logged_rows[comp["request"]]), w, pd._beta(r))
+    # INVARIANT(cache-bytes): the compaction request is gated on exact bytes of
+    # the stored (identically redacted) wire bodies, not only the prefix class.
+    stored_logged = gzip.decompress((case / f"{comp['request']}.json.gz").read_bytes())
+    stored_cand = pd._read_bytes(pd.find_request_file(r["req_id"], "wire", env.log_dir)).decode(
+        "utf-8").replace(str(config), REAL_CONFIG_DIR).encode()
+    out["compaction"]["bytes_equal"] = stored_logged == stored_cand
+    ok = out["compaction"]["class"] == "identical" and out["compaction"]["bytes_equal"]
+    if cand_post is None:
+        out["post"] = {"ok": False, "reason": "no post-compaction main request captured"}
+        ok = False
+    else:
+        pr, pw = cand_post
+        logged_p = json.loads(gzip.decompress((case / f"{comp['post_request']}.json.gz").read_bytes()))
+        res = compare(logged_p, pd._beta(logged_rows[comp["post_request"]]), pw, pd._beta(pr))
+        path = (res.get("first_divergence") or {}).get("path") or ""
+        # the summary text is the capture endpoint's canned reply: only
+        # messages[0] may differ (or nothing)
+        res["ok"] = res["class"] in ("identical", "append") or (
+            res["class"] == "history-changed" and path.startswith("messages[0]"))
+        out["post"] = res
+        ok = ok and res["ok"]
+    out["ok"] = ok
+    return out
 
 
 async def amain(args) -> int:
@@ -506,6 +672,12 @@ async def amain(args) -> int:
             line = f"{rep['verdict']:4s} {rep['case_id']:44s} wire={rep.get('wire', {}).get('summary', rep.get('reason'))}"
             if "pre" in rep:
                 line += f" pre={rep['pre']['summary']} norm={rep.get('candidate_norm_action')}"
+            if "serialization" in rep:
+                line += f" ser={'ok' if rep['serialization']['ok'] else 'RAW' if rep['serialization'].get('raw_utf8') else 'bad'}"
+            if "compaction_check" in rep:
+                cc = rep["compaction_check"]
+                line += f" compaction={(cc.get('compaction') or {}).get('class', cc.get('reason'))}" \
+                        f"/bytes={(cc.get('compaction') or {}).get('bytes_equal')} post={(cc.get('post') or {}).get('class')}"
             if "reverse" in rep:
                 line += f" reverse={rep['reverse'].get('summary', rep['reverse'].get('reason'))}"
             print(line, flush=True)
@@ -532,10 +704,13 @@ def main(argv=None):
     ap.add_argument("--require-pre", action="store_true",
                     help="also require the candidate's own bytes to extend the logged body and the "
                          "proxy to normalize nothing (the OBS-owned binary's gate)")
+    ap.add_argument("--require-serialization", action="store_true",
+                    help="require only the serialization gate (ensure_ascii compact pre bytes) on top of the wire check")
     ap.add_argument("--report-pre", action="store_true", help="report the pre comparison without requiring it")
     ap.add_argument("--reverse", action="store_true", help="also resume the candidate-written session under --reverse-cli")
     ap.add_argument("--reverse-cli", default=PINNED)
     ap.add_argument("--case-timeout", type=float, default=180)
+    ap.add_argument("--no-compaction", action="store_true", help="skip the compaction step of compaction cases")
     ap.add_argument("--no-prime", action="store_true",
                     help="do not recreate the conversation's proxy pins from the logged body first")
     args = ap.parse_args(argv)
