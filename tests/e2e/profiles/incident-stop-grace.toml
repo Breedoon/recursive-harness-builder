@@ -1,0 +1,20 @@
+# incident-stop-grace: the dev lane with a 1 s stop-kill grace, so every /stop of a
+# streaming turn takes the escalation's disconnect path (obs-22.43,
+# tests/e2e/harness/suites/test_stop_escalation.py). Not for smoke or baseline runs.
+name = "incident-stop-grace"
+credential_class = "dev"
+route = "claude"
+model = "haiku"
+claude_credentials = "shared-lane-copy"
+bot_pool = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+bot_pool_exclude = ["env:OBS_TEST_TELEGRAM_BOT_TOKEN"]
+userbot_id_ref = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
+needs_cliproxy = false
+spend_cap_usd = 5.0
+
+[lane_env]
+OBS_AGENT_MODEL = "haiku"
+OBS_DEFAULT_MODEL = "haiku"
+OBS_EFFORT_LEVEL = "low"
+OBS_NEW_SESSION_EFFORT_LEVEL = "low"
+OBS_STOP_KILL_GRACE_SECONDS = "1"

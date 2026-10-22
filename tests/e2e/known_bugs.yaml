@@ -3,3 +3,16 @@
   runs: ["20261022T085610Z-1b3e0f", "20261022T100410Z-8ecad4"]
   obs_telegram_blob: "755dcec2cd0889a1c1f7474f39c4db2bbb912389"
   cli_runtime: "cc-2.1.59"
+- bead: obs-22.43
+  classification: "Product bug in src/obs_agent/telegram.py:_escalate_stop: on the disconnect path (stopped turn still active after OBS_STOP_KILL_GRACE_SECONDS) stop_cleanup reports the owned CLI as surviving (owned 1, survivors 1)."
+  runs: ["20261022T190450Z-a2578d", "20261022T225255Z-ac16a7"]
+  obs_telegram_blob: "755dcec2cd0889a1c1f7474f39c4db2bbb912389"
+  cli_runtime: "cc-2.1.59"
+  test: "tests/e2e/harness/suites/test_stop_escalation.py::test_stop_escalation_reaps_owned_cli_obs_22_43 (suite incident-stop-escalation, profile incident-stop-grace)"
+- bead: "F1 - Registry owner bead pending"
+  classification: "Product bug, owner outside obs-22 (cache-proxy stream relay or provider stream without message_stop): a dev fork child's API stream delivered its text but never completed, so the turn stayed open with no DoneEvent and no proxy index row."
+  runs: ["20261022T181903Z-b6ecc9"]
+  candidate_bead: "vault-wa5i (filed 2026-10-22T22:55:37Z from E1e's routing note; not yet confirmed as the Registry's owner bead)"
+  obs_telegram_blob: "755dcec2cd0889a1c1f7474f39c4db2bbb912389"
+  cli_runtime: "cc-2.1.59"
+  status: "register-only: one reproduction and no test, so no @known_bug marker may cite it yet"
