@@ -54,7 +54,7 @@ def pytest_configure(config):
 
 def _marker_info(item) -> dict:
     needs = {}
-    for mark in item.iter_markers("needs"):
+    for mark in reversed(list(item.iter_markers("needs"))):
         needs.update(mark.kwargs)
     suites: list[str] = []
     for mark in item.iter_markers("suite"):

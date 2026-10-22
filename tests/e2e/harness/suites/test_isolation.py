@@ -146,10 +146,9 @@ async def test_iii_lane_env_is_the_allow_list(lane):
     assert passed, findings or {"lanectl_equals_allow_list": lanectl_exact}
 
 
+@pytest.mark.needs(all_lanes=False, credential="dev")
 async def test_v_expired_lane_token_does_not_touch_production(lane):
     """Expire this lane's own token copy, then run a turn on it (probe (v), lane half)."""
-    if lane.profile.route != "claude":
-        pytest.skip("probe (v) needs a Claude-route lane (the lane holds a Claude token copy)")
     script = (
         "import json,time,os;p=os.path.expanduser('~/.claude/.credentials.json');d=json.load(open(p));"
         "d['claudeAiOauth']['expiresAt']=int((time.time()-3600)*1000);"
@@ -164,10 +163,9 @@ async def test_v_expired_lane_token_does_not_touch_production(lane):
                              "turn_subtype": end.get("subtype")})
 
 
+@pytest.mark.needs(all_lanes=False)
 async def test_vi_prod_send_is_update_free(lane):
     """Exercise the runner-side prod-send profile (update-free calls only), once per run."""
-    if int(lane.info.get("index", 0)) != 0:
-        pytest.skip("prod-send is exercised once per run, from lane index 0")
     if not lane.manifest.get("prod_send"):
         pytest.fail("this isolation run lacks --prod-send; probe (vi) must exercise prod-send")
     rpc = lane._rpc
