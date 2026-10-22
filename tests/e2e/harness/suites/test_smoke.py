@@ -6,6 +6,8 @@ the matching ``telegram_send``; timeouts only ever fail a test (R10).
 
 from __future__ import annotations
 
+import asyncio
+import re
 import uuid
 
 import pytest
@@ -17,6 +19,19 @@ def _nonce() -> str:
     return uuid.uuid4().hex[:8].upper()
 
 
+def _number_turn_output(event: dict) -> bool:
+    head = event.get("text_head") or ""
+    return "thinking" in head.lower() or bool(re.match(r"^\s*\d+(?:\s|$)", head))
+
+
+def _assert_partial_number_answer(messages: list[dict], total: int = 8000) -> None:
+    text = "\n".join(message.get("text") or "" for message in messages)
+    numbers = [int(value) for value in re.findall(r"(?m)^\s*(\d+)\s*$", text)]
+    assert len(numbers) < total // 2 and max(numbers, default=0) < total // 2, (
+        f"/stop did not interrupt the numbered answer: count={len(numbers)}, last={max(numbers, default=0)}, total={total}"
+    )
+
+
 async def test_send_reply_then_follow_up(lane):
     topic = await lane.new_topic()
     nonce = _nonce()
@@ -26,8 +41,7 @@ async def test_send_reply_then_follow_up(lane):
 
     second = await lane.turn(topic, f"Reply with exactly: PING-{nonce}")
     assert f"PING-{nonce}" in second.text, second.messages
-    # Negative assertion (design-v3 §2.3): after the first turn ended, nothing more
-    # was sent in this topic before the next turn started.
+    # The shared negative-window API excludes the next input's receipt acknowledgement.
     lane.assert_none("telegram_send", agent=topic, after=first.end, before=second.start)
     # The follow-up resumed the same conversation.
     assert second.end.get("session_id") == first.end.get("session_id"), (first.end, second.end)
@@ -38,16 +52,20 @@ async def test_stop_interrupts_running_turn(lane):
     nonce = _nonce()
     sent = await lane.send(
         topic,
-        "Write the whole numbered list from 1 to 3000, one number per line, with no other text.",
+        "Write every integer from 1 through 8000, one number per line, with no other text. Do not abbreviate or omit numbers.",
     )
     start = await lane.wait("turn_start", match={"trigger_message_id": sent.message_id})
+    output = await lane.wait("telegram_send", agent=topic, match=_number_turn_output, after=start)
     stop = await lane.command(topic, "/stop")
-    end = await lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start)
-    cleanup = await lane.wait("stop_cleanup", agent=topic, after=start)
+    ack, end, cleanup = await asyncio.gather(
+        lane.wait("telegram_send", agent=topic, match=lambda event: "interrupt sent" in (event.get("text_head") or "").lower(), after=output),
+        lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start),
+        lane.wait("stop_cleanup", agent=topic, after=start),
+    )
     assert cleanup.get("survivors") == 0, cleanup
+    assert ack["ts"] >= output["ts"] and end["ts"] >= output["ts"]
     replies = await lane.telegram.messages(topic, since=sent, from_bot=True)
-    assert not any("3000" in (m.get("text") or "") for m in replies), "the turn ran to completion; /stop did not interrupt it"
-    assert end["ts"] >= start["ts"]
+    _assert_partial_number_answer(replies)
 
     # The stopped agent is idle, not dead: the next message gets a normal turn.
     after = await lane.turn(topic, f"Reply with exactly: AFTER-{nonce}")
