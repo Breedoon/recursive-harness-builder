@@ -298,9 +298,10 @@ def _run_once(args) -> int:
                 continue
             used.add(token)
             resolved.append((index, profile, token, checks[token]))
+        manifest["preflight_eligible_lanes"] = len(resolved)
         _atomic_json(run_dir / "manifest.json", manifest)
-        if not resolved:
-            raise HarnessError("no valid unheld lane bots remain")
+        if len(resolved) != args.lanes:
+            raise HarnessError(f"requested {args.lanes} lanes but only {len(resolved)} eligible bots remain after reservations and holder probes")
         homes = []
         for index, profile, token, checked in resolved:
             name = f"lane{index}"

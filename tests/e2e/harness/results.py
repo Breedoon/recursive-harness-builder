@@ -130,6 +130,7 @@ def write_summary(run_dir: Path, *, junit: ET.ElementTree | None = None,
               "worker_exitcodes": worker_exitcodes, "lanes_excluded": manifest.get("lanes_excluded", []),
               "bots_excluded": manifest.get("bots_excluded", []),
               "requested_lanes": manifest.get("requested_lanes"), "active_lanes": len(manifest.get("lanes", [])),
+              "preflight_eligible_lanes": manifest.get("preflight_eligible_lanes"),
               "five_lane_count_met": len(manifest.get("lanes", [])) >= 5,
               "error": error}
     result["summary_line"] = (f"obs-e2e {result['run_id']}: exit={exit_code} "
