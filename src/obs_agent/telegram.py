@@ -786,6 +786,9 @@ class TelegramBot:
         # unread message every poll cycle within this daemon process. Pre-start
         # inbox messages are ignored after daemon restart.
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
+        # vault-ruoi: no-wake inbox rows held for a cold agent since its last turn, by
+        # (team, agent); its next turn gets one hint line. In memory only.
+        self._held_inbox_counts: dict[tuple[str, str], int] = {}
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._pending_schedule_owners: dict[str, tuple[_TopicScheduleRecord, Any]] = {}
         self._pending_schedule_owner_retirements: set[str] = set()
@@ -2890,6 +2893,10 @@ class TelegramBot:
                     if self._outage_inbox_floor is not None:
                         # B9: restarting is not a read acknowledgement. A launcher
                         # may not yet have consumed its pre-outage final report.
+                        continue
+                    if item.get("wake") is False:
+                        # vault-ruoi: a held row never wakes anything, so it stays
+                        # unread until its agent reads it, even after a kill switch.
                         continue
                     message_ts = self._try_parse_rfc3339_timestamp(item.get("timestamp"))
                     if message_ts is not None and message_ts >= self._inbox_wake_floor:
@@ -6553,7 +6560,16 @@ class TelegramBot:
                 "summary": str(args.get("summary") or "").strip() or f"from {label}",
                 "sender": label,
                 "allow_cold_wake": bool(args.get("allow_cold_wake")),
+                "hold_if_cold": bool(args.get("hold_if_cold")),
             })
+            held = result.get("tool_use_result") if isinstance(result.get("tool_use_result"), dict) else {}
+            if held.get("outcome") == "held":
+                # vault-ruoi: the recipient's next turn gets the held-notice hint.
+                self._note_held_inbox_rows(
+                    (str(held.get("team_name") or args["team_name"]).strip(),
+                     str(held.get("recipient") or args["recipient"]).strip()),
+                    1,
+                )
             return tool_result_to_control(result)
         if op == "stop":
             return await self._control_stop_child(args)
@@ -9908,6 +9924,11 @@ class TelegramBot:
                     logger.exception("[jsonl_recovery_failed] could not notify route=%s", state.route)
             raise
         self._recovery_failure_notified.pop(state.route, None)
+        held_hint = self._held_inbox_hint(state)
+        if held_hint is not None:
+            # vault-ruoi: no-wake rows were held for this agent while it was cold;
+            # its next turn, whatever started it, says where they are.
+            pending_messages.insert(0, held_hint)
 
         # Keep queued work owned by the route until session preflight succeeds.
         # A cancelled/failed detached delivery can then retry without losing it.
@@ -10739,6 +10760,17 @@ class TelegramBot:
             queued = _drain_queue(state.hook_state.message_queue)
             if not queued and not state.pending_messages:
                 return
+            # INVARIANT(cold-parent-notice-hold): an idle parent past its prompt-cache
+            # lifetime is never woken just to read AgentTask notices; they go to its
+            # inbox as no-wake rows. Any other queued item, a warm parent or a failed
+            # write delivers as before. Breaking it re-bills a cold parent's whole context.
+            # Doc: vault:Projects/Personal Projects/OBS Platform/Feature Inventory/Teams
+            if (
+                not state.pending_messages
+                and all(item.fork_task_id for item in queued)
+                and await self._hold_cold_task_notices(state, queued)
+            ):
+                return
             logger.info(
                 "Auto-delivering queued updates route=%s queued=%d pending=%d",
                 state.route, len(queued), len(state.pending_messages),
@@ -10766,6 +10798,103 @@ class TelegramBot:
                     state.route,
                     failed=raised or (isinstance(outcome, _RunOutcome) and outcome.failed),
                 )
+
+    def _inbox_key_for_route(self, route: TelegramRoute) -> tuple[str, str] | None:
+        """(team, agent) of the team inbox this route reads, as _recipient_cache_readiness resolves it."""
+        task_id = self._fork_task_by_child_route.get(route)
+        record = self._fork_tasks_by_id.get(task_id) if task_id else None
+        if record is not None:
+            team = (record.team_name or "").strip()
+            agent = (record.agent_name or "").strip()
+            if team and agent:
+                return team, agent
+        return self._route_inbox_target_keys_by_route.get(route)
+
+    def _note_held_inbox_rows(self, key: tuple[str, str], count: int) -> None:
+        if count > 0:
+            self._held_inbox_counts[key] = self._held_inbox_counts.get(key, 0) + count
+
+    async def _append_no_wake_inbox_rows(self, key: tuple[str, str], rows: list[dict[str, Any]]) -> bool:
+        """Append unread rows that never wake their agent (vault-ruoi); False writes nothing."""
+        from obs_agent.tools import _inbox_lock
+
+        inbox_path = self._team_inbox_path(key[0], key[1])
+        try:
+            inbox_path.parent.mkdir(parents=True, exist_ok=True)
+            async with _inbox_lock(inbox_path):
+                entries: list[dict[str, Any]] = []
+                if inbox_path.exists():
+                    loaded = json.loads(inbox_path.read_text(encoding="utf-8"))
+                    if not isinstance(loaded, list):
+                        return False
+                    entries = [item for item in loaded if isinstance(item, dict)]
+                entries.extend({**row, "read": False, "wake": False} for row in rows)
+                inbox_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
+        except Exception:
+            logger.warning("[cache_readiness] no-wake inbox write failed path=%s", inbox_path, exc_info=True)
+            return False
+        self._note_held_inbox_rows(key, len(rows))
+        return True
+
+    async def _hold_cold_task_notices(
+        self,
+        state: TelegramSessionState,
+        items: list[QueuedMessage],
+    ) -> bool:
+        """Hold AgentTask notices for a cold idle parent in its inbox (vault-ruoi).
+
+        True means every notice was written as a no-wake inbox row and no turn
+        should start. False (warm or unknown readiness, no inbox identity, write
+        failure) means deliver as before: over-deliver rather than lose a notice.
+        """
+        readiness = self._state_cache_readiness(state=state, session_id=state.session_id)
+        if readiness is None or not readiness.cold:
+            return False
+        key = self._inbox_key_for_route(state.route)
+        if key is None:
+            return False
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        rows: list[dict[str, Any]] = []
+        for item in items:
+            record = self._fork_tasks_by_id.get(item.fork_task_id or "")
+            child_name = ((record.agent_name or "").strip() if record is not None else "") or "agent-task"
+            child_team = ((record.team_name or "").strip() if record is not None else "") or key[0]
+            summary = self._record_summary(record) if record is not None else "Agent task finished"
+            rows.append({
+                "from": child_name,
+                "from_team": child_team,
+                "text": item.text,
+                "summary": f"{summary} (held: your prompt cache had expired)",
+                "timestamp": now,
+            })
+        if not await self._append_no_wake_inbox_rows(key, rows):
+            return False
+        for item, row in zip(items, rows):
+            logger.info(
+                "[cache_readiness] held agent-task notice route=%s team=%s recipient=%s task_id=%s child=%s idle=%.0fs family=%s",
+                state.route,
+                key[0],
+                key[1],
+                item.fork_task_id,
+                row["from"],
+                readiness.idle_seconds or 0,
+                readiness.family,
+            )
+        return True
+
+    def _held_inbox_hint(self, state: TelegramSessionState) -> QueuedMessage | None:
+        """One pending line for an agent whose inbox got no-wake rows since its last turn."""
+        key = self._inbox_key_for_route(state.route)
+        count = self._held_inbox_counts.pop(key, 0) if key is not None else 0
+        if count <= 0 or key is None:
+            return None
+        return QueuedMessage(
+            text=(
+                f"(System: {count} notice(s) arrived while you were idle past your prompt-cache lifetime; "
+                "they did not wake you and are unread in your inbox. Read them with "
+                f"ReadInbox team_name={key[0]}, agent={key[1]}, include_read=false, mark_read=true.)"
+            )
+        )
 
     def _record_auto_delivery_outcome(self, route: TelegramRoute, *, failed: bool) -> None:
         """Exponential backoff for auto-delivery that keeps failing (vault-qjit)."""
@@ -11885,6 +12014,12 @@ class TelegramBot:
                 "must_reply": False,
                 "replied": False,
             }
+            # INVARIANT(cold-parent-notice-hold): a bounce-back to a sender past its
+            # prompt-cache lifetime is a no-wake row (the inbox poller would otherwise
+            # wake it). Doc: vault:Projects/Personal Projects/OBS Platform/Feature Inventory/Teams
+            sender_readiness = self._recipient_cache_readiness(team_name=dead_team, agent_name=sender_name)
+            if sender_readiness is not None and sender_readiness.cold:
+                bounce_msg["wake"] = False
             try:
                 sender_entries: list = []
                 if sender_inbox.exists():
@@ -11898,6 +12033,16 @@ class TelegramBot:
                     sender_name,
                     dead_agent,
                 )
+                if bounce_msg.get("wake") is False:
+                    self._note_held_inbox_rows((dead_team, sender_name), 1)
+                    logger.info(
+                        "[cache_readiness] held bounce-back team=%s recipient=%s dead_agent=%s idle=%.0fs family=%s",
+                        dead_team,
+                        sender_name,
+                        dead_agent,
+                        sender_readiness.idle_seconds or 0,
+                        sender_readiness.family,
+                    )
             except Exception:
                 logger.debug(
                     "Failed sending bounce-back to %s for dead agent %s",
@@ -11941,6 +12086,12 @@ class TelegramBot:
             if not isinstance(item, dict):
                 continue
             if bool(item.get("read", False)):
+                continue
+            # INVARIANT(no-wake-inbox-row): a row written with "wake": false (held for a
+            # cold agent) is read only by ReadInbox and never starts a turn. Breaking it
+            # turns every held notice back into a cold wake.
+            # Doc: vault:Projects/Personal Projects/OBS Platform/Feature Inventory/Teams
+            if item.get("wake") is False:
                 continue
             message_ts = self._try_parse_rfc3339_timestamp(item.get("timestamp"))
             if message_ts is None or message_ts < self._inbox_wake_floor:
@@ -13312,8 +13463,13 @@ class TelegramBot:
             except Exception:
                 logger.exception("Failed to send parent completion marker for ForkTask task_id=%s", task_id)
             finally:
+                # vault-ruoi: tagged so _deliver_background_queue can hold it for a
+                # cold idle parent; the runner sees the same text as before.
                 parent_state.hook_state.message_queue.put_nowait(
-                    self._build_fork_task_callback_payload(record)
+                    QueuedMessage(
+                        text=self._build_fork_task_callback_payload(record),
+                        fork_task_id=record.task_id,
+                    )
                 )
 
         if (

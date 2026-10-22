@@ -379,6 +379,26 @@ the same call overrides. Human Telegram messages and scheduled wakes are never g
 - Code: `src/obs_agent/cache_readiness.py`; wiring in `telegram.py`
   (`_make_inbox_recipient_validator`, `_launch_fork_task`).
 
+**Automatic notices to a cold agent are held, not woken (vault-ruoi, 2026-10-22).** The same
+cold decision now covers notices nobody sends on purpose:
+- An AgentTask completion/idle/failed notice to a parent whose turn has ended and whose session is
+  past its cache lifetime does not start a turn. It is written to the parent's team inbox as an
+  unread row with `"wake": false` (log `[cache_readiness] held agent-task notice …`). A parent
+  that is running — including one blocked in `AgentTaskOutput(block=true)` — gets the notice in
+  its running turn as before; so does a warm idle parent, and any queue that also holds another
+  item.
+- A bounce-back to a cold sender of a dead agent is written the same way.
+- `SendInboxMessage` keeps its refusal for agents. The backend-only `hold_if_cold` argument
+  (not in the tool schema; scripts set it with `obs-agentctl message --hold-if-cold`) writes a
+  cold recipient's message as a `"wake": false` row instead (outcome `held`).
+- The inbox poller never wakes an agent for a `"wake": false` row, and a kill-switch start does
+  not mark such rows read. The agent's next turn, whatever starts it, begins with one line saying
+  how many held rows are unread and the `ReadInbox` call that shows them (in memory: after a
+  restart the rows stay unread without the line).
+- Code: `telegram.py` `_deliver_background_queue` / `_hold_cold_task_notices`,
+  `_latest_unread_team_inbox_message`, `_send_bounce_backs_for_dead_agent`, `_held_inbox_hint`;
+  `tools.py` `hold_if_cold`; `queueing.QueuedMessage.fork_task_id`.
+
 ### Sender team on inbox messages (vault-5lko)
 
 Every `SendInboxMessage` row records the sender's own tree as `from_team` (its root team key),

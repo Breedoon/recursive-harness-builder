@@ -6340,7 +6340,9 @@ class TestForkTaskRuntime:
         assert record.child_completion_message_id == 910
         assert record.parent_callback_message_id == 911
         assert "task-123" not in parent_state.active_fork_task_ids
-        queued = parent_state.hook_state.message_queue.get_nowait()
+        queued_item = parent_state.hook_state.message_queue.get_nowait()
+        assert queued_item.fork_task_id == "task-123"  # vault-ruoi: tagged notice
+        queued = queued_item.text
         assert "<task-notification>" in queued
         assert "<status>idle</status>" in queued
         assert "SECRET-42" in queued
@@ -7085,7 +7087,7 @@ class TestForkTaskRuntime:
             await bot._execute_fork_task("task-123")
 
         assert record.status == "stopped"
-        queued = parent_state.hook_state.message_queue.get_nowait()
+        queued = parent_state.hook_state.message_queue.get_nowait().text
         assert "<status>stopped</status>" in queued
 
     def test_fork_task_launch_builder_orders_stable_identity_before_uuid(self, config):

@@ -1500,6 +1500,13 @@ def create_obs_tools(
             allow_cold_wake = _coerce_bool_arg(args.get("allow_cold_wake", False), name="allow_cold_wake")
         except ValueError:
             return _error_result("Cannot use SendInboxMessage: allow_cold_wake must be true or false")
+        # vault-ruoi: backend-only like must_reply (absent from the MCP schema, so the tool
+        # list is unchanged). For scripts: a cold recipient gets a no-wake inbox row
+        # instead of a refusal; it reads it at its next own turn.
+        try:
+            hold_if_cold = _coerce_bool_arg(args.get("hold_if_cold", False), name="hold_if_cold")
+        except ValueError:
+            return _error_result("Cannot use SendInboxMessage: hold_if_cold must be true or false")
 
         if recipient.startswith(_EXTERNAL_SENDER_PREFIX):
             # obs-12: messages from scripts (obs-agentctl message) arrive "from external:NAME".
@@ -1561,9 +1568,16 @@ def create_obs_tools(
                     inbox_path = candidate_path
                     validation = candidate_validation
 
+        held = False
         if validation is not None and not _is_deliverable(validation):
             reason = str(validation.get("reason") or validation.get("warning") or "recipient has no current route binding")
             cold = bool(validation.get("cold"))
+            # INVARIANT(cold-parent-notice-hold): a hold_if_cold message to a cold
+            # recipient is written as a no-wake row and never notifies; everything else
+            # about the refusal is unchanged. Breaking it makes script notices cold wakes.
+            # Doc: vault:Projects/Personal Projects/OBS Platform/Feature Inventory/Teams
+            held = cold and hold_if_cold
+        if validation is not None and not _is_deliverable(validation) and not held:
             return {
                 "content": [{"type": "text", "text": reason if cold else f"message underdelivered: {reason}"}],
                 "tool_use_result": {
@@ -1598,6 +1612,8 @@ def create_obs_tools(
             if must_reply:
                 message["must_reply"] = True
                 message["replied"] = False
+            if held:
+                message["wake"] = False
             entries.append(message)
             inbox_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
 
@@ -1642,6 +1658,25 @@ def create_obs_tools(
         }
         if validation is not None and validation.get("warning"):
             response["warning"] = str(validation["warning"])
+        if held:
+            logger.info(
+                "[cache_readiness] held inbox message team=%s recipient=%s sender=%s",
+                team_name,
+                resolved_recipient,
+                sender,
+            )
+            return {
+                "content": [{"type": "text", "text": (
+                    f"message held in {resolved_recipient}'s inbox without a wake: {validation.get('reason') or 'recipient is cold'}"
+                )}],
+                "tool_use_result": {
+                    **response,
+                    "delivered": False,
+                    "held": True,
+                    "outcome": "held",
+                    "reason": str(validation.get("reason") or ""),
+                },
+            }
         notifier_result: dict[str, Any] | None = None
         if hook_state is not None and hook_state.inbox_message_notifier is not None:
             try:

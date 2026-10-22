@@ -12,6 +12,9 @@ class QueuedMessage:
     text: str
     telegram_message_id: int | None = None
     reply_to_message_id: int | None = None
+    # vault-ruoi: set only on an AgentTask completion/idle notice to its parent, so the
+    # idle-delivery path can hold it for a cold parent. Never sent to the model.
+    fork_task_id: str | None = None
 
 
 def coerce_queued_message(item: QueuedMessage | str) -> QueuedMessage:

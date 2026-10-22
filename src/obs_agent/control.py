@@ -213,13 +213,16 @@ class ControlServer:
 
 
 def _audit_outcome(result: dict[str, Any]) -> str:
-    """ok / cold_blocked (cold-cache guard refusal, vault-vokl) / failed (ops-1.11.13).
+    """ok / held (no-wake inbox row for a cold recipient, vault-ruoi) / cold_blocked (cold-cache
+    guard refusal, vault-vokl) / failed (ops-1.11.13).
 
     "refused" stays reserved for authentication failures.
     """
+    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+    if result.get("ok") and nested.get("outcome") == "held":
+        return "held"
     if result.get("ok"):
         return "ok"
-    nested = result.get("result") if isinstance(result.get("result"), dict) else {}
     if result.get("cold") or nested.get("outcome") == "cold_blocked":
         return "cold_blocked"
     return "failed"
@@ -290,6 +293,9 @@ def _parser() -> argparse.ArgumentParser:
     m.add_argument("--text", dest="content", required=True)
     m.add_argument("--summary", default=None)
     m.add_argument("--allow-cold-wake", action="store_true")
+    # default None: the flag is sent only when given, so plain messages keep their exact args.
+    m.add_argument("--hold-if-cold", action="store_true", default=None,
+                   help="a cold recipient gets the message as a no-wake inbox row instead of a refusal (vault-ruoi)")
     la = sub.add_parser("launch", parents=[common], help="AgentTask as if PARENT called it")
     la.add_argument("--parent-team", required=True)
     la.add_argument("--parent", dest="parent_agent", required=True)

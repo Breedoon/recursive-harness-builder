@@ -5,7 +5,7 @@ the reflection watcher) can wake or launch agents without an agent in the loop.
 
 ```text
 obs-agentctl --as error-monitor ping
-obs-agentctl --as error-monitor message --team <root_team_key> --to <agent_name> --text "..." [--summary ..] [--allow-cold-wake]
+obs-agentctl --as error-monitor message --team <root_team_key> --to <agent_name> --text "..." [--summary ..] [--allow-cold-wake | --hold-if-cold]
 obs-agentctl --as nightly-check launch --parent-team <team> --parent <agent> --name "Fix X" --prompt "..." [--fresh] [--model ..] [--prompt-file ..] [--hooks '{..}'] [--session-source ..] [--allow-cold-wake]
 obs-agentctl --as nightly-check new-tree --title "Disk alert" (--prompt "..." | --prompt-file P) [--chat NAME|ID | --chat-id N] [--model ..] [--effort ..] [--hooks '{..}'] [--env '{..}'] [--origin-team T --origin-agent A]
 ```
@@ -33,7 +33,9 @@ obs-agentctl --as nightly-check new-tree --title "Disk alert" (--prompt "..." | 
   - over Tailscale: `ssh -p 2220 agent@100.66.160.62 '...'` with a key in that same file.
 - Global flags (`--as`, `--json`, `--idempotency-key`) may go before or after the op name (ops-1.11.5). `--as` is required.
 - Every request, accepted or refused, is appended to `obs-control/audit.jsonl`.
-  - Outcomes: `ok`; `cold_blocked` when the cold-cache guard (vault-vokl) refused a message or a
+  - Outcomes: `ok`; `held` when `message --hold-if-cold` wrote a cold recipient's message as a
+    no-wake inbox row instead of waking it (vault-ruoi; see configuration.md "Cold-cache guard");
+    `cold_blocked` when the cold-cache guard (vault-vokl) refused a message or a
     fork (ops-1.11.13); `failed` when the dispatched action did not happen for any other reason;
     `refused` only for an authentication failure (peer uid or token); `invalid` for a malformed
     request; `replayed` for an idempotency hit. Entries written before the ops-1.11.13 deploy
