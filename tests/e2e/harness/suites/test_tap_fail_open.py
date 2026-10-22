@@ -58,10 +58,18 @@ async def test_tap_write_failure_keeps_reply_schedule_and_agenttask_alive(lane):
     pong = f"TAP-PONG-{nonce}"
     sent = await lane.send(topic, f"Reply with exactly: {pong}")
     replies = await _until_changed(lane, lambda: _messages(lane, topic, sent, pong))
-    route = _rows(lane, "SELECT session_id, agent_lineage_json FROM route_state WHERE chat_id=? AND thread_id=?",
+    route = _rows(lane, "SELECT session_id FROM route_state WHERE chat_id=? AND thread_id=?",
                   (topic.chat_id, topic.topic_id))[0]
-    lineage = json.loads(route["agent_lineage_json"])
-    assert route["session_id"] and lineage, route
+    identity_result = await lane.exec(
+        "/workspace/obs/.venv/bin/python", "-c",
+        "import json,sys;from obs_agent.lineage import find_latest_obs_bootstrap_for_session;"
+        "b=find_latest_obs_bootstrap_for_session(session_id=sys.argv[1],cwd='/workspace/runtime/git/obs-vault-active');"
+        "assert b is not None;print(json.dumps({'team':b.root_team_key,'agent':b.agent_name}))",
+        route["session_id"], env={"PYTHONPATH": lane.info["code_dir"] + "/src"},
+    )
+    assert identity_result["rc"] == 0, identity_result
+    identity = json.loads(identity_result["stdout"])
+    assert identity["team"] and identity["agent"], identity
 
     description = f"E2E tap fail-open {nonce}"
     scheduled_marker = f"TAP-SCHEDULE-{nonce}"
@@ -87,7 +95,7 @@ async def test_tap_write_failure_keeps_reply_schedule_and_agenttask_alive(lane):
 
     child_marker = f"TAP-CHILD-{nonce}"
     launch = await lane.control(
-        "--as", "obs-e2e-tap-selftest", "--json", "launch", "--parent-team", lineage[0], "--parent", lineage[-1],
+        "--as", "obs-e2e-tap-selftest", "--json", "launch", "--parent-team", identity["team"], "--parent", identity["agent"],
         "--name", f"tap fail-open child {nonce}", "--prompt", f"Reply with exactly: {child_marker}", "--fresh",
     )
     assert launch["rc"] == 0, launch
