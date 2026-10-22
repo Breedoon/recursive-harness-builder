@@ -91,6 +91,26 @@ class TestIdleDeliveryHold:
         assert hint is not None and "1 notice(s)" in hint.text and f"agent={AGENT}" in hint.text
         assert bot._held_inbox_hint(parent) is None
 
+    def test_sender_team_matches_the_wake_eligible_message(self, config, tmp_path, monkeypatch):
+        bot, _, _ = _parent(config, tmp_path, monkeypatch, age_seconds=60)
+        inbox = tmp_path / ".claude" / "teams" / TEAM / "inboxes" / f"{AGENT}.json"
+        inbox.parent.mkdir(parents=True)
+        eligible = {
+            "from": "ordinary-sender", "from_team": "ordinary-team", "text": "ordinary",
+            "summary": "ordinary summary", "timestamp": "2030-01-01T00:00:00Z", "read": False,
+        }
+        for excluded in (
+            {"wake": False},
+            {"timestamp": "1970-01-01T00:00:00Z"},
+            {"must_reply": True, "replied": True},
+        ):
+            newer = {**eligible, "from": "excluded-sender", "from_team": "excluded-team", **excluded}
+            inbox.write_text(json.dumps([eligible, newer]))
+            assert bot._latest_unread_team_inbox_message(team_name=TEAM, agent_name=AGENT) == (
+                "ordinary-sender", "ordinary summary", "ordinary",
+            )
+            assert bot._latest_unread_sender_team(team_name=TEAM, agent_name=AGENT) == "ordinary-team"
+
     def test_kill_switch_start_keeps_held_rows_unread(self, config, tmp_path, monkeypatch):
         bot, _, _ = _parent(config, tmp_path, monkeypatch, age_seconds=60)
         inbox = tmp_path / ".claude" / "teams" / TEAM / "inboxes" / f"{AGENT}.json"

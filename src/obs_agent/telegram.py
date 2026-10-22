@@ -12052,7 +12052,7 @@ class TelegramBot:
                 )
 
     def _latest_unread_sender_team(self, *, team_name: str, agent_name: str) -> str | None:
-        """vault-5lko: the latest unread message's sender team, when recorded."""
+        """vault-5lko/ruoi: the wake-eligible unread message's sender team, when recorded."""
         inbox_path = self._team_inbox_path(team_name, agent_name)
         try:
             entries = json.loads(inbox_path.read_text(encoding="utf-8"))
@@ -12061,8 +12061,17 @@ class TelegramBot:
         if not isinstance(entries, list):
             return None
         for item in reversed(entries):
-            if isinstance(item, dict) and not bool(item.get("read", False)):
-                return str(item.get("from_team") or "").strip() or None
+            if not isinstance(item, dict) or bool(item.get("read", False)) or item.get("wake") is False:
+                continue
+            message_ts = self._try_parse_rfc3339_timestamp(item.get("timestamp"))
+            if message_ts is None or message_ts < self._inbox_wake_floor:
+                continue
+            if item.get("must_reply") and item.get("replied"):
+                continue
+            # INVARIANT(no-wake-inbox-row): match the message selector below so a
+            # held/stale/replied row cannot attribute another sender's wake to its team.
+            # Doc: vault:Projects/Personal Projects/OBS Platform/Feature Inventory/Teams
+            return str(item.get("from_team") or "").strip() or None
         return None
 
     def _latest_unread_team_inbox_message(

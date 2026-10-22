@@ -111,7 +111,7 @@ class TestSenderTeam:
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps([
             {"from": "a", "text": "1", "read": True, "from_team": "old"},
-            {"from": "b", "text": "2", "read": False, "from_team": "team-z"},
+            {"from": "b", "text": "2", "read": False, "from_team": "team-z", "timestamp": "2030-01-01T00:00:00Z"},
         ]))
         assert bot._latest_unread_sender_team(team_name="team", agent_name="agent") == "team-z"
         path.write_text(json.dumps([{"from": "b", "text": "2", "read": False}]))
