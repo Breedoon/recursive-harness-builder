@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import os
 import re
 import socket
@@ -18,6 +19,24 @@ class RpcError(RuntimeError):
         self.status = status
         self.payload = payload
         super().__init__(f"RPC status {status}: {payload.get('error', 'request failed') if isinstance(payload, dict) else 'request failed'}")
+
+
+class _FloodMetadata(logging.Handler):
+    def __init__(self, path: Path):
+        super().__init__()
+        self.path = path
+
+    def emit(self, record):
+        matched = re.search(r"Sleeping(?: early)? for (\d+)s .* on (\w+) flood wait", record.getMessage())
+        if matched is None:
+            return
+        row = {"ts": record.created, "request_class": matched.group(2),
+               "sleep_s": int(matched.group(1)), "early": "Sleeping early" in record.getMessage()}
+        try:
+            with self.path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row) + "\n")
+        except OSError:
+            pass
 
 
 def _encode_request(path: str, body, method: str | None) -> bytes:
@@ -61,7 +80,7 @@ def _decode_response(first: str, data: bytes):
 
 
 class RpcClient:
-    def __init__(self, sock_path: Path | str, *, timeout: float = 120):
+    def __init__(self, sock_path: Path | str, *, timeout: float = 125):
         self.sock_path = str(sock_path)
         self.timeout = timeout
 
@@ -110,6 +129,10 @@ class TelegramRPCServer:
         self.server: asyncio.AbstractServer | None = None
         self._topic_chats: dict[tuple[str, int], int] = {}
         self._connections: set[asyncio.Task] = set()
+        self._call_sequence = 0
+        self._flood_logger = logging.getLogger("telethon.client.users")
+        self._flood_handler = _FloodMetadata(self.run_dir / "runner" / "telegram-transport.jsonl")
+        self._previous_flood_level = self._flood_logger.level
 
     async def start(self) -> None:
         self.sock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,6 +140,8 @@ class TelegramRPCServer:
             self.sock_path.unlink()
         self.server = await asyncio.start_unix_server(self._handle, path=str(self.sock_path))
         os.chmod(self.sock_path, 0o600)
+        self._flood_logger.setLevel(logging.INFO)
+        self._flood_logger.addHandler(self._flood_handler)
 
     async def close(self) -> None:
         if self.server is not None:
@@ -128,6 +153,14 @@ class TelegramRPCServer:
         if self._connections:
             await asyncio.gather(*list(self._connections), return_exceptions=True)
         self.sock_path.unlink(missing_ok=True)
+        self._flood_logger.removeHandler(self._flood_handler)
+        self._flood_logger.setLevel(self._previous_flood_level)
+
+    def _phase(self, call_id: int, phase: str, path: str, lane, status: int | None, started: float) -> None:
+        row = {"ts": time.time(), "call_id": call_id, "phase": phase, "path": path, "lane": lane,
+               "status": status, "duration_s": time.monotonic() - started}
+        with (self.run_dir / "runner" / "rpc-phases.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
 
     def _log(self, path: str, lane, status: int, duration: float) -> None:
         row = {"ts": time.time(), "path": path, "lane": lane, "status": status, "duration_s": duration}
@@ -138,6 +171,8 @@ class TelegramRPCServer:
         task = asyncio.current_task()
         self._connections.add(task)
         started, path, lane, status = time.monotonic(), "?", None, 500
+        self._call_sequence += 1
+        call_id = self._call_sequence
         try:
             async with asyncio.timeout(120):
                 first, data = await _read_frame(reader)
@@ -148,6 +183,7 @@ class TelegramRPCServer:
                 if not isinstance(body, dict):
                     raise RpcError(400, {"error": "JSON object required"})
                 lane = body.get("lane")
+                self._phase(call_id, "received", path, lane, None, started)
                 payload = await self.dispatch(method, path, body)
                 status = 200
         except RpcError as exc:
@@ -159,12 +195,14 @@ class TelegramRPCServer:
             status, payload = 500, {"error": exc.__class__.__name__}
         except asyncio.CancelledError:
             status, payload = 503, {"error": "RPC server is closing"}
+        self._phase(call_id, "dispatched", path, lane, status, started)
         try:
             data = json.dumps(payload, default=_json_default).encode("utf-8")
             reason = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed"}.get(status, "Internal Server Error")
             writer.write((f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n"
                           f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n").encode() + data)
             await writer.drain()
+            self._phase(call_id, "written", path, lane, status, started)
         except (ConnectionError, BrokenPipeError):
             pass
         finally:
@@ -175,6 +213,7 @@ class TelegramRPCServer:
                 pass
             finally:
                 self._log(path, lane, status, time.monotonic() - started)
+                self._phase(call_id, "closed", path, lane, status, started)
                 self._connections.discard(task)
 
     async def dispatch(self, method: str, path: str, body: dict):

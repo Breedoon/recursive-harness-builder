@@ -67,9 +67,10 @@ class TurnResult:
 class _Uds:
     """JSON over HTTP on a Unix socket (lanectl and the runner's Telegram RPC)."""
 
-    def __init__(self, path: Path, name: str) -> None:
+    def __init__(self, path: Path, name: str, *, default_timeout: float = 60) -> None:
         self.path = Path(path)
         self.name = name
+        self.default_timeout = default_timeout
         self._client: httpx.AsyncClient | None = None
 
     def client(self) -> httpx.AsyncClient:
@@ -79,8 +80,9 @@ class _Uds:
             )
         return self._client
 
-    async def call(self, method: str, path: str, body: dict | None = None, timeout: float = 60) -> Any:
-        resp = await self.client().request(method, path, json=body, timeout=timeout)
+    async def call(self, method: str, path: str, body: dict | None = None, timeout: float | None = None) -> Any:
+        resp = await self.client().request(method, path, json=body,
+                                           timeout=self.default_timeout if timeout is None else timeout)
         try:
             data = resp.json()
         except ValueError:
@@ -134,7 +136,8 @@ class Lane:
         self.events = EventLog(self.lane_dir / "events.jsonl", timing=self.timing)
         self.telegram = TelegramView(self)
         self._ctl = _Uds(self.lane_dir / "lanectl.sock", f"lanectl-{self.name}")
-        self._rpc = _Uds(self.run_dir / "runner" / "telegram.sock", "telegram-rpc")
+        # The broker bounds Telegram work at 120s; allow its response frame to arrive.
+        self._rpc = _Uds(self.run_dir / "runner" / "telegram.sock", "telegram-rpc", default_timeout=125)
         self._jsonl: dict[str, JsonlTail] = {}
         self._profile = None
 
