@@ -11,6 +11,7 @@ from tests.e2e.harness.suites.test_smoke import _assert_partial_number_answer
 pytestmark = [pytest.mark.suite("incident"), pytest.mark.needs(all_lanes=False, credential="dev")]
 
 
+@pytest.mark.known_bug("obs-22.24")
 async def test_preflight_stop_obs_22_24(lane):
     topic = await lane.new_topic()
     sent = await lane.send(topic, "Write the whole numbered list from 1 to 3000, one number per line, with no other text.")

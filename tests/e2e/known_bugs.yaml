@@ -1,0 +1,5 @@
+- bead: obs-22.24
+  classification: "Product bug in src/obs_agent/telegram.py:_request_route_interrupt and _escalate_stop: stop intent before SDK connection is not applied when the captured client=None is replaced."
+  runs: ["20261022T085610Z-1b3e0f", "20261022T100410Z-8ecad4"]
+  obs_telegram_blob: "755dcec2cd0889a1c1f7474f39c4db2bbb912389"
+  cli_runtime: "cc-2.1.59"
