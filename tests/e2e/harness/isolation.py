@@ -144,8 +144,10 @@ def _lane_pin_keys(run_dir: Path) -> set[str]:
             data = json.loads(pins.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        for table in data.values() if isinstance(data, dict) else []:
-            if isinstance(table, dict):
+        # EffortPinStore.texts de-duplicates common section content by its hash;
+        # only the other tables' keys identify conversations and their prefixes.
+        for name, table in data.items() if isinstance(data, dict) else []:
+            if name != "texts" and isinstance(table, dict):
                 keys.update(table.keys())
     return keys
 
@@ -171,7 +173,7 @@ def after_run(run_dir: Path, before: dict, *, prod_send_exercised_required: bool
             elif name == "effort-pins.json":
                 try:
                     prod = json.loads(path.read_text(encoding="utf-8"))
-                    prod_keys = {k for t in prod.values() if isinstance(t, dict) for k in t}
+                    prod_keys = {k for name, table in prod.items() if name != "texts" and isinstance(table, dict) for k in table}
                 except (OSError, ValueError):
                     prod_keys = set()
                 hits = len(prod_keys & lane_pins)
