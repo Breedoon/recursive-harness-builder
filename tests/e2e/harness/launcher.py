@@ -198,6 +198,7 @@ def _run_once(args) -> int:
     from . import credcheck, creds, docker, profiles, provision
     from .results import compute_timing, write_summary
     from .secrets import bot_id_of, fingerprint, production_bot_tokens, read_env_file, resolve
+    from .userbot import UserbotLock, UserbotLockTimeout
     import httpx
 
     run_id = args.run_id or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + random_secrets.token_hex(3)
@@ -217,6 +218,7 @@ def _run_once(args) -> int:
                 "forums_path": str(_registry_dir() / "forums.json")}
     _atomic_json(run_dir / "manifest.json", manifest)
     resync, sentinel, result = None, None, 2
+    launch_lock = None
     isolation, isolation_before = None, None
     previous_handlers = {}
 
@@ -265,6 +267,16 @@ def _run_once(args) -> int:
             raise HarnessError("a candidate lane bot resolves to a production token")
         if not candidates:
             raise HarnessError("no unreserved candidate lane bots remain")
+        # INVARIANT(credential-selection): a launch lease precedes holder probes and lasts through teardown; the runner separately owns its client lock. Breaking it lets parallel probes displace each other's getUpdates before serialization.
+        # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Runner#Single userbot client
+        session_lock = UserbotLock.for_session(resolve("env:OBS_TEST_TELEGRAM_SESSION", secret_env))
+        launch_lock = UserbotLock(session_lock.path.with_suffix(".launch.lock"))
+        launch_lock.acquire(
+            timeout=args.userbot_lock_timeout, owner={"run_id": run_id, "by": "obs-e2e launcher"},
+            on_wait=lambda holder: print(f"obs-e2e {run_id}: waiting for userbot session launch lock before bot probes "
+                                         f"at {_now()}, held by {holder}", flush=True),
+        )
+        print(f"obs-e2e {run_id}: acquired userbot session launch lock at {_now()}", flush=True)
         prepared = {}
         manifest["bot_probes_started_at"] = _now()
         print(f"obs-e2e {run_id}: checking {len(candidates)} candidate bots concurrently; "
@@ -374,8 +386,8 @@ def _run_once(args) -> int:
         _atomic_json(run_dir / "manifest.json", manifest)
         write_summary(run_dir, error="launcher interrupted", exit_code=result)
     except Exception as exc:
-        result = 2
-        message = str(exc) if isinstance(exc, HarnessError) else exc.__class__.__name__
+        result = 3 if isinstance(exc, UserbotLockTimeout) else 2
+        message = str(exc) if isinstance(exc, (HarnessError, UserbotLockTimeout)) else exc.__class__.__name__
         _atomic_json(run_dir / "manifest.json", manifest)
         write_summary(run_dir, error=message, exit_code=result)
         print(f"obs-e2e: {message}", file=sys.stderr, flush=True)
@@ -435,6 +447,8 @@ def _run_once(args) -> int:
         if (run_dir / "summary.json").exists():
             summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
             print(summary["summary_line"], flush=True)
+        if launch_lock is not None:
+            launch_lock.release()
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
     return result
