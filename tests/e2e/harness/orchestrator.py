@@ -228,14 +228,26 @@ async def _ready(lane: dict, run_dir: Path, timeout: float) -> None:
             raise LaneHeldError(lane, stop_error)
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
-            raise HarnessError(f"lane {lane['lane']} not ready within {timeout}s (last state: {last})")
+            unavailable = []
+            if isinstance(last, dict):
+                if not last.get("supervisord"):
+                    unavailable.append("supervisord")
+                if last.get("obs") != "RUNNING":
+                    unavailable.append("OBS daemon")
+                if not last.get("proxy_healthy"):
+                    unavailable.append("cache proxy")
+            else:
+                unavailable.append("lane control socket")
+            raise HarnessError(f"lane {lane['lane']} not ready within {timeout}s; "
+                               f"unavailable dependencies: {', '.join(unavailable)} (last state: {last})")
         try:
             state = await RpcClient(path, timeout=min(5, remaining)).acall("/ready", method="GET")
             last = {key: state.get(key) for key in ("supervisord", "obs", "proxy_healthy")}
             if state.get("supervisord") and state.get("obs") == "RUNNING" and state.get("proxy_healthy"):
                 return
         except (OSError, TimeoutError, EOFError):
-            last = "control socket unavailable"
+            if not isinstance(last, dict):
+                last = "control socket unavailable"
         # The control socket represents a kernel/external resource, not a timed test assertion.
         await asyncio.sleep(min(0.25, max(0.0, deadline - asyncio.get_running_loop().time())))
 
