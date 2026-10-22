@@ -1,7 +1,7 @@
 """obs-e2e smoke suite (E1 WP10): send/reply, /stop and a fork, on every lane.
 
-Every wait is on an event-tap event or a Telegram message the runner reads after
-the matching ``telegram_send``; timeouts only ever fail a test (R10).
+Every wait observes a tap event, a real CLI JSONL row or matching Telegram
+readback; timeouts only ever fail a test (R10).
 """
 
 from __future__ import annotations
@@ -17,11 +17,6 @@ pytestmark = [pytest.mark.suite("smoke"), pytest.mark.needs(all_lanes=True)]
 
 def _nonce() -> str:
     return uuid.uuid4().hex[:8].upper()
-
-
-def _number_turn_output(event: dict) -> bool:
-    head = event.get("text_head") or ""
-    return "thinking" in head.lower() or bool(re.match(r"^\s*\d+(?:\s|$)", head))
 
 
 def _assert_partial_number_answer(messages: list[dict], total: int = 8000) -> None:
@@ -50,15 +45,28 @@ async def test_send_reply_then_follow_up(lane):
 async def test_stop_interrupts_running_turn(lane):
     topic = await lane.new_topic()
     nonce = _nonce()
+    primed = await lane.turn(topic, f"Reply with exactly: READY-{nonce}")
+    assert f"READY-{nonce}" in primed.text, primed.messages
+    fixture = "/workspace/runtime/git/obs-vault-active/CLAUDE.md"
     sent = await lane.send(
         topic,
-        "Write every integer from 1 through 8000, one number per line, with no other text. Do not abbreviate or omit numbers.",
+        f"First call the Read tool once on {fixture}. Then write every integer from 1 through 8000, "
+        "one number per line, with no other text. Do not abbreviate or omit numbers.",
     )
     start = await lane.wait("turn_start", match={"trigger_message_id": sent.message_id})
-    output = await lane.wait("telegram_send", agent=topic, match=_number_turn_output, after=start)
+    session_id = start.get("session_id") or primed.end["session_id"]
+    cursor = float(start["ts"])
+    async with asyncio.timeout(120):
+        while True:
+            output = await lane.wait("jsonl_append", match={"session_id": session_id, "type": "assistant"}, after=cursor)
+            blocks = (output["row"].get("message") or {}).get("content") or []
+            if any(isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Read"
+                   and (block.get("input") or {}).get("file_path") == fixture for block in blocks):
+                break
+            cursor = output
     stop = await lane.command(topic, "/stop")
     ack, end, cleanup = await asyncio.gather(
-        lane.wait("telegram_send", agent=topic, match=lambda event: "interrupt sent" in (event.get("text_head") or "").lower(), after=output),
+        lane.wait("telegram_send", agent=topic, match=lambda event: "interrupt sent" in (event.get("text_head") or "").lower(), after=float(output["ts"])),
         lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start),
         lane.wait("stop_cleanup", agent=topic, after=start),
     )
