@@ -48,6 +48,7 @@ from obs_agent.config import (
     parse_context_suffix,
     resolve_model,
 )
+from obs_agent import event_tap as _event_tap
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
 from obs_agent.context_jsonl import find_session_jsonl
@@ -992,6 +993,7 @@ class TelegramBot:
                         message_thread_id=op.route.thread_id,
                     )
                     self._note_chat_send_success(op.route.chat_id)
+                    _event_tap.emit_route("telegram_send", self, op.route, message_id=getattr(sent, "message_id", None), reply_to_message_id=op.reply_to_message_id, text=op.text, text_head=160)
                     return sent
                 except RetryAfter as exc:
                     delay = max(float(exc.retry_after), 1.0)
@@ -4640,6 +4642,7 @@ class TelegramBot:
                 state.hook_state.schedule_run_active = True
                 state.hook_state.triggered_schedule_id = record.schedule_id
                 state.hook_state.active_schedule = self._schedule_summary_payload(record)
+                _event_tap.emit_route("schedule_fired", self, record.route, state=state, schedule_id=record.schedule_id, trigger_kind=trigger_kind)
                 try:
                     outcome = await self._run_and_send(
                         state=state,
@@ -5323,6 +5326,7 @@ class TelegramBot:
                 type(exc).__name__,
                 exc,
             )
+            _event_tap.emit_route("recovery", self, state.route, state=state, source=source, outcome="failed", reason=target.reason, error=type(exc).__name__)
             raise
         logger.warning(
             "[jsonl_recovery] route=%s source=%s old_session_id=%s "
@@ -5336,6 +5340,7 @@ class TelegramBot:
             target.health.first_unsafe_tail_uuid,
             target.health.first_poison_uuid,
         )
+        _event_tap.emit_route("recovery", self, state.route, state=state, source=source, outcome="forked", old_session_id=session_id, session_id=recovery_session_id, reason=target.health.unsafe_tail_reason)
 
         self._set_session_head(session_id=session_id, jsonl_uuid=target.target_uuid)
         self._set_session_head(session_id=recovery_session_id, jsonl_uuid=target.target_uuid)
@@ -5966,6 +5971,7 @@ class TelegramBot:
             except Exception:
                 logger.warning("[stop_escalation] retained tree kill failed route=%s", state.route, exc_info=True)
         if not stopped_turn_active:
+            _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="turn_ended", owned=len(owned), survivors=lambda: len(_maint.refresh_process_tree(dict(owned))))
             return
         logger.warning("[stop_escalation] disconnecting stopped CLI pid=%s route=%s", pid, state.route)
         session_mgr = state.session_manager
@@ -5984,6 +5990,7 @@ class TelegramBot:
             # The owned OS tree was already reaped above. Bypassing this lock
             # could instead kill a replacement client or clobber its reference.
             logger.warning("[stop_escalation] stopped client teardown unavailable route=%s", state.route, exc_info=True)
+        _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="disconnected", owned=len(owned), survivors=lambda: len(_maint.refresh_process_tree(dict(owned))))
 
     async def _request_route_interrupt(self, state: TelegramSessionState) -> bool:
         """Set interrupt intent and attempt SDK interrupt for one route."""
@@ -9915,6 +9922,7 @@ class TelegramBot:
             "[run_and_send] START route=%s msg=%s",
             state.route, user_text[:80],
         )
+        _event_tap.emit_route("turn_start", self, state.route, state=state, trigger_message=trigger_message, schedule_id=triggered_schedule_id, text=user_text)
 
         state.inflight_user_text = user_text
         try:
@@ -10355,6 +10363,7 @@ class TelegramBot:
                         )
                 except Exception:
                     logger.debug("Failed to send completion summary in finally", exc_info=True)
+            _event_tap.emit_route("turn_end", self, state.route, state=state, trigger_message=trigger_message, schedule_id=triggered_schedule_id, failed=failed, turns=turn_count, subtype=lambda: _event_tap.result_subtype(runner, failed=failed, interrupted=interrupt_discarded_count is not None), cli_runtime=lambda: _event_tap.cli_runtime(state))
 
         if (
             not trigger_user_mapped
@@ -11736,6 +11745,7 @@ class TelegramBot:
                 content=content,
             )
         )
+        _event_tap.emit_route("inbox_delivered", self, state.route, state=state, team=team_name, agent_name=agent_name, sender=sender, mode="post_stop" if state.busy and state.hook_state.stop_requested_at is not None else "queued")
         if state.busy and state.hook_state.stop_requested_at is not None:
             # The stopped turn discards its leftover queue when it ends; keep
             # this later notice out of that discard.
@@ -12004,6 +12014,7 @@ class TelegramBot:
                 f"Cannot wake team worker {agent_name}: no bot available for route={record.child_route}"
             )
         child_state.last_bot = bot
+        _event_tap.emit_route("inbox_delivered", self, record.child_route, state=child_state, team=team_name, agent_name=agent_name, sender=sender, mode="wake")
 
         sender_norm = (sender or "").strip() or None
         summary_norm = (summary or "").strip() or None
@@ -12126,6 +12137,7 @@ class TelegramBot:
             content=content_norm,
         )
         self._clear_stop_latch(state, "inbox_wake")
+        _event_tap.emit_route("inbox_delivered", self, state.route, state=state, team=team_name, agent_name=agent_name, sender=sender_norm, mode="wake")
         queued_before = _drain_queue(state.hook_state.message_queue)
         await self._run_and_send(
             state=state,

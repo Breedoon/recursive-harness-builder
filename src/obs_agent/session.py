@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+from obs_agent import event_tap as _event_tap
 from obs_agent._sdk_patch import ensure_query_close_patch, ensure_raw_uuid_patch
 from obs_agent.hooks import HookState, create_hook_matchers
 from obs_agent.prompt import (
@@ -639,6 +640,7 @@ class SessionManager:
         else:
             options.resume = None
 
+        _event_tap.emit_session_build(options, env_overrides=self._sdk_env_overrides, session_id=options.resume or self._session_id, model=cli_model, claude_route=is_claude_model(clean_model))
         return options
 
     # CACHE-PREFIX WARNING: every reconnect/wake resumes from JSONL (prepare_session_replay
@@ -882,6 +884,7 @@ class SessionManager:
             )
             self._session_id = new_session_id
             self.last_activity = time.time()
+            _event_tap.emit("recovery", source="poisoned_session", outcome="forked", old_session_id=old_session_id, session_id=new_session_id, reason=target.health.unsafe_tail_reason, agent_name=self._sdk_env_overrides.get("CLAUDE_CODE_AGENT_NAME"), team=self._sdk_env_overrides.get("CLAUDE_CODE_TEAM_NAME"))
             return old_session_id, new_session_id, target.target_uuid
 
     async def soft_reset(self) -> None:
