@@ -274,7 +274,7 @@ class TelegramRPCServer:
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", method):
             raise RpcError(400, {"error": "invalid Bot API method"})
         is_prod = profile == "prod-send" or credential_class == "prod-send"
-        # INVARIANT(prod-send): no production polling/session-control calls.
+        # INVARIANT(credential-selection): prod-send never calls getUpdates, setWebhook, deleteWebhook, close or logOut, and calls only its allowed_methods. Breaking it consumes or disrupts production's update stream.
         # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Profiles#prod-send
         if is_prod and method.lower() in {"getupdates", "setwebhook", "deletewebhook", "close", "logout"}:
             self._botapi_log(method, token, profile, refused=True)

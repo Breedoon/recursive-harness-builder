@@ -153,7 +153,7 @@ def shard_tests(tests: list[dict], lanes: list[dict], suites: str = "all") -> di
 
 
 def _worker_env(run_dir: Path, **extra: str) -> dict[str, str]:
-    # INVARIANT(single-userbot): worker processes cannot create their own session client.
+    # INVARIANT(credential-selection): pytest worker processes never get the userbot session and cannot create a Telethon client. Breaking it risks AUTH_KEY_DUPLICATED on the test account.
     # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Runner#Single userbot client
     env = {name: value for name, value in os.environ.items()
            if name != "OBS_E2E_PROD_SEND_TOKEN" and

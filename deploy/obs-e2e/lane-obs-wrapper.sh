@@ -71,8 +71,8 @@ watch_cache_proxy() {
 }
 
 terminate_rest_of_group() {
-  # INVARIANT: run only inside a lane PID namespace, never next to production.
-  # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Isolation
+  # INVARIANT(process-identity): this wrapper runs only inside a lane PID namespace, never next to production. Breaking it lets the lane OBS's restart and reaper code act on production processes.
+  # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
   trap '' TERM INT
   local pgid
   pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"

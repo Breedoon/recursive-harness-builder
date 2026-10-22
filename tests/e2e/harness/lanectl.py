@@ -274,7 +274,7 @@ print(json.dumps(answer))
         if action == "kill_tree" and type(pid) is not int:
             raise ValueError("pid must be an integer")
         env = dict(os.environ, PYTHONPATH=str(Path(self.config["code_dir"]) / "src"))
-        # INVARIANT(process-identity): probe only in a lane PID namespace; sharing can kill production.
+        # INVARIANT(process-identity): probe and signal only inside a lane PID namespace. Breaking it lets a lane probe or kill production processes.
         # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
         result = subprocess.run(
             [PYTHON, "-c", code, env["PYTHONPATH"], action, json.dumps(pid)],

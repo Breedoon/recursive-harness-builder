@@ -70,7 +70,7 @@ async def _connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         for stream in writers:
             stream.close()
         await asyncio.gather(*(stream.wait_closed() for stream in writers), return_exceptions=True)
-        # INVARIANT(auth): log metadata only; payload logging would expose provider requests.
+        # INVARIANT(auth): the relay logs connection metadata only. Breaking it writes provider requests and credentials into run logs.
         # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
         print(
             f"relay={args.command} opened={opened} closed={datetime.now(timezone.utc).isoformat()} "

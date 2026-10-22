@@ -222,8 +222,8 @@ def _python_files(paths: Iterable[str]) -> list[Path]:
         candidates = path.rglob("*.py") if path.is_dir() else [path]
         for candidate in candidates:
             resolved = candidate.resolve()
-            # INVARIANT R10: harness internals may poll, but harness/suites are tests.
-            # See Projects/Personal Projects/OBS Platform/E2E Harness.md.
+            # INVARIANT(protocol): harness internals may poll, but files under harness/suites are tests and get no fixed-sleep exemption. Breaking it lets fixed sleeps back into tests (R10).
+            # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Events Wait Layer#Waits
             harness_internal = _under(resolved, "tests", "e2e", "harness")
             harness_suite = _under(resolved, "tests", "e2e", "harness", "suites")
             if candidate.suffix == ".py" and (not harness_internal or harness_suite):

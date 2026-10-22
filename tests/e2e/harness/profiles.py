@@ -74,7 +74,7 @@ class Profile:
             raise ProfileError(f"profile {self.name!r} is runner-only and never a lane (G11)")
         reserved = self._reserved(env)
         tokens = [token for token in self._pool(env) if token not in reserved]
-        # INVARIANT: the standing test-instance bot is never probed or allocated.
+        # INVARIANT(credential-selection): bots named by bot_pool_exclude (the standing test-instance bot) are never probed or allocated. Breaking it makes a lane fight a standing OBS test instance for its updates (run 20261022T080654Z-9f0ede).
         # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Profiles#Profiles
         if any(token in production_bot_tokens(env) for token in tokens):
             raise ProfileError(f"profile {self.name!r} pool contains a production bot token (G11)")

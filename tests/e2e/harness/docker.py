@@ -149,9 +149,9 @@ def ensure_image(context_dir: Path) -> str:
 
 def _validate_source(source: Path) -> None:
     resolved = source.resolve()
-    # INVARIANT: only fixture sources may occupy production paths in a lane.
+    # INVARIANT(side-effects): only fixture sources may occupy production paths in a lane; a production source or any ancestor of one is refused. Breaking it lets a lane write production state through its production-path mounts.
     # Check sources (including symlink targets/ancestor mounts), not destinations.
-    # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Isolation
+    # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
     for forbidden in _FORBIDDEN_SOURCES:
         for blocked in {Path(forbidden), Path(forbidden).resolve()}:
             if resolved.is_relative_to(blocked) or blocked.is_relative_to(resolved):

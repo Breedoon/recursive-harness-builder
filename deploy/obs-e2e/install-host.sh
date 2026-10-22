@@ -30,8 +30,8 @@ CPUQuota=800%
 TasksMax=8192
 UNIT
 
-# INVARIANT: the slice caps all lanes together, not just each container.
-# Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Isolation
+# INVARIANT(side-effects): obs-e2e.slice caps all lanes together (14G, no swap, 800% CPU, 8192 tasks), not just each container. Breaking it lets the lanes starve production obs-test of memory and CPU.
+# Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
 install -d /etc/systemd/system
 if ! cmp -s "$unit" /etc/systemd/system/obs-e2e.slice; then
   install -m 0644 "$unit" /etc/systemd/system/obs-e2e.slice

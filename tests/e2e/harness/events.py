@@ -293,7 +293,7 @@ class EventLog:
                 return all(record.get(key) == scope[key] for key in scope)
 
             reply = event.get("reply_to_message_id", event.get("reply_to_msg_id"))
-            # INVARIANT(C3): a later receipt is outside the window; an explicit old-turn reply is not.
+            # INVARIANT(protocol): a negative window ends at the test's next input, but a send replying to the asserted turn's trigger still counts. Breaking it fails tests on the next input's receipt or hides late sends of the asserted turn.
             # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Runner#Python test API
             if asserted_message is not None and reply == asserted_message and same_route(anchor):
                 found.append(event)

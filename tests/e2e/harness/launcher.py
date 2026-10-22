@@ -85,8 +85,8 @@ def code_identity(code: str, run_dir: Path) -> tuple[Path, dict]:
         if (worktree / ".env").exists() or (worktree / ".env").is_symlink():
             code_dir = run_dir / "code"
             code_dir.mkdir()
-            # INVARIANT: a checkout's .env never becomes a container-readable mount.
-            # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Isolation
+            # INVARIANT(credential-selection): a checkout's .env never becomes a container-readable mount; a --code dir holding one is snapshotted (tracked files only). Breaking it hands production tokens to every lane.
+            # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
             for raw in _git(worktree, "ls-files", "-z").split(b"\0"):
                 if not raw:
                     continue
@@ -259,7 +259,7 @@ def _run_once(args) -> int:
                     reserved_ids.add(excluded["bot_id"])
         manifest["candidate_bot_count"] = len(candidates)
         _atomic_json(run_dir / "manifest.json", manifest)
-        # INVARIANT: prod-send is runner-only; production bots must never be lane pollers.
+        # INVARIANT(credential-selection): prod-send is runner-only; a production bot token never enters a lane env. Breaking it puts a second getUpdates poller on a production bot (the 2026-03-17 freeze).
         # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Profiles#Secrets
         if any(token in production for token in candidates):
             raise HarnessError("a candidate lane bot resolves to a production token")
@@ -351,8 +351,8 @@ def _run_once(args) -> int:
                                  env_file=private / f"{row['lane']}.env", mounts=mounts, workdir=str(HARNESS_ROOT),
                                  command=[PYTHON, "-m", "tests.e2e.harness.lanectl", "serve", "--lane-dir", str(lane_dir)])
         runner_name = f"obs-e2e-{run_id}-runner"
-        # INVARIANT: the registry's atomic rename must not expose other runs' private envs.
-        # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Isolation
+        # INVARIANT(side-effects): the registry's atomic rename stays inside registry/, which never holds private env files. Breaking it exposes other runs' lane secrets to this run's containers.
+        # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
         runner_mounts = [docker.Mount(run_dir, str(run_dir)),
                          docker.Mount(_registry_dir(), str(_registry_dir())),
                          docker.Mount(E2E_ROOT / "locks", str(E2E_ROOT / "locks")),

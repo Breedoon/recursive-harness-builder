@@ -67,7 +67,7 @@ def build_fixture_vault(
 ) -> Path:
     vault = Path(lane_dir) / "vault"
     _private_dir(vault)
-    # INVARIANT(side-effects): archive only this allow-list; a full clone exposes personal files.
+    # INVARIANT(side-effects): the fixture vault archives only this allow-list. Breaking it copies personal vault files into every lane.
     # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
     archive = subprocess.Popen(
         ["git", "-C", str(vault_src), "archive", "HEAD", "--", *FIXTURE_PATHS],
@@ -140,7 +140,7 @@ def lane_env(
     userbot_id: int,
 ) -> dict[str, str]:
     lane_dir = _lane_path(run_dir, lane)
-    # INVARIANT(auth): construct from scratch; inherited env can expose production credentials.
+    # INVARIANT(auth): the lane env is built from scratch from the allow-list, never from the caller's env. Breaking it leaks the agent shell's production secrets into a lane.
     # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
     env = {
         "PATH": f"{lane_dir}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
