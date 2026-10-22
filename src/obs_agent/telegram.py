@@ -10363,7 +10363,7 @@ class TelegramBot:
                         )
                 except Exception:
                     logger.debug("Failed to send completion summary in finally", exc_info=True)
-            _event_tap.emit_route("turn_end", self, state.route, state=state, trigger_message=trigger_message, schedule_id=triggered_schedule_id, failed=failed, turns=turn_count, subtype=lambda: _event_tap.result_subtype(runner, failed=failed, interrupted=interrupt_discarded_count is not None), cli_runtime=lambda: _event_tap.cli_runtime(state))
+            _event_tap.emit_route("turn_end", self, state.route, state=state, trigger_message=trigger_message, schedule_id=triggered_schedule_id, failed=failed, turns=turn_count, subtype=lambda: _event_tap.result_subtype(runner, failed=failed, interrupted=interrupt_discarded_count is not None), cli_runtime=lambda: _event_tap.cli_runtime(state), cost_usd=lambda: (state.hook_state.last_result_data or {}).get("total_cost_usd"))
 
         if (
             not trigger_user_mapped

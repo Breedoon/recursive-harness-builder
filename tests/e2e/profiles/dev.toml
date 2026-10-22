@@ -1,0 +1,18 @@
+# dev: Claude lane on the single existing Claude OAuth credential (lane copy without
+# the refresh token, tests/e2e/harness/creds.py), a test bot from the pool, Haiku.
+# Secret references only; values live in the secrets file (default /workspace/obs/.env).
+name = "dev"
+credential_class = "dev"
+route = "claude"
+model = "haiku"
+claude_credentials = "shared-lane-copy"
+bot_pool = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+userbot_id_ref = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
+needs_cliproxy = false
+spend_cap_usd = 5.0
+
+[lane_env]
+OBS_AGENT_MODEL = "haiku"
+OBS_DEFAULT_MODEL = "haiku"
+OBS_EFFORT_LEVEL = "low"
+OBS_NEW_SESSION_EFFORT_LEVEL = "low"

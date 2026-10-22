@@ -1,0 +1,11 @@
+# prod-send: NOT a lane (design-v3 §2.2, ADR-0017/ADR-0036, G11). The runner itself
+# makes update-free Bot API calls with a production bot token into a throwaway topic
+# of a test forum, to check that production-bot messages render. Every call is logged
+# to <run>/runner/botapi-calls.jsonl; getUpdates, setWebhook, deleteWebhook, close and
+# logOut are never called with this token. Opt-in per run (--prod-send).
+name = "prod-send"
+credential_class = "prod-send"
+runner_only = true
+bot_token_ref = "env:OBS_PROD_TELEGRAM_BOT_TOKEN"
+target_forum_chat_id = -1004468920625
+allowed_methods = ["getMe", "getChat", "sendMessage", "editMessageText", "deleteMessage"]

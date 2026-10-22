@@ -1,0 +1,21 @@
+# sub-2: second GPT lane. On 2026-10-22 exactly one Codex sub-credential exists
+# (the CLIProxyAPI Codex OAuth account; ~/.codex/auth.json is the same account), and
+# the Z.AI GLM key behind CLIProxyAPI answers "Insufficient balance" (a recharge is a
+# payment, out of agent scope). So sub-2 shares sub-1's credential on another model;
+# point `subcredential`/`model` here at a second account once one is provisioned.
+name = "sub-2"
+credential_class = "sub"
+route = "gpt"
+model = "gpt-5.6-luna"
+claude_credentials = "shared-lane-copy"
+bot_pool = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+userbot_id_ref = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
+needs_cliproxy = true
+subcredential = "codex-oauth-1"
+spend_cap_usd = 5.0
+
+[lane_env]
+OBS_AGENT_MODEL = "gpt-5.6-luna"
+OBS_DEFAULT_MODEL = "gpt-5.6-luna"
+OBS_EFFORT_LEVEL = "low"
+OBS_NEW_SESSION_EFFORT_LEVEL = "low"

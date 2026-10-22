@@ -1,0 +1,20 @@
+# claude-2: slot for a second Claude subscription credential. Empty until E6
+# provisions it (edge 13, relayed E6 -> T2 -> depth-2 Router -> T1 -> E1). It is not a
+# V-HARNESS dependency (A5 ruling 2026-10-21T18:56Z). Selecting it fails visibly.
+name = "claude-2"
+credential_class = "claude-2"
+route = "claude"
+model = "haiku"
+available = false
+claude_credentials = "profile-file"
+claude_credentials_ref = ""
+bot_pool = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+userbot_id_ref = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
+needs_cliproxy = false
+spend_cap_usd = 5.0
+
+[lane_env]
+OBS_AGENT_MODEL = "haiku"
+OBS_DEFAULT_MODEL = "haiku"
+OBS_EFFORT_LEVEL = "low"
+OBS_NEW_SESSION_EFFORT_LEVEL = "low"

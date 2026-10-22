@@ -1,0 +1,152 @@
+# Readable docker-run contract; the launcher creates containers with docker.py.
+# All *_HOST_DIR / *_HOST_FILE variables are paths on the Ubuntu Docker host.
+x-common: &common
+  image: obs-e2e:${OBS_E2E_IMAGE_TAG:-latest}
+  init: true
+  user: "1000:1000"
+  cgroup_parent: obs-e2e.slice
+  mem_limit: 14g
+  memswap_limit: 14g
+  cpus: 8
+  pids_limit: 8192
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,exec,size=1g
+
+services:
+  lane:
+    <<: *common
+    # Build once: all three services use this image, without competing exporters.
+    build:
+      context: .
+    container_name: obs-e2e-${OBS_E2E_RUN_ID}-lane${OBS_E2E_LANE_INDEX:-1}
+    network_mode: bridge
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    env_file:
+      - ${OBS_E2E_LANE_ENV_HOST_FILE}
+    labels:
+      obs-e2e.run: ${OBS_E2E_RUN_ID}
+      obs-e2e.role: lane
+      obs-e2e.lane: lane${OBS_E2E_LANE_INDEX:-1}
+    working_dir: ${OBS_E2E_HARNESS_ROOT}
+    entrypoint: []
+    command:
+      - /workspace/obs/.venv/bin/python
+      - -m
+      - tests.e2e.harness.lanectl
+      - serve
+      - --lane-dir
+      - ${OBS_E2E_LANE_DIR}
+    volumes:
+      - type: bind
+        source: ${OBS_E2E_RUN_HOST_DIR}
+        target: ${OBS_E2E_RUN_DIR}
+      - type: bind
+        source: ${OBS_E2E_CODE_HOST_DIR}
+        target: ${OBS_E2E_CODE_DIR}
+        read_only: true
+      - type: bind
+        source: ${OBS_E2E_HARNESS_HOST_DIR}
+        target: ${OBS_E2E_HARNESS_ROOT}
+        read_only: true
+      - type: bind
+        source: ${OBS_E2E_VENV_HOST_DIR}
+        target: /workspace/obs/.venv
+        read_only: true
+      - type: bind
+        source: ${OBS_E2E_RUNTIME_BIN_HOST_DIR}
+        target: /workspace/runtime/bin
+        read_only: true
+      - type: bind
+        source: ${OBS_E2E_REFERENCE_HOST_DIR}
+        target: /workspace/runtime/reference/claude-code-src
+        read_only: true
+      - type: bind
+        source: ${OBS_E2E_PRESERVED_HOST_DIR}
+        target: /workspace/runtime/preserved/cache-proxy-request-log-freeze-20261020T200401Z
+        read_only: true
+      - type: bind
+        source: ${OBS_E2E_FIXTURES_HOST_DIR}
+        target: /workspace/runtime/e2e/fixtures
+        read_only: true
+      - type: bind
+        source: ${OBS_E2E_LANE_HOST_DIR}/state
+        target: /workspace/runtime/state
+      - type: bind
+        source: ${OBS_E2E_LANE_HOST_DIR}/logs
+        target: /workspace/runtime/logs
+      - type: bind
+        source: ${OBS_E2E_LANE_HOST_DIR}/home
+        target: /home/agent
+      - type: bind
+        source: ${OBS_E2E_LANE_HOST_DIR}/vault
+        target: /workspace/runtime/git/obs-vault-active
+
+  runner:
+    <<: *common
+    container_name: obs-e2e-${OBS_E2E_RUN_ID}-runner
+    network_mode: bridge
+    env_file:
+      - ${OBS_E2E_RUNNER_ENV_HOST_FILE}
+    labels:
+      obs-e2e.run: ${OBS_E2E_RUN_ID}
+      obs-e2e.role: runner
+    working_dir: ${OBS_E2E_HARNESS_ROOT}
+    entrypoint: []
+    command:
+      - /workspace/obs/.venv/bin/python
+      - -m
+      - tests.e2e.harness.orchestrator
+      - --run-dir
+      - ${OBS_E2E_RUN_DIR}
+    volumes:
+      - type: bind
+        source: ${OBS_E2E_RUN_HOST_DIR}
+        target: ${OBS_E2E_RUN_DIR}
+      - type: bind
+        source: ${OBS_E2E_HARNESS_HOST_DIR}
+        target: ${OBS_E2E_HARNESS_ROOT}
+        read_only: true
+      - type: bind
+        source: ${OBS_E2E_VENV_HOST_DIR}
+        target: /workspace/obs/.venv
+        read_only: true
+      # forums.json is atomically replaced, so mount its parent, not the file.
+      - type: bind
+        source: ${OBS_E2E_ROOT_HOST_DIR}
+        target: /workspace/runtime/e2e
+
+  relay:
+    <<: *common
+    container_name: obs-e2e-${OBS_E2E_RUN_ID}-relay
+    network_mode: container:obs-test
+    env_file:
+      - ${OBS_E2E_RELAY_ENV_HOST_FILE}
+    labels:
+      obs-e2e.run: ${OBS_E2E_RUN_ID}
+      obs-e2e.role: relay
+    working_dir: ${OBS_E2E_HARNESS_ROOT}
+    entrypoint: []
+    command:
+      - /workspace/obs/.venv/bin/python
+      - -m
+      - tests.e2e.harness.relay
+      - unix-to-tcp
+      - --unix
+      - ${OBS_E2E_RUN_DIR}/sockets/cliproxy.sock
+      - --target
+      - 127.0.0.1:8317
+    volumes:
+      - type: bind
+        source: ${OBS_E2E_RUN_HOST_DIR}
+        target: ${OBS_E2E_RUN_DIR}
+      - type: bind
+        source: ${OBS_E2E_HARNESS_HOST_DIR}
+        target: ${OBS_E2E_HARNESS_ROOT}
+        read_only: true
+      - type: bind
+        source: ${OBS_E2E_VENV_HOST_DIR}
+        target: /workspace/obs/.venv
+        read_only: true

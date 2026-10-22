@@ -1,0 +1,19 @@
+# sub-1: GPT lane on the Codex sub-credential behind the existing CLIProxyAPI
+# (lanes are clients only; CLIProxyAPI keeps owning its Codex refresh, ADR-0036).
+# Validity is checked by `obs-e2e credcheck` (WP1).
+name = "sub-1"
+credential_class = "sub"
+route = "gpt"
+model = "luna"
+claude_credentials = "shared-lane-copy"
+bot_pool = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+userbot_id_ref = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
+needs_cliproxy = true
+subcredential = "codex-oauth-1"
+spend_cap_usd = 5.0
+
+[lane_env]
+OBS_AGENT_MODEL = "luna"
+OBS_DEFAULT_MODEL = "luna"
+OBS_EFFORT_LEVEL = "low"
+OBS_NEW_SESSION_EFFORT_LEVEL = "low"

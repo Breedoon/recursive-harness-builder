@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+root="$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)"
+cd "$root"
+exec env PYTHONPATH="$root" /workspace/obs/.venv/bin/python -m tests.e2e.harness.cli "$@"
