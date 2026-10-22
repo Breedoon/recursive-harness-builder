@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -212,7 +213,7 @@ def _run_once(args) -> int:
                 "keep_lanes": args.keep_lanes, "prod_send": getattr(args, "prod_send", False),
                 "caller_canary": "OBS_PROFILE_FORCED_BY_CALLER" if "OBS_PROFILE_FORCED_BY_CALLER" in os.environ else None,
                 "userbot_lock_timeout": args.userbot_lock_timeout,
-                "lane_ready_timeout": args.lane_ready_timeout, "lanes": [], "lanes_excluded": [],
+                "lane_ready_timeout": args.lane_ready_timeout, "lanes": [], "lanes_excluded": [], "bots_excluded": [],
                 "forums_path": str(_registry_dir() / "forums.json")}
     _atomic_json(run_dir / "manifest.json", manifest)
     resync, sentinel, result = None, None, 2
@@ -248,36 +249,62 @@ def _run_once(args) -> int:
         lane_profiles = profiles.lane_profiles(args)
         if len(lane_profiles) != args.lanes:
             raise HarnessError("profile resolution did not return one profile per requested lane")
-        resolved = []
-        seen_tokens = set()
-        with httpx.Client() as client:
+        pools = [profile.bot_pool_tokens(secret_env) for profile in lane_profiles]
+        candidates = list(dict.fromkeys(token for pool in pools for token in pool))
+        reserved_ids = set()
+        for profile in lane_profiles:
+            for excluded in profile.excluded_bots(secret_env):
+                if excluded["bot_id"] not in reserved_ids:
+                    manifest["bots_excluded"].append(excluded)
+                    reserved_ids.add(excluded["bot_id"])
+        manifest["candidate_bot_count"] = len(candidates)
+        _atomic_json(run_dir / "manifest.json", manifest)
+        # INVARIANT: prod-send is runner-only; production bots must never be lane pollers.
+        # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Profiles#Secrets
+        if any(token in production for token in candidates):
+            raise HarnessError("a candidate lane bot resolves to a production token")
+        if not candidates:
+            raise HarnessError("no unreserved candidate lane bots remain")
+        prepared = {}
+        manifest["bot_probes_started_at"] = _now()
+        print(f"obs-e2e {run_id}: checking {len(candidates)} candidate bots concurrently; "
+              f"reserved={len(manifest['bots_excluded'])}", flush=True)
+        with httpx.Client() as client, ThreadPoolExecutor(max_workers=1) as probes:
+            checking = probes.submit(credcheck.check_bots, candidates, holder_probe=True, client=client)
+            manifest["provisioning_started_at"] = _now()
             for index, profile in enumerate(lane_profiles, start=1):
-                token = profile.lane_bot_token(index - 1, secret_env)
-                # INVARIANT: prod-send is runner-only; production bots must never be lane pollers.
-                # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Profiles#Secrets
-                if token in production or profile.credential_class == "prod-send":
-                    raise HarnessError(f"lane{index} profile resolves to a production/runner-only bot")
-                if token in seen_tokens:
-                    manifest["lanes_excluded"].append({"lane": f"lane{index}", "profile": profile.name,
-                                                       "bot_id": bot_id_of(token), "reason": "duplicate bot within run"})
-                    continue
-                seen_tokens.add(token)
-                checked = credcheck.check_bot(token, holder_probe=True, client=client)
-                if not checked.get("valid") or checked.get("held_by_other_poller") or not checked.get("getUpdates_ok"):
-                    reason = "held by another poller" if checked.get("held_by_other_poller") else "bot validity/holder probe failed"
-                    manifest["lanes_excluded"].append({"lane": f"lane{index}", "profile": profile.name,
-                                                       "bot_id": bot_id_of(token), "reason": reason})
-                    continue
-                resolved.append((index, profile, token, checked))
+                lane_dir = provision.make_lane_dirs(run_dir, f"lane{index}")
+                provision.build_fixture_vault(lane_dir)
+                provision.write_lane_bin(lane_dir, code_dir)
+                prepared[index] = (lane_dir, creds.write_lane_credentials(lane_dir / "home"))
+            image = docker.ensure_image(HARNESS_ROOT / "deploy" / "obs-e2e")
+            manifest["image"] = image
+            manifest["provisioning_finished_at"] = _now()
+            checked_rows = checking.result()
+        manifest["bot_probes_finished_at"] = _now()
+        manifest["bot_probes"] = checked_rows
+        checks = dict(zip(candidates, checked_rows))
+        for token, checked in checks.items():
+            if not checked.get("valid") or not checked.get("getUpdates_ok"):
+                reason = "held:probe-conflict" if checked.get("held_by_other_poller") else "invalid:bot-check"
+                manifest["bots_excluded"].append({"bot_id": bot_id_of(token), "reason": reason})
+        resolved, used = [], set()
+        for index, (profile, pool) in enumerate(zip(lane_profiles, pools), start=1):
+            token = next((token for token in pool if token not in used and checks[token].get("valid")
+                          and checks[token].get("getUpdates_ok")), None)
+            if token is None:
+                manifest["lanes_excluded"].append({"lane": f"lane{index}", "profile": profile.name,
+                                                   "reason": "pool:insufficient-free-bots"})
+                continue
+            used.add(token)
+            resolved.append((index, profile, token, checks[token]))
         _atomic_json(run_dir / "manifest.json", manifest)
         if not resolved:
             raise HarnessError("no valid unheld lane bots remain")
         homes = []
         for index, profile, token, checked in resolved:
             name = f"lane{index}"
-            lane_dir = provision.make_lane_dirs(run_dir, name)
-            provision.build_fixture_vault(lane_dir)
-            provision.write_lane_bin(lane_dir, code_dir)
+            lane_dir, credentials = prepared[index]
             env = provision.lane_env(profile, run_dir=run_dir, lane=name, lane_index=index - 1,
                                      code_dir=code_dir, harness_root=HARNESS_ROOT,
                                      bot_token=token, userbot_id=userbot_id)
@@ -291,7 +318,6 @@ def _run_once(args) -> int:
                    "proxy_port": 29925, "needs_cliproxy": profile.needs_cliproxy,
                    "env_names": sorted(env), "container": f"obs-e2e-{run_id}-{name}", "created_at": _now()}
             provision.write_lane_json(lane_dir, row)
-            credentials = creds.write_lane_credentials(lane_dir / "home")
             manifest["lanes"].append({**row, "bot_token_fingerprint": fingerprint(token), "credentials": credentials})
             homes.append(lane_dir / "home")
         resync = creds.ResyncThread(homes, interval=600)
@@ -299,8 +325,6 @@ def _run_once(args) -> int:
         provision.write_env_file(private / "runner.env", _runner_env(secret_env, userbot_id, run_id,
                                                                    prod_send=getattr(args, "prod_send", False)))
         provision.write_env_file(private / "relay.env", _common_env())
-        image = docker.ensure_image(HARNESS_ROOT / "deploy" / "obs-e2e")
-        manifest["image"] = image
         manifest["flags"] = {"cgroup_parent": "obs-e2e.slice", "memory": "14g", "memory_swap": "14g",
                              "cpus": 8, "pids_limit": 8192, "user": "1000:1000", "init": True}
         if {"isolation", "all"}.intersection(part.strip() for part in args.suite.split(",")):

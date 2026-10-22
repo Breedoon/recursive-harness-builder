@@ -9,6 +9,7 @@ available = false
 claude_credentials = "profile-file"
 claude_credentials_ref = ""
 bot_pool = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+bot_pool_exclude = ["env:OBS_TEST_TELEGRAM_BOT_TOKEN"]
 userbot_id_ref = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
 needs_cliproxy = false
 spend_cap_usd = 5.0

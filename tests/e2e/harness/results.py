@@ -128,10 +128,15 @@ def write_summary(run_dir: Path, *, junit: ET.ElementTree | None = None,
     result = {"run_id": manifest.get("run_id", run_dir.name), "exit_code": exit_code,
               "tests": cases, "totals": {**totals, "total": len(cases)},
               "worker_exitcodes": worker_exitcodes, "lanes_excluded": manifest.get("lanes_excluded", []),
+              "bots_excluded": manifest.get("bots_excluded", []),
+              "requested_lanes": manifest.get("requested_lanes"), "active_lanes": len(manifest.get("lanes", [])),
+              "five_lane_count_met": len(manifest.get("lanes", [])) >= 5,
               "error": error}
     result["summary_line"] = (f"obs-e2e {result['run_id']}: exit={exit_code} "
                               f"passed={totals['passed']} xfailed={totals['xfailed']} "
                               f"failed={totals['failed']} errors={totals['error']} skipped={totals['skipped']} "
-                              f"lanes_excluded={len(result['lanes_excluded'])}")
+                              f"lanes_excluded={len(result['lanes_excluded'])} "
+                              f"bots_excluded={len(result['bots_excluded'])} "
+                              f"lanes={result['active_lanes']}/{result['requested_lanes']}")
     (run_dir / "summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result

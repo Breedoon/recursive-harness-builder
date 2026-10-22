@@ -37,6 +37,14 @@ class HarnessError(RuntimeError):
     pass
 
 
+class LaneHeldError(HarnessError):
+    def __init__(self, lane: dict, stop_error: str | None = None):
+        self.lane = lane
+        self.stop_error = stop_error
+        super().__init__(f"lane {lane['lane']} bot {lane['bot_id']} held:start-conflict; "
+                         f"requested lane count unmet" + (f"; stop failed: {stop_error}" if stop_error else ""))
+
+
 class ForumRegistry:
     def __init__(self, client, lanes: list[dict], run_dir: Path, path: Path):
         self.client = client
@@ -189,7 +197,35 @@ async def _ready(lane: dict, run_dir: Path, timeout: float) -> None:
     path = run_dir / "lanes" / lane["lane"] / "lanectl.sock"
     deadline = asyncio.get_running_loop().time() + timeout
     last = None
+    offsets, tails = {}, {}
+    log_paths = [run_dir / "lanes" / lane["lane"] / "logs" / name
+                 for name in ("obs-telegram-prod.stderr.log", "telegram-prod.log")]
     while True:
+        conflict = False
+        for log in log_paths:
+            try:
+                with log.open("rb") as stream:
+                    offset = offsets.get(log, 0)
+                    if log.stat().st_size < offset:
+                        offset, tails[log] = 0, b""
+                    stream.seek(offset)
+                    chunk = stream.read()
+                    offsets[log] = stream.tell()
+            except FileNotFoundError:
+                continue
+            data = tails.get(log, b"") + chunk
+            conflict = conflict or b"_TelegramPollingConflictError" in data or b"Conflict: terminated by other getUpdates request" in data
+            tails[log] = data[-128:]
+        if conflict:
+            stop_error = None
+            try:
+                stopped = await RpcClient(path, timeout=75).acall(
+                    "/supervisor", {"action": "stop", "program": "obs-telegram-prod"})
+                if stopped.get("rc") != 0:
+                    stop_error = f"supervisor rc={stopped.get('rc')}"
+            except Exception as exc:
+                stop_error = exc.__class__.__name__
+            raise LaneHeldError(lane, stop_error)
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise HarnessError(f"lane {lane['lane']} not ready within {timeout}s (last state: {last})")
@@ -225,7 +261,14 @@ async def _run(args, manifest: dict, client) -> int:
         forums = await registry.ensure()
         server = TelegramRPCServer(client, forums, run_dir, fresh_forum=registry.fresh)
         await server.start()
-        await asyncio.gather(*(_ready(lane, run_dir, args.lane_ready_timeout) for lane in lanes))
+        readiness = [asyncio.create_task(_ready(lane, run_dir, args.lane_ready_timeout)) for lane in lanes]
+        try:
+            await asyncio.gather(*readiness)
+        finally:
+            for ready in readiness:
+                if not ready.done():
+                    ready.cancel()
+            await asyncio.gather(*readiness, return_exceptions=True)
         collect_path = runner / "collect.json"
         collect_path.unlink(missing_ok=True)
         command = [sys.executable, "-m", "pytest", "--collect-only", "-q",
@@ -283,6 +326,13 @@ async def _run(args, manifest: dict, client) -> int:
         print(summary["summary_line"], flush=True)
         return 2
     except Exception as exc:
+        if isinstance(exc, LaneHeldError):
+            excluded = {"lane": exc.lane["lane"], "bot_id": exc.lane["bot_id"],
+                        "profile": exc.lane["profile"], "reason": "held:start-conflict", "stop_error": exc.stop_error}
+            manifest.setdefault("lanes_excluded", []).append(excluded)
+            manifest.setdefault("bots_excluded", []).append({"bot_id": exc.lane["bot_id"], "reason": "held:start-conflict"})
+            manifest["lanes"] = [lane for lane in manifest["lanes"] if lane["lane"] != exc.lane["lane"]]
+            _atomic_json(run_dir / "manifest.json", manifest)
         error = str(exc) if isinstance(exc, HarnessError) else exc.__class__.__name__
         summary = write_summary(run_dir, worker_exitcodes=exitcodes, error=error, exit_code=2)
         print(f"obs-e2e: {error}", file=sys.stderr, flush=True)

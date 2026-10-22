@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 
 DEFAULT_SECRETS_FILE = Path("/workspace/obs/.env")
+HARNESS_BOTS_FILE = Path("/workspace/runtime/e2e/secrets/bots.env")
 
 
 class SecretError(RuntimeError):
@@ -36,20 +37,21 @@ def secrets_file() -> Path:
 
 def read_env_file(path: Path | None = None) -> dict[str, str]:
     """Parse KEY=VALUE lines exactly like obs_agent.runtime_env._read_env_file."""
-    path = path or secrets_file()
-    if not path.exists():
-        return {}
+    paths = [Path(path)] if path is not None else [secrets_file(), HARNESS_BOTS_FILE]
     loaded: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        raw = line.strip()
-        if not raw or raw.startswith("#") or "=" not in raw:
+    for candidate in paths:
+        if not candidate.exists():
             continue
-        key, _, value = raw.partition("=")
-        key, value = key.strip(), value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        if key and value:
-            loaded[key] = value
+        for line in candidate.read_text(encoding="utf-8").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            key, _, value = raw.partition("=")
+            key, value = key.strip(), value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            if key and value:
+                loaded[key] = value
     return loaded
 
 

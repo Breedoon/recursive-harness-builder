@@ -22,7 +22,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .secrets import SecretError, production_bot_tokens, read_env_file, resolve
+from .secrets import bot_id_of, production_bot_tokens, read_env_file, resolve
 
 PROFILE_DIR = Path(__file__).resolve().parents[1] / "profiles"
 CREDENTIAL_CLASSES = ("dev", "sub", "claude-2", "prod-send")
@@ -40,6 +40,7 @@ class Profile:
     model: str = "haiku"
     claude_credentials: str = "shared-lane-copy"
     bot_pool: str = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+    bot_pool_exclude: tuple[str, ...] = ()
     bot_token_ref: str = ""
     userbot_id_ref: str = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
     needs_cliproxy: bool = False
@@ -52,15 +53,40 @@ class Profile:
     lane_env: dict[str, str] = field(default_factory=dict)
     path: str = ""
 
-    def lane_bot_token(self, lane_index: int, env: dict[str, str] | None = None) -> str:
-        """This lane's test bot: item ``lane_index`` of the pool (or the pinned ref)."""
-        if self.runner_only:
+    def _pool(self, env: dict[str, str]) -> list[str]:
+        if self.bot_token_ref:
+            return [resolve(self.bot_token_ref, env)]
+        raw = resolve(self.bot_pool, env) + "," + env.get("OBS_E2E_TELEGRAM_BOT_TOKENS", "")
+        return list(dict.fromkeys(token.strip() for token in raw.split(",") if token.strip()))
+
+    def _reserved(self, env: dict[str, str]) -> set[str]:
+        return {token.strip() for ref in self.bot_pool_exclude for token in resolve(ref, env).split(",") if token.strip()}
+
+    def excluded_bots(self, env: dict[str, str] | None = None) -> list[dict]:
+        env = read_env_file() if env is None else env
+        reserved = self._reserved(env)
+        return [{"bot_id": bot_id_of(token), "reason": "reserved:test-instance"}
+                for token in self._pool(env) if token in reserved]
+
+    def bot_pool_tokens(self, env: dict[str, str] | None = None) -> list[str]:
+        env = read_env_file() if env is None else env
+        if self.runner_only or self.credential_class == "prod-send":
             raise ProfileError(f"profile {self.name!r} is runner-only and never a lane (G11)")
-        ref = self.bot_token_ref or f"{self.bot_pool}#{lane_index}"
-        token = resolve(ref, env)
-        if token in production_bot_tokens(env):
-            raise ProfileError(f"profile {self.name!r} resolves lane {lane_index} to a production bot token (G11)")
-        return token
+        reserved = self._reserved(env)
+        tokens = [token for token in self._pool(env) if token not in reserved]
+        # INVARIANT: the standing test-instance bot is never probed or allocated.
+        # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Profiles#Profiles
+        if any(token in production_bot_tokens(env) for token in tokens):
+            raise ProfileError(f"profile {self.name!r} pool contains a production bot token (G11)")
+        return tokens
+
+    def lane_bot_token(self, lane_index: int, env: dict[str, str] | None = None) -> str:
+        """Index the usable pool, after reservations and harness-owned additions."""
+        tokens = self.bot_pool_tokens(env)
+        try:
+            return tokens[0 if self.bot_token_ref else lane_index]
+        except IndexError:
+            raise ProfileError(f"profile {self.name!r} has only {len(tokens)} usable test bots") from None
 
     def userbot_id(self, env: dict[str, str] | None = None) -> int:
         return int(resolve(self.userbot_id_ref, env))
@@ -86,6 +112,7 @@ def load_profile(name: str) -> Profile:
         model=str(data.get("model", "haiku")),
         claude_credentials=str(data.get("claude_credentials", "shared-lane-copy")),
         bot_pool=str(data.get("bot_pool", "env:OBS_TEST_TELEGRAM_BOT_TOKENS")),
+        bot_pool_exclude=tuple(data.get("bot_pool_exclude") or ()),
         bot_token_ref=str(data.get("bot_token_ref", "")),
         userbot_id_ref=str(data.get("userbot_id_ref", "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0")),
         needs_cliproxy=bool(data.get("needs_cliproxy", False)),
@@ -125,13 +152,4 @@ def lane_profiles(
         if not prof.available:
             raise ProfileError(f"profile {name!r} is not provisioned yet (claude-2 arrives from E6, edge 13)")
         out.append(prof)
-    env = read_env_file()
-    pool_size = len([t for t in (env.get("OBS_TEST_TELEGRAM_BOT_TOKENS") or "").split(",") if t.strip()])
-    if len(out) > pool_size:
-        raise ProfileError(f"{len(out)} lanes requested but the test bot pool has {pool_size} bots")
-    for index, prof in enumerate(out):
-        try:
-            prof.lane_bot_token(index, env)
-        except SecretError as exc:
-            raise ProfileError(str(exc)) from None
     return out

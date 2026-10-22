@@ -9,6 +9,7 @@ route = "gpt"
 model = "gpt-5.6-luna"
 claude_credentials = "shared-lane-copy"
 bot_pool = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+bot_pool_exclude = ["env:OBS_TEST_TELEGRAM_BOT_TOKEN"]
 userbot_id_ref = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
 needs_cliproxy = true
 subcredential = "codex-oauth-1"
