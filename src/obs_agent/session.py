@@ -634,12 +634,45 @@ class SessionManager:
         )
 
         # Resume if within cache window, otherwise fresh
-        if self.should_resume():
+        if self.should_resume() and not self._session_is_unborn():
             options.resume = self._session_id
         else:
             options.resume = None
 
         return options
+
+    def _session_is_unborn(self) -> bool:
+        """True when the session's JSONL exists but holds no conversation yet (vault-1i53).
+
+        The id is known from the CLI's ``system/init`` message before the CLI
+        writes the turn's first rows, so a turn cut off in that window (a
+        restart, crash or CLI kill before the first reply was written) leaves
+        an id that ``--resume`` rejects with "No conversation found". Start a
+        fresh session instead; its own init then reports the new id. A missing
+        JSONL keeps the old behaviour (resume), since nothing proves the session
+        unborn.
+        """
+        session_id = self._session_id
+        if not session_id:
+            return False
+        from obs_agent.context_jsonl import session_jsonl_has_conversation
+
+        try:
+            has_conversation = session_jsonl_has_conversation(
+                session_id=session_id, cwd=self.config.vault_path
+            )
+        except Exception:
+            logger.debug("Unable to inspect JSONL before resume session_id=%s", session_id, exc_info=True)
+            return False
+        if has_conversation is not False:
+            return False
+        logger.warning(
+            "[session_resume] session_id=%s has no conversation rows yet (cut off before its first "
+            "reply was written); starting a fresh session instead of --resume",
+            session_id,
+        )
+        self._session_id = None
+        return True
 
     # CACHE-PREFIX WARNING: every reconnect/wake resumes from JSONL (prepare_session_replay
     # may append parent overlays). Replayed bytes must equal the live history.

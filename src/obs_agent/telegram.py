@@ -50,7 +50,7 @@ from obs_agent.config import (
 )
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
-from obs_agent.context_jsonl import find_session_jsonl
+from obs_agent.context_jsonl import find_session_jsonl, session_jsonl_has_conversation
 from obs_agent.jsonl_health import (
     JsonlSessionHealth,
     is_stale_session_head,
@@ -310,6 +310,13 @@ class TelegramSessionState:
     # route whose session id is not known yet, so a resume after a crash in
     # the first seconds of a new session does not lose the original request.
     inflight_user_text: str | None = None
+    # True while the turn in flight started without a session id, i.e. it is
+    # the first turn of a new session (vault-1i53). The session id is known
+    # from the CLI's init message soon after, but until the CLI writes the
+    # turn's first rows the session cannot be resumed, so the crash snapshot
+    # keeps the turn's input for this whole turn and the resume decides from
+    # the transcript.
+    inflight_first_turn: bool = False
 
     @property
     def session_id(self) -> str | None:
@@ -2172,10 +2179,13 @@ class TelegramBot:
                 continue
             session_id = state.session_id
             inflight_prompt: str | None = None
-            if not session_id:
-                # No transcript to resume yet (the SDK reports the session id
-                # with its first message). Keep the turn's input so the resume
-                # can re-send it instead of a bare "continue" into a new session.
+            if not session_id or state.inflight_first_turn:
+                # No transcript to resume yet, or maybe none: a new session's id
+                # is known from the CLI's init message (vault-1i53), but until the
+                # CLI writes the turn's first rows `--resume` fails. Keep the
+                # turn's input so the resume can re-send it into a new session
+                # instead of a bare "continue"; it resumes the transcript when
+                # there is one.
                 inflight_prompt = state.inflight_user_text
                 if not inflight_prompt and record is not None and (record.prompt or record.prompt_file_content):
                     inflight_prompt = self._compose_prompt_file_context(
@@ -2450,6 +2460,17 @@ class TelegramBot:
             return None
         if entry.session_id and state.session_id != entry.session_id:
             await self._activate_route_session(state, entry.session_id)
+        if entry.inflight_prompt and state.session_id and not self._session_resumable(state.session_id):
+            # vault-1i53: the first turn was cut off after the CLI reported its
+            # session id but before it wrote the turn's first rows, so there is
+            # no transcript to --resume. A fresh session gets the original request.
+            logger.warning(
+                "[maintenance_restart] route=%s session_id=%s has no transcript yet; "
+                "re-sending the original request in a fresh session",
+                route,
+                state.session_id,
+            )
+            await self._activate_route_session(state, None)
         bot = self._bot_for_state(state)
         if bot is None:
             logger.warning("[maintenance_restart] skip route=%s reason=no_bot", route)
@@ -2548,6 +2569,17 @@ class TelegramBot:
         task.add_done_callback(self._on_detached_wake_done)
         self._track_crash_resume(route, entry, kind=kind, run=task)
         return task
+
+    def _session_resumable(self, session_id: str) -> bool:
+        """True when the session's JSONL has a conversation row the CLI can resume."""
+        try:
+            return (
+                session_jsonl_has_conversation(session_id=session_id, cwd=self._config.vault_path)
+                is True
+            )
+        except Exception:
+            logger.warning("Unable to inspect JSONL before resume session_id=%s", session_id, exc_info=True)
+            return True
 
     def _track_crash_resume(
         self,
@@ -3151,6 +3183,31 @@ class TelegramBot:
             self._route_by_session_id[session_id] = state.route
             self._upsert_route_inbox_target(state)
             self._persist_state_for_route(state.route)
+            self._record_task_session(state, session_id)
+
+    def _record_task_session(self, state: TelegramSessionState, session_id: str) -> None:
+        """Put the route's current session id on its AgentTask handle, durably (vault-1i53).
+
+        Runs on every event of a run, so a fresh child's handle names its session
+        from the CLI's init message on, not from its first wake or resume:
+        AgentTaskOutput, AgentTaskStop, the rounds watchdog and crash recovery
+        can find a child that is still in, or died in, its first turn.
+        """
+        record = self._find_task_by_child_route(state.route)
+        if record is None or record.child_session_id == session_id:
+            return
+        previous = record.child_session_id
+        record.child_session_id = session_id
+        self._persist_task_handle_record(record)
+        self._persist_team_worker_record(record)
+        logger.info(
+            "[agent_task] session recorded task_id=%s agent=%s session_id=%s previous=%s route=%s",
+            record.task_id,
+            record.agent_name,
+            session_id,
+            previous or None,
+            state.route,
+        )
 
     def _unbind_route_sessions(self, route: TelegramRoute) -> None:
         stale = [session_id for session_id, mapped_route in self._route_by_session_id.items() if mapped_route == route]
@@ -9917,6 +9974,7 @@ class TelegramBot:
         )
 
         state.inflight_user_text = user_text
+        state.inflight_first_turn = not state.session_id
         try:
             if state.pending_obs_bootstrap is None and not self._session_heads.get(state.session_id or ""):
                 had_lineage = state.agent_lineage is not None
@@ -10300,6 +10358,7 @@ class TelegramBot:
                 state.hook_state.post_stop_messages = []
             state.busy = False
             state.inflight_user_text = None
+            state.inflight_first_turn = False
             state.hook_state.execution_active = False
             state.hook_state.interrupt_requested = False
             try:
@@ -13121,6 +13180,10 @@ class TelegramBot:
                 if parent_state is not None:
                     parent_state.active_fork_task_ids.discard(task_id)
             record.completed_at = time.time()
+            # vault-1i53: the run's own session, even if it changed after the last event.
+            finished_session_id = (child_state.session_id or "").strip() if child_state is not None else ""
+            if finished_session_id:
+                record.child_session_id = finished_session_id
             result_data = child_state.hook_state.last_result_data if child_state is not None else None
             usage = result_data.get("usage") if isinstance(result_data, dict) else None
             if isinstance(usage, dict):

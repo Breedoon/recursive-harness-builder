@@ -1941,8 +1941,9 @@ def create_obs_tools(
             return _error_result("Cannot use session_lineage: no OBS bootstrap found for current session")
         current_session_id = get_session_id()
         if not current_session_id and hook_state is not None:
-            # A fresh session's manager learns its id only when the SDK turn
-            # finishes; the hook layer already saw it on this tool call (B27).
+            # The manager learns a fresh session's id from the CLI's system/init
+            # (vault-1i53; before that, only when the turn finished). The hook
+            # layer also sees it on every tool call (B27), so keep it as a fallback.
             current_session_id = hook_state.session_id
         payload = obs_bootstrap_to_dict(
             bootstrap,

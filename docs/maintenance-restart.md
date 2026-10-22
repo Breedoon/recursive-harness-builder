@@ -235,14 +235,29 @@ Tests: `tests/test_freeze_guard.py` runs the real vault tool against isolated st
      agent then replies with one line and stops.
    - Queued messages are replayed after the note.
    - The normal JSONL health recovery repairs poisoned tails from the kill.
-   - **Routes with no session id yet.** The SDK reports a session id with its
-     first message, so a turn cut off in its first seconds (or a fork reserved
-     but still waiting for its child lock) has no transcript to continue. The
-     snapshot still lists such a route (routes are never dropped for lacking a
-     session id) and also records the turn's input text (`inflight_prompt`,
-     only while there is no session id). The resume then starts a fresh
-     session whose note carries that original request instead of "continue".
-     Older markers without the field still parse, and older readers ignore it.
+   - **First turns (vault-1i53).** OBS records a new session's id from the
+     CLI's `system/init` message, under a second after the turn starts, and
+     writes it at once to `route_state` and to the AgentTask handle
+     (`task_handle_state`/`team_worker_state.child_session_id`). Before
+     2026-10-22 it learned the id only when the first turn ended, and the
+     handle of a fresh child kept an empty id until its next wake, so a first
+     turn cut off at any point could not be resumed and its handle stayed
+     `launched` with no session.
+   - **A turn whose transcript may not exist yet.** The CLI writes a turn's
+     user row together with its first reply block, so between init and the
+     first reply (a slow first response) the JSONL holds only
+     `queue-operation` rows and `--resume` fails with "No conversation found".
+     The snapshot lists such routes too (routes are never dropped for lacking
+     a session id) and records the turn's input text (`inflight_prompt`) for
+     every first turn and for a route with no session id at all (a fork
+     reserved but still waiting for its child lock). On resume, a session
+     whose JSONL has a user/assistant row is resumed with "continue" (the
+     normal health recovery keeps its completed tool rounds); otherwise a
+     fresh session gets a note carrying the original request. Older markers
+     without the field still parse, and older readers ignore it.
+   - Any other resume of such an unborn session (a later wake, an AgentTask
+     resume) starts a fresh session instead of `--resume`
+     (`SessionManager._session_is_unborn`, log `[session_resume]`).
 6. Fork and AgentTask children get `emit_parent_callback` re-armed, so the
    waiting parent is notified when the resumed child finishes. (Unit-tested;
    not yet observed live — in the first live run the resumed children were

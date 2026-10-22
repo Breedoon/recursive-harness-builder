@@ -332,10 +332,10 @@ async def test_run_and_send_sets_and_clears_inflight_text(config):
     bot = _bot(config)
     route = TelegramRoute(chat_id=67890, thread_id=523)
     state = bot._get_state(route, topic_title="T")
-    seen: list[str | None] = []
+    seen: list[tuple[str | None, bool]] = []
 
     def boom(*args, **kwargs):
-        seen.append(state.inflight_user_text)
+        seen.append((state.inflight_user_text, state.inflight_first_turn))
         raise RuntimeError("stop here")
 
     with (
@@ -347,8 +347,9 @@ async def test_run_and_send_sets_and_clears_inflight_text(config):
             await bot._run_and_send(state=state, user_text="hello there", bot=AsyncMock())
         except Exception:
             pass
-    assert seen == ["hello there"]
+    assert seen == [("hello there", True)]  # no session id at run start: a first turn
     assert state.inflight_user_text is None
+    assert state.inflight_first_turn is False
 
 
 @pytest.mark.asyncio
@@ -372,13 +373,35 @@ async def test_resume_without_session_resends_original_request(config):
     assert text.rstrip().endswith("build the widget")
 
 
+def _write_session_jsonl(config, monkeypatch, tmp_path: Path, session_id: str, rows: list[dict]) -> Path:
+    """A session JSONL under a private HOME (the isolated test home links the real projects dir)."""
+    import json
+
+    from obs_agent.context_jsonl import _encode_project_path
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    path = home / ".claude" / "projects" / _encode_project_path(Path(config.vault_path)) / f"{session_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    return path
+
+
+_QUEUE_ROWS = [
+    {"type": "queue-operation", "operation": "enqueue", "sessionId": "x", "content": "hi"},
+    {"type": "queue-operation", "operation": "dequeue", "sessionId": "x"},
+]
+_USER_ROW = {"type": "user", "uuid": "u-1", "parentUuid": None, "message": {"role": "user", "content": "hi"}}
+
+
 @pytest.mark.asyncio
-async def test_resume_with_session_keeps_continue_prompt(config):
+async def test_resume_with_session_keeps_continue_prompt(config, monkeypatch, tmp_path):
     bot = _bot(config)
     bot._primary_bot = MagicMock()
     route = TelegramRoute(chat_id=67890, thread_id=525)
     state = bot._get_state(route, topic_title="Known")
     state.session_manager.set_session_id("sid-525")
+    _write_session_jsonl(config, monkeypatch, tmp_path, "sid-525", [*_QUEUE_ROWS, _USER_ROW])
     entry = maint.ResumeEntry(
         chat_id=route.chat_id, thread_id=route.thread_id, session_id="sid-525", inflight_prompt="ignored"
     )
@@ -391,6 +414,113 @@ async def test_resume_with_session_keeps_continue_prompt(config):
         await task
     text = run.await_args.kwargs["user_text"]
     assert "Continue your task from where you left off." in text and "ignored" not in text
+    assert state.session_id == "sid-525"
+
+
+@pytest.mark.asyncio
+async def test_resume_of_first_turn_cut_before_its_first_rows_resends_original(config, monkeypatch, tmp_path):
+    """vault-1i53: the id came from init, but the CLI had written only queue rows."""
+    bot = _bot(config)
+    bot._primary_bot = MagicMock()
+    route = TelegramRoute(chat_id=67890, thread_id=526)
+    state = bot._get_state(route, topic_title="Unborn")
+    state.session_manager.set_session_id("sid-526")
+    _write_session_jsonl(config, monkeypatch, tmp_path, "sid-526", _QUEUE_ROWS)
+    entry = maint.ResumeEntry(
+        chat_id=route.chat_id, thread_id=route.thread_id, session_id="sid-526", inflight_prompt="build the widget"
+    )
+    run = AsyncMock()
+    with (
+        patch.object(bot, "_send_system_html_message", AsyncMock(return_value=[])),
+        patch.object(bot, "_run_and_send", run),
+    ):
+        task = await bot._resume_maintenance_entry(entry, requested_at=time.time(), kind="crash")
+        await task
+    text = run.await_args.kwargs["user_text"]
+    assert text.rstrip().endswith("build the widget")
+    assert state.session_id is None  # a fresh session; its own init names it
+
+
+@pytest.mark.asyncio
+async def test_resume_uses_session_recorded_after_the_snapshot(config, monkeypatch, tmp_path):
+    """The 15 s snapshot predates init; the restored route already names the session."""
+    bot = _bot(config)
+    bot._primary_bot = MagicMock()
+    route = TelegramRoute(chat_id=67890, thread_id=527)
+    state = bot._get_state(route, topic_title="Restored")
+    state.session_manager.set_session_id("sid-527")
+    _write_session_jsonl(config, monkeypatch, tmp_path, "sid-527", [*_QUEUE_ROWS, _USER_ROW])
+    entry = maint.ResumeEntry(
+        chat_id=route.chat_id, thread_id=route.thread_id, session_id=None, inflight_prompt="build the widget"
+    )
+    run = AsyncMock()
+    with (
+        patch.object(bot, "_send_system_html_message", AsyncMock(return_value=[])),
+        patch.object(bot, "_run_and_send", run),
+    ):
+        task = await bot._resume_maintenance_entry(entry, requested_at=time.time(), kind="crash")
+        await task
+    text = run.await_args.kwargs["user_text"]
+    assert "build the widget" not in text
+    assert state.session_id == "sid-527"
+
+
+def test_snapshot_keeps_input_for_a_first_turn_whose_session_is_known(config):
+    """vault-1i53: init names the session early, but it may not be resumable yet."""
+    bot = _bot(config)
+    route = TelegramRoute(chat_id=67890, thread_id=528)
+    state = bot._get_state(route, topic_title="First turn")
+    state.session_manager.set_session_id("sid-528")
+    state.busy = True
+    state.inflight_first_turn = True
+    state.inflight_user_text = "please do the thing"
+    (entry,) = bot._collect_maintenance_entries(allow_jsonl_lookup=False)
+    assert entry.session_id == "sid-528" and entry.inflight_prompt == "please do the thing"
+
+
+@pytest.mark.asyncio
+async def test_run_binding_records_a_fresh_child_session_on_its_handle_durably(config, monkeypatch, tmp_path):
+    """vault-1i53: the handle names the session from the run's first event on, across a restore."""
+    jsonl = _write_session_jsonl(config, monkeypatch, tmp_path, "sid-529", _QUEUE_ROWS)  # right after init
+    bot = _bot(config)
+    child = TelegramRoute(chat_id=67890, thread_id=529)
+    state = bot._get_state(child, topic_title="Fresh child")
+    rec = _child_record(child, task_id="t-529")
+    rec.child_session_id = ""  # a fresh (fork=false) child before its first event
+    rec.is_fork = False
+    bot._fork_tasks_by_id[rec.task_id] = rec
+    bot._fork_task_by_child_route[child] = rec.task_id
+    bot._register_team_worker_record(rec)
+
+    state.session_manager.set_session_id("sid-529")  # what the runner does on system/init
+    bot._bind_state_session(state)  # what _run_and_send does on every runner event
+
+    assert rec.child_session_id == "sid-529"
+    snap = bot._state_store.load_snapshot()
+    handle = next(h for h in snap.task_handle_states if h.task_id == "t-529")
+    worker = next(w for w in snap.team_worker_states if w.task_id == "t-529")
+    route_row = next(r for r in snap.route_states if r.thread_id == 529)
+    assert handle.child_session_id == worker.child_session_id == route_row.session_id == "sid-529"
+    assert handle.status == "launched"
+    running = asyncio.create_task(asyncio.sleep(30))  # the child's first turn, still running
+    bot._fork_task_tasks["t-529"] = running
+    try:
+        with patch.object(bot, "_caller_team_name", return_value="team-lc"):  # the launcher's team
+            output = await bot._fork_task_output(
+                route=PARENT, args={"task_id": "t-529", "block": False, "timeout": 0}
+            )
+    finally:
+        running.cancel()
+    assert output["tool_use_result"]["retrieval_status"] == "not_ready"
+    assert output["tool_use_result"]["task"]["session_id"] == "sid-529"
+    assert output["tool_use_result"]["task"]["output_file"] == str(jsonl)
+    bot._fork_task_tasks.pop("t-529", None)
+    await bot.shutdown()
+
+    restored = await _restored(config)
+    assert restored._fork_tasks_by_id["t-529"].child_session_id == "sid-529"
+    assert restored._get_state(child, create=False).session_id == "sid-529"
+    await restored.shutdown()
 
 
 def test_inflight_prompt_round_trips_and_old_markers_parse(tmp_path: Path):

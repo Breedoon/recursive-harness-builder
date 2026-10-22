@@ -248,6 +248,42 @@ class TestCreateOptions:
         options = mgr.create_options()
         assert options.resume is None
 
+    def test_unborn_session_is_not_resumed(self, config, tmp_path):
+        """vault-1i53: an id known from init whose JSONL has only queue rows."""
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text(
+            '{"type":"queue-operation","operation":"enqueue","content":"hi"}\n'
+            '{"type":"queue-operation","operation":"dequeue"}\n',
+            encoding="utf-8",
+        )
+        mgr = SessionManager(config=config)
+        mgr.set_session_id("sess-unborn")
+        with patch("obs_agent.context_jsonl.find_session_jsonl", return_value=jsonl):
+            options = mgr.create_options()
+        assert options.resume is None
+        assert mgr.session_id is None  # the fresh CLI's init names the new session
+
+    def test_session_with_conversation_is_resumed(self, config, tmp_path):
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text(
+            '{"type":"queue-operation","operation":"enqueue","content":"hi"}\n'
+            '{"type":"user","uuid":"u1","message":{"role":"user","content":"hi"}}\n',
+            encoding="utf-8",
+        )
+        mgr = SessionManager(config=config)
+        mgr.set_session_id("sess-1")
+        with patch("obs_agent.context_jsonl.find_session_jsonl", return_value=jsonl):
+            options = mgr.create_options()
+        assert options.resume == "sess-1"
+        assert mgr.session_id == "sess-1"
+
+    def test_session_without_jsonl_is_still_resumed(self, config):
+        mgr = SessionManager(config=config)
+        mgr.set_session_id("sess-missing")
+        with patch("obs_agent.context_jsonl.find_session_jsonl", return_value=None):
+            options = mgr.create_options()
+        assert options.resume == "sess-missing"
+
     def test_sets_cwd_and_project_setting_source(self, config):
         mgr = SessionManager(config=config)
         options = mgr.create_options()
