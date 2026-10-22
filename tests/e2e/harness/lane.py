@@ -175,7 +175,10 @@ class Lane:
         body = {"lane": self.name, "topic_id": topic_id, "text": text}
         if reply_to is not None:
             body["reply_to"] = int(reply_to)
+        position, sent_at = self.events.mark(), time.time()
         data = await self._rpc.call("POST", "/send", body)
+        self.events.record_input(position=position, message_id=int(data["message_id"]),
+                                 chat_id=int(data["chat_id"]), topic_id=topic_id, ts=sent_at)
         return SentMessage(message_id=int(data["message_id"]), topic_id=topic_id, text=text, date=data.get("date"))
 
     async def command(self, topic: Topic | int | str, text: str, reply_to: int | None = None) -> SentMessage:

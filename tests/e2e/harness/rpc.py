@@ -214,7 +214,7 @@ class TelegramRPCServer:
             return await self._close_topic(chat_id, topic_id)
         if path == "/send":
             message = await self.client.send_message(chat_id, body["text"], reply_to=int(body.get("reply_to") or topic_id))
-            return {"message_id": message.id, "date": _json_default(message.date)}
+            return {"message_id": message.id, "chat_id": chat_id, "date": _json_default(message.date)}
         if path == "/messages":
             limit = int(body.get("limit", 100))
             if limit <= 0:

@@ -177,6 +177,7 @@ class EventLog:
 
     def __post_init__(self) -> None:
         self._waiters: list[_Waiter] = []
+        self.inputs: list[dict] = []
         self._tail = FileTail(self.path, self._on_line)
         self.bad_lines = 0
 
@@ -194,6 +195,11 @@ class EventLog:
         """A position to pass as ``after=``: only later events count."""
         self._tail.drain()
         return len(self.events)
+
+    def record_input(self, *, position: int, message_id: int, chat_id: int, topic_id: int, ts: float) -> None:
+        """Record the pre-send cursor after Telegram confirms that the input was sent."""
+        self.inputs.append({"position": position, "message_id": message_id,
+                            "chat_id": chat_id, "topic_id": topic_id, "ts": ts})
 
     def _on_line(self, line: str, read_at: float) -> None:
         try:
@@ -273,8 +279,33 @@ class EventLog:
 
     def assert_none(self, kind: str, *, agent: Any = None, match: Any = None, after: Any = None,
                     before: Any = None) -> None:
-        """Negative assertion over the log between ``after`` and ``before`` (or now)."""
-        found = self.find(kind, agent=agent, match=match, after=after, before=before)
+        """Assert absence until the next input/turn, preserving explicit old-turn attribution."""
+        candidates = self.find(kind, agent=agent, match=match, after=after, before=before)
+        lower = self._min_index(after)
+        anchor = after if isinstance(after, dict) else {}
+        asserted_message = anchor.get("trigger_message_id")
+        found = []
+        for event in candidates:
+            scope = {key: event.get(key) if event.get(key) is not None else anchor.get(key)
+                     for key in ("chat_id", "topic_id")}
+
+            def same_route(record):
+                return all(record.get(key) == scope[key] for key in scope)
+
+            reply = event.get("reply_to_message_id", event.get("reply_to_msg_id"))
+            # INVARIANT(C3): a later receipt is outside the window; an explicit old-turn reply is not.
+            # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Runner#Python test API
+            if asserted_message is not None and reply == asserted_message and same_route(anchor):
+                found.append(event)
+                continue
+            inputs = [record for record in self.inputs if record["position"] >= lower and same_route(record)]
+            later_reply = reply is not None and any(record["message_id"] == reply for record in inputs)
+            past_input = any(record["position"] <= event["_index"] for record in inputs)
+            past_turn = any(record.get("kind") == "turn_start" and same_route(record) and
+                            (asserted_message is None or record.get("trigger_message_id") != asserted_message)
+                            for record in self.events[lower:event["_index"] + 1])
+            if not (later_reply or past_input or past_turn):
+                found.append(event)
         if found:
             raise AssertionError(f"unexpected {kind} event(s) for {agent!r}: {found[:3]}")
 
