@@ -22,6 +22,7 @@ def emit(event, **data):
 
 
 class FakeTelegram:
+    defaults = None
     id = 9990001
     username = "ruoi_e2e_bot"
 
