@@ -135,6 +135,10 @@ async def test_iii_lane_env_is_the_allow_list(lane):
                 findings.append({"pid": pid, "kind": kind, "unexpected": sorted(bad)})
         elif kind in ("wrapper", "telegram_main", "cache_proxy"):
             bad = extra - SUPERVISOR_ADDS - PROGRAM_ADDS - WRAPPER_ADDS - SHELL_ADDS
+            if kind == "cache_proxy":
+                # runtime_env.bootstrap_runtime_env sets this after lane entry;
+                # telegram_main --prod passes it to its proxy child, not lanectl.
+                bad.discard("OBS_PROFILE")
             if bad:
                 findings.append({"pid": pid, "kind": kind, "unexpected": sorted(bad)})
         per_kind.setdefault(kind, set()).update(extra)
