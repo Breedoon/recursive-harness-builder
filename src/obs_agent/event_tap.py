@@ -13,8 +13,10 @@ Kinds and their extra fields (every line also has ``ts``, ``kind``, ``pid``,
 - ``turn_start``: ``trigger`` (message|schedule|inbox|other), ``trigger_message_id``,
   ``schedule_id``, ``text_len``, ``text_sha``
 - ``turn_end``: the same trigger fields plus ``subtype`` (the CLI result subtype
-  when known, else success|error|interrupted), ``failed``, ``turns``, ``cli_runtime``
-- ``telegram_send``: ``message_id``, ``reply_to_message_id``, ``text_len``, ``text_head``
+  when known, else success|error|interrupted), ``failed``, ``turns``, ``cli_runtime``,
+  ``cost_usd`` (the CLI's reported total, when present)
+- ``telegram_send``: ``message_id``, ``reply_to_message_id``, ``text_len``, ``text_sha``,
+  ``text_head``
 - ``schedule_fired``: ``schedule_id``, ``trigger_kind``
 - ``inbox_delivered``: ``mode`` (wake|queued|post_stop), ``sender``
 - ``session_build``: ``runtime``, ``version``, ``credential_profile``, ``source``
