@@ -1,4 +1,6 @@
 // Supporting attachment/runtime feasibility only; real CLI path proof is separate.
+if(process.argv.includes('--help')){console.log('Benign attachment and valid-format preservation probe; no work in help mode');process.exit(0);}
+const fixedNode=process.env.BUN_PROBE_FIXED_NODE || process.env.OBS_BUN_DECODER_NODE;
 const http=require('node:http'), zlib=require('node:zlib'), cp=require('node:child_process');
 const originalFetch=globalThis.fetch;
 const plain=Buffer.from('BUN_ATTACHMENT_VALID_BODY\n');
@@ -6,6 +8,7 @@ const br=zlib.brotliCompressSync(plain);
 const result={bun:process.versions.bun,node:process.versions.node,cases:[]};
 const server=http.createServer((req,res)=>{
   if(req.url==='/redirect'){res.writeHead(302,{'Location':'/body','content-encoding':'br'});res.end(br);return;}
+  if(req.url==='/raw-deflate'){const raw=zlib.deflateRawSync(plain);res.writeHead(200,{'content-encoding':'deflate','content-length':raw.length});res.write(raw.subarray(0,1));setTimeout(()=>res.end(raw.subarray(1)),80);return;}
   const status=req.url==='/error'?418:200;
   res.writeHead(status,{'content-type':req.url==='/sse'?'text/event-stream':'text/plain','content-encoding':'br','content-length':br.length});res.end(br);
 });
@@ -16,7 +19,7 @@ server.listen(0,'127.0.0.1',async()=>{
     for(const path of ['/body','/redirect','/error','/sse']){
       const r=await originalFetch(url+path,{decompress:false,headers:{'accept-encoding':'identity'}});
       const raw=Buffer.from(await r.arrayBuffer());
-      const decoded=cp.spawnSync(process.env.BUN_PROBE_FIXED_NODE,['-e',"process.stdin.pipe(require('node:zlib').createBrotliDecompress()).pipe(process.stdout)"],{input:raw,env:{PATH:'/usr/bin:/bin'}});
+      const decoded=cp.spawnSync(fixedNode,['-e',"process.stdin.pipe(require('node:zlib').createBrotliDecompress()).pipe(process.stdout)"],{input:raw,env:{PATH:'/usr/bin:/bin'}});
       const h=new Headers(r.headers);h.delete('content-encoding');h.delete('content-length');
       const rebuilt=new Response(decoded.stdout,{status:r.status,statusText:r.statusText,headers:h});
       for(const key of ['url','redirected','type'])Object.defineProperty(rebuilt,key,{value:r[key],configurable:true});
@@ -41,7 +44,21 @@ server.listen(0,'127.0.0.1',async()=>{
     try{
       const d=new DecompressionStream('brotli');const writer=d.writable.getWriter();const read=new Response(d.readable).arrayBuffer();await writer.write(br);await writer.close();record('DecompressionStream-brotli',{supported:true,decoded:Buffer.from(await read).equals(plain),global_descriptor:{writable:Object.getOwnPropertyDescriptor(globalThis,'DecompressionStream').writable,configurable:Object.getOwnPropertyDescriptor(globalThis,'DecompressionStream').configurable}});
     }catch(e){record('DecompressionStream-brotli',{supported:false,error:e.message});}
-    record('fixed-decoder-identity',{executable:process.env.BUN_PROBE_FIXED_NODE,versions:JSON.parse(cp.spawnSync(process.env.BUN_PROBE_FIXED_NODE,['-p','JSON.stringify(process.versions)'],{env:{PATH:'/usr/bin:/bin'},encoding:'utf8'}).stdout)});
+    const compatibility=[];
+    for(const [name,fetcher,path,options,expected] of [
+      ['native raw-deflate',Bun.fetch,'/raw-deflate',{},plain],
+      ['adapted raw-deflate',originalFetch,'/raw-deflate',{},plain],
+      ['node-fetch raw-deflate',nf.default||nf,'/raw-deflate',{},plain],
+      ['adapted explicit no-decode',originalFetch,'/body',{decompress:false},br],
+      ['node-fetch explicit no-decode',nf.default||nf,'/body',{decompress:false},br]]){
+      const response=await fetcher(url+path,options);const bytes=Buffer.from(await response.arrayBuffer());
+      compatibility.push({name,pass:bytes.equals(expected)&&(options.decompress!==false || response.headers.get('content-encoding')==='br')});
+    }
+    const info=zlib.brotliDecompressSync(br,{info:true});
+    compatibility.push({name:'sync info engine contract',pass:info.buffer.equals(plain)&&info.engine instanceof zlib.BrotliDecompress&&info.engine.constructor===zlib.BrotliDecompress});
+    result.compatibility=compatibility;result.pass=compatibility.every(row=>row.pass);
+    if(!result.pass)throw new Error('Valid-format/API preservation regression');
+    record('fixed-decoder-identity',{executable:fixedNode,versions:JSON.parse(cp.spawnSync(fixedNode,['-p','JSON.stringify(process.versions)'],{env:{PATH:'/usr/bin:/bin'},encoding:'utf8'}).stdout)});
   }catch(e){result.error={name:e.name,message:e.message};}
   server.close(()=>{console.log(JSON.stringify(result));process.exit(result.error?1:0);});
 });

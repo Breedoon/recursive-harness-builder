@@ -14,8 +14,9 @@ const options = JSON.parse(process.argv[3] || '{}', (_, value) =>
 const errorValue = error => ({message:error.message, code:error.code, errno:error.errno, name:error.name});
 if (process.argv[2] === 'sync') {
   try {
-    const result = zlib.brotliDecompressSync(fs.readFileSync(0), {...options, info:false});
-    fs.writeFileSync(1, result);
+    const result = zlib.brotliDecompressSync(fs.readFileSync(0), {...options, info:true});
+    fs.writeFileSync(1, result.buffer);
+    if (options.info) fs.writeFileSync(2, JSON.stringify({bytesWritten:result.engine.bytesWritten}));
   } catch (error) {
     fs.writeFileSync(2, JSON.stringify(errorValue(error)) + '\n');
     process.exitCode = 1;

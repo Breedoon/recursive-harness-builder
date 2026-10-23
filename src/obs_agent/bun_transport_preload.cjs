@@ -37,9 +37,14 @@ if (process.versions.bun && !globalThis[Symbol.for('obs.bun.transport')]) {
   // Projects/Personal Projects/OBS Platform/CLI Runtime/OBS Touchpoints/Bundled Bun HTTP Decoding/Overview.md
   const flushOperation = Symbol('Brotli flush');
   class FixedBrotliDecompress extends Duplex {
-    constructor(options = {}) {
+    constructor(options = {}, completedBytes) {
       super({...options, decodeStrings:true, autoDestroy:true});
-      this.bytesWritten = 0;
+      this.bytesWritten = completedBytes ?? 0;
+      if (completedBytes !== undefined) {
+        this._child = null;
+        this.push(null); this.end(); this.destroy();
+        return;
+      }
       this._sequence = 0;
       this._acks = new Map();
       this._finalCallback = null;
@@ -71,7 +76,7 @@ if (process.versions.bun && !globalThis[Symbol.for('obs.bun.transport')]) {
         callback?.(this.destroyed ? this._decoderError : undefined);
       });
     }
-    _read() { this._child.stdout.resume(); }
+    _read() { this._child?.stdout.resume(); }
     _send(type, data, callback) {
       const id = ++this._sequence;
       this._acks.set(id, callback);
@@ -87,10 +92,12 @@ if (process.versions.bun && !globalThis[Symbol.for('obs.bun.transport')]) {
       }
     }
     _final(callback) {
+      if (!this._child) { callback(); return; }
       this._finalCallback = callback;
       this._child.stdin.end(frame(1, ++this._sequence));
     }
     _destroy(error, callback) {
+      if (!this._child) { callback(error); return; }
       this._decoderError ||= error;
       this._child.stdin.destroy(); this._child.stdout.destroy();
       if (this._child.exitCode === null && this._child.signalCode === null) this._child.kill();
@@ -111,6 +118,7 @@ if (process.versions.bun && !globalThis[Symbol.for('obs.bun.transport')]) {
   }
   function BrotliDecompress(options) { return new FixedBrotliDecompress(options); }
   BrotliDecompress.prototype = FixedBrotliDecompress.prototype;
+  Object.defineProperty(BrotliDecompress.prototype, 'constructor', {value:BrotliDecompress, configurable:true, writable:true});
   Object.setPrototypeOf(BrotliDecompress, FixedBrotliDecompress);
   const createBrotliDecompress = options => new FixedBrotliDecompress(options);
   function brotliDecompress(buffer, options, callback) {
@@ -137,18 +145,49 @@ if (process.versions.bun && !globalThis[Symbol.for('obs.bun.transport')]) {
       try { error = restoreError(JSON.parse(result.stderr.toString())); } catch (_) { error = new Error(`OBS HTTP decoder exited ${result.status ?? result.signal}`); }
       throw error;
     }
-    return options.info ? {buffer:result.stdout, engine:{bytesWritten:input.length}} : result.stdout;
+    if (!options.info) return result.stdout;
+    const info = JSON.parse(result.stderr.toString());
+    return {buffer:result.stdout, engine:new FixedBrotliDecompress(options, info.bytesWritten)};
   }
   Object.assign(zlib, {BrotliDecompress, createBrotliDecompress, brotliDecompress, brotliDecompressSync});
   require('node:module').syncBuiltinESMExports();
 
+  // INVARIANT: disabling fetch's automatic decoding must preserve its valid
+  // wrapped/raw-deflate and explicit no-decode contracts, not only Brotli safety.
+  // Projects/Personal Projects/OBS Platform/CLI Runtime/OBS Touchpoints/Bundled Bun HTTP Decoding/Overview.md
+  class HttpDeflate extends Duplex {
+    constructor() { super({autoDestroy:true}); this._prefix = Buffer.alloc(0); this._decoder = null; }
+    _start() {
+      const bytes = this._prefix;
+      const wrapped = bytes.length >= 2 && (bytes[0] & 15) === 8 && (bytes[0] >> 4) <= 7 && bytes.readUInt16BE(0) % 31 === 0;
+      this._decoder = wrapped ? zlib.createInflate() : zlib.createInflateRaw();
+      this._decoder.on('data', data => { if (!this.push(data)) this._decoder.pause(); });
+      this._decoder.once('end', () => this.push(null));
+      this._decoder.on('error', error => this.destroy(error));
+      return bytes;
+    }
+    _read() { this._decoder?.resume(); }
+    _write(chunk, encoding, callback) {
+      if (!this._decoder) {
+        this._prefix = Buffer.concat([this._prefix, chunk]);
+        if (this._prefix.length < 2) { callback(); return; }
+        chunk = this._start(); this._prefix = Buffer.alloc(0);
+      }
+      this._decoder.write(chunk, callback);
+    }
+    _final(callback) {
+      if (!this._decoder) { const bytes = this._start(); this._prefix = Buffer.alloc(0); this._decoder.end(bytes, callback); }
+      else this._decoder.end(callback);
+    }
+    _destroy(error, callback) { this._decoder?.destroy(); callback(error); }
+  }
   function decoders(headers) {
     const encoding = headers.get('content-encoding');
     if (!encoding) return [];
     const factories = encoding.split(',').map(x => x.trim().toLowerCase()).reverse().map(name => {
       if (name === 'br') return createBrotliDecompress;
       if (name === 'gzip' || name === 'x-gzip') return zlib.createGunzip;
-      if (name === 'deflate') return zlib.createInflate;
+      if (name === 'deflate') return () => new HttpDeflate();
       if (name === 'identity') return null;
       return undefined;
     });
@@ -209,7 +248,7 @@ if (process.versions.bun && !globalThis[Symbol.for('obs.bun.transport')]) {
   // Projects/Personal Projects/OBS Platform/CLI Runtime/OBS Touchpoints/Bundled Bun HTTP Decoding/Overview.md
   globalThis.fetch = async function fixedDecoderFetch(input, init) {
     const response = await nativeFetch(input, {...init, decompress:false});
-    const factories = decoders(response.headers);
+    const factories = init?.decompress === false ? [] : decoders(response.headers);
     if (!response.body || !factories.length) return response;
     const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
     const body = Readable.toWeb(decodedStream(Readable.fromWeb(response.body), factories, signal));
@@ -228,7 +267,7 @@ if (process.versions.bun && !globalThis[Symbol.for('obs.bun.transport')]) {
     let response;
     try { response = await nativeNodeFetch(input, {...init, signal:controller.signal, decompress:false}); }
     finally { signal?.removeEventListener('abort', abortHeaders); }
-    const factories = decoders(response.headers);
+    const factories = init?.decompress === false ? [] : decoders(response.headers);
     const rawBody = nativeBody.call(response);
     if (!rawBody) return response;
     const source = Readable.fromWeb(rawBody);
