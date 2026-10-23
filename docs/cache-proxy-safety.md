@@ -298,6 +298,39 @@ that specific evidence instead of changing cache acceptance or relabeling the
 original FAIL. F3 environment routing remains separately owned; gate runs still
 use `/workspace/runtime/e2e/gate-runs/run-gate.sh` in an isolated obs-e2e container.
 
+### Recovery effects fixture boundary
+
+`recovery_multi` establishes its existing fixture prerequisites before it
+cancels the in-flight turn and forks. A proposed Bash sleep tool call is not
+proof that the earlier commands have written their effects. The driver keeps
+consuming the existing SDK message stream and observes the actual effects file
+until it contains exactly `step3`, then `step4`; only that ledger plus the sleep
+milestone permits recovery. It no longer uses an unconditional two-second settle.
+
+The effects deadline is 30 monotonic seconds after the first sleep-tool
+milestone (`RECOVERY_EFFECTS_TIMEOUT`), with checks at most 0.05 seconds apart and
+bounded by the remaining deadline. Already-ready effects proceed immediately.
+Before that milestone, the existing outer scenario deadline still applies; no
+new CLI flag, model setting or public output field is introduced. The pending
+message read/iterator is closed on observation, timeout, terminal response or
+outer cancellation. A terminal response, ended stream or missing/incorrect
+ledger cannot be recovered as a valid fixture and remains a non-PASS scenario.
+
+The existing post-recovery requirements remain: both effect lists must equal
+`[step3, step4]`, the original source must be unchanged, and every prefix,
+breakpoint, tool-fidelity and cache-read check must pass. Empty-before equals
+empty-after is not success. This boundary is not a known-intermittent exception
+and changes neither the admission table nor the 0.95 threshold.
+
+**Decision/rationale (obs-22.46 follow-up, 2026-10-23):** a preserved full run
+reached recovery with absent fixture effects despite an intact producer prefix;
+a separately authorized baseline had the expected effects. That comparison does
+not establish a unique cause, but the fixture must observe its prerequisites
+rather than infer execution from a tool proposal and a fixed delay. The repair
+is staged in a separate worktree so existing gates can retain the exact borrowed
+11b tooling. Constructed event/file schedules are labelled as such; hygiene and
+those controls do not replace a newly authorized exact-identity live gate.
+
 ### How to read the runner's result
 
 - `PASS` — every request pair was a pure append with at least 95% cache read.

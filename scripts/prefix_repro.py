@@ -61,6 +61,7 @@ import re
 import sys
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -81,6 +82,7 @@ from claude_agent_sdk import (  # noqa: E402
 DEFAULT_BASE_URL = "http://127.0.0.1:28925"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 UTILITY_INDEX_TIMEOUT = 30.0
+RECOVERY_EFFECTS_TIMEOUT = 30.0
 WORK_ROOT = Path(os.environ.get("PREFIX_REPRO_ROOT", "/workspace/runtime/prefix-repro"))
 # Built at runtime so this file never contains the literal placeholder itself
 # (the CLI would rewrite it if an agent ever reads this file into context).
@@ -447,6 +449,59 @@ async def sc_parallel_fork(args):
                             "original_source_sha256": before, "source_unchanged": source_unchanged}
 
 
+async def _wait_recovery_effects(messages, effect_path, timeout):
+    # INVARIANT: observe the fixture's completed effects before cancelling its
+    # in-flight turn; a tool-use proposal alone does not establish execution.
+    # Doc: docs/cache-proxy-safety.md#recovery-effects-fixture-boundary
+    started = time.monotonic()
+    sleep_seen_at = None
+    checks = 0
+    pending = asyncio.create_task(anext(messages))
+
+    def observation(status):
+        now = time.monotonic()
+        return {"status": status, "timeout_seconds": timeout, "checks": checks,
+                "sleep_tool_seen": sleep_seen_at is not None,
+                "elapsed_seconds": round(now - started, 4),
+                "effects_wait_seconds": round(now - sleep_seen_at, 4) if sleep_seen_at is not None else None}
+
+    try:
+        while True:
+            if pending.done():
+                try:
+                    msg = pending.result()
+                except StopAsyncIteration:
+                    return observation("stream_ended")
+                if isinstance(msg, AssistantMessage):
+                    if any(isinstance(b, ToolUseBlock) and b.name == "Bash" and "sleep" in str(b.input)
+                           for b in msg.content):
+                        if sleep_seen_at is None:
+                            sleep_seen_at = time.monotonic()
+                if isinstance(msg, ResultMessage):
+                    return observation("terminal_before_ready")
+                pending = asyncio.create_task(anext(messages))
+            if sleep_seen_at is None:
+                await asyncio.wait({pending})  # the outer scenario deadline still applies
+                continue
+            try:
+                effects = effect_path.read_text().splitlines()
+            except FileNotFoundError:
+                effects = []
+            checks += 1
+            elapsed = time.monotonic() - sleep_seen_at
+            if effects == ["step3", "step4"] and elapsed <= timeout:
+                return observation("observed")
+            if elapsed >= timeout:
+                return observation("timed_out")
+            await asyncio.wait({pending}, timeout=min(0.05, timeout - elapsed))
+    finally:
+        if not pending.done():
+            pending.cancel()
+        with suppress(asyncio.CancelledError, StopAsyncIteration):
+            await pending
+        await messages.aclose()
+
+
 async def sc_recovery_multi(args):
     """Like recovery, but the killed turn already completed several tool rounds
     (text, parallel reads, more tools) before the in-flight one — the shape of
@@ -471,17 +526,9 @@ async def sc_recovery_multi(args):
             "Do these steps in order without pausing: (1) say 'working', (2) in ONE message call the "
             f"Read tool on a.txt and b.txt in parallel, (3) run Bash `echo step3 >> {effect_path.name}`, "
             f"(4) run Bash `echo step4 >> {effect_path.name}`, (5) run Bash `sleep 60`.")
-        seen = 0
-        async for msg in client.receive_messages():
-            if isinstance(msg, AssistantMessage):
-                for b in msg.content:
-                    if isinstance(b, ToolUseBlock) and b.name == "Bash" and "sleep" in str(b.input):
-                        seen = 1
-            if seen:
-                break
-            if isinstance(msg, ResultMessage):
-                break
-        await asyncio.sleep(2)
+        setup = await _wait_recovery_effects(client.receive_messages(), effect_path, RECOVERY_EFFECTS_TIMEOUT)
+        if setup["status"] != "observed":
+            raise RuntimeError(f"recovery_multi: required effects before recovery not observed ({setup['status']})")
     finally:
         await client.disconnect()
     target = resolve_safe_jsonl_target(session_id=sid, cwd=cwd)
