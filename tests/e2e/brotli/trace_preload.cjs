@@ -70,8 +70,38 @@ for (const [module, protocol] of [[https,'https:'],[http,'http:']]) {
     return Reflect.apply(request,this,[mapped,cb]);
   };
 }
-if (!process.argv.includes('--version')) {
+const positiveZlibFactory = zlib.createBrotliDecompress;
+const cp = require('node:child_process');
+const spawn = cp.spawn;
+cp.spawn = function observedDecoderSpawn(executable, args, options) {
+  const child = Reflect.apply(spawn, this, [executable,args,options]);
+  if (args?.[0]?.endsWith('/bun_decoder_worker.cjs')) {
+    event('fixed_worker_spawn', {child_pid:child.pid, executable, decoder_sha256:sha(fs.readFileSync(executable)), worker_sha256:sha(fs.readFileSync(args[0])), env_names:Object.keys(options.env).sort()});
+    const input=[], output=[]; let pending=Buffer.alloc(0);
+    const write=child.stdin.write.bind(child.stdin), end=child.stdin.end.bind(child.stdin);
+    function observe(chunk) {
+      if (!chunk || typeof chunk === 'function') return;
+      pending=Buffer.concat([pending,Buffer.from(chunk)]);
+      while(pending.length >= 9) {
+        const length=pending.readUInt32BE(5);
+        if(pending.length < length+9)break;
+        if(pending[0]===0)input.push(pending.subarray(9,9+length));
+        pending=pending.subarray(9+length);
+      }
+    }
+    child.stdin.write=function(chunk,...rest){observe(chunk);return write(chunk,...rest);};
+    child.stdin.end=function(chunk,...rest){observe(chunk);return end(chunk,...rest);};
+    const emit=child.stdout.emit;
+    child.stdout.emit=function(type,...args){if(type==='data')output.push(Buffer.from(args[0]));return Reflect.apply(emit,this,[type,...args]);};
+    child.once('close',(code,signal)=>event('fixed_worker_end',{child_pid:child.pid,code,signal,input_sha256:sha(Buffer.concat(input)),output_sha256:sha(Buffer.concat(output)),input_bytes:Buffer.concat(input).length,output_bytes:Buffer.concat(output).length}));
+  }
+  return child;
+};
+if (!process.argv.includes('--version') && !process.argv.includes('--ripgrep')) {
   Promise.resolve().then(async()=>{
+    const plain=Buffer.from('BUN_NATIVE_ZLIB_CONTROL\\n');
+    const stream=positiveZlibFactory();
+    stream.resume();stream.end(zlib.brotliCompressSync(plain));
     const url=`https://127.0.0.1:${port}/control`;
     for(const decompress of [false,true]){
       const r=await originalFetch(url,{headers:{'accept-encoding':'identity'},decompress});

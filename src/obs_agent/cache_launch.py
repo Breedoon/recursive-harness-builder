@@ -34,8 +34,10 @@ def _fallback(state: Path) -> tuple[dict | None, str]:
         record = json.loads((state / "current.json").read_text())
         release = Path(record["repo"])
         # A pointer alone is not proof: rehash the saved source on every launch.
-        if gate.code_identity(release) != record["code"]:
-            return None, "saved release bytes or external CLIProxyAPI changed"
+        identity = gate.code_identity(release)
+        same, _ = gate._same_code({"code": record["code"], "proxy_source": record["code"].get("proxy_source_sha256")}, identity)
+        if not same:
+            return None, "saved release bytes or external dependency changed"
         if not (release / "src/obs_agent/telegram_main.py").is_file():
             return None, "saved release has no daemon entrypoint"
         return record, "verified admitted release"
@@ -120,7 +122,13 @@ def select(repo: Path, state: Path, *, report_root: Path | None = None, dry_run:
         if previous:
             baseline = Path(previous["repo"])
             names = gate.sensitive_files(repo) | gate.sensitive_files(baseline)
-            inherited = _sensitive_bytes(repo, names) == _sensitive_bytes(baseline, names)
+            # INVARIANT: unchanged source cannot waive a changed/missing external
+            # decoder; the previous snapshot binds its actually admitted bytes.
+            # Projects/Personal Projects/OBS Platform/CLI Runtime/OBS Touchpoints/Bundled Bun HTTP Decoding/Overview.md
+            inherited = (
+                _sensitive_bytes(repo, names) == _sensitive_bytes(baseline, names)
+                and target.get("bun_decoder") == previous["code"].get("bun_decoder")
+            )
         override = _restart_override(target)
         if not report and not inherited and override:
             # Preserve the documented explicit escape hatch, but never call it a gated baseline.

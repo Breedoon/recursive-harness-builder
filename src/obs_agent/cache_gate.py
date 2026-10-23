@@ -35,6 +35,7 @@ the last gated fallback. A plain restart that skips a failing gate is logged as 
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import hashlib
 import json
@@ -86,6 +87,35 @@ def cliproxy_identity(cliproxy_dir: Path | None = None) -> str | None:
     return hashlib.sha256("|".join(p or "-" for p in parts).encode()).hexdigest()
 
 
+def bun_decoder_identity(repo: Path, ref: str | None = None) -> dict | None:
+    # INVARIANT: actual external decoder bytes, including absence/removal, are
+    # compared at gate/admission time, not just the expected digest in source.
+    # Projects/Personal Projects/OBS Platform/CLI Runtime/OBS Touchpoints/Bundled Bun HTTP Decoding/Overview.md
+    relative = "src/obs_agent/bun_transport.py"
+    if ref:
+        result = subprocess.run(["git", "-C", str(repo), "show", f"{ref}:{relative}"], capture_output=True)
+        if result.returncode:
+            return None
+        source = result.stdout.decode()
+    else:
+        path = repo / relative
+        if not path.exists():
+            return None
+        source = path.read_text()
+    constants = {}
+    for statement in ast.parse(source).body:
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            name = getattr(statement.targets[0], "id", "")
+            if name == "DECODER_NODE":
+                constants["path"] = ast.literal_eval(statement.value.args[0])
+            elif name == "DECODER_SHA256":
+                constants["expected_sha256"] = ast.literal_eval(statement.value)
+    if set(constants) != {"path", "expected_sha256"}:
+        raise ValueError("Incomplete Bun decoder release identity")
+    constants["sha256"] = _sha256_file(Path(constants["path"]))
+    return constants
+
+
 def code_identity(repo: Path, *, cliproxy_dir: Path | None = None, ref: str | None = None) -> dict:
     """Working-tree identity, or the clean committed bytes of an explicit push target."""
     repo = Path(repo)
@@ -94,6 +124,7 @@ def code_identity(repo: Path, *, cliproxy_dir: Path | None = None, ref: str | No
         source = subprocess.run(["git", "-C", str(repo), "show", f"{head}:src/cache_proxy.py"],
                                 capture_output=True, check=False)
         return {"head": head, "dirty": "clean", "cliproxy": cliproxy_identity(cliproxy_dir),
+                "bun_decoder": bun_decoder_identity(repo, head),
                 "proxy_source_sha256": hashlib.sha256(source.stdout).hexdigest() if source.returncode == 0 else None}
     head = _git(repo, "rev-parse", "HEAD").strip()
     diff = _git(repo, "diff", "HEAD", "--", *IDENTITY_PATHS)
@@ -107,6 +138,7 @@ def code_identity(repo: Path, *, cliproxy_dir: Path | None = None, ref: str | No
         "head": head,
         "dirty": dirty,
         "cliproxy": cliproxy_identity(cliproxy_dir),
+        "bun_decoder": bun_decoder_identity(repo),
         "proxy_source_sha256": _sha256_file(repo / "src" / "cache_proxy.py"),
     }
 
@@ -186,6 +218,11 @@ def _same_code(report: dict, target: dict) -> tuple[bool, str]:
         return False, "proxy under test did not load this src/cache_proxy.py"
     if code.get("cliproxy") != target.get("cliproxy"):
         return False, "different CLIProxyAPI"
+    if code.get("bun_decoder") != target.get("bun_decoder"):
+        return False, "different external Bun decoder"
+    decoder = target.get("bun_decoder")
+    if decoder and decoder.get("sha256") != decoder.get("expected_sha256"):
+        return False, "external Bun decoder does not match the pinned dependency"
     return True, "match"
 
 
@@ -382,6 +419,11 @@ def check(repo: Path, *, base: str | None = None, report_root: Path | None = Non
         why = f"changed since {base[:12]}"
     if running and running.get("cliproxy") and target.get("cliproxy") and running["cliproxy"] != target["cliproxy"]:
         touched.append("CLIProxyAPI (/workspace/runtime/cliproxy binary or config)")
+    if running and running.get("bun_decoder") != target.get("bun_decoder"):
+        touched.append("External Bun decoder (actual binary or configured pin)")
+    decoder = target.get("bun_decoder")
+    if decoder and decoder.get("sha256") != decoder.get("expected_sha256"):
+        return GateResult(False, touched, None, "cache gate REFUSED: fixed Bun decoder dependency mismatch", target)
     if changed is not None and not touched:
         return GateResult(True, [], None, "cache gate: no cache-sensitive change; pass", target)
     report, notes = find_passing_report(target, report_root)

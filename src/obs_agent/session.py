@@ -613,6 +613,12 @@ class SessionManager:
                 f"http://127.0.0.1:{self.config.cache_proxy_port}"
             )
 
+        # INVARIANT: process-local decoding is attached on fresh/resume/fork/reset
+        # launches alike, without changing prompt, settings or MCP/tool schema bytes.
+        # Projects/Personal Projects/OBS Platform/CLI Runtime/OBS Touchpoints/Bundled Bun HTTP Decoding/Overview.md
+        from obs_agent.bun_transport import launch_environment
+        effective_env.update(launch_environment(effective_env))
+
         options = ClaudeAgentOptions(
             model=cli_model,
             hooks=hook_matchers,

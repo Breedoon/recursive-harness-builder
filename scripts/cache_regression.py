@@ -189,6 +189,13 @@ def main(argv=None) -> int:
     ap.add_argument("--out-dir", default=None)
     args = ap.parse_args(argv)
 
+    # INVARIANT: qualify the same launch-only transport used by Session; this
+    # propagates to prefix_repro's real CLI children, without editing scenarios.
+    # Projects/Personal Projects/OBS Platform/CLI Runtime/OBS Touchpoints/Bundled Bun HTTP Decoding/Overview.md
+    sys.path.insert(0, str(REPO / "src"))
+    from obs_agent.bun_transport import launch_environment
+    os.environ.update(launch_environment({}))
+
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = Path(args.out_dir) if args.out_dir else OUT_ROOT / stamp
     out_dir.mkdir(parents=True, exist_ok=True)

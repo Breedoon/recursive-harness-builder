@@ -114,7 +114,7 @@ class Fixture:
                     tools = data.get("tools", [])
                     names = [x.get("name") for x in tools]
                     messages = data.get("messages", [])
-                    results = [b for m in messages for b in (m.get("content") if isinstance(m.get("content"), list) else []) if isinstance(b, dict) and b.get("type") == "tool_result"]
+                    results = [b for m in messages[-1:] for b in (m.get("content") if isinstance(m.get("content"), list) else []) if isinstance(b, dict) and b.get("type") == "tool_result"]
                     fixture.record({"kind": "model_request", "model": data.get("model"), "tools": names, "tools_sha256": digest(json.dumps(tools, sort_keys=True).encode()), "roles": [m.get("role") for m in messages], "tool_results": results})
                     mcp_name = next((x for x in names if x and x.endswith("__bun_probe")), None)
                     if not results and fixture.path == "mcp" and mcp_name:
@@ -157,6 +157,14 @@ async def run_cell(args):
             "ENABLE_TOOL_SEARCH": "false", "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
             "CLAUDE_CODE_EAGER_FLUSH": "1", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1", "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1",
         }
+        if args.candidate:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+            from obs_agent.bun_transport import launch_environment
+            attachment = launch_environment({})
+            # Observer attaches first so saved original decoder references remain usable
+            # as positive controls. Production attachment itself remains unmodified.
+            attachment["BUN_OPTIONS"] = env["BUN_OPTIONS"] + " " + attachment["BUN_OPTIONS"]
+            env.update(attachment)
         (root / "home").mkdir()
         (root / ".claude").mkdir()
         (root / ".claude" / "settings.json").write_text(json.dumps({"env": {"ENABLE_TOOL_SEARCH": "false"}}))
@@ -165,12 +173,28 @@ async def run_cell(args):
         options = ClaudeAgentOptions(cli_path=CLI, cwd=root, model="claude-haiku-4-5-20251001", system_prompt={"type": "preset", "preset": "claude_code"}, permission_mode="bypassPermissions", setting_sources=["project"], mcp_servers=servers, extra_args={"strict-mcp-config": None}, env=env, max_turns=4, stderr=errors.append)
         started = time.time()
         error = None
-        try:
-            async with asyncio.timeout(90):
-                async with ClaudeSDKClient(options=options) as client:
-                    await client.query(f"Benign transport baseline {args.run_id}: execute the fixture tool and report its marker.")
+        lifecycle = []
+        async def turns(label, selected, count=1):
+            session = None
+            async with ClaudeSDKClient(options=selected) as client:
+                for number in range(count):
+                    phase = label if number == 0 else "warm-reuse"
+                    await client.query(f"Benign transport baseline {args.run_id} {phase}: execute the fixture tool and report its marker.")
+                    success = False
                     async for message in client.receive_response():
-                        messages.append({"class": type(message).__name__, "value": dataclasses.asdict(message)})
+                        messages.append({"class": type(message).__name__, "phase":phase, "value": dataclasses.asdict(message)})
+                        if type(message).__name__ == "ResultMessage":
+                            session = message.session_id
+                            success = message.subtype == "success" and not message.is_error
+                    lifecycle.append({"phase":phase,"session_id":session,"success":success,"resume":selected.resume,"fork_session":selected.fork_session,"attachment":{k:env[k] for k in ("BUN_OPTIONS","OBS_BUN_DECODER_NODE","OBS_BUN_DECODER_SHA256") if k in env}})
+            return session
+        try:
+            async with asyncio.timeout(150 if args.lifecycle else 90):
+                initial = await turns("fresh", options, 2 if args.lifecycle else 1)
+                if args.lifecycle:
+                    await turns("resume-new-process", dataclasses.replace(options, resume=initial))
+                    await turns("fork-new-process", dataclasses.replace(options, resume=initial, fork_session=True))
+                    await turns("reset-new-process", dataclasses.replace(options, resume=None))
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         finally:
@@ -179,7 +203,7 @@ async def run_cell(args):
         (output / "server-events.json").write_text(json.dumps(fixture.events, indent=2))
         (output / "cli-events.json").write_text(json.dumps(messages, indent=2, default=str))
         (output / "cli-stderr.txt").write_text("\n".join(errors))
-        result = {"run_id": args.run_id, "path": args.path, "encoding": args.encoding, "cli_sha256": PIN, "node_encoder": fixture.node_version, "fixture_program_sha256": digest(Path(__file__).read_bytes()), "trace_program_sha256": digest(Path(__file__).with_name("trace_preload.cjs").read_bytes()), "seconds": time.time()-started, "error": error, "events": len(messages), "network_events": len(fixture.events), "env_names": sorted(env), "no_production_credentials": True, "configuration_difference": "test-only model/TLS/route instrumentation; production nonessential-traffic setting remains unset; project-only settings, eager flush, background/git/ClaudeAI/tool-search controls reproduced"}
+        result = {"run_id": args.run_id, "candidate": args.candidate, "lifecycle": lifecycle, "code_identity": os.environ.get("BUN_PROBE_CODE_IDENTITY"), "path": args.path, "encoding": args.encoding, "cli_sha256": PIN, "node_encoder": fixture.node_version, "fixture_program_sha256": digest(Path(__file__).read_bytes()), "trace_program_sha256": digest(Path(__file__).with_name("trace_preload.cjs").read_bytes()), "seconds": time.time()-started, "error": error, "events": len(messages), "network_events": len(fixture.events), "env_names": sorted(env), "no_production_credentials": True, "configuration_difference": "test-only model/TLS/route instrumentation; production nonessential-traffic setting remains unset; project-only settings, eager flush, background/git/ClaudeAI/tool-search controls reproduced"}
         (output / "result.json").write_text(json.dumps(result, indent=2))
         print(json.dumps(result))
         if error:
@@ -193,6 +217,8 @@ def main():
     parser.add_argument("--path", choices=["mcp", "webfetch", "direct"], required=True)
     parser.add_argument("--encoding", choices=["identity", "br"], required=True)
     parser.add_argument("--out", default="/evidence")
+    parser.add_argument("--candidate", action="store_true", help="attach the exact candidate transport after the observer")
+    parser.add_argument("--lifecycle", action="store_true", help="exercise warm reuse, new-process resume/fork and reset with the same attachment")
     args = parser.parse_args()
     return asyncio.run(run_cell(args))
 
