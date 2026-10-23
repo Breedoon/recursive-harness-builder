@@ -264,6 +264,40 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
 
 **Rollback:** `git revert <commit>`, push, maintenance restart, re-run step 6.
 
+### Utility request observation boundary (F4)
+
+`prefix_repro.py`'s `utility_route` scenario waits for its own completed utility
+request to appear in the proxy index **before final evaluation**. The deadline is
+30 seconds (`UTILITY_INDEX_TIMEOUT`), measured by a monotonic clock. It re-reads
+the index at intervals of at most 0.1 seconds, bounded by the remaining deadline;
+a row already present proceeds immediately. This is a condition wait, not an
+unconditional settling delay, scenario retry or larger resume gap. The existing
+three-second evaluator settle and all prefix/cache thresholds remain unchanged.
+
+Only current scenario session ids, request timestamps at or after its start,
+`/v1/messages` paths excluding `count_tokens`, a completed HTTP-status row and the
+existing wire-system predicate `Extract any file paths` satisfy observation.
+Unrelated, stale or other-scenario rows cannot end the wait. A completed utility
+row can have null usage: HTTP 200 with no captured usage remains valid route
+evidence, not a cache-pair request. Ordinary conversation pairs still require
+unchanged wire-prefix, breakpoint, tool-fidelity and cache-read checks.
+
+The result's `utility_observation` records `observed` or `timed_out`, deadline,
+elapsed seconds and check count. Missing/incomplete rows reach `timed_out` and
+FAIL even if a row lands during the subsequent evaluation. An observed wrong
+route or non-200 status also FAILs, without waiting for a replacement; Codex's
+existing exact-model/all-scoped-route check still applies. Anthropic utility
+requests must stay on the Anthropic route. No observation outcome waives bad
+prefix pairs or the gate's known-intermittent admission rules.
+
+**Decision/rationale (obs-22.46, 2026-10-23):** request-index rows are published at
+stream completion, which can follow CLI/session teardown. The recorded C4 round2
+utility request took 9855 ms, returned HTTP 200 on the correct GPT route with null
+usage, and missed the saved snapshot while all three cache pairs passed. Wait for
+that specific evidence instead of changing cache acceptance or relabeling the
+original FAIL. F3 environment routing remains separately owned; gate runs still
+use `/workspace/runtime/e2e/gate-runs/run-gate.sh` in an isolated obs-e2e container.
+
 ### How to read the runner's result
 
 - `PASS` — every request pair was a pure append with at least 95% cache read.

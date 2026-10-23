@@ -80,6 +80,7 @@ from claude_agent_sdk import (  # noqa: E402
 
 DEFAULT_BASE_URL = "http://127.0.0.1:28925"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+UTILITY_INDEX_TIMEOUT = 30.0
 WORK_ROOT = Path(os.environ.get("PREFIX_REPRO_ROOT", "/workspace/runtime/prefix-repro"))
 # Built at runtime so this file never contains the literal placeholder itself
 # (the CLI would rewrite it if an agent ever reads this file into context).
@@ -954,6 +955,36 @@ def _provider_errors(log_dir, since):
 ANTHROPIC_ONLY = {"volatile_flip", "ws_resume", "recovered_poison", "ttl_flip", "ttl_flip_down"}
 
 
+def _scoped_rows(log_dir, session_ids, since):
+    want = set(session_ids)
+    return [r for r in pd.read_index(log_dir) if r.get("session_id") in want
+            and r.get("ts", 0) >= since and str(r.get("path", "")).startswith("/v1/messages")
+            and "count_tokens" not in str(r.get("path", ""))]
+
+
+def _utility_rows(log_dir, rows):
+    return [r for r in rows if isinstance(r.get("http_status"), int)
+            and "Extract any file paths" in str(pd.load_request(r["req_id"], "wire", log_dir).get("system"))]
+
+
+def _wait_utility_index(log_dir, session_ids, since, timeout):
+    # INVARIANT: only this scenario's completed utility row ends the bounded
+    # observation wait; route/status and every prefix check still apply afterward.
+    # Doc: docs/cache-proxy-safety.md#utility-request-observation-boundary-f4
+    started = time.monotonic()
+    checks = 0
+    while True:
+        utility = _utility_rows(log_dir, _scoped_rows(log_dir, session_ids, since))
+        checks += 1
+        elapsed = time.monotonic() - started
+        observed = bool(utility) and elapsed <= timeout
+        if observed or elapsed >= timeout:
+            return {"status": "observed" if observed else "timed_out",
+                    "timeout_seconds": timeout, "elapsed_seconds": round(elapsed, 4),
+                    "checks": checks}
+        time.sleep(min(0.1, timeout - elapsed))
+
+
 def run(args, name):
     fn, note = SCENARIOS[name]
     since = time.time() - 1
@@ -978,21 +1009,22 @@ def run(args, name):
         if rows_p and rows_c:
             pairs.append((rows_p[-1], rows_c[0]))  # the recovery boundary
         pairs += list(zip(rows_c, rows_c[1:]))
+    utility_observation = None
+    if name == "utility_route":
+        utility_observation = _wait_utility_index(args.log_dir, sids, since, UTILITY_INDEX_TIMEOUT)
     if meta and "direct_verdicts" in meta:  # volatile_flip: verdicts come from direct calls
         rows, verdicts = _rows(args.log_dir, sids, since), meta["direct_verdicts"]
     else:
         rows, verdicts = evaluate(args.log_dir, sids, since, args.threshold, pairs=pairs)
-    scoped_rows = [r for r in pd.read_index(args.log_dir) if r.get("session_id") in set(sids)
-                   and r.get("ts", 0) >= since and str(r.get("path", "")).startswith("/v1/messages")
-                   and "count_tokens" not in str(r.get("path", ""))]
+    scoped_rows = _scoped_rows(args.log_dir, sids, since)
     route_ok = all(r.get("route") == "cli-proxy" and r.get("model") == args.model for r in scoped_rows) if args.provider == "codex" else True
     utility_ids = []
     if name == "utility_route":
-        for row in scoped_rows:
-            wire = pd.load_request(row["req_id"], "wire", args.log_dir)
-            if "Extract any file paths" in str(wire.get("system")):
-                utility_ids.append(row["req_id"])
-        route_ok = route_ok and bool(utility_ids)
+        utility = _utility_rows(args.log_dir, scoped_rows)
+        utility_ids = [r["req_id"] for r in utility]
+        expected_route = "cli-proxy" if args.provider == "codex" else "anthropic"
+        route_ok = (route_ok and utility_observation["status"] == "observed" and bool(utility)
+                    and all(r.get("route") == expected_route and r.get("http_status") == 200 for r in utility))
     meta_ok = not meta or (meta.get("effects_unchanged", True) and meta.get("source_unchanged", True)
                            and meta.get("final_response_preserved", True))
     ok = bool(verdicts) and route_ok and meta_ok and all(v["ok"] for v in verdicts)
@@ -1007,7 +1039,8 @@ def run(args, name):
             "routes": sorted({r.get("route", "") for r in rows}),
             "requests": [r["req_id"] for r in rows], "pairs": verdicts, "ok": ok,
             "all_scoped_requests": [{"req_id": r["req_id"], "model": r.get("model"), "route": r.get("route"), "http_status": r.get("http_status")} for r in scoped_rows],
-            "utility_requests": utility_ids}
+            "utility_requests": utility_ids,
+            "utility_observation": utility_observation}
 
 
 def main(argv=None):
