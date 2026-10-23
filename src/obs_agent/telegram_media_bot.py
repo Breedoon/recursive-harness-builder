@@ -5,11 +5,14 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
+import re
 import resource
 import secrets
 import sqlite3
 import time
+import traceback
 import uuid
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -33,7 +36,13 @@ MODEL_REGISTRY = {
         "deprecated": False,
     },
     "h3": {
-        "label": "H3 Eros Max beta5 (checkpoint)",
+        "label": "H3 Eros Max beta6 (checkpoint)",
+        "media_kind": "video",
+        "qualified": True,
+        "deprecated": False,
+    },
+    "h3-beta1": {
+        "label": "H3 Eros Max beta1 (previous checkpoint)",
         "media_kind": "video",
         "qualified": True,
         "deprecated": False,
@@ -56,13 +65,67 @@ SELECTABLE_VIDEO_MODELS = tuple(name for name in SELECTABLE_MODELS if MODEL_REGI
 PRESET_LONGEST = {"low": 500, "medium": 700, "high": 1000}
 VIDEO_LORAS = {"aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"}
 ABANDONED_JOB_SECONDS = 24 * 60 * 60
+DIAGNOSTIC_STAGES = {"received", "preflight", "rejected", "download", "image_probe", "normalize", "upload", "submit", "queued", "status", "result", "delivery", "cleanup", "delivered", "restart"}
+DIAGNOSTIC_CAUSES = {"generation_failed", "tensor_shape_mismatch", "dtype_mismatch", "device_mismatch", "model_missing", "image_decode_failed", "gpu_memory_exhausted", "gpu_resource_unavailable", "operation_timeout", "invalid_geometry", "invalid_steps", "invalid_fps", "invalid_duration", "image_required", "invalid_prompt", "invalid_image_path", "invalid_upload", "unsupported_model_mode", "unsupported_model", "invalid_request", "job_not_succeeded", "result_missing", "unsafe_output_path", "purge_failed", "unknown_job", "invalid_upload_path", "api_rate_limited", "api_unreachable", "api_transport_error", "image_probe_failed", "image_normalization_failed", "telegram_transport_error", "aborted_restart", "abandoned_timeout", "cleanup_failed", "failed", "cancelled", "delivery_failed"}
+DIAGNOSTIC_NUMBERS = {"width", "height", "steps", "cfg", "seed", "seconds", "fps", "length", "strength", "lora_strength", "longest", "prompt_characters", "prompt_utf8_bytes", "input_bytes", "input_width", "input_height", "normalized_bytes", "normalized_width", "normalized_height", "output_bytes", "http_status", "effective_frame_count", "requested_seconds", "effective_duration_seconds", "rotation_degrees"}
+
+
+def _safe_parameters(request: dict[str, Any]) -> dict[str, Any]:
+    result = {key: value for key, value in request.items() if key in DIAGNOSTIC_NUMBERS and isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)}
+    choices = {"model": set(MODEL_REGISTRY), "mode": {"t2i", "edit", "i2v", "t2v"}, "variant": {"turbo", "int8", "w4a8", "uncensored", "beta1", "beta6"}, "lora": VIDEO_LORAS | {"none"}, "preset": set(PRESET_LONGEST), "media_kind": {"image", "video"}, "input_format": {"png", "jpeg", "mjpeg", "webp", "bmp", "tiff", "gif", "unknown"}, "pixel_format": {"rgb24", "rgba", "rgb48be", "rgb48le", "gray", "gray16be", "gray16le", "yuv420p", "yuvj420p", "yuvj422p", "yuvj444p", "pal8", "gbrp", "gbrap"}, "normalization": {"aspect_fit_pad", "aspect_cover"}, "checkpoint": {"beta1", "beta6", "eros-beta1", "eros-beta6"}}
+    for key, allowed in choices.items():
+        value = request.get(key)
+        if isinstance(value, str) and value in allowed:
+            result[key] = value
+    for key in ("has_image", "auto_size", "content_purged"):
+        if isinstance(request.get(key), bool):
+            result[key] = request[key]
+    return result
+
+
+def _safe_failure_code(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    parts = value.split(":")
+    cause = parts[-1]
+    if cause not in DIAGNOSTIC_CAUSES and not re.fullmatch(r"api_http_[1-5][0-9]{2}", cause):
+        return None
+    return value if len(parts) == 1 or (len(parts) == 2 and parts[0] in DIAGNOSTIC_STAGES | {"generation", "comfyui_start", "graph_submit", "output_validation", "handoff_begin", "gpu_lock_acquire", "handoff_acquired", "comfyui_cleanup", "gpu_lock_release", "handoff_release", "handoff_cancel", "worker", "input_stage"}) else None
+
+
+def _safe_exception(exc: Exception) -> dict[str, Any]:
+    code = "generation_failed"
+    details: dict[str, Any] = {}
+    if isinstance(exc, httpx.HTTPStatusError):
+        details["http_status"] = exc.response.status_code
+        try:
+            response_data = exc.response.json()
+            candidate = response_data.get("error")
+            code = _safe_failure_code(candidate) or f"api_http_{exc.response.status_code}"
+            request_id = response_data.get("request_id")
+            if isinstance(request_id, str) and re.fullmatch(r"request-[0-9a-f]{16}", request_id):
+                details["api_request_id"] = request_id
+        except (ValueError, AttributeError):
+            code = f"api_http_{exc.response.status_code}"
+    elif isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        code = "operation_timeout"
+    elif isinstance(exc, httpx.TransportError):
+        code = "api_transport_error"
+    elif _safe_failure_code(str(exc)):
+        code = str(exc).rsplit(":", 1)[-1]
+    kind = type(exc).__name__
+    details.update(code=code, exception_type=kind if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", kind) else "Exception")
+    details["frames"] = [{"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name} for frame in traceback.extract_tb(exc.__traceback__)[-12:] if re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", Path(frame.filename).name) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,100}", frame.name)]
+    return details
 
 
 def _alignment(model: str, mode: str) -> int:
-    if model == "h3":
+    if model in {"h3", "h3-beta1"}:
         return 32 if mode == "i2v" else 16
     if model == "ltx":
         return 64
+    if model == "qwen-image-2.1":
+        return 32
     return 16
 
 
@@ -76,6 +139,8 @@ def _default_aspect(model: str, mode: str) -> float:
 
 def _aligned_dimensions(model: str, mode: str, longest: int, aspect: float) -> tuple[int, int]:
     aspect = max(0.05, aspect)
+    if model == "qwen-image-2.1":
+        longest = min(longest, 1000)
     if aspect >= 1:
         width, height = longest, round(longest / aspect)
     else:
@@ -87,6 +152,8 @@ def _aligned_dimensions(model: str, mode: str, longest: int, aspect: float) -> t
     for width_step in range(max(1, width_steps - 1), width_steps + 2):
         for height_step in range(max(1, height_steps - 1), height_steps + 2):
             candidate_width, candidate_height = width_step * unit, height_step * unit
+            if model == "qwen-image-2.1" and max(candidate_width, candidate_height) > 1000:
+                continue
             ratio_error = abs((candidate_width / candidate_height) - aspect)
             size_error = abs(max(candidate_width, candidate_height) - longest)
             candidates.append((ratio_error, size_error, candidate_width, candidate_height))
@@ -146,6 +213,14 @@ class StateStore:
           created_at REAL NOT NULL, updated_at REAL NOT NULL, delivered_at REAL
         );
         CREATE INDEX IF NOT EXISTS jobs_nonterminal ON jobs(state);
+        CREATE TABLE IF NOT EXISTS job_diagnostics (
+          job_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS job_events (
+          event_id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+          stage TEXT NOT NULL, occurred_at REAL NOT NULL, details_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS job_events_job ON job_events(job_id,event_id);
         """)
         self._ensure_column("error_code", "TEXT")
         self._scrub_legacy_content()
@@ -157,7 +232,12 @@ class StateStore:
             self.db.commit()
 
     def _scrub_legacy_content(self) -> None:
-        self.db.execute("UPDATE jobs SET prompt='', request_json='{}', output_path=NULL, last_status=state, error_code=CASE WHEN state IN ('failed','cancelled','delivery_failed') THEN state ELSE NULL END")
+        self.db.execute("UPDATE jobs SET prompt='', request_json='{}', output_path=NULL, last_status=state")
+        for row in self.db.execute("SELECT job_id,state,error_code FROM jobs").fetchall():
+            code = _safe_failure_code(row["error_code"])
+            if code is None and row["state"] in {"failed", "cancelled", "delivery_failed"}:
+                code = row["state"]
+            self.db.execute("UPDATE jobs SET error_code=? WHERE job_id=?", (code, row["job_id"]))
         self.db.commit()
         self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self.db.execute("PRAGMA journal_mode=DELETE")
@@ -173,7 +253,16 @@ class StateStore:
             data = json.loads(row[0])
             settings = Settings(**{k: data[k] for k in asdict(Settings()) if k in data})
             if settings.model not in SELECTABLE_MODELS:
-                return Settings(media_kind="video", model="h3", mode="t2v", variant="turbo", steps=4, width=640, height=384)
+                return Settings(media_kind="video", model="h3", mode="t2v", variant="beta6", steps=8, width=640, height=384)
+            if settings.model == "h3" and settings.variant == "beta1":
+                settings = replace(settings, model="h3-beta1")
+                self.put_settings(user_id, settings)
+            elif settings.model == "h3" and settings.variant != "beta6":
+                settings = replace(settings, variant="beta6", steps=8 if settings.steps == 4 else settings.steps, lora=None, lora_strength=None)
+                self.put_settings(user_id, settings)
+            elif settings.model == "h3-beta1" and settings.variant != "beta1":
+                settings = replace(settings, variant="beta1", lora=None, lora_strength=None)
+                self.put_settings(user_id, settings)
             return settings
         except (TypeError, ValueError, KeyError):
             return Settings()
@@ -184,12 +273,36 @@ class StateStore:
         self.db.commit()
 
     def create_job(self, *, user_id: int, chat_id: int, message_id: int, prompt: str, request: dict[str, Any]) -> str:
-        del prompt, request
+        metadata = {**_safe_parameters(request), "prompt_characters": len(prompt), "prompt_utf8_bytes": len(prompt.encode("utf-8")), "has_image": request.get("mode") in {"i2v", "edit"}, "lora": request.get("lora") if request.get("lora") in VIDEO_LORAS else "none"}
         job_id = uuid.uuid4().hex
         now = time.time()
         self.db.execute("INSERT INTO jobs(job_id,user_id,chat_id,message_id,prompt,request_json,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (job_id, user_id, chat_id, message_id, "", "{}", "submitting", now, now))
         self.db.commit()
+        self.record_diagnostics(job_id, stage="received", metadata=metadata)
         return job_id
+
+    def record_diagnostics(self, job_id: str, *, stage: str, metadata: dict[str, Any] | None = None, error: Exception | None = None) -> None:
+        if stage not in DIAGNOSTIC_STAGES:
+            raise ValueError("unknown diagnostic stage")
+        now = time.time()
+        row = self.db.execute("SELECT metadata_json FROM job_diagnostics WHERE job_id=?", (job_id,)).fetchone()
+        current = json.loads(row[0]) if row else {"schema_version": 1}
+        details = _safe_parameters(metadata or {})
+        current.update(details)
+        if error is not None:
+            details["error"] = _safe_exception(error)
+            current["error"] = details["error"]
+        current["stage"] = stage
+        current["updated_at"] = now
+        self.db.execute("INSERT INTO job_diagnostics(job_id,metadata_json,updated_at) VALUES(?,?,?) ON CONFLICT(job_id) DO UPDATE SET metadata_json=excluded.metadata_json,updated_at=excluded.updated_at", (job_id, json.dumps(current, separators=(",", ":"), allow_nan=False), now))
+        self.db.execute("INSERT INTO job_events(job_id,stage,occurred_at,details_json) VALUES(?,?,?,?)", (job_id, stage, now, json.dumps(details, separators=(",", ":"), allow_nan=False)))
+        self.db.commit()
+
+    def get_diagnostics(self, job_id: str) -> dict[str, Any]:
+        row = self.db.execute("SELECT metadata_json FROM job_diagnostics WHERE job_id=?", (job_id,)).fetchone()
+        result = json.loads(row[0]) if row else {}
+        result["events"] = [{"stage": event["stage"], "at": event["occurred_at"], **json.loads(event["details_json"])} for event in self.db.execute("SELECT stage,occurred_at,details_json FROM job_events WHERE job_id=? ORDER BY event_id", (job_id,))]
+        return result
 
     def update_job(self, job_id: str, **fields: Any) -> None:
         if not fields:
@@ -291,7 +404,7 @@ class MediaBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
             return await self.deny(update)
-        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3|ltx (H3 Eros Max beta5 checkpoint or qualified LTX 2.5).")
+        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3|h3-beta1|ltx (H3 Eros Max beta6 or previous beta1 checkpoint or qualified LTX 2.5).")
 
     @staticmethod
     def _display_strength(settings: Settings) -> float | str:
@@ -345,11 +458,11 @@ class MediaBot:
         elif key in {"kind", "media_kind"}:
             if value not in {"image", "video"}: raise ValueError
             data.update(media_kind=value, model="qwen-image-2.1" if value == "image" else "h3", mode="t2i" if value == "image" else "t2v", auto_size=True, width=None, height=None)
-            data.update(steps=20 if value == "image" else 4, lora=None if value == "image" else data["lora"], lora_strength=None if value == "image" else data["lora_strength"])
+            data.update(steps=20 if value == "image" else 8, variant="turbo" if value == "image" else "beta6", lora=None, lora_strength=None)
         elif key == "model":
             if value not in SELECTABLE_MODELS: raise ValueError
             data.update(model=value, media_kind="image" if value == "qwen-image-2.1" else "video", mode="t2i" if value == "qwen-image-2.1" else "t2v", auto_size=True, width=None, height=None)
-            data.update(variant="turbo" if value == "h3" else "uncensored", steps=20 if value == "qwen-image-2.1" else (4 if value == "h3" else 8), lora=None if value != "h3" else data["lora"], lora_strength=None if value != "h3" else data["lora_strength"])
+            data.update(variant="beta6" if value == "h3" else "beta1" if value == "h3-beta1" else "uncensored", steps=20 if value == "qwen-image-2.1" else 4 if value == "h3-beta1" else 8, lora=None, lora_strength=None)
         elif key == "mode":
             valid = {"t2i", "edit"} if settings.media_kind == "image" else {"t2v", "i2v"}
             if value not in valid: raise ValueError
@@ -382,11 +495,11 @@ class MediaBot:
                 data[target] = None if value == "none" else float(raw)
                 if data[target] is not None and not 0.0 <= data[target] <= 2.0: raise ValueError
             elif key == "variant":
-                valid = {"h3": {"turbo", "int8", "w4a8"}, "ltx": {"uncensored"}, "qwen-image-2.1": set()}.get(settings.model, set())
+                valid = {"h3": {"beta6"}, "h3-beta1": {"beta1"}, "ltx": {"uncensored"}, "qwen-image-2.1": set()}.get(settings.model, set())
                 if value not in valid: raise ValueError
                 data["variant"] = value
             else:
-                if settings.model != "h3" or value not in VIDEO_LORAS | {"none"}: raise ValueError
+                if settings.model not in {"h3", "h3-beta1"} or value not in VIDEO_LORAS | {"none"}: raise ValueError
                 data["lora"] = None if value == "none" else value
         else:
             raise ValueError
@@ -398,7 +511,7 @@ class MediaBot:
         args = context.args
         cmd = update.effective_message.text.split()[0].split("@", 1)[0].lower()
         settings = self.state.get_settings(update.effective_user.id)
-        usage = "Usage: /set KEY VALUE (model, mode, preset, longest, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|h3|ltx"
+        usage = "Usage: /set KEY VALUE (model, mode, preset, longest, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|h3|h3-beta1|ltx"
         if cmd == "/set":
             if len(args) != 2:
                 return await update.effective_message.reply_text(usage)
@@ -426,7 +539,7 @@ class MediaBot:
             await query.answer("This control belongs to another user", show_alert=True)
             return
         settings = self.state.get_settings(user.id)
-        step_values = [4, 20] if settings.model == "h3" else ([8, 20] if settings.model == "ltx" else [12, 20])
+        step_values = [8, 12, 20] if settings.model == "h3" else [4, 20] if settings.model == "h3-beta1" else [8] if settings.model == "ltx" else [12, 20]
         choices = {
             "kind": ["image", "video"],
             "preset": list(PRESET_LONGEST),
@@ -482,59 +595,75 @@ class MediaBot:
             return
         settings = self.state.get_settings(update.effective_user.id)
         has_image = bool(message.photo or (message.document and (message.document.mime_type or "").startswith("image/")))
-        if message.document and not has_image:
-            await message.reply_text("Only image documents are supported as media input.")
-            return
         prompt = (message.caption or message.text or "").strip()
-        if has_image and not message.caption:
-            await message.reply_text("Add a caption describing the edit or image-to-video request; a photo alone is not generated.")
+        if not prompt and not has_image and not message.document:
             return
-        if not prompt:
-            return
-        if settings.media_kind == "image" and settings.model != "qwen-image-2.1":
-            await message.reply_text("Image mode requires qwen-image-2.1."); return
-        if settings.media_kind == "video" and settings.model == "qwen-image-2.1":
-            await message.reply_text("Video mode requires the qualified H3 Eros Max beta5 checkpoint."); return
-        if not has_image and settings.mode in {"edit", "i2v"}:
-            await message.reply_text(f"Mode {settings.mode} requires an image attachment.")
-            return
-        if has_image:
-            if settings.media_kind == "image":
-                mode = "edit"
-            else:
-                mode = "i2v"
-        else:
-            mode = settings.mode
-        width, height = _resolve_dimensions(settings)
-        request = {"model": settings.model, "mode": mode, "prompt": prompt, "width": width, "height": height, "steps": settings.steps}
+        mode = ("edit" if settings.media_kind == "image" else "i2v") if has_image else settings.mode
+        effective_settings = replace(settings, mode=mode)
+        width, height = _resolve_dimensions(effective_settings)
+        request = {"model": "h3" if settings.model == "h3-beta1" else settings.model, "mode": mode, "prompt": prompt, "width": width, "height": height, "steps": settings.steps}
         if settings.media_kind == "video":
             request.update(seconds=settings.seconds, variant=settings.variant)
-            if settings.lora: request.update(lora=settings.lora, lora_strength=settings.lora_strength)
-        if settings.media_kind == "image":
+            if settings.lora:
+                request.update(lora=settings.lora, lora_strength=settings.lora_strength)
+        else:
             request.update(cfg=4.0, strength=settings.strength)
         job_id = self.state.create_job(user_id=update.effective_user.id, chat_id=message.chat_id, message_id=message.message_id, prompt=prompt, request=request)
-        ack = await message.reply_text(f"Queued {job_id[:12]} ({settings.model}/{mode}, {settings.preset} {width}x{height})")
+        self.state.record_diagnostics(job_id, stage="preflight", metadata={**asdict(settings), "has_image": has_image})
+        rejection = None
+        if message.document and not has_image:
+            rejection = ("invalid_upload", "Only image documents are supported as media input.")
+        elif has_image and not message.caption:
+            rejection = ("invalid_prompt", "Add a caption describing the edit or image-to-video request; a photo alone is not generated.")
+        elif settings.media_kind == "image" and settings.model != "qwen-image-2.1":
+            rejection = ("unsupported_model_mode", "Image mode requires qwen-image-2.1.")
+        elif settings.media_kind == "video" and settings.model == "qwen-image-2.1":
+            rejection = ("unsupported_model_mode", "Video mode requires a qualified video checkpoint.")
+        elif not has_image and settings.mode in {"edit", "i2v"}:
+            rejection = ("image_required", f"Mode {settings.mode} requires an image attachment.")
+        if rejection:
+            code, notice = rejection
+            self.state.record_diagnostics(job_id, stage="rejected", error=ValueError(code))
+            self.state.update_job(job_id, state="failed", error_code=f"preflight:{code}")
+            await message.reply_text(f"{notice} Reference {job_id[:12]}.")
+            return
+        try:
+            ack = await message.reply_text(f"Queued {job_id[:12]} ({settings.model}/{mode}, {settings.preset} {width}x{height})")
+        except Exception as exc:
+            self.state.record_diagnostics(job_id, stage="delivery", error=exc)
+            self.state.update_job(job_id, state="failed", error_code="delivery:telegram_transport_error")
+            return
         self.state.update_job(job_id, status_message_id=ack.message_id)
-        task = asyncio.create_task(self._submit_and_watch(job_id, update.effective_user.id, message.chat_id, message, settings, has_image, request))
+        task = asyncio.create_task(self._submit_and_watch(job_id, update.effective_user.id, message.chat_id, message, effective_settings, has_image, request))
         self.tasks.add(task); task.add_done_callback(self.tasks.discard)
 
-    async def _probe_image_size(self, raw: bytes) -> tuple[int, int]:
+    async def _probe_image(self, raw: bytes) -> dict[str, Any]:
         process = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error", "-f", "image2pipe", "-i", "pipe:0",
-            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+            "-show_entries", "stream=width,height,codec_name,pix_fmt:stream_side_data=rotation", "-of", "json",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        output, error = await process.communicate(raw)
-        if process.returncode != 0 or b"x" not in output:
-            raise RuntimeError(f"image dimensions unavailable: {error.decode(errors='replace')[-300:]}")
-        width, height = output.decode().strip().split("x", 1)
-        return int(width), int(height)
+        output, _error = await process.communicate(raw)
+        if process.returncode != 0:
+            raise RuntimeError("image_probe_failed")
+        try:
+            stream = json.loads(output)["streams"][0]
+            width, height = int(stream["width"]), int(stream["height"])
+            rotation = next((item["rotation"] for item in stream.get("side_data_list", []) if isinstance(item.get("rotation"), (int, float))), 0)
+            if int(rotation) % 180 == 90:
+                width, height = height, width
+            return _safe_parameters({"input_width": width, "input_height": height, "input_format": stream.get("codec_name", "unknown"), "pixel_format": stream.get("pix_fmt"), "rotation_degrees": rotation})
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise RuntimeError("image_probe_failed") from None
 
     async def _normalize_image(self, raw: bytes, settings: Settings) -> bytes:
         """Apply aspect-cover crop and model-valid resize before upload."""
         if settings.width is None or settings.height is None:
             raise RuntimeError("resolved dimensions are required before image normalization")
-        vf = f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=increase,crop={settings.width}:{settings.height}"
+        if settings.model == "qwen-image-2.1":
+            vf = f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=decrease,pad={settings.width}:{settings.height}:(ow-iw)/2:(oh-ih)/2"
+        else:
+            vf = f"scale={settings.width}:{settings.height}:force_original_aspect_ratio=increase,crop={settings.width}:{settings.height}"
         process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
             "-vf", vf, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1",
@@ -542,56 +671,69 @@ class MediaBot:
         )
         output, error = await process.communicate(raw)
         if process.returncode != 0 or not output:
-            raise RuntimeError(f"image normalization failed: {error.decode(errors='replace')[-300:]}")
+            raise RuntimeError("image_normalization_failed")
         return output
 
     async def _submit_and_watch(self, job_id: str, user_id: int, chat_id: int, message, settings: Settings, has_image: bool, request: dict[str, Any]) -> None:
         request = dict(request)
+        settings = replace(settings, mode=request["mode"])
         uploaded_path = None
         backend_id = None
+        stage = "download" if has_image else "submit"
+        self.state.record_diagnostics(job_id, stage=stage)
         try:
             if has_image:
                 attachment = message.photo[-1] if message.photo else message.document
                 telegram_file = await attachment.get_file()
                 raw = bytes(await telegram_file.download_as_bytearray())
-                source_size = await self._probe_image_size(raw)
+                stage = "image_probe"
+                self.state.record_diagnostics(job_id, stage=stage, metadata={"input_bytes": len(raw)})
+                image_metadata = await self._probe_image(raw)
+                source_size = (image_metadata["input_width"], image_metadata["input_height"])
                 width, height = _resolve_dimensions(settings, source_size)
                 effective_settings = replace(settings, width=width, height=height, auto_size=False)
                 request.update(width=width, height=height)
+                stage = "normalize"
+                self.state.record_diagnostics(job_id, stage=stage, metadata={**image_metadata, **request, "normalization": "aspect_fit_pad" if settings.model == "qwen-image-2.1" else "aspect_cover"})
                 raw = await self._normalize_image(raw, effective_settings)
+                stage = "upload"
+                self.state.record_diagnostics(job_id, stage=stage, metadata={"normalized_bytes": len(raw), "normalized_width": width, "normalized_height": height})
                 uploaded_path = await self.api.upload(raw, "image/png")
                 request["image_path"] = uploaded_path
                 del raw
+            stage = "submit"
+            self.state.record_diagnostics(job_id, stage=stage, metadata=request)
             submitted = await self.api.submit(request)
             backend_id = submitted["job_id"]
             self.state.update_job(job_id, backend_job_id=backend_id, state="queued")
+            self.state.record_diagnostics(job_id, stage="queued", metadata=submitted)
             await self._watch(job_id, backend_id, chat_id)
         except Exception as exc:
-            error_code = type(exc).__name__
+            self.state.record_diagnostics(job_id, stage=stage, error=exc)
+            error_code = f"{stage}:{_safe_exception(exc)['code']}"
             LOG.error("media job failed job=%s error_code=%s", job_id, error_code)
             if uploaded_path and not backend_id:
                 try:
                     await self.api.purge_upload(uploaded_path)
                 except Exception as cleanup_exc:
+                    self.state.record_diagnostics(job_id, stage="cleanup", error=cleanup_exc)
                     LOG.error("uploaded media cleanup pending job=%s error_code=%s", job_id, type(cleanup_exc).__name__)
             current = self.state.get_job(job_id)
             if current is not None and current["state"] == "delivering":
                 self.state.update_job(job_id, last_status="delivery_ambiguous", error_code=error_code)
-                try:
-                    await message.reply_text(f"Job {job_id[:12]} delivery failed; resubmit from Telegram if needed.")
-                except Exception:
-                    LOG.debug("delivery notice failed")
                 return
-            if backend_id:
-                self.state.update_job(job_id, state="cleanup_pending", last_status="cleanup_pending", error_code=error_code)
-            else:
-                self.state.update_job(job_id, state="failed", last_status="failed", error_code=error_code)
-            await message.reply_text(f"Job {job_id[:12]} failed: {error_code}; resubmit from Telegram if needed")
+            self.state.update_job(job_id, state="cleanup_pending" if backend_id else "failed", last_status="failed", error_code=error_code)
+            try:
+                await message.reply_text(f"Job {job_id[:12]} failed: {error_code}; diagnostic metadata saved, no prompt or image retained. Resubmit from Telegram if needed.")
+            except Exception as notice_exc:
+                self.state.record_diagnostics(job_id, stage="delivery", error=notice_exc)
 
     async def _purge_backend(self, job_id: str, backend_id: str) -> bool:
+        self.state.record_diagnostics(job_id, stage="cleanup")
         for attempt in range(3):
             try:
                 await self.api.purge(backend_id)
+                self.state.record_diagnostics(job_id, stage="cleanup", metadata={"content_purged": True})
                 return True
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 404:
@@ -609,21 +751,31 @@ class MediaBot:
 
     async def _deliver_backend_result(self, job_id: str, backend_id: str, chat_id: int, *, explicit: bool = False) -> None:
         del explicit
+        self.state.record_diagnostics(job_id, stage="result")
+        try:
+            content, content_type = await self.api.result(backend_id)
+        except Exception as exc:
+            self.state.record_diagnostics(job_id, stage="result", error=exc)
+            self.state.update_job(job_id, state="cleanup_pending", error_code=f"result:{_safe_exception(exc)['code']}")
+            await self._purge_backend(job_id, backend_id)
+            return
         self.state.update_job(job_id, state="delivering", last_status="delivering")
-        content, content_type = await self.api.result(backend_id)
+        self.state.record_diagnostics(job_id, stage="delivery", metadata={"output_bytes": len(content)})
         try:
             if content_type.startswith("image/"):
                 await self.application.bot.send_photo(chat_id=chat_id, photo=content, caption=f"Job {job_id[:12]} complete")
             else:
                 await self.application.bot.send_video(chat_id=chat_id, video=content, caption=f"Job {job_id[:12]} complete", supports_streaming=True)
         except Exception as exc:
+            self.state.record_diagnostics(job_id, stage="delivery", error=exc)
             purged = await self._purge_backend(job_id, backend_id)
-            self.state.update_job(job_id, state="delivery_failed", last_status="delivery_failed", error_code=type(exc).__name__ if purged else "cleanup_failed")
+            self.state.update_job(job_id, state="delivery_failed", last_status="delivery_failed", error_code="delivery:telegram_transport_error" if purged else "cleanup_failed")
             if not purged:
                 LOG.error("delivery cleanup pending job=%s", job_id)
         else:
             purged = await self._purge_backend(job_id, backend_id)
             self.state.update_job(job_id, state="delivered", last_status="delivered" if purged else "cleanup_pending", delivered_at=time.time(), error_code=None if purged else "cleanup_failed")
+            self.state.record_diagnostics(job_id, stage="delivered", metadata={"content_purged": purged})
         finally:
             del content
 
@@ -631,34 +783,45 @@ class MediaBot:
         row = self.state.get_job(job_id)
         status_message_id = row["status_message_id"]
         last_update = 0.0
+        previous_state = None
         while True:
             try:
                 status = await self.api.status(backend_id)
             except Exception as exc:
-                self.state.update_job(job_id, state="cleanup_pending", last_status="cleanup_pending", error_code=type(exc).__name__)
+                self.state.record_diagnostics(job_id, stage="status", error=exc)
+                self.state.update_job(job_id, state="cleanup_pending", last_status="cleanup_pending", error_code=f"status:{_safe_exception(exc)['code']}")
                 if self.application:
                     await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: status unavailable; resubmit from Telegram")
                 return
             state = str(status.get("state", "unknown"))
+            if state not in {"queued", "waiting_for_gpu", "starting_comfyui", "running", "finalizing", "succeeded", "failed", "cancelled"}:
+                state = "unknown"
+            if state != previous_state:
+                self.state.record_diagnostics(job_id, stage="status", metadata=status)
+                previous_state = state
             self.state.update_job(job_id, state=state, last_status=state)
             now = time.monotonic()
             if now - last_update >= 30 and self.application:
                 try:
                     await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: {state} ({backend_id})")
                 except Exception:
-                    LOG.debug("status edit failed", exc_info=True)
+                    LOG.debug("status edit failed job=%s", job_id)
                 last_update = now
             if state in {"succeeded", "failed", "cancelled"}:
                 break
             await asyncio.sleep(5)
         if state != "succeeded":
-            self.state.update_job(job_id, state=state, last_status=state, error_code=None if state == "cancelled" else state)
+            cause = _safe_failure_code(status.get("error")) or "generation_failed"
+            failure_stage = status.get("failure_stage", "generation")
+            safe_code = _safe_failure_code(f"{failure_stage}:{cause}") or f"status:{cause}"
+            self.state.record_diagnostics(job_id, stage="status", error=RuntimeError(safe_code))
+            self.state.update_job(job_id, state=state, last_status=state, error_code="cancelled" if state == "cancelled" else safe_code)
             try:
                 await self.api.purge(backend_id)
             except Exception as exc:
                 LOG.error("terminal media cleanup pending job=%s error_code=%s", job_id, type(exc).__name__)
                 self.state.update_job(job_id, last_status="cleanup_pending", error_code=type(exc).__name__)
-            await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: {state}")
+            await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: {state} ({safe_code}); diagnostic metadata saved.")
             return
         await self._deliver_backend_result(job_id, backend_id, chat_id)
 
@@ -677,6 +840,7 @@ class MediaBot:
                 self.state.update_job(row["job_id"], last_status="cleanup_complete", error_code=None)
         for row in self.state.nonterminal():
             if not row["backend_job_id"]:
+                self.state.record_diagnostics(row["job_id"], stage="restart", error=RuntimeError("aborted_restart"))
                 self.state.update_job(row["job_id"], state="failed", last_status="aborted_restart", error_code="aborted_restart")
                 continue
             if now - float(row["updated_at"]) > ABANDONED_JOB_SECONDS:
@@ -714,11 +878,16 @@ class MediaBot:
             ("result", "recover an explicitly requested result"),
         ])
 
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del update
+        LOG.error("media handler failed exception_type=%s", type(context.error).__name__)
+
     def build(self) -> Application:
         token = os.environ.get("TELEGRAM_MEDIA_BOT_TOKEN", "").strip()
         if not token:
             raise RuntimeError("TELEGRAM_MEDIA_BOT_TOKEN is required")
         app = Application.builder().token(token).build()
+        app.add_error_handler(self.error_handler)
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("settings", self.settings_cmd))
         for command in ("set", "auto", "kind", "model", "mode", "preset", "longest", "width", "height", "steps", "duration", "variant", "lora", "strength"):
