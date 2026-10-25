@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import httpx
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -235,6 +236,39 @@ def test_fork_from_an_earlier_point_matches_the_parent_there():
     child, res = _proxy(_request(hist), store, now=T0 + 100)
     assert not res["recorded"]
     assert _cls(parent[27], child) == "append"
+
+
+def test_an_early_fork_that_grew_differently_gets_its_own_floor():
+    # V1 counterexample at 15452b2: the parent learned front 6 / floor 22; a fork
+    # from its first image round then read 94 images in one new message. The
+    # same front reused floor 22 on a 9-message history and dropped all 100.
+    store = _store()
+    _proxy(_request(_history(17)), store)
+    child = _history(1) + [{"role": "assistant", "content": [{"type": "text", "text": "the rest together"}]},
+                           {"role": "user", "content": [_img(6 + i) for i in range(94)]}]
+    body = _request(child)
+    newest = copy.deepcopy(cache_proxy.normalize_request(copy.deepcopy(body))[0]["messages"][-1])
+    out, res = _proxy(body, store)
+    assert _n_media(out) == 94 and out["messages"][-1] == newest
+    # and the child's own floor then holds steady for it, while the parent's stays put
+    later = child + [{"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                     {"role": "user", "content": [{"type": "text", "text": "compare them"}]}]
+    out2, res2 = _proxy(_request(later), store)
+    assert res2["floor"] == res["floor"] and not res2["recorded"] and _cls(out, out2) == "append"
+    again, res3 = _proxy(_request(_history(18)), store)
+    assert res3["floor"] == 22 and not res3["recorded"]
+
+
+@pytest.mark.parametrize("batch", [1, 2, 3, 5, 6, 10, 17, 25, 33, 40, 49, 50, 51, 60, 75, 90, 99, 100, 101])
+def test_never_more_than_a_batch_beyond_the_cli_and_never_the_newest_message(batch):
+    store = _store()
+    for turns in range(max(1, 100 // batch - 1), max(1, 100 // batch - 1) + 8):
+        body = _request(_history(turns, per_turn=batch))
+        cli = _n_media(body)
+        newest = copy.deepcopy(cache_proxy.normalize_request(copy.deepcopy(body))[0]["messages"][-1])
+        out, res = _proxy(body, store, now=T0 + turns)
+        assert _n_media(out) >= cli - cache_proxy.MEDIA_FLOOR_STEP, (batch, turns, res)
+        assert out["messages"][-1] == newest, (batch, turns, res)
 
 
 def test_newest_message_is_never_touched():

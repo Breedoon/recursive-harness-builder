@@ -612,15 +612,18 @@ def session_has_own_answer(health: JsonlSessionHealth) -> bool:
     return False
 
 
-def _fork_source_path(session_id: str) -> Path | None:
-    """The JSONL a session was forked or recovered from (jsonl_fork's receipt), if any."""
+def _fork_source(session_id: str) -> tuple[Path | None, str | None]:
+    """(source JSONL, fork target uuid) from jsonl_fork's receipt for a session, if any."""
     root = Path(os.environ.get("OBS_SESSION_REPLAY_PROVENANCE_DIR", "/workspace/runtime/state/session-replay"))
     try:
         receipt = json.loads((root / "forks" / f"{session_id}.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
-    source = receipt.get("source_path") if isinstance(receipt, dict) else None
-    return Path(source) if isinstance(source, str) and source else None
+        return None, None
+    if not isinstance(receipt, dict):
+        return None, None
+    source, target = receipt.get("source_path"), receipt.get("target_uuid")
+    return (Path(source) if isinstance(source, str) and source else None,
+            target if isinstance(target, str) and target else None)
 
 
 def futile_refusal_streak(
@@ -632,7 +635,9 @@ def futile_refusal_streak(
     from, in a row, that were refused before answering anything of their own.
     It is read from the session files and fork receipts, so it survives an OBS
     restart, and a fresh session (/clear, a new launch) starts its own count.
-    (None, 0) when the tail is not a content refusal.
+    A fork made from earlier than where its parent itself started (a reply to
+    an earlier message, rolling the refused part back) also starts its own
+    count. (None, 0) when the tail is not a content refusal.
     """
     kind = content_refusal_after(health, uuid)
     if kind is None:
@@ -647,9 +652,21 @@ def futile_refusal_streak(
         if count and content_refusal_after(current, current.safe_recovery_uuid) is None:
             break  # an earlier attempt that failed some other way does not count
         count += 1
-        source = _fork_source_path(current.session_id)
-        current = (analyze_jsonl_path(path=source, session_id=source.stem)
-                   if source is not None and source.exists() else None)
+        source, target = _fork_source(current.session_id)
+        if source is None or not source.exists():
+            break
+        try:
+            parent = analyze_jsonl_path(path=source, session_id=source.stem)
+        except (OSError, ValueError, KeyError):
+            break
+        line = parent.uuid_line_numbers.get(target) if target else None
+        if line is None:
+            break
+        _grandparent, parent_start = _fork_source(parent.session_id)
+        start = parent.uuid_line_numbers.get(parent_start) if parent_start else None
+        if start is not None and line < start:
+            break  # forked from before the parent's own start: a rolled-back context
+        current = parent
     return kind, count
 
 

@@ -1495,6 +1495,29 @@ def _media_free_bytes(msg: dict) -> bytes:
     return _msg_bytes(msg)
 
 
+def _floor_fingerprint(msg: dict) -> str:
+    """Identity of the message just before a floor, whoever removed its media.
+
+    A stored floor is reused only where this matches: the history up to the
+    floor is then the one it was learned on. A fork that left the parent
+    earlier and grew differently gets its own floor (V1 finding: an early fork
+    that read 94 new images reused the parent's later floor and lost all 100).
+    """
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        blocks = []
+        for b in content:
+            if _is_media(b):
+                continue
+            if (isinstance(b, dict) and b.get("type") == "tool_result"
+                    and isinstance(b.get("content"), list)):
+                inner = [x for x in b["content"] if not _is_media(x)]
+                b = dict(b, content=[] if not inner or _placeholder_only(inner) else inner)
+            blocks.append(b)
+        msg = dict(msg, content=blocks)
+    return hashlib.sha256(_msg_bytes(msg)).hexdigest()[:16]
+
+
 def pin_media_floor(body: dict, store: "EffortPinStore | None" = None,
                     now: float | None = None) -> dict:
     """Evict old images in large, pinned steps (see above). Mutates body.
@@ -1516,14 +1539,20 @@ def pin_media_floor(body: dict, store: "EffortPinStore | None" = None,
     now = time.time() if now is None else now
     key = hashlib.sha256(str(body.get("model", "")).encode() + b"\0"
                          + _media_free_bytes(msgs[0]) + b"\0").hexdigest()
+    last = len(msgs) - 1
     with store.lock:
         entry = store.media.get(key)
         floors = entry[0] if entry else []
         floor = None
-        for f_front, f_floor in floors:  # sorted by front
-            if f_front > front:
+        # the floor learned at the latest front not after this one, on this
+        # history: it must lie before the newest message and its preceding
+        # message must be the one it was learned on
+        for f in reversed(floors):  # sorted by front
+            if len(f) < 3 or f[0] > front:
+                continue
+            if f[1] <= last and _floor_fingerprint(msgs[f[1] - 1]) == f[2]:
+                floor = f[1]
                 break
-            floor = f_floor
         dirty = entry is None or now - entry[1] >= TTL_PIN_SAVE_EVERY
         if floor is None or floor <= front:
             # first time at the cap, or the CLI's front reached the floor. The
@@ -1535,7 +1564,9 @@ def pin_media_floor(body: dict, store: "EffortPinStore | None" = None,
             floor = pos[MEDIA_FLOOR_STEP]
             if floor <= front:
                 return result
-            floors = sorted([f for f in floors if f[0] != front] + [[front, floor]])
+            fp = _floor_fingerprint(msgs[floor - 1])
+            floors = sorted([f for f in floors if len(f) >= 3 and (f[0], f[2]) != (front, fp)]
+                            + [[front, floor, fp]])
             floors = floors[-MEDIA_FLOOR_MAX_ENTRIES:]
             result["recorded"] = dirty = True
         store.media[key] = [floors, now]

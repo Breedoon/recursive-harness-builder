@@ -236,6 +236,53 @@ async def test_a_fresh_context_gets_its_own_budget(config, project_dir):
     assert retry and retry != "sid-unrelated"
 
 
+async def test_a_reply_that_rolls_back_past_the_refusals_gets_its_own_budget(config, project_dir):
+    # V1 counterexample at 15452b2: a reply to the FIRST row of the stopped
+    # session forks from before the refused part; its first refusal must not
+    # inherit the discarded attempts (it was stopped at once, streak 3).
+    bot, state = await _stopped(config, project_dir)
+    old = state.session_id
+    first = json.loads((project_dir / f"{old}.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    bot._record_message_binding(route=state.route, message_id=11, jsonl_uuid=first["uuid"],
+                                session_id=old, role="user")
+    bot._send_system_message = AsyncMock()
+    proceed, _ = await bot._resolve_session_for_trigger(
+        state=state, bot=MagicMock(),
+        trigger_message=QueuedMessage(text="a different task from here", telegram_message_id=21,
+                                      reply_to_message_id=11))
+    assert proceed and state.session_id != old
+    assert await bot._recover_route_session_if_needed(state=state, source="run_start") is None
+    _refused_retry(project_dir, state.session_id)
+    assert await bot._recover_route_session_if_needed(state=state, source="run_start")
+
+
+def test_the_receipt_walk_ends_on_missing_or_cyclic_receipts(project_dir, tmp_path, monkeypatch):
+    from obs_agent.jsonl_health import futile_refusal_streak
+    root = tmp_path / "receipts"
+    (root / "forks").mkdir(parents=True)
+    monkeypatch.setenv("OBS_SESSION_REPLAY_PROVENANCE_DIR", str(root))
+    a = _Rows(project_dir / "sid-a.jsonl", "sid-a")
+    start = a.user("start")
+    a.refusal()
+    b = _Rows(project_dir / "sid-b.jsonl", "sid-b")
+    b.user("start")
+    b.refusal()
+    health = analyze_jsonl_path(path=a.path, session_id="sid-a")
+    for receipts, expect in (
+            ({}, 1),
+            ({"sid-a": "{"}, 1),
+            ({"sid-a": {"source_path": str(a.path), "target_uuid": start}}, 1),
+            ({"sid-a": {"source_path": str(project_dir / "gone.jsonl"), "target_uuid": start}}, 1),
+            ({"sid-a": {"source_path": str(b.path), "target_uuid": "sid-b-1"},
+              "sid-b": {"source_path": str(a.path), "target_uuid": start}}, 2)):
+        for p in (root / "forks").glob("*.json"):
+            p.unlink()
+        for sid, receipt in receipts.items():
+            (root / "forks" / f"{sid}.json").write_text(
+                receipt if isinstance(receipt, str) else json.dumps(receipt))
+        assert futile_refusal_streak(health, health.safe_recovery_uuid) == ("usage_policy", expect)
+
+
 async def test_an_inbox_wake_keeps_queued_work_when_the_loop_stops(config, project_dir):
     bot, state = await _stopped(config, project_dir)
     state.last_bot = MagicMock()
