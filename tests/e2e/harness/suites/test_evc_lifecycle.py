@@ -49,6 +49,10 @@ async def _shape(lane, shape, nonce, root, signals, proof):
     proof["primed_turn_end"] = ready.end
     if shape == "S3":
         prompt = "Write every integer from1 through8000, one per line, no other text and no tools."
+    elif shape == "S1":
+        command = shlex.join(["python3", "./evc_fixture.py", "hold", "--root", root])
+        prompt = (f"Call Bash exactly once with command `{command}`, timeout120000 and run_in_background=true. "
+                  "After it returns, write every integer from1 through8000, one per line, with no further tools.")
     elif shape == "S5m":
         prompt = "Call the `mcp__evc-hold__hold_probe` tool exactly once now; no other tool, then reply DONE."
     else:
@@ -124,6 +128,32 @@ async def _shape(lane, shape, nonce, root, signals, proof):
     return topic, sent, start, observed
 
 
+def _recorded_background_call(lane, root):
+    directory = lane.lane_dir / "home/.claude/projects/-workspace-runtime-git-obs-vault-active"
+    calls = {}
+    for path in sorted(directory.glob("*.jsonl")):
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("type") != "assistant" or row.get("sessionId") != path.stem:
+                continue
+            content = (row.get("message") or {}).get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if (isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Bash"
+                        and root in str(block.get("input", {}).get("command", ""))):
+                    calls[block["id"]] = {"source": str(path), "source_session": path.stem,
+                        "row_uuid": row.get("uuid"), "tool_use_id": block["id"],
+                        "input": {key: block["input"].get(key) for key in ("command", "timeout", "run_in_background")}}
+    assert len(calls) == 1, {"matching_Bash_call_count": len(calls)}
+    call = next(iter(calls.values()))
+    assert call["input"]["run_in_background"] is True, call
+    return call
+
+
 def _live_prior_tools(before, after, observed):
     if observed.get("pid") is None:
         return []
@@ -181,8 +211,10 @@ async def _after_cleanup_observation_epoch(proof, cleanup):
 async def _run(lane, config, shape, path):
     if path not in {"P1a", "P1c", "P2", "P7"}:
         raise NotImplementedError(f"No native trigger implemented for {path}; never count fall-through as RAN-PASS")
-    if shape not in {"S2", "S3", "S4", "S5h", "S5m"}:
-        raise NotImplementedError(f"No authored native shape implemented for {shape}; S1 must really start background Bash")
+    if shape not in {"S1", "S2", "S3", "S4", "S5h", "S5m"}:
+        raise NotImplementedError(f"No authored native shape implemented for {shape}")
+    if shape == "S1" and config != "RC-alt":
+        raise NotImplementedError("S1 requires the authored RC-alt background override")
     case = f"{config}/{shape}/{path}/2.1.59/R13"
     nonce = uuid.uuid4().hex[:8]
     root = f"/workspace/runtime/state/evc-{nonce}"
@@ -219,6 +251,10 @@ async def _run(lane, config, shape, path):
         if shape == "S4":
             assert not before["tool_started"], before
             proof["pre_event_tool_not_started"] = True
+        if shape == "S1":
+            proof["background_bash_call"] = _recorded_background_call(lane, root)
+            target_cli = next(value for value in candidates if value["pid"] == proof["target_cli_pid"])
+            assert target_cli["flags"].get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS") == "0", target_cli["flags"]
         if path in {"P1a", "P2"}:
             proof["stop_sent"] = (await lane.command(topic, "/stop")).message_id
             ack, end, cleanup = await asyncio.gather(
