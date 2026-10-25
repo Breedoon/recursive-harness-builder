@@ -4446,7 +4446,7 @@ class TestCommands:
         assert record.agent_name == agent_name
         await bot.shutdown()
 
-    async def test_launch_session_source_child_seeds_foreign_jsonl_and_preserves_user_hooks(self, config, tmp_path):
+    async def test_launch_session_source_child_seeds_foreign_jsonl_and_preserves_user_hooks(self, config, tmp_path, commit_hook):
         bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
         parent_route = TelegramRoute(chat_id=-10067890, thread_id=55)
         parent_state = bot._get_state(parent_route, topic_title="Root")
@@ -4502,11 +4502,10 @@ class TestCommands:
             + "\n",
             encoding="utf-8",
         )
-        hook_path = tmp_path / "guard.py"
-        hook_path.write_text(
+        hook_path = commit_hook(
+            config.vault_path, "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/new_chat_guard.py",
             "def check(hook_input, tool_use_id, context):\n"
             "    return {'decision': 'block', 'reason': 'hook active'}\n",
-            encoding="utf-8",
         )
         fake_task_id = uuid.UUID("33333333-3333-3333-3333-333333333333")
         fake_child_session = uuid.UUID("44444444-4444-4444-4444-444444444444")
