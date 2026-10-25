@@ -424,6 +424,89 @@ async def sc_parallel_resume(args):
     return [sid], None
 
 
+def _tiny_png(i):
+    import struct
+    import zlib
+    rgb = bytes(((i * 37) % 256, (i * 91) % 256, (i * 53) % 256))
+    raw = b"".join(b"\x00" + rgb * 8 for _ in range(8))
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+# The API looks back at most 20 content blocks from a breakpoint for an earlier
+# cache entry, and an image nested in a tool result counts as a block of its
+# own. A round of 5 parallel reads adds 16 blocks (text + 5 tool_use, 5 results
+# + 5 images); with 8 or 10 (25/31 blocks) the results request never sees the
+# previous request's entry and reads an older one, which right after the
+# proxy's activation predates it (measured 2026-10-25: ratio 0.60-0.62 on the
+# first pair at the cap, at both 8 and 10). Production's PDF reviewer read 6.
+IMAGE_CAP_BATCH = 5
+IMAGE_CAP_LIVE_BATCHES = 22
+
+
+async def sc_image_cap(args):
+    """Past the CLI's 100-image cap (bead obs-51). The bundled CLI drops the
+    oldest image of the conversation from every request once it holds more
+    than 100, so each request that reads an image changes an early message and
+    re-bills the conversation. The real CLI reads 115 distinct tiny PNGs, 5 per
+    turn in parallel, the last 5 after a new-process resume. Judged pairs
+    (_image_cap_pairs) are the adjacent requests at the cap after the proxy's
+    one-time activation: every one must be an append with a full read. Expect
+    FAIL on the unfixed proxy."""
+    sid = str(uuid.uuid4())
+    folder = WORK_ROOT / "cwd" / f"image_cap_{sid[:8]}"
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for i in range((IMAGE_CAP_LIVE_BATCHES + 1) * IMAGE_CAP_BATCH):
+        p = folder / f"page_{i:03d}.png"
+        p.write_bytes(_tiny_png(i))
+        paths.append(str(p))
+
+    def batch(k):
+        files = "\n".join(paths[k * IMAGE_CAP_BATCH:(k + 1) * IMAGE_CAP_BATCH])
+        return (f"In ONE message call the Read tool once for EACH of these {IMAGE_CAP_BATCH} image "
+                f"files, all in parallel, then reply with the single word: seen.\n{files}")
+
+    await _session(args, [batch(k) for k in range(IMAGE_CAP_LIVE_BATCHES)]
+                   + ["Reply with the single word: done."], session_id=sid)
+    await _session(args, [batch(IMAGE_CAP_LIVE_BATCHES), "Reply with the single word: after."],
+                   resume=sid)
+    return [sid], {"images": len(paths)}
+
+
+def _media_count(body):
+    n = 0
+    for m in body.get("messages") or []:
+        for b in m.get("content") if isinstance(m.get("content"), list) else []:
+            if b.get("type") in ("image", "document"):
+                n += 1
+            elif b.get("type") == "tool_result" and isinstance(b.get("content"), list):
+                n += sum(1 for x in b["content"] if isinstance(x, dict) and x.get("type") in ("image", "document"))
+    return n
+
+
+def _image_cap_pairs(log_dir, sids, since):
+    """Adjacent pairs at the cap, from the second request after the first one at it.
+
+    The proxy's activation is that first request (a one-time re-bill). The
+    request right after it is not judged either: in this harness a request that
+    follows a text-only exchange never reads the entry of the request just
+    before it, only the one before that (measured 2026-10-25 on old and new
+    proxies alike: every prompt request re-wrote the previous tool round,
+    ratio ~0.985), and right after the activation that older entry predates it.
+    """
+    rows = _rows(log_dir, sids, since)
+    counts = [_media_count(pd.load_request(r["req_id"], "pre", log_dir)) for r in rows]
+    first = next((i for i, c in enumerate(counts) if c >= 100), len(rows))
+    pairs = [(rows[i], rows[i + 1]) for i in range(first + 1, len(rows) - 1)
+             if counts[i] >= 100 and counts[i + 1] >= 100]
+    return pairs, counts
+
+
 async def sc_parallel_fork(args):
     import hashlib
     from obs_agent.context_jsonl import find_session_jsonl
@@ -945,6 +1028,7 @@ SCENARIOS = {
     "volatile_flip": (sc_volatile_flip, "server flag flips system section/context_management mid-conversation (Anthropic)"),
     "ttl_flip": (sc_ttl_flip, "CLI process at 5m inside a 1h conversation, then 1h again (Anthropic, vault-h6yt)"),
     "ttl_flip_down": (sc_ttl_flip_down, "warm 5m conversation whose next process asks for 1h (Anthropic, vault-h6yt)"),
+    "image_cap": (sc_image_cap, "past the CLI's 100-image cap, live and resumed (Anthropic, obs-51); expect FAIL on unfixed proxy"),
 }
 
 
@@ -955,7 +1039,8 @@ def _provider_errors(log_dir, since):
             if r.get("ts", 0) >= since and (r.get("http_status") or 0) >= 500]
 
 
-ANTHROPIC_ONLY = {"volatile_flip", "ws_resume", "recovered_poison", "ttl_flip", "ttl_flip_down"}
+ANTHROPIC_ONLY = {"volatile_flip", "ws_resume", "recovered_poison", "ttl_flip", "ttl_flip_down",
+                  "image_cap"}
 
 
 def run(args, name):
@@ -982,6 +1067,13 @@ def run(args, name):
         if rows_p and rows_c:
             pairs.append((rows_p[-1], rows_c[0]))  # the recovery boundary
         pairs += list(zip(rows_c, rows_c[1:]))
+    if name == "image_cap":
+        time.sleep(3)
+        pairs, counts = _image_cap_pairs(args.log_dir, sids, since)
+        meta["pre_media_counts"] = counts
+        meta["judged_pairs"] = len(pairs)
+        # too few pairs at the cap proves nothing (the model skipped reads)
+        meta["enough_pairs_at_cap"] = len(pairs) >= 3
     if meta and "direct_verdicts" in meta:  # volatile_flip: verdicts come from direct calls
         rows, verdicts = _rows(args.log_dir, sids, since), meta["direct_verdicts"]
     else:
@@ -998,7 +1090,8 @@ def run(args, name):
                 utility_ids.append(row["req_id"])
         route_ok = route_ok and bool(utility_ids)
     meta_ok = not meta or (meta.get("effects_unchanged", True) and meta.get("source_unchanged", True)
-                           and meta.get("final_response_preserved", True))
+                           and meta.get("final_response_preserved", True)
+                           and meta.get("enough_pairs_at_cap", True))
     ok = bool(verdicts) and route_ok and meta_ok and all(v["ok"] for v in verdicts)
     errs = [{"req_id": r["req_id"], "http_status": r.get("http_status")} for r in scoped_rows
             if (r.get("http_status") or 0) >= 500]

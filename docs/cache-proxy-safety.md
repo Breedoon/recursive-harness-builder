@@ -88,6 +88,25 @@ real break mechanisms in live traffic; none was caught by a unit test:
    conversation sent at 1h stays 1h; a warm 5m conversation stays 5m until it
    idles past the 5m entry life. Live scenarios `ttl_flip` / `ttl_flip_down`.
    Never "fix" this by upgrading Claude Code (Daniel's standing decision).
+12. The CLI's media cap. CLI 2.1.59 sends at most 100 image/document blocks
+   per request (constant `gFI=100`, function `LS9` in its query path: it
+   counts top-level and tool_result-nested media in every message and drops
+   the oldest beyond 100; the JSONL keeps them all). Past 100, every request
+   that adds an image drops one more old one, so an early message changes and
+   the conversation is re-billed on every such request (2026-10-24 06:04-06:22Z:
+   one PDF-review agent, 42 breaks, 15.9M tokens; bead `obs-51`). The API's own
+   limit is higher for 1M-context models (probe 2026-10-25: `claude-opus-5-5`
+   accepts 600 images and refuses 601, `claude-haiku-4-5` refuses 101), but
+   raising the CLI constant would only move the cliff and meet the 32 MB request
+   limit at about 450 page images. Fixed 2026-10-25 (`pin_media_floor`): while a
+   request carries 100 media, a per-conversation floor above the CLI's eviction
+   front removes every media block before it (image-only results become one
+   fixed placeholder, whoever removed the image), and moves about 50 media at a
+   time, so the conversation is re-billed once per ~50 new images. Live scenario
+   `image_cap`. In that harness a prompt request never reads the previous
+   request's entry, only the one before it (ratio ~0.985 in every run, old and
+   new proxy), so the request right after the floor first appears or moves can
+   re-bill once more; the scenario judges the pairs after it.
 
 Not a mechanism (checked 2026-10-16, bead `vault-1r7n.9`): the "Continue from
 where you left off." block the CLI adds to the last user message when a fork or
@@ -442,6 +461,16 @@ These are deliberate tradeoffs. Re-decide them if they start to hurt.
   writes; accepted, because a flip re-bills the whole prefix). The pin is keyed
   like the other pins (model plus first message), so same-first-message
   conversations share it. Tool-less side calls are never pinned.
+- **Past 100 images the model sees the newest 50-100, not 100 (2026-10-25,
+  obs-51).** `pin_media_floor` removes up to about 50 more old images than the
+  CLI itself would, so that the prefix changes once per ~50 new images instead
+  of on every image. An agent that needs an old image back has to read the file
+  again. Floors are kept per conversation (model plus first message without
+  media) and per CLI eviction front, so forks and recoveries from an earlier
+  point get the floor that was in force there; two live conversations with the
+  same first message share the list, and one that is further ahead can move
+  the other's floor (one extra re-bill). Anthropic route only. A whole window
+  of 100 images inside the newest message is sent as the CLI built it.
 
 ## More detail
 
