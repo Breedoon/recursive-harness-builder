@@ -156,9 +156,22 @@ def setup(root: Path, shape: str) -> dict:
     return snapshot(root)
 
 
+def zombie_control(root: Path) -> None:
+    child = os.fork()
+    if child == 0:
+        os._exit(0)
+    try:
+        os.waitid(os.P_PID, child, os.WEXITED | os.WNOWAIT)
+        identity = _process_record(Path("/proc") / str(child), cli=False)
+        record(root, "zombie_control", child_pid=child, child_start=identity["start"], child_state=identity["state"])
+        hold(root, "zombie_parent_holding")
+    finally:
+        os.waitpid(child, 0)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("hold", "hook", "mcp", "snapshot", "setup", "release"))
+    parser.add_argument("mode", choices=("hold", "hook", "mcp", "snapshot", "setup", "release", "zombie"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--shape", default="S2")
     parser.add_argument("--identities", type=json.loads, default={})
@@ -177,6 +190,8 @@ def main() -> int:
         def hold_probe() -> str:
             return hold(args.root, "mcp_running")
         server.run(transport="stdio")
+    elif args.mode == "zombie":
+        zombie_control(args.root)
     elif args.mode == "snapshot":
         print(json.dumps(snapshot(args.root, args.identities)))
     elif args.mode == "setup":

@@ -275,7 +275,6 @@ async def _run(lane, config, shape, path):
             assert len(checks) == len(prior) and all(p["outcome"] != "UNAVAILABLE" for p in checks), checks
             alive = [p for p in checks if p["outcome"] == "SAME_IDENTITY" and p["state"] not in {"Z", "X"}]
             assert not alive, alive
-            await _helper(lane, "release", root)
         proof["raw_status"] = "RAN-PASS"
     except Exception as exc:
         proof.update(raw_status="RAN-FAIL", error=type(exc).__name__ + ": " + str(exc)[-2000:])
@@ -286,6 +285,11 @@ async def _run(lane, config, shape, path):
                 proof["failure_cleanup_stop"] = (await lane.command(proof["topic_id"], "/stop")).message_id
             except Exception as exc:
                 proof["failure_cleanup_error"] = type(exc).__name__
+        if proof.get("configuration_before_turn"):
+            try:
+                proof["owned_fixture_release"] = await _helper(lane, "release", root)
+            except Exception as exc:
+                proof["owned_fixture_release_error"] = type(exc).__name__
         proof["finished_epoch"] = time.time()
         target.write_text(json.dumps(proof, indent=2, default=str) + "\n")
         signals.close()
