@@ -36,7 +36,7 @@ except Exception:  # pragma: no cover - optional import error surfaced on cron c
 
 from telegram import Bot, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, TelegramError
+from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -115,6 +115,13 @@ _MEDIA_GROUP_GAP_SECONDS = 0.75
 
 # Background queue polling interval
 _BACKGROUND_POLL_SECONDS = 3.0
+# obs-54: the inbox wake poller reuses a parsed inbox while its file is
+# unchanged, but only once the file is older than this (coarse fs clocks).
+_INBOX_CACHE_SETTLE_SECONDS = 2.0
+# obs-54: long synchronous sweeps hand the event loop back this often.
+_LOOP_YIELD_EVERY = 256
+# obs-54: an unchanged team-config member entry is rewritten at most this often.
+_TEAM_PROJECTION_REFRESH_SECONDS = 30.0
 
 # One-shot reminder for the root/main session age.
 _MAIN_SESSION_WARNING_SECONDS = 50 * 60.0
@@ -170,7 +177,9 @@ _PRIORITY_SYSTEM = 0
 _PRIORITY_ASSISTANT = 10
 _PRIORITY_OBSERVABILITY = 30
 _TOPIC_CREATE_MAX_ATTEMPTS = 3
-_TASK_LAUNCH_SEND_MAX_ATTEMPTS = 3
+# obs-54: launch/resume notices retry through 2+4+8+16+30 s of backoff before
+# the launch goes on without them (_send_task_launch_notice); was 3 attempts.
+_TASK_LAUNCH_SEND_MAX_ATTEMPTS = 6
 _RANDOM_TOPIC_WORDS = (
     "amber",
     "atlas",
@@ -790,6 +799,12 @@ class TelegramBot:
         # unread message every poll cycle within this daemon process. Pre-start
         # inbox messages are ignored after daemon restart.
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
+        # inbox path -> (file identity, wake floor, latest unread); see
+        # _latest_unread_team_inbox_message (obs-54).
+        self._inbox_latest_cache: dict[Path, tuple[tuple[int, int, int, int], float, Any]] = {}
+        # (team, agent) -> (member data fingerprint, monotonic write time); see
+        # _upsert_team_projection_config (obs-54).
+        self._team_projection_written: dict[tuple[str, str], tuple[str, float]] = {}
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._pending_schedule_owners: dict[str, tuple[_TopicScheduleRecord, Any]] = {}
         self._pending_schedule_owner_retirements: set[str] = set()
@@ -2970,17 +2985,32 @@ class TelegramBot:
             icon_custom_emoji_id=icon_custom_emoji_id,
         )
 
+    def _active_fork_task_ids(self) -> set[str]:
+        """Every task id some route currently lists as an active child, in one pass."""
+        active: set[str] = set()
+        for state in self._states_by_route.values():
+            if state.active_fork_task_ids:
+                active.update(state.active_fork_task_ids)
+        return active
+
     def _is_fork_task_running(
         self,
         record: _ForkTaskRecord,
         *,
         completing_task_id: str | None = None,
+        active_task_ids: set[str] | None = None,
     ) -> bool:
+        """``active_task_ids``: a ``_active_fork_task_ids()`` result taken with no
+        await since, for callers that test many records (obs-54: testing each of
+        ~11k records against ~7k routes blocked the event loop 2-7 s per idle
+        sweep)."""
         if record.task_id == completing_task_id:
             return False
         task = self._fork_task_tasks.get(record.task_id)
         if task is not None and not task.done():
             return True
+        if active_task_ids is not None:
+            return record.task_id in active_task_ids
         return any(record.task_id in state.active_fork_task_ids for state in self._states_by_route.values())
 
     def _idle_claude_process_candidates(
@@ -2994,6 +3024,7 @@ class TelegramBot:
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
 
         candidates: list[_IdleClaudeProcessCandidate] = []
+        active_task_ids = self._active_fork_task_ids()
         for record in self._fork_tasks_by_id.values():
             if not record.idle_ready:
                 skip("not_idle_ready")
@@ -3001,7 +3032,9 @@ class TelegramBot:
             if not (record.team_name or "").strip() or not (record.agent_name or "").strip():
                 skip("missing_team_or_agent")
                 continue
-            if self._is_fork_task_running(record, completing_task_id=completing_task_id):
+            if self._is_fork_task_running(
+                record, completing_task_id=completing_task_id, active_task_ids=active_task_ids,
+            ):
                 skip("running")
                 continue
             child_state = self._states_by_route.get(record.child_route)
@@ -3410,12 +3443,13 @@ class TelegramBot:
         def _status(*, team_name: str | None = None, **_: Any) -> dict[tuple[str, str], dict[str, Any]]:
             requested_team = (team_name or "").strip()
             records: dict[tuple[str, str], dict[str, Any]] = {}
+            active_task_ids = self._active_fork_task_ids()
             for record in self._fork_tasks_by_id.values():
                 record_team = (record.team_name or "").strip()
                 record_agent = (record.agent_name or "").strip()
                 if not record_team or not record_agent or (requested_team and record_team != requested_team):
                     continue
-                running = self._is_fork_task_running(record)
+                running = self._is_fork_task_running(record, active_task_ids=active_task_ids)
                 child_state = self._states_by_route.get(record.child_route)
                 if child_state is not None:
                     running = running or child_state.busy or child_state.hook_state.execution_active
@@ -5155,6 +5189,21 @@ class TelegramBot:
 
         team_dir = Path.home() / ".claude" / "teams" / normalized_team
         config_path = team_dir / "config.json"
+        # obs-54: this ran on every stream event of every run (_bind_state_session),
+        # re-reading and rewriting team configs of up to 1.5 MB on the event loop.
+        # Skip it while the same member data was written within the refresh
+        # interval; only the joinedAt/updated_at stamps would differ.
+        memo_key = (normalized_team, normalized_agent)
+        fingerprint = self._team_projection_fingerprint(child_session_id, obs_metadata)
+        written = self._team_projection_written.get(memo_key)
+        if (
+            written is not None
+            and written[0] == fingerprint
+            and time.monotonic() - written[1] < _TEAM_PROJECTION_REFRESH_SECONDS
+            and config_path.exists()
+            and (team_dir / "inboxes" / f"{normalized_agent}.json").exists()
+        ):
+            return
         team_dir.mkdir(parents=True, exist_ok=True)
 
         payload: dict[str, Any] = {}
@@ -5231,6 +5280,15 @@ class TelegramBot:
         inbox_path = inbox_dir / f"{normalized_agent}.json"
         if not inbox_path.exists():
             inbox_path.write_text("[]", encoding="utf-8")
+        self._team_projection_written[memo_key] = (fingerprint, time.monotonic())
+
+    @staticmethod
+    def _team_projection_fingerprint(
+        child_session_id: str | None,
+        obs_metadata: dict[str, Any] | None,
+    ) -> str:
+        stable = {key: value for key, value in (obs_metadata or {}).items() if key != "updated_at"}
+        return json.dumps([child_session_id, stable], sort_keys=True, default=str)
 
     def _child_session_path(self, session_id: str) -> str | None:
         path = find_session_jsonl(
@@ -7258,6 +7316,47 @@ class TelegramBot:
         )
         self._remember_system_message_ids(route=route, sent_messages=sent_messages)
         return sent_messages
+
+    async def _send_task_launch_notice(
+        self,
+        *,
+        route: TelegramRoute,
+        bot,
+        html_text: str,
+        underline: bool = True,
+        purpose: str,
+    ) -> list:
+        """A launch or resume notice; the launch goes on without it if Telegram keeps failing.
+
+        obs-54: on 2026-10-25 AgentTask launches aborted after the child topic
+        was created, because the child's first service message timed out three
+        times while the event loop stalled; that left empty topics and NoTask
+        handles. The notice is retried with the transport's backoff
+        (2, 4, 8, 16, 30 s), and a timeout, network error or flood wait after
+        the last attempt returns no messages instead of failing the launch.
+        Other errors (deleted topic, bad request) still raise.
+        """
+        try:
+            return await self._send_system_html_message(
+                route=route,
+                bot=bot,
+                html_text=html_text,
+                disable_notification=True,
+                underline=underline,
+                max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+            )
+        except (TimedOut, NetworkError, RetryAfter) as exc:
+            if isinstance(exc, BadRequest):
+                raise
+            logger.warning(
+                "[launch_notice] %s not sent route=%s after %d attempts (%s: %s); continuing without it",
+                purpose,
+                route,
+                _TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+                type(exc).__name__,
+                exc,
+            )
+            return []
 
     def _active_schedules_for_route(self, route: TelegramRoute) -> list[_TopicScheduleRecord]:
         schedule_ids = self._schedule_ids_by_route.get(route, set())
@@ -11471,13 +11570,14 @@ class TelegramBot:
             else None
         )
         styled_service_html = self._underline_first_nonempty_line_html(child_service_html)
-        service_messages = await self._send_system_html_message(
+        # obs-54: the topic exists from here on; a failed notice must not abort
+        # the launch and leave the topic empty with no task behind it.
+        service_messages = await self._send_task_launch_notice(
             route=child_route,
             bot=bot,
             html_text=styled_service_html,
-            disable_notification=True,
             underline=False,
-            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+            purpose="child service message",
         )
         service_message_id = self._sent_message_id(service_messages[0]) if service_messages else None
         if service_message_id is not None:
@@ -11501,6 +11601,9 @@ class TelegramBot:
                 bot=bot,
                 text=session_marker_text,
                 disable_notification=True,
+                # obs-54: best-effort like the notices; unbounded retries held
+                # the launch here for as long as Telegram stayed unreachable.
+                max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
             )
             session_marker_id = self._sent_message_id(session_marker)
             if session_marker_id is not None:
@@ -11969,6 +12072,48 @@ class TelegramBot:
                 return str(item.get("from_team") or "").strip() or None
         return None
 
+    def _cached_latest_unread_team_inbox_message(
+        self,
+        *,
+        team_name: str,
+        agent_name: str,
+    ) -> tuple[str | None, str | None, str | None] | None:
+        """``_latest_unread_team_inbox_message``, reused while the inbox file is unchanged.
+
+        obs-54: the wake poller asks for every team worker and route inbox
+        (~19k on 2026-10-25) every 3 s, and reading and parsing each file
+        blocked the event loop. The answer is a function of the file bytes and
+        the wake floor, so it is reused while the file's identity (device,
+        inode, size, mtime) is unchanged. It is stored only for a file last
+        modified more than ``_INBOX_CACHE_SETTLE_SECONDS`` before it was read:
+        a later write then gets a later mtime even on a coarse filesystem
+        clock, so a same-size rewrite cannot hide behind the stored identity.
+        """
+        inbox_path = self._team_inbox_path(team_name, agent_name)
+        try:
+            st = inbox_path.stat()
+        except OSError:
+            self._inbox_latest_cache.pop(inbox_path, None)
+            return None
+        identity = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        floor = self._inbox_wake_floor
+        cached = self._inbox_latest_cache.get(inbox_path)
+        if cached is not None and cached[0] == identity and cached[1] == floor:
+            return cached[2]
+        settled = time.time() - st.st_mtime > _INBOX_CACHE_SETTLE_SECONDS
+        result = self._latest_unread_team_inbox_message(team_name=team_name, agent_name=agent_name)
+        try:
+            after = inbox_path.stat()
+        except OSError:
+            after = None
+        if settled and after is not None and (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+        ) == identity:
+            self._inbox_latest_cache[inbox_path] = (identity, floor, result)
+        else:
+            self._inbox_latest_cache.pop(inbox_path, None)
+        return result
+
     def _latest_unread_team_inbox_message(
         self,
         *,
@@ -12016,7 +12161,10 @@ class TelegramBot:
     async def _poll_team_worker_inbox_wakes(self) -> None:
         handled_keys: set[tuple[str, str]] = set()
         task_ids = list(dict.fromkeys(self._team_worker_records.values()))
-        for task_id in task_ids:
+        for index, task_id in enumerate(task_ids):
+            if index and index % _LOOP_YIELD_EVERY == 0:
+                # obs-54: ~19k inboxes per sweep; let other topics run between batches.
+                await asyncio.sleep(0)
             record = self._fork_tasks_by_id.get(task_id)
             if record is None:
                 self._remove_team_worker_mappings_for_task(task_id)
@@ -12029,7 +12177,7 @@ class TelegramBot:
             if not team_name or not agent_name:
                 continue
             handled_keys.add((team_name, agent_name))
-            latest = self._latest_unread_team_inbox_message(
+            latest = self._cached_latest_unread_team_inbox_message(
                 team_name=team_name,
                 agent_name=agent_name,
             )
@@ -12054,14 +12202,16 @@ class TelegramBot:
                     "content": content,
                 },
             )
-        for key, route in list(self._route_inbox_targets.items()):
+        for index, (key, route) in enumerate(list(self._route_inbox_targets.items())):
+            if index and index % _LOOP_YIELD_EVERY == 0:
+                await asyncio.sleep(0)
             if key in handled_keys:
                 continue
             state = self._get_state(route, create=False)
             if state is None:
                 self._remove_route_inbox_target(route)
                 continue
-            latest = self._latest_unread_team_inbox_message(
+            latest = self._cached_latest_unread_team_inbox_message(
                 team_name=key[0],
                 agent_name=key[1],
             )
@@ -12669,13 +12819,12 @@ class TelegramBot:
             team_name=record.team_name,
             agent_name=record.agent_name,
         )
-        resume_service_messages = await self._send_system_html_message(
+        resume_service_messages = await self._send_task_launch_notice(
             route=record.child_route,
             bot=state.last_bot,
             html_text=self._underline_first_nonempty_line_html(resume_service_html),
-            disable_notification=True,
             underline=False,
-            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+            purpose="resume service message",
         )
         record.launch_child_message_id = (
             self._sent_message_id(resume_service_messages[0]) if resume_service_messages else None
@@ -12705,12 +12854,11 @@ class TelegramBot:
                 f'<a href="{html.escape(child_link)}">'
                 f"{html.escape(self._current_topic_title(record.child_route))}</a>"
             )
-        parent_messages = await self._send_system_html_message(
+        parent_messages = await self._send_task_launch_notice(
             route=route,
             bot=state.last_bot,
             html_text=parent_html,
-            disable_notification=True,
-            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+            purpose="parent resume notice",
         )
         record.launch_parent_message_id = (
             self._sent_message_id(parent_messages[0]) if parent_messages else None
@@ -13052,12 +13200,11 @@ class TelegramBot:
                 f'<a href="{html.escape(child_link)}">'
                 f"{html.escape(topic_name)}</a>"
             )
-        confirmation_messages = await self._send_system_html_message(
+        confirmation_messages = await self._send_task_launch_notice(
             route=route,
             bot=state.last_bot,
             html_text=confirmation,
-            disable_notification=True,
-            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+            purpose="parent launch confirmation",
         )
         confirmation_id = (
             self._sent_message_id(confirmation_messages[0]) if confirmation_messages else None

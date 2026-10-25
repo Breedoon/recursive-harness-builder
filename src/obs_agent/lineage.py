@@ -16,6 +16,7 @@ from __future__ import annotations
 # A break is silent: no error, the API just re-bills the whole conversation.
 # Live check: scripts/cache_regression.py resume_new_proc parallel_fork (docs/cache-proxy-safety.md).
 
+import functools
 import hashlib
 import json
 import re
@@ -26,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from obs_agent.append_scan import AppendScanCache
 from obs_agent.context_jsonl import find_session_jsonl
 
 _OBS_BOOTSTRAP_RE = re.compile(
@@ -276,6 +278,9 @@ def extract_obs_bootstrap_xml(text: str | None) -> str | None:
     return match.group(1)
 
 
+# obs-54: called for every route's pending bootstrap on each team-status and
+# inbox-projection pass. The result is a frozen value of the text alone.
+@functools.lru_cache(maxsize=4096)
 def parse_obs_bootstrap_xml(xml_text: str) -> ObsBootstrap:
     """Parse a canonical OBS bootstrap XML block."""
     root = ET.fromstring(xml_text)
@@ -416,24 +421,36 @@ def _entry_candidate_texts(entry: dict[str, Any]) -> Iterable[str]:
     yield from _message_text_blocks(message.get("content"))
 
 
+def _fold_latest_bootstrap_xml(latest_xml: str | None, line: str) -> str | None:
+    if not line:
+        return latest_xml
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        return latest_xml
+    if not isinstance(entry, dict):
+        return latest_xml
+    for text in _entry_candidate_texts(entry):
+        bootstrap_xml = extract_obs_bootstrap_xml(text)
+        if bootstrap_xml:
+            latest_xml = bootstrap_xml
+    return latest_xml
+
+
+# obs-54: this scan ran over the whole session JSONL on every stream event of
+# every run (_bind_state_session -> _state_inbox_projection), on the event
+# loop. Session files only grow, so the latest block found so far is kept with
+# the offset it was found at and only appended bytes are read. A line can only
+# hold a block if the raw line contains the tag name, so other lines are not
+# JSON-decoded at all (JSON escaping never touches ASCII letters or "-").
+_bootstrap_scan_cache: AppendScanCache[str | None] = AppendScanCache(
+    _fold_latest_bootstrap_xml, None, needle=b"obs-bootstrap",
+)
+
+
 def find_latest_obs_bootstrap_in_jsonl(path: Path) -> ObsBootstrap | None:
     """Scan a transcript JSONL for the latest canonical bootstrap."""
-    latest_xml: str | None = None
-    with path.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(entry, dict):
-                continue
-            for text in _entry_candidate_texts(entry):
-                bootstrap_xml = extract_obs_bootstrap_xml(text)
-                if bootstrap_xml:
-                    latest_xml = bootstrap_xml
+    latest_xml = _bootstrap_scan_cache.scan(path)
     if latest_xml is None:
         return None
     return parse_obs_bootstrap_xml(latest_xml)

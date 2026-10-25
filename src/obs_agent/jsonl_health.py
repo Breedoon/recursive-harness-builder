@@ -255,22 +255,42 @@ def _collect_chain_unsafe(
     by_uuid: dict[str, _ParsedEntry],
     poison_uuids: set[str],
 ) -> frozenset[str]:
+    """Rows whose own ancestor chain holds a poison row or a parent cycle.
+
+    obs-54: the previous version walked every row's chain to the root
+    separately, O(rows x depth), which is quadratic on a linear session: 1-2 s
+    per call on 4k-row sessions, run on the event loop several times per turn
+    (1,276 of 3,323 loop stalls on 2026-10-25). Each walk now stops at the
+    first row whose verdict is already known and gives every row on its path
+    that verdict, so each row is walked once. The result is the same set
+    (checked against the old walk on real session files).
+    """
     unsafe: set[str] = set(poison_uuids)
+    safe: set[str] = set()
     for uuid_value in by_uuid:
-        seen: set[str] = set()
+        if uuid_value in unsafe or uuid_value in safe:
+            continue
+        path: list[str] = []
+        on_path: set[str] = set()
         cursor: str | None = uuid_value
+        is_unsafe = False
         while cursor:
             if cursor in unsafe:
-                unsafe.add(uuid_value)
+                is_unsafe = True
                 break
-            if cursor in seen:
-                unsafe.add(uuid_value)
+            if cursor in safe:
                 break
-            seen.add(cursor)
+            if cursor in on_path:
+                # A parent cycle: every row on the path leads into it.
+                is_unsafe = True
+                break
             entry = by_uuid.get(cursor)
             if entry is None:
                 break
+            path.append(cursor)
+            on_path.add(cursor)
             cursor = entry.parent_uuid
+        (unsafe if is_unsafe else safe).update(path)
     return frozenset(unsafe)
 
 

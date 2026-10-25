@@ -14,10 +14,12 @@ import inspect
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +28,7 @@ import xml.etree.ElementTree as ET
 
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
+from obs_agent.append_scan import AppendScanCache
 from obs_agent.context_probe import probe_context_via_claude_cli
 from obs_agent.context_jsonl import find_session_jsonl_index
 from obs_agent import start_step as _start_step
@@ -438,26 +441,71 @@ def _activity_fallback(entry: dict[str, Any]) -> tuple[float | None, str]:
     return None, "unknown"
 
 
-def _jsonl_event_activity(path: Any) -> float | None:
-    newest: float | None = None
+def _fold_jsonl_event_activity(newest: float | None, raw: str) -> float | None:
+    if not raw:
+        return newest
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for raw_line in handle:
-                raw = raw_line.strip()
-                if not raw:
-                    continue
-                try:
-                    record = json.loads(raw)
-                except (TypeError, ValueError, RecursionError):
-                    continue
-                if not isinstance(record, dict):
-                    continue
-                timestamp = _parse_jsonl_event_timestamp(record.get("timestamp"))
-                if timestamp is not None and (newest is None or timestamp > newest):
-                    newest = timestamp
+        record = json.loads(raw)
+    except (TypeError, ValueError, RecursionError):
+        return newest
+    if not isinstance(record, dict):
+        return newest
+    timestamp = _parse_jsonl_event_timestamp(record.get("timestamp"))
+    if timestamp is not None and (newest is None or timestamp > newest):
+        return timestamp
+    return newest
+
+
+# obs-54: search_team parsed every member's whole session JSONL on each call
+# (187 loop stalls of ~8 s on 2026-10-25). The newest timestamp is a running
+# maximum, so it is kept with the offset reached and only appended bytes are
+# read; search_team also runs these scans off the event loop.
+_event_activity_cache: AppendScanCache[float | None] = AppendScanCache(
+    _fold_jsonl_event_activity, None, errors="replace",
+)
+
+
+def _jsonl_event_activity(path: Any) -> float | None:
+    try:
+        if not isinstance(path, (str, os.PathLike)):
+            # A path-like object that only offers open(): fold it in full.
+            newest: float | None = None
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for raw_line in handle:
+                    newest = _fold_jsonl_event_activity(newest, raw_line.strip())
+            return newest
+        return _event_activity_cache.scan(path)
     except (OSError, UnicodeError):
         return None
-    return newest
+
+
+def _jsonl_path_activity(path: Path) -> tuple[float | None, str]:
+    activity_epoch = _jsonl_event_activity(path)
+    if activity_epoch is not None:
+        return activity_epoch, "jsonl_event_timestamp"
+    try:
+        activity_epoch = _parse_jsonl_event_timestamp(path.stat().st_mtime)
+    except OSError:
+        return None, "unknown"
+    if activity_epoch is not None:
+        return activity_epoch, "jsonl_mtime_fallback"
+    return None, "unknown"
+
+
+def _jsonl_activities(paths: list[Path]) -> dict[Path, tuple[float | None, str]]:
+    return {path: _jsonl_path_activity(path) for path in paths}
+
+
+_JSONL_SCAN_EXECUTOR: "ThreadPoolExecutor | None" = None
+
+
+def _jsonl_scan_executor() -> "ThreadPoolExecutor":
+    """One worker thread for session-file scans, so concurrent scans queue
+    behind each other instead of all contending with the event loop."""
+    global _JSONL_SCAN_EXECUTOR
+    if _JSONL_SCAN_EXECUTOR is None:
+        _JSONL_SCAN_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="obs-jsonl-scan")
+    return _JSONL_SCAN_EXECUTOR
 
 
 def _load_team_projection_metadata(team_name: str) -> dict[str, dict[str, Any]]:
@@ -2261,6 +2309,13 @@ def create_obs_tools(
             session_ids=session_ids,
             cwd=config.vault_path,
         )
+        # obs-54: reading the members' session files is file and CPU work;
+        # keep it off the event loop that serves every topic and agent.
+        jsonl_activity = await asyncio.get_running_loop().run_in_executor(
+            _jsonl_scan_executor(),
+            _jsonl_activities,
+            [path for path in session_paths.values() if path is not None],
+        )
         for name, details in merged_known.items():
             details["team_name"] = team_name
             details["agent_name"] = name
@@ -2277,16 +2332,7 @@ def create_obs_tools(
             activity_epoch = None
             activity_source = "unknown"
             if path is not None:
-                activity_epoch = _jsonl_event_activity(path)
-                if activity_epoch is not None:
-                    activity_source = "jsonl_event_timestamp"
-                else:
-                    try:
-                        activity_epoch = _parse_jsonl_event_timestamp(path.stat().st_mtime)
-                        if activity_epoch is not None:
-                            activity_source = "jsonl_mtime_fallback"
-                    except OSError:
-                        pass
+                activity_epoch, activity_source = jsonl_activity.get(path, (None, "unknown"))
             if activity_epoch is None:
                 activity_epoch, activity_source = _activity_fallback(details)
             details["last_activity_source"] = activity_source
