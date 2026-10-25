@@ -259,6 +259,81 @@ def test_an_early_fork_that_grew_differently_gets_its_own_floor():
     assert res3["floor"] == 22 and not res3["recorded"]
 
 
+def _rounds(sizes, first="review the pages"):
+    """Full history whose turn t reads sizes[t] images in parallel."""
+    msgs = [{"role": "user", "content": [{"type": "text", "text": first}]}]
+    n = 0
+    for t, k in enumerate(sizes):
+        ids = [f"toolu_{t:03d}_{j}" for j in range(k)]
+        msgs.append({"role": "assistant", "content": [{"type": "text", "text": f"reading batch {t}"}]
+                     + [{"type": "tool_use", "id": i, "name": "Read", "input": {"file_path": f"/p/{i}.png"}}
+                        for i in ids]})
+        msgs.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": i, "content": [_img(n + j)]}
+                                                 for j, i in enumerate(ids)]})
+        n += k
+    return msgs
+
+
+def test_a_floor_that_would_cut_more_than_a_batch_here_is_not_reused():
+    # The parent learned front 2 / floor 18 when the CLI had already evicted 36
+    # of the 40 images in its front message. A fork made after the floor that
+    # then grew less reaches the cap with 36 of them still there: reusing floor
+    # 18 would cut 78 of its 100 images. It gets its own floor instead.
+    store = _store()
+    parent, rp = _proxy(_request(_rounds([40] + [6] * 16)), store, now=T0)
+    assert (rp["front"], rp["floor"], rp["recorded"]) == (2, 18, True)
+    child_hist = _rounds([40] + [6] * 9) + [
+        {"role": "assistant", "content": [{"type": "text", "text": "ten more together"}]},
+        {"role": "user", "content": [_img(1000 + i) for i in range(10)]}]
+    body = _request(child_hist)
+    cli = _n_media(body)
+    out, rc = _proxy(body, store, now=T0 + 1)
+    assert rc["front"] == 2 and rc["floor"] != 18 and rc["recorded"]
+    assert _n_media(out) >= cli - cache_proxy.MEDIA_FLOOR_STEP
+    # the parent keeps its own floor: its next request is an append
+    nxt, rn = _proxy(_request(_rounds([40] + [6] * 17)), store, now=T0 + 2)
+    assert rn["floor"] == 18 and not rn["recorded"] and _cls(parent, nxt) == "append"
+
+
+def test_a_history_that_differs_before_the_floor_never_uses_it():
+    # Two conversations with the same first message (one pin key) that differ
+    # early but carry the same message just before the floor: each keeps its
+    # own floors, so neither one's later floors move the other's bytes.
+    store = _store()
+    a_hist = _history(17)
+    b_hist = copy.deepcopy(a_hist)
+    b_hist[3]["content"][0]["text"] = "go on, differently"
+    a, ra = _proxy(_request(a_hist), store, now=T0)
+    b, rb = _proxy(_request(b_hist), store, now=T0 + 1)
+    assert ra["floor"] == rb["floor"] and ra["recorded"] and rb["recorded"]
+    assert a["messages"][ra["floor"] - 1] == b["messages"][rb["floor"] - 1]
+    # each conversation then moves along its own floors only
+    prev = {"a": a, "b": b}
+    for turns in range(18, 40):
+        for name, hist in (("a", _history(turns)), ("b", copy.deepcopy(_history(turns)))):
+            if name == "b":
+                hist[3]["content"][0]["text"] = "go on, differently"
+            body, res = _proxy(_request(hist), store, now=T0 + turns)
+            cls = _cls(prev[name], body)
+            assert cls == "append" or res["recorded"], (name, turns, cls, res)
+            prev[name] = body
+
+
+def test_a_breakpoint_that_moves_off_the_history_does_not_move_the_floor():
+    # the floor sits right behind a message that carried a cache_control marker
+    # when it was learned; the CLI moves its markers forward, the floor stays
+    store = _store()
+    hist = _rounds([50, 50])
+    body = _request(hist)
+    body["messages"][3]["content"][0]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    first, r1 = _proxy(body, store)
+    assert (r1["front"], r1["floor"], r1["recorded"]) == (2, 4, True)
+    later = hist + [{"role": "assistant", "content": [{"type": "text", "text": "read"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "compare them"}]}]
+    second, r2 = _proxy(_request(later), store)
+    assert r2["floor"] == 4 and not r2["recorded"]
+
+
 @pytest.mark.parametrize("batch", [1, 2, 3, 5, 6, 10, 17, 25, 33, 40, 49, 50, 51, 60, 75, 90, 99, 100, 101])
 def test_never_more_than_a_batch_beyond_the_cli_and_never_the_newest_message(batch):
     store = _store()

@@ -56,6 +56,7 @@ from obs_agent.jsonl_health import (
     JsonlSessionHealth,
     futile_refusal_streak,
     is_stale_session_head,
+    record_refusal_streak,
     resolve_safe_jsonl_target,
 )
 from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
@@ -5457,8 +5458,11 @@ class TelegramBot:
         # of the proc-work trunk in 18 minutes, one per wake, none answered).
         # A refused session that answered nothing of its own was a futile retry
         # of that context; after _CONTENT_REFUSAL_FUTILE_LIMIT of them in a row
-        # (read from the session files and fork receipts, so restarts keep it)
-        # stop and tell the route. Nothing is reworded; any answer resets it.
+        # stop and tell the route. The count so far is recorded for each
+        # recovery fork made here, so restarts keep it and later work in the
+        # source session cannot change it; every other session (/clear, a
+        # reply forking from an earlier message) starts its own count.
+        # Nothing is reworded; any answer resets it.
         refusal, futile = futile_refusal_streak(target.health, target.target_uuid)
         if refusal is not None and futile >= _CONTENT_REFUSAL_FUTILE_LIMIT:
             logger.warning(
@@ -5520,6 +5524,13 @@ class TelegramBot:
             target.health.first_unsafe_tail_uuid,
             target.health.first_poison_uuid,
         )
+        if refusal is not None:
+            try:
+                record_refusal_streak(recovery_session_id, futile_before=futile, kind=refusal,
+                                      source_session_id=session_id)
+            except OSError as exc:
+                logger.warning("[refusal_loop] could not record the streak for session_id=%s: %s",
+                               recovery_session_id, exc)
 
         self._set_session_head(session_id=session_id, jsonl_uuid=target.target_uuid)
         self._set_session_head(session_id=recovery_session_id, jsonl_uuid=target.target_uuid)

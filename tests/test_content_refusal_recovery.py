@@ -12,8 +12,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from obs_agent.jsonl_health import (
+    _refusal_streak_path,
     analyze_jsonl_path,
     content_refusal_after,
+    futile_refusal_streak,
     session_has_own_answer,
 )
 from obs_agent.queueing import QueuedMessage
@@ -216,7 +218,8 @@ async def _stopped(config, project_dir):
 async def test_the_stop_survives_an_obs_restart(config, project_dir):
     _, state = await _stopped(config, project_dir)
     # fresh daemon objects over the same stored session: the count comes from
-    # the session files and fork receipts, not from memory (V1 finding)
+    # the session file and the streak recorded at its recovery, not from memory
+    # (V1 finding)
     again, restored = _bot(config, state.session_id)
     with pytest.raises(ContentRefusalLoopError):
         await again._recover_route_session_if_needed(state=restored, source="run_start")
@@ -236,14 +239,20 @@ async def test_a_fresh_context_gets_its_own_budget(config, project_dir):
     assert retry and retry != "sid-unrelated"
 
 
-async def test_a_reply_that_rolls_back_past_the_refusals_gets_its_own_budget(config, project_dir):
+@pytest.mark.parametrize("point", ["first row", "last user row before the refusal"])
+async def test_a_reply_that_rolls_back_past_the_refusals_gets_its_own_budget(config, project_dir, point):
     # V1 counterexample at 15452b2: a reply to the FIRST row of the stopped
     # session forks from before the refused part; its first refusal must not
-    # inherit the discarded attempts (it was stopped at once, streak 3).
+    # inherit the discarded attempts (it was stopped at once, streak 3). The
+    # same holds for a reply to the stopped retry's own last user row.
     bot, state = await _stopped(config, project_dir)
     old = state.session_id
-    first = json.loads((project_dir / f"{old}.jsonl").read_text(encoding="utf-8").splitlines()[0])
-    bot._record_message_binding(route=state.route, message_id=11, jsonl_uuid=first["uuid"],
+    rows = [json.loads(x) for x in (project_dir / f"{old}.jsonl").read_text(encoding="utf-8").splitlines()]
+    if point == "first row":
+        target = rows[0]
+    else:
+        target = [r for r in rows if r.get("type") == "user" and r.get("sessionId") == old][-1]
+    bot._record_message_binding(route=state.route, message_id=11, jsonl_uuid=target["uuid"],
                                 session_id=old, role="user")
     bot._send_system_message = AsyncMock()
     proceed, _ = await bot._resolve_session_for_trigger(
@@ -256,31 +265,57 @@ async def test_a_reply_that_rolls_back_past_the_refusals_gets_its_own_budget(con
     assert await bot._recover_route_session_if_needed(state=state, source="run_start")
 
 
-def test_the_receipt_walk_ends_on_missing_or_cyclic_receipts(project_dir, tmp_path, monkeypatch):
-    from obs_agent.jsonl_health import futile_refusal_streak
-    root = tmp_path / "receipts"
-    (root / "forks").mkdir(parents=True)
-    monkeypatch.setenv("OBS_SESSION_REPLAY_PROVENANCE_DIR", str(root))
+async def test_later_work_in_the_source_session_does_not_change_the_count(config, project_dir):
+    # V1 counterexample at 15452b2: the count was re-read from the source
+    # session's current file, so an answer appended there later (never copied
+    # into the child) unblocked the unchanged refused child.
+    bot, state = await _stopped(config, project_dir)
+    child = project_dir / f"{state.session_id}.jsonl"
+    before = child.read_bytes()
+    source_sid = json.loads(_refusal_streak_path(state.session_id).read_text())["source_session_id"]
+    source = project_dir / f"{source_sid}.jsonl"
+    last = json.loads(source.read_text(encoding="utf-8").splitlines()[-1])["uuid"]
+    rows = _Rows(source, source_sid, parent=last)
+    rows.n = 1000
+    rows.user("independent later work in the source session")
+    rows.answer("progress the child never saw")
+    assert child.read_bytes() == before
+    with pytest.raises(ContentRefusalLoopError):
+        await bot._recover_route_session_if_needed(state=state, source="run_start")
+
+
+async def test_only_content_refusal_recoveries_record_a_streak(config, project_dir):
+    rows = _Rows(project_dir / "sid-trunk.jsonl", "sid-trunk")
+    rows.user("start")
+    rows.answer("ok")
+    rows.user("slow")
+    rows.refusal("Request timed out", with_refusal_row=False)
+    bot, state = _bot(config, "sid-trunk")
+    plain = await bot._recover_route_session_if_needed(state=state, source="run_start")
+    assert plain and not _refusal_streak_path(plain).exists()
+    # refused after an interrupted attempt: the interruption ended the streak
+    _refused_retry(project_dir, plain)
+    first = await bot._recover_route_session_if_needed(state=state, source="run_start")
+    assert json.loads(_refusal_streak_path(first).read_text())["futile_before"] == 1
+    _refused_retry(project_dir, first)
+    with pytest.raises(ContentRefusalLoopError):
+        await bot._recover_route_session_if_needed(state=state, source="run_start")
+
+
+def test_an_unreadable_streak_record_counts_as_none(project_dir):
     a = _Rows(project_dir / "sid-a.jsonl", "sid-a")
-    start = a.user("start")
+    a.user("start")
     a.refusal()
-    b = _Rows(project_dir / "sid-b.jsonl", "sid-b")
-    b.user("start")
-    b.refusal()
     health = analyze_jsonl_path(path=a.path, session_id="sid-a")
-    for receipts, expect in (
-            ({}, 1),
-            ({"sid-a": "{"}, 1),
-            ({"sid-a": {"source_path": str(a.path), "target_uuid": start}}, 1),
-            ({"sid-a": {"source_path": str(project_dir / "gone.jsonl"), "target_uuid": start}}, 1),
-            ({"sid-a": {"source_path": str(b.path), "target_uuid": "sid-b-1"},
-              "sid-b": {"source_path": str(a.path), "target_uuid": start}}, 2)):
-        for p in (root / "forks").glob("*.json"):
-            p.unlink()
-        for sid, receipt in receipts.items():
-            (root / "forks" / f"{sid}.json").write_text(
-                receipt if isinstance(receipt, str) else json.dumps(receipt))
-        assert futile_refusal_streak(health, health.safe_recovery_uuid) == ("usage_policy", expect)
+    record = _refusal_streak_path("sid-a")
+    record.parent.mkdir(parents=True, exist_ok=True)
+    for text, expect in (("", 1), ("{", 1), ("[3]", 1), ('{"futile_before": -2}', 1),
+                         ('{"futile_before": true}', 1), ('{"futile_before": "3"}', 1),
+                         ('{"futile_before": 0}', 1), ('{"futile_before": 4}', 5)):
+        record.write_text(text)
+        assert futile_refusal_streak(health, health.safe_recovery_uuid) == ("usage_policy", expect), text
+    record.unlink()
+    assert futile_refusal_streak(health, health.safe_recovery_uuid) == ("usage_policy", 1)
 
 
 async def test_an_inbox_wake_keeps_queued_work_when_the_loop_stops(config, project_dir):

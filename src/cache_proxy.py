@@ -66,6 +66,7 @@ Client:
     ANTHROPIC_BASE_URL=http://localhost:18923
 
 """
+import bisect
 import gzip
 import hashlib
 import itertools
@@ -900,7 +901,7 @@ class EffortPinStore:
         self.variants: dict[str, list] = {}
         self.texts: dict[str, str] = {}  # sha256 -> pinned section text (dedup)
         self.ttls: dict[str, list] = {}  # key -> [ttl, last_used]; see pin_cache_ttl
-        # key -> [[[front, floor], ...], last_used]; see pin_media_floor
+        # key -> [[[front, floor, fingerprint], ...], last_used]; see pin_media_floor
         self.media: dict[str, list] = {}
         self._load()
 
@@ -1398,9 +1399,13 @@ def pin_cache_ttl(body: dict, store: "EffortPinStore | None" = None,
 #     model sees the newest 50-100 images; when the front message alone holds
 #     more than MEDIA_FLOOR_STEP media no floor is set (the request goes as the
 #     CLI built it, so a large parallel batch is never dropped whole).
-# Floors are stored per front, so a fork or recovery from an earlier point
-# gets the floor that was in force there and its bytes match the parent's.
-# The newest message is never touched. Anthropic route only. If the bundled
+# Floors are stored per front with a fingerprint of the history before them
+# (media, markers and emptied results left out), so a resume, a recovery or a
+# fork from an earlier point gets the floor that was in force there and its
+# bytes match the parent's, while a history that differs before a floor never
+# uses it. A stored floor is used only where it lies before the newest message
+# and cuts at most MEDIA_FLOOR_STEP media of this request. The newest message
+# is never touched. Anthropic route only. If the bundled
 # CLI's media cap changes, MEDIA_CAP must change with it.
 # Live check: scripts/cache_regression.py image_cap (docs/cache-proxy-safety.md).
 MEDIA_CAP = 100
@@ -1495,14 +1500,8 @@ def _media_free_bytes(msg: dict) -> bytes:
     return _msg_bytes(msg)
 
 
-def _floor_fingerprint(msg: dict) -> str:
-    """Identity of the message just before a floor, whoever removed its media.
-
-    A stored floor is reused only where this matches: the history up to the
-    floor is then the one it was learned on. A fork that left the parent
-    earlier and grew differently gets its own floor (V1 finding: an early fork
-    that read 94 new images reused the parent's later floor and lost all 100).
-    """
+def _floor_digest(msg: dict) -> bytes:
+    """One message as a floor fingerprint sees it: whoever removed its media."""
     content = msg.get("content") if isinstance(msg, dict) else None
     if isinstance(content, list):
         blocks = []
@@ -1515,7 +1514,26 @@ def _floor_fingerprint(msg: dict) -> str:
                 b = dict(b, content=[] if not inner or _placeholder_only(inner) else inner)
             blocks.append(b)
         msg = dict(msg, content=blocks)
-    return hashlib.sha256(_msg_bytes(msg)).hexdigest()[:16]
+    return hashlib.sha256(_msg_bytes(msg)).digest()
+
+
+class _FloorFingerprints:
+    """Fingerprint of msgs[:n] for any n, each message digested once.
+
+    A stored floor is reused only where this matches: the history up to the
+    floor is then the one it was learned on (V1 findings, 2026-10-25: an early
+    fork that grew differently reused the parent's later floor and lost all
+    100 images; a check of the one message before the floor could match by
+    coincidence).
+    """
+
+    def __init__(self, msgs: list):
+        self.msgs, self.digests = msgs, []
+
+    def __call__(self, n: int) -> str:
+        while len(self.digests) < n:
+            self.digests.append(_floor_digest(self.msgs[len(self.digests)]))
+        return hashlib.sha256(b"".join(self.digests[:n])).hexdigest()[:16]
 
 
 def pin_media_floor(body: dict, store: "EffortPinStore | None" = None,
@@ -1540,17 +1558,20 @@ def pin_media_floor(body: dict, store: "EffortPinStore | None" = None,
     key = hashlib.sha256(str(body.get("model", "")).encode() + b"\0"
                          + _media_free_bytes(msgs[0]) + b"\0").hexdigest()
     last = len(msgs) - 1
+    fingerprint = _FloorFingerprints(msgs)
     with store.lock:
         entry = store.media.get(key)
         floors = entry[0] if entry else []
         floor = None
         # the floor learned at the latest front not after this one, on this
-        # history: it must lie before the newest message and its preceding
-        # message must be the one it was learned on
-        for f in reversed(floors):  # sorted by front
-            if len(f) < 3 or f[0] > front:
+        # history: before the newest message, cutting at most one batch of
+        # this request's media, with the history before it unchanged
+        for f in reversed(floors):  # sorted by front, then floor
+            if len(f) < 3 or f[0] > front or f[1] > last:
                 continue
-            if f[1] <= last and _floor_fingerprint(msgs[f[1] - 1]) == f[2]:
+            if bisect.bisect_left(pos, f[1]) > MEDIA_FLOOR_STEP:
+                continue
+            if fingerprint(f[1]) == f[2]:
                 floor = f[1]
                 break
         dirty = entry is None or now - entry[1] >= TTL_PIN_SAVE_EVERY
@@ -1564,8 +1585,8 @@ def pin_media_floor(body: dict, store: "EffortPinStore | None" = None,
             floor = pos[MEDIA_FLOOR_STEP]
             if floor <= front:
                 return result
-            fp = _floor_fingerprint(msgs[floor - 1])
-            floors = sorted([f for f in floors if len(f) >= 3 and (f[0], f[2]) != (front, fp)]
+            fp = fingerprint(floor)
+            floors = sorted([f for f in floors if len(f) >= 3 and f != [front, floor, fp]]
                             + [[front, floor, fp]])
             floors = floors[-MEDIA_FLOOR_MAX_ENTRIES:]
             result["recorded"] = dirty = True

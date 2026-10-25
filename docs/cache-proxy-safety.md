@@ -105,7 +105,14 @@ real break mechanisms in live traffic; none was caught by a unit test:
    time, so the conversation is re-billed once per ~50 new images. Whole
    messages are cut, at most ~50 media beyond the CLI's own eviction; when the
    front message alone holds more than 50 media no floor is set (V1 finding: a
-   100-image parallel round would otherwise be dropped whole). Live scenario
+   100-image parallel round would otherwise be dropped whole). Floors are
+   stored per front with a fingerprint of the whole history before them
+   (media, markers and emptied results left out): a resume, recovery or fork
+   from an earlier point reuses the floor in force there, a history that
+   differs before a floor never uses it, and a stored floor is reused only
+   before the newest message and where it cuts at most 50 of the request's
+   media (V1 findings: an early fork reused its parent's later floor and lost
+   all 100 images). Live scenario
    `image_cap`. In that harness a prompt request never reads the previous
    request's entry, only the one before it (ratio ~0.985 in every run, old and
    new proxy), so the request right after the floor first appears or moves can

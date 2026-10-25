@@ -612,62 +612,54 @@ def session_has_own_answer(health: JsonlSessionHealth) -> bool:
     return False
 
 
-def _fork_source(session_id: str) -> tuple[Path | None, str | None]:
-    """(source JSONL, fork target uuid) from jsonl_fork's receipt for a session, if any."""
+def _refusal_streak_path(session_id: str) -> Path:
     root = Path(os.environ.get("OBS_SESSION_REPLAY_PROVENANCE_DIR", "/workspace/runtime/state/session-replay"))
+    return root / "refusal-streaks" / f"{session_id}.json"
+
+
+def recorded_refusal_streak(session_id: str) -> int:
+    """Futile refused attempts before this session, as recorded when a
+    content-refusal recovery created it (0 when it was not created that way)."""
     try:
-        receipt = json.loads((root / "forks" / f"{session_id}.json").read_text(encoding="utf-8"))
+        record = json.loads(_refusal_streak_path(session_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None, None
-    if not isinstance(receipt, dict):
-        return None, None
-    source, target = receipt.get("source_path"), receipt.get("target_uuid")
-    return (Path(source) if isinstance(source, str) and source else None,
-            target if isinstance(target, str) and target else None)
+        return 0
+    futile = record.get("futile_before") if isinstance(record, dict) else None
+    return futile if type(futile) is int and futile > 0 else 0
 
 
-def futile_refusal_streak(
-    health: JsonlSessionHealth, uuid: str | None, *, max_depth: int = 8,
-) -> tuple[str | None, int]:
+def record_refusal_streak(session_id: str, *, futile_before: int, kind: str, source_session_id: str) -> None:
+    """Record, for a recovery fork made because of a content refusal, how many
+    futile refused attempts came before it. Written once, next to the fork
+    receipts; later work in the source session cannot change it."""
+    path = _refusal_streak_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({
+        "session_id": session_id, "source_session_id": source_session_id,
+        "kind": kind, "futile_before": futile_before,
+    }) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def futile_refusal_streak(health: JsonlSessionHealth, uuid: str | None) -> tuple[str | None, int]:
     """(kind, n) for a session whose tail after ``uuid`` is a content refusal (obs-52).
 
-    ``n`` counts this session and the sessions it was forked or recovered
-    from, in a row, that were refused before answering anything of their own.
-    It is read from the session files and fork receipts, so it survives an OBS
-    restart, and a fresh session (/clear, a new launch) starts its own count.
-    A fork made from earlier than where its parent itself started (a reply to
-    an earlier message, rolling the refused part back) also starts its own
-    count. (None, 0) when the tail is not a content refusal.
+    ``n`` counts the futile attempts in a row that ended here: this session,
+    when it was refused before answering anything of its own, plus the ones
+    recorded for it when a content-refusal recovery created it. The record is
+    written once, at that recovery, so the count survives an OBS restart and
+    nothing that happens later in the source session changes it. Any other
+    session (a fresh one after /clear, a reply that forks from an earlier
+    message, an AgentTask fork) has no record and starts its own count.
+    (None, 0) when the tail is not a content refusal.
     """
     kind = content_refusal_after(health, uuid)
     if kind is None:
         return None, 0
-    count = 0
-    current: JsonlSessionHealth | None = health
-    seen: set[str] = set()
-    while current is not None and count < max_depth and current.session_id not in seen:
-        seen.add(current.session_id)
-        if session_has_own_answer(current):
-            break
-        if count and content_refusal_after(current, current.safe_recovery_uuid) is None:
-            break  # an earlier attempt that failed some other way does not count
-        count += 1
-        source, target = _fork_source(current.session_id)
-        if source is None or not source.exists():
-            break
-        try:
-            parent = analyze_jsonl_path(path=source, session_id=source.stem)
-        except (OSError, ValueError, KeyError):
-            break
-        line = parent.uuid_line_numbers.get(target) if target else None
-        if line is None:
-            break
-        _grandparent, parent_start = _fork_source(parent.session_id)
-        start = parent.uuid_line_numbers.get(parent_start) if parent_start else None
-        if start is not None and line < start:
-            break  # forked from before the parent's own start: a rolled-back context
-        current = parent
-    return kind, count
+    if session_has_own_answer(health):
+        return kind, 0
+    return kind, 1 + recorded_refusal_streak(health.session_id)
 
 
 # CACHE-PREFIX WARNING (M5): safe recovery means a complete API message,
