@@ -54,8 +54,10 @@ from obs_agent.hooks import HookState
 from obs_agent.context_jsonl import find_session_jsonl, session_jsonl_has_conversation
 from obs_agent.jsonl_health import (
     JsonlSessionHealth,
+    content_refusal_after,
     is_stale_session_head,
     resolve_safe_jsonl_target,
+    session_has_own_answer,
 )
 from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
 from obs_agent import maintenance_restart as _maint
@@ -347,6 +349,46 @@ class _TopicDeletedError(Exception):
 
 class _TelegramPollingConflictError(RuntimeError):
     pass
+
+
+# obs-52: how many times in a row a route may be recovered from a content
+# refusal by a session that answered nothing of its own (a futile retry of the
+# same context) before OBS stops and tells the route. Two is the upper end of
+# "not ... more than once or twice" (bead obs-52): on 2026-10-25 a
+# cybersecurity-flagged route got going again on a retry, the proc-work trunk
+# never did.
+_CONTENT_REFUSAL_FUTILE_LIMIT = 2
+_CONTENT_REFUSAL_LABELS = {
+    "usage_policy": "it says the request appears to violate its Usage Policy",
+    "cybersecurity_flag": "it flagged the content as a possible cybersecurity risk",
+}
+
+
+class ContentRefusalLoopError(RuntimeError):
+    """obs-52: the API keeps refusing this context; recovering again would re-send it.
+
+    The text is stable for one session and kind, so the run-start failure
+    notice (deduplicated per session and error) is posted once, not per wake.
+    """
+
+    def __init__(self, *, session_id: str, kind: str, futile: int) -> None:
+        self.session_id = session_id
+        self.kind = kind
+        self.futile = futile
+        super().__init__(
+            f"content refusal ({kind}) of session {session_id}; {futile} attempts in a row were "
+            "refused before answering anything, so the same context is not re-sent"
+        )
+
+    def notice(self) -> str:
+        return (
+            "The model provider refused this conversation again "
+            f"({_CONTENT_REFUSAL_LABELS.get(self.kind, self.kind)}). {self.futile} attempts in a "
+            "row were refused before answering anything, so OBS stopped re-sending the same "
+            "context. Nothing was sent to the model for this message; queued agent messages "
+            "stay queued. To continue, reply to an earlier message to fork from before the "
+            "refused part, or send /clear to start a fresh session."
+        )
 
 
 @dataclass
@@ -760,6 +802,9 @@ class TelegramBot:
         self._session_heads: dict[str, str] = {}
         # route -> (session_id, error) already reported, so retries do not spam the topic.
         self._recovery_failure_notified: dict[TelegramRoute, tuple[str | None, str]] = {}
+        # route -> futile content-refusal retries in a row (obs-52); see
+        # _recover_route_session_if_needed.
+        self._content_refusal_futile: dict[TelegramRoute, int] = {}
         self._fork_tasks_by_id: dict[str, _ForkTaskRecord] = {}
         self._fork_task_by_child_route: dict[TelegramRoute, str] = {}
         self._fork_task_tasks: dict[str, asyncio.Task] = {}
@@ -5410,7 +5455,27 @@ class TelegramBot:
             if target is not None and target.target_uuid and not target.health.needs_recovery:
                 self._set_session_head(session_id=session_id, jsonl_uuid=target.target_uuid)
         if target is None or not target.health.needs_recovery or not target.target_uuid:
+            self._content_refusal_futile.pop(state.route, None)
             return None
+        # obs-52: a content refusal is driven by what the context holds, so a
+        # recovery re-sends it and is refused again (2026-10-25: nine recoveries
+        # of the proc-work trunk in 18 minutes, one per wake, none answered).
+        # A refused session that answered nothing of its own was a futile retry
+        # of that context; after _CONTENT_REFUSAL_FUTILE_LIMIT of them in a row
+        # stop and tell the route. Nothing is reworded; any answer resets it.
+        refusal = content_refusal_after(target.health, target.target_uuid)
+        if refusal is None or session_has_own_answer(target.health):
+            self._content_refusal_futile.pop(state.route, None)
+        else:
+            futile = self._content_refusal_futile.get(state.route, 0) + 1
+            if futile >= _CONTENT_REFUSAL_FUTILE_LIMIT:
+                logger.warning(
+                    "[refusal_loop] route=%s source=%s session_id=%s kind=%s futile=%d "
+                    "recovery_uuid=%s: not recovering into the same context again",
+                    state.route, source, session_id, refusal, futile, target.target_uuid,
+                )
+                raise ContentRefusalLoopError(session_id=session_id, kind=refusal, futile=futile)
+            self._content_refusal_futile[state.route] = futile
 
         old_model_override = state.session_manager.model_override
         old_effort_override = state.session_manager.effort_override
@@ -10063,6 +10128,7 @@ class TelegramBot:
                         route=state.route,
                         bot=bot,
                         text=(
+                            exc.notice() if isinstance(exc, ContentRefusalLoopError) else
                             f"Session recovery failed for {state.session_id}, so this turn could not run "
                             f"({error}). Send /clear to start a fresh session in this topic."
                         ),

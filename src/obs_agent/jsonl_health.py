@@ -546,6 +546,71 @@ def is_stale_session_head(health: JsonlSessionHealth, head: str | None) -> bool:
     return any(health.uuid_line_numbers[uuid] > line for uuid in health.recovered_poison_uuids)
 
 
+# Content refusals (obs-52): the API declined the request because of what the
+# conversation holds, so a recovery that re-sends the same context is refused
+# again (2026-10-25: proc-work trunk, 9 recoveries in 18 minutes, each one
+# refused within seconds). The texts are the CLI's and the API's own words.
+CONTENT_REFUSAL_MARKERS = (
+    ("usage_policy", "violate our Usage Policy"),
+    ("cybersecurity_flag", "flagged for possible cybersecurity risk"),
+)
+
+
+def content_refusal_after(health: JsonlSessionHealth, uuid: str | None) -> str | None:
+    """The content-refusal kind among the rows after ``uuid`` (a recovery target).
+
+    A row counts when the API ended the turn with ``stop_reason: "refusal"``
+    or the CLI wrote an API-error row with one of the refusal texts. Returns
+    None when there is none (an ordinary interrupted or failed turn).
+    """
+    after = health.uuid_line_numbers.get(uuid) if uuid else None
+    if after is None:
+        return None
+    try:
+        with health.path.open("r", encoding="utf-8") as handle:
+            for line_no, raw in enumerate(handle, 1):
+                if line_no <= after or ('"refusal"' not in raw and "isApiErrorMessage" not in raw):
+                    continue
+                entry = _parse_entry(line_no, raw)
+                if entry is None or entry.type != "assistant":
+                    continue
+                if entry.obj.get("message", {}).get("stop_reason") == "refusal":
+                    return "usage_policy"
+                if entry.is_error:
+                    for kind, marker in CONTENT_REFUSAL_MARKERS:
+                        if marker in entry.text:
+                            return kind
+    except OSError:
+        return None
+    return None
+
+
+_ANSWER_STOP_REASONS = frozenset({"end_turn", "tool_use", "max_tokens", "stop_sequence"})
+
+
+def session_has_own_answer(health: JsonlSessionHealth) -> bool:
+    """Whether the session's own CLI wrote at least one complete real answer.
+
+    Rows a fork or recovery copied in keep their original ``sessionId``, so a
+    recovery fork that was refused before answering anything has none: it was
+    a futile retry of the context it was copied from (obs-52).
+    """
+    sid = health.session_id
+    try:
+        with health.path.open("r", encoding="utf-8") as handle:
+            for line_no, raw in enumerate(handle, 1):
+                if sid not in raw or '"assistant"' not in raw:
+                    continue
+                entry = _parse_entry(line_no, raw)
+                if (entry is not None and entry.obj.get("sessionId") == sid
+                        and _is_real_assistant(entry)
+                        and entry.obj.get("message", {}).get("stop_reason") in _ANSWER_STOP_REASONS):
+                    return True
+    except OSError:
+        return True  # unknown: do not count it as a futile retry
+    return False
+
+
 # CACHE-PREFIX WARNING (M5): safe recovery means a complete API message,
 # not merely its text row. Grouped tools/results must remain replay-equivalent,
 # with side effects reconciled before any retry. Original histories stay intact.
