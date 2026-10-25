@@ -320,6 +320,7 @@ async def test_help_menu_and_registered_handler_replace_context(config, monkeypa
     application.bot_data = {}
     builder = MagicMock()
     builder.token.return_value = builder
+    builder.get_updates_request.return_value = builder  # the polling retry request (obs-22.61)
     builder.concurrent_updates.return_value = builder
     builder.build.return_value = application
     monkeypatch.setattr("obs_agent.telegram.Application.builder", lambda: builder)
