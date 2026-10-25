@@ -2,7 +2,73 @@
 
 from __future__ import annotations
 
+import os
+
 from claude_agent_sdk._internal import message_parser
+
+_PRODUCTION_BOT_ENV_KEYS = (
+    "OBS_PROD_TELEGRAM_BOT_TOKEN",
+    "OBS_PROD_TELEGRAM_BOT_TOKENS",
+)
+_BOT_ENV_PATCHED = False
+
+
+def _without_production_bot_tokens(values: dict[str, str], tokens: set[str]) -> dict[str, str]:
+    cleaned = {}
+    for key, value in values.items():
+        if key in _PRODUCTION_BOT_ENV_KEYS:
+            continue
+        if any(token in value for token in tokens):
+            value = ",".join(part for part in value.split(",") if part.strip() not in tokens)
+            for token in sorted(tokens, key=len, reverse=True):
+                value = value.replace(token, "")
+            if not value:
+                continue
+        cleaned[key] = value
+    return cleaned
+
+
+def ensure_production_bot_env_patch() -> None:
+    """Keep production transport credentials out of SDK-spawned processes."""
+    global _BOT_ENV_PATCHED
+    if _BOT_ENV_PATCHED:
+        return
+
+    from claude_agent_sdk._internal.transport import subprocess_cli
+
+    original_anyio = subprocess_cli.anyio
+
+    class _AgentSubprocessAnyIO:
+        def __getattr__(self, name):
+            return getattr(original_anyio, name)
+
+        async def open_process(self, *args, **kwargs):
+            # The SDK version probe has no explicit env; the main CLI passes its
+            # inherited+override merge. Sanitize a copy at both actual spawns,
+            # never mutate the daemon's environment across an async await.
+            parent = dict(os.environ)
+            environment = kwargs.get("env")
+            environment = parent if environment is None else dict(environment)
+            tokens = {
+                token.strip()
+                for values in (parent, environment)
+                for key in _PRODUCTION_BOT_ENV_KEYS
+                for token in values.get(key, "").split(",")
+                if token.strip()
+            }
+            if not tokens and parent.get("OBS_PROFILE", "prod") == "prod":
+                tokens.update(
+                    token.strip()
+                    for key in ("OBS_TELEGRAM_BOT_TOKEN", "OBS_TELEGRAM_BOT_TOKENS")
+                    for token in parent.get(key, "").split(",")
+                    if token.strip()
+                )
+            kwargs["env"] = _without_production_bot_tokens(environment, tokens)
+            return await original_anyio.open_process(*args, **kwargs)
+
+    # Replace only this SDK module's dependency, not the shared anyio module.
+    subprocess_cli.anyio = _AgentSubprocessAnyIO()
+    _BOT_ENV_PATCHED = True
 
 _PATCHED = False
 

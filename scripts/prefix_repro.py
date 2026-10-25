@@ -78,6 +78,10 @@ from claude_agent_sdk import (  # noqa: E402
     ToolUseBlock,
 )
 
+from obs_agent._sdk_patch import ensure_production_bot_env_patch  # noqa: E402
+
+ensure_production_bot_env_patch()
+
 DEFAULT_BASE_URL = "http://127.0.0.1:28925"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 WORK_ROOT = Path(os.environ.get("PREFIX_REPRO_ROOT", "/workspace/runtime/prefix-repro"))

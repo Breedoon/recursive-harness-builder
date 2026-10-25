@@ -28,7 +28,11 @@ from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-from obs_agent._sdk_patch import ensure_query_close_patch, ensure_raw_uuid_patch
+from obs_agent._sdk_patch import (
+    ensure_production_bot_env_patch,
+    ensure_query_close_patch,
+    ensure_raw_uuid_patch,
+)
 from obs_agent.hooks import HookState, create_hook_matchers
 from obs_agent.prompt import (
     ENTRY_FILE_SENTINEL,
@@ -44,6 +48,7 @@ logger = logging.getLogger("obs_agent.session")
 
 ensure_raw_uuid_patch()
 ensure_query_close_patch()
+ensure_production_bot_env_patch()
 
 _ANTHROPIC_AUTH_ENV_KEYS = (
     "ANTHROPIC_API_KEY",

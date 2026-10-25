@@ -13,7 +13,10 @@ from typing import TYPE_CHECKING
 
 from claude_agent_sdk import ClaudeAgentOptions, TextBlock, query
 
+from obs_agent._sdk_patch import ensure_production_bot_env_patch
 from obs_agent.metrics import log_result
+
+ensure_production_bot_env_patch()
 
 if TYPE_CHECKING:
     from obs_agent.config import OBSConfig
