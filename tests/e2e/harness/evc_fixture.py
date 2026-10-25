@@ -54,7 +54,7 @@ def snapshot(root: Path) -> dict:
             continue
         try:
             args = (entry / "cmdline").read_bytes().split(b"\0")
-            if not (b"stream-json" in args or any(str(root).encode() in arg for arg in args)):
+            if not (b"stream-json" in args or b"obs_agent.telegram_main" in args or any(str(root).encode() in arg for arg in args)):
                 continue
             fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
             env = {}

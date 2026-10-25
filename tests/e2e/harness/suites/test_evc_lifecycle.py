@@ -53,7 +53,7 @@ async def _shape(lane, shape, nonce, root, signals, proof):
         # The fixture is in the throwaway lane vault, not the protected OBS source tree.
         command = shlex.join(["python3", "./evc_fixture.py", "hold", "--root", root])
         prompt = f"Call Bash once with command `{command}`, timeout120000, foreground only. Wait for its result."
-    if shape in {"S2", "S5m"}:
+    if shape in {"S2", "S5m"} or proof.get("require_child"):
         from types import SimpleNamespace
         hooks = {"PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/executor_guard.py::check"}
         mark = lane.events.mark()
@@ -65,8 +65,12 @@ async def _shape(lane, shape, nonce, root, signals, proof):
         proof["fixture_child_control"] = result
         assert result["rc"] == 0, result
         response = json.loads(result["stdout"])
-        child = response["result"]
+        assert response["ok"], response
+        child = {key.strip(): value.strip() for line in response["text"].splitlines()
+                 for key, separator, value in [line.partition(":")] if separator}
+        assert child.get("team_name") and child.get("agent_name"), child
         proof["fixture_child"] = child
+        proof["fixture_child_hooks"] = hooks
         start = await lane.wait("turn_start", agent=child["agent_name"], after=mark)
         topic = int(start["topic_id"])
         proof["topic_id"] = topic
@@ -111,7 +115,8 @@ async def _run(lane, config, shape, path):
              "harness_head": lane.manifest.get("code"), "started_utc_epoch": time.time(),
              "configuration_validation": "metadata recorded; EV-G/reference join still required",
              "trigger": "24cf5ca:src/obs_agent/telegram.py:5995-6011" if path != "P7" else "24cf5ca:src/obs_agent/telegram.py:14024-14033",
-             "added_hook": shape in {"S4", "S5h"}, "mcp_lane_copy_mechanism": shape == "S5m"}
+             "added_hook": shape in {"S4", "S5h"}, "mcp_lane_copy_mechanism": shape == "S5m",
+             "require_child": path in {"P1c", "P1d", "P5"}}
     target = _proof_path(lane, case)
     try:
         proof["configuration_before_turn"] = await _helper(lane, "setup", root, shape)
