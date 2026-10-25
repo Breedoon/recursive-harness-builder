@@ -9029,7 +9029,7 @@ class TestFragmentBuffer:
     async def test_single_message_flushed(self):
         received: list[str] = []
 
-        async def on_complete(text, update, context):
+        async def on_complete(text, update, context, *, last_message_id):
             received.append(text)
 
         buf = FragmentBuffer(on_complete=on_complete, gap_seconds=_TEST_GAP)
@@ -9042,7 +9042,7 @@ class TestFragmentBuffer:
     async def test_consecutive_fragments_reassembled(self):
         received: list[str] = []
 
-        async def on_complete(text, update, context):
+        async def on_complete(text, update, context, *, last_message_id):
             received.append(text)
 
         buf = FragmentBuffer(on_complete=on_complete, gap_seconds=_TEST_GAP)
@@ -9063,7 +9063,7 @@ class TestFragmentBuffer:
     async def test_quick_short_messages_are_batched_together(self):
         received: list[str] = []
 
-        async def on_complete(text, update, context):
+        async def on_complete(text, update, context, *, last_message_id):
             received.append(text)
 
         buf = FragmentBuffer(on_complete=on_complete, gap_seconds=_TEST_GAP)
@@ -9078,7 +9078,7 @@ class TestFragmentBuffer:
     async def test_message_after_gap_starts_new_batch(self):
         received: list[str] = []
 
-        async def on_complete(text, update, context):
+        async def on_complete(text, update, context, *, last_message_id):
             received.append(text)
 
         buf = FragmentBuffer(on_complete=on_complete, gap_seconds=_TEST_GAP)

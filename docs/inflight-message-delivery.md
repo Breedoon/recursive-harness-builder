@@ -54,6 +54,39 @@ acknowledgement: process crashes or failures after a write may remain ambiguous.
 This patch does not claim crash-proof exactly-once delivery or solve every historic
 route-binding error. It does not alter cache-proxy normalization behavior.
 
+## Telegram normalization admission (vault-izcx)
+
+Telegram update admission occurs after authorization but before the first ingress
+await, not after file download, voice transcription or batch buffering. The
+runtime set of pending message IDs rejects exact in-flight duplicates before they
+can enter those operations twice. The existing persisted processed-input watermark supplies
+the replay floor after restart. Already-admitted callbacks do not reapply that
+floor when normalization completes: a newer text or short voice must not cancel
+an earlier input merely by finishing first.
+
+Delivery remains completion-ordered; this repair does not hold fast text behind
+slow media, reorder existing conversation history or introduce an arrival-order
+queue. The original update, sender and reply target remain attached. Processed
+watermarks only advance, including the last member of a fragment batch or album,
+while the first update remains the logical turn's representative. Clearing a
+route clears the watermark and pending admission IDs. A canceled or failed single
+attachment normalization releases its admission so it can be retried while still
+above the processed cursor.
+
+These cursors are not a durable inbound-message spool. An update interrupted
+before normalization or SDK handoff is not made crash-proof by this change;
+replaying below a restored processed cursor retains the existing stale-update
+policy. Genuine transport-level out-of-order arrivals remain subject to that
+policy; only asynchronous completion is allowed to overtake admission. New
+messages with identical content but distinct increasing IDs remain independent.
+
+`tests/test_telegram_inbound_admission.py` drives the actual ingress, attachment
+normalizer, fragment/album buffers and route dispatch with synthetic download and
+ASR boundaries. It includes a real turn-delivery adapter run with a model-free
+runner, reverse voice completion, duplicate in-flight updates, queued delivery,
+constituent replay suppression and persistent-cursor restoration. These local
+proofs neither qualify provider caching nor demonstrate production deployment.
+
 ## Regression coverage
 
 With development dependencies installed, relevant local library/mock and

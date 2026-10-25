@@ -544,7 +544,7 @@ class FragmentBuffer:
 
     def __init__(
         self,
-        on_complete,  # async callable(full_text, update, context)
+        on_complete,  # async callable(full_text, update, context, *, last_message_id)
         gap_seconds: float = _FRAGMENT_MAX_GAP_SECONDS,
     ) -> None:
         self._on_complete = on_complete
@@ -623,7 +623,10 @@ class FragmentBuffer:
         full_text = "\n\n".join(pending.segments)
         if pending.update is not None and pending.context is not None:
             try:
-                await self._on_complete(full_text, pending.update, pending.context)
+                await self._on_complete(
+                    full_text, pending.update, pending.context,
+                    last_message_id=pending.last_message_id,
+                )
             except Exception:
                 logger.exception("Error in fragment flush callback")
 
@@ -730,7 +733,7 @@ class TelegramBot:
                 "OBS_TELEGRAM_TEMP_ROOT to avoid startup cleanup deleting persistence data."
             )
         self._fragment_buffer = FragmentBuffer(
-            on_complete=self._process_message, gap_seconds=fragment_gap
+            on_complete=self._process_admitted_message, gap_seconds=fragment_gap
         )
         self._media_group_buffer = MediaGroupBuffer(
             on_complete=self._process_media_group,
@@ -847,6 +850,7 @@ class TelegramBot:
         self._system_message_ids: set[tuple[int, int]] = set()
         self._system_message_routes: dict[tuple[int, int], TelegramRoute] = {}
         self._last_inbound_message_id_by_route: dict[TelegramRoute, int] = {}
+        self._pending_inbound_message_ids_by_route: dict[TelegramRoute, set[int]] = {}
         self._topic_metadata_by_route: dict[TelegramRoute, _TopicMetadata] = {}
         self._state_store = TelegramStateStore(config.telegram_state_db_path)
         self._state_store.initialize()
@@ -7509,6 +7513,7 @@ class TelegramBot:
             len(state.pending_messages),
         )
         self._last_inbound_message_id_by_route.pop(state.route, None)
+        self._pending_inbound_message_ids_by_route.pop(state.route, None)
         self._unbind_route_sessions(state.route)
         await state.session_manager.async_reset()
         state.pending_messages.clear()
@@ -7658,6 +7663,7 @@ class TelegramBot:
             thread_id=route.thread_id,
         )
         self._last_inbound_message_id_by_route.pop(route, None)
+        self._pending_inbound_message_ids_by_route.pop(route, None)
         self._persist_state_for_route(route)
 
     async def _await_persisted_session_uuid(
@@ -8039,8 +8045,20 @@ class TelegramBot:
             logger.warning("Unauthorized Telegram user: %d", user_id)
             return
 
-        await self._ensure_background_poller(context.bot)
         message = update.effective_message
+        route = self._route_for_message(message)
+        last_seen = self._last_inbound_message_id_by_route.get(route, 0)
+        pending_ids = self._pending_inbound_message_ids_by_route.setdefault(route, set())
+        if message.message_id <= last_seen or message.message_id in pending_ids:
+            logger.info(
+                "Skipping duplicate/stale inbound at receipt route=%s message_id=%s last_seen=%s",
+                route, message.message_id, last_seen,
+            )
+            return
+        # Admission must precede every await: normalization and buffer flushes
+        # finish out of order, but cannot revoke an already received input.
+        pending_ids.add(message.message_id)
+        await self._ensure_background_poller(context.bot)
         # Cache the group chat title for General topic naming
         chat = getattr(message, "chat", None)
         if chat is not None:
@@ -8101,20 +8119,26 @@ class TelegramBot:
             if isinstance(status_id, int):
                 receipt_message_ids.append(status_id)
 
-        if message.voice is not None:
-            normalized = await self._normalizer.normalize_update(
-                update,
-                transcription_progress=report_transcription_progress,
-            )
-        else:
-            normalized = await self._normalizer.normalize_update(update)
+        try:
+            if message.voice is not None:
+                normalized = await self._normalizer.normalize_update(
+                    update,
+                    transcription_progress=report_transcription_progress,
+                )
+            else:
+                normalized = await self._normalizer.normalize_update(update)
+        except BaseException:
+            pending_ids.discard(message.message_id)
+            raise
         if not normalized.agent_text.strip():
+            pending_ids.discard(message.message_id)
             logger.info("Skipping empty normalized Telegram message id=%s", message.message_id)
             return
         await self._process_message(
             normalized.agent_text,
             update,
             context,
+            inbound_admitted=True,
             pre_sent_status_message_ids=receipt_message_ids,
             user_warnings=normalized.user_warnings,
         )
@@ -10508,6 +10532,15 @@ class TelegramBot:
             f'user_id="{int(user_id)}"/>\n{user_text}'
         )
 
+    async def _process_admitted_message(
+        self, user_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        *, last_message_id: int,
+    ) -> None:
+        await self._process_message(
+            user_text, update, context,
+            inbound_admitted=True, last_message_id=last_message_id,
+        )
+
     async def _process_message(
         self,
         user_text: str,
@@ -10516,6 +10549,8 @@ class TelegramBot:
         *,
         pre_sent_status_message_ids: list[int] | None = None,
         user_warnings: list[str] | None = None,
+        inbound_admitted: bool = False,
+        last_message_id: int | None = None,
     ) -> None:
         """Process a complete (possibly reassembled) user message."""
         if update.effective_message is None or update.effective_user is None:
@@ -10524,7 +10559,7 @@ class TelegramBot:
         route = self._route_for_message(update.effective_message)
         message_id = update.effective_message.message_id
         last_seen = self._last_inbound_message_id_by_route.get(route)
-        if isinstance(last_seen, int) and message_id <= last_seen:
+        if not inbound_admitted and isinstance(last_seen, int) and message_id <= last_seen:
             logger.info(
                 "Skipping duplicate/out-of-order inbound route=%s message_id=%s last_seen=%s",
                 route,
@@ -10532,7 +10567,15 @@ class TelegramBot:
                 last_seen,
             )
             return
-        self._last_inbound_message_id_by_route[route] = message_id
+        self._last_inbound_message_id_by_route[route] = max(
+            last_seen or 0, message_id, last_message_id or 0,
+        )
+        pending_ids = self._pending_inbound_message_ids_by_route.get(route)
+        if pending_ids is not None:
+            pending_ids.difference_update({
+                mid for mid in pending_ids
+                if mid <= self._last_inbound_message_id_by_route[route]
+            })
         state = self._get_state(route)
         if state is None:
             return
@@ -10652,6 +10695,8 @@ class TelegramBot:
             normalized.agent_text,
             updates[0],
             context,
+            inbound_admitted=True,
+            last_message_id=max(item.effective_message.message_id for item in updates),
             pre_sent_status_message_ids=receipt_message_ids,
             user_warnings=normalized.user_warnings,
         )
