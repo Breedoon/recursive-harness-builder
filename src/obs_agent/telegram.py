@@ -12903,6 +12903,9 @@ class TelegramBot:
         record.launch_parent_message_id = self._run_generation(
             self._sent_message_id(parent_messages[0]) if parent_messages else None
         )
+        # obs-54 V1: make the new generation durable before the run starts, so a
+        # restart in between restores the generation a control stop will pin.
+        self._persist_task_handle_record(record)
         await self._schedule_fork_task(task_id=task_id, parent_state=state)
         return {
             "content": [

@@ -362,6 +362,9 @@ class TestScopedStop:
         assert not resumed.get("is_error"), resumed
         generation = record.launch_parent_message_id
         assert isinstance(generation, int) and generation < 0  # synthetic, not None
+        # Durable before the run starts: a restart restores the generation stops pin.
+        persisted = {row.task_id: row for row in bot._state_store.load_snapshot().task_handle_states}
+        assert persisted[record.task_id].launch_parent_message_id == generation
         bot._clear_stop_latch(child, "test_explicit_resume")
         child.busy = True
         before = bot._interrupt_live_client.await_count
