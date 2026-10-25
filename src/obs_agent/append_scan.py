@@ -31,6 +31,7 @@ S = TypeVar("S")
 # Bytes kept from the start of the file and from just before the stored
 # offset. Both must be unchanged on the next call, or the file is scanned again.
 _SIGNATURE_BYTES = 256
+_BLOCK_BYTES = 4 << 20
 
 
 class AppendScanCache(Generic[S]):
@@ -40,9 +41,10 @@ class AppendScanCache(Generic[S]):
     included, and returns the new state. States must be immutable values: the
     stored state is reused by later calls.
 
-    ``needle``: lines that do not contain these bytes are skipped without being
-    decoded, so the fold must leave the state unchanged for such lines (a pure
-    optimization). Undecodable bytes in a skipped line are then not an error.
+    ``needle``: lines that do not contain this text are not passed to the fold,
+    so the fold must leave the state unchanged for such lines (a pure
+    optimization). Every line is still decoded, so undecodable bytes raise
+    exactly as a full text-mode read would with ``errors="strict"``.
     """
 
     def __init__(
@@ -52,7 +54,7 @@ class AppendScanCache(Generic[S]):
         *,
         encoding: str = "utf-8",
         errors: str = "strict",
-        needle: bytes | None = None,
+        needle: str | None = None,
         maxsize: int = 4096,
     ) -> None:
         self._fold = fold
@@ -74,15 +76,14 @@ class AppendScanCache(Generic[S]):
     def _fold_bytes(self, state: S, data: bytes) -> S:
         fold = self._fold
         needle = self._needle
-        for raw in data.split(b"\n"):
-            if needle is not None and needle not in raw:
+        for line in data.decode(self._encoding, self._errors).split("\n"):
+            if needle is not None and needle not in line:
                 continue
-            text = raw.decode(self._encoding, self._errors)
-            if "\r" in text:
-                for piece in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if "\r" in line:
+                for piece in line.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
                     state = fold(state, piece.strip())
             else:
-                state = fold(state, text.strip())
+                state = fold(state, line.strip())
         return state
 
     def scan(self, path: Path) -> S:
@@ -106,29 +107,41 @@ class AppendScanCache(Generic[S]):
                             state = cached_state
                             head = cached_head
                             before = cached_before
-            if offset:
+            reused = offset
+            if reused:
                 self.incremental_scans += 1
             else:
                 handle.seek(0)
                 self.full_scans += 1
-            data = handle.read()
-        cut = data.rfind(b"\n") + 1
-        complete = data[:cut]
-        tail = data[cut:]
-        if complete:
-            # The piece after the last newline is empty, not a line: drop it.
-            state = self._fold_bytes(state, complete[:-1])
-            if not offset:
-                head = complete[:_SIGNATURE_BYTES]
-            offset += len(complete)
-            before = (before + complete)[-_SIGNATURE_BYTES:]
+            # Blocks keep a first scan of a large file from holding it all in memory.
+            carry = b""
+            while True:
+                block = handle.read(_BLOCK_BYTES)
+                if not block:
+                    break
+                block = carry + block
+                cut = block.rfind(b"\n") + 1
+                if not cut:
+                    carry = block
+                    continue
+                complete = block[:cut]
+                carry = block[cut:]
+                # The piece after the last newline is empty, not a line: drop it.
+                state = self._fold_bytes(state, complete[:-1])
+                if not offset:
+                    head = complete[:_SIGNATURE_BYTES]
+                offset += len(complete)
+                before = (before + complete)[-_SIGNATURE_BYTES:]
         with self._lock:
-            if complete:
+            if offset and (not reused or offset != reused):
                 self._entries[key] = (st.st_dev, st.st_ino, offset, head, before, state)
+            elif not offset:
+                self._entries.pop(key, None)
             if key in self._entries:
                 self._entries.move_to_end(key)
             while len(self._entries) > self._maxsize:
                 self._entries.popitem(last=False)
-        if tail:
-            return self._fold_bytes(state, tail)
+        if carry:
+            # A torn last line counts for this answer only.
+            return self._fold_bytes(state, carry)
         return state

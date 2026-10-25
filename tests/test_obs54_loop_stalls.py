@@ -176,11 +176,22 @@ def test_append_scan_universal_newlines_and_needle(tmp_path):
     path.write_bytes(b"a\r\nb\rc\n\nkeep-me\n")
     cache: AppendScanCache[tuple] = AppendScanCache(_collect, ())
     assert cache.scan(path) == _full_fold(path, _collect, ()) == ("a", "b", "c", "keep-me")
-    needle_cache: AppendScanCache[tuple] = AppendScanCache(_collect, (), needle=b"keep")
+    needle_cache: AppendScanCache[tuple] = AppendScanCache(_collect, (), needle="keep")
     assert needle_cache.scan(path) == ("keep-me",)
 
 
-def test_append_scan_matches_a_full_scan_under_random_appends(tmp_path):
+def test_append_scan_still_raises_on_undecodable_bytes_like_a_text_read(tmp_path):
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(b"ok\n\xff\xfe\n")
+    with pytest.raises(UnicodeDecodeError):
+        AppendScanCache(_collect, (), needle="never-present").scan(path)
+    assert AppendScanCache(_collect, (), errors="replace").scan(path) == ("ok", "\ufffd\ufffd")
+
+
+def test_append_scan_matches_a_full_scan_under_random_appends(tmp_path, monkeypatch):
+    from obs_agent import append_scan
+
+    monkeypatch.setattr(append_scan, "_BLOCK_BYTES", 7)  # many block boundaries
     rng = random.Random(7)
     path = tmp_path / "s.jsonl"
     path.write_bytes(b"")

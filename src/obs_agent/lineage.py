@@ -442,9 +442,10 @@ def _fold_latest_bootstrap_xml(latest_xml: str | None, line: str) -> str | None:
 # loop. Session files only grow, so the latest block found so far is kept with
 # the offset it was found at and only appended bytes are read. A line can only
 # hold a block if the raw line contains the tag name, so other lines are not
-# JSON-decoded at all (JSON escaping never touches ASCII letters or "-").
+# JSON-parsed at all (JSON escaping never touches ASCII letters or "-"); every
+# line is still decoded, so an undecodable transcript raises as before.
 _bootstrap_scan_cache: AppendScanCache[str | None] = AppendScanCache(
-    _fold_latest_bootstrap_xml, None, needle=b"obs-bootstrap",
+    _fold_latest_bootstrap_xml, None, needle="obs-bootstrap",
 )
 
 
