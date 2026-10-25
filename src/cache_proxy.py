@@ -1392,9 +1392,12 @@ def pin_cache_ttl(body: dict, store: "EffortPinStore | None" = None,
 #     only the reminder placeholder, which is what an image result the CLI
 #     emptied becomes) gets MEDIA_PLACEHOLDER. Those bytes then no longer
 #     depend on how far the CLI's own eviction has got;
-#   * the floor stays until the CLI's front reaches it, then moves about
-#     MEDIA_FLOOR_STEP media further: one re-bill per ~50 new images instead
-#     of one per image. The model sees the newest 50-100 images.
+#   * the floor stays until the CLI's front reaches it, then moves to the
+#     message holding the next MEDIA_FLOOR_STEP-th media: one re-bill per ~50
+#     new images instead of one per image. Whole messages are cut, so the
+#     model sees the newest 50-100 images; when the front message alone holds
+#     more than MEDIA_FLOOR_STEP media no floor is set (the request goes as the
+#     CLI built it, so a large parallel batch is never dropped whole).
 # Floors are stored per front, so a fork or recovery from an earlier point
 # gets the floor that was in force there and its bytes match the parent's.
 # The newest message is never touched. Anthropic route only. If the bundled
@@ -1508,7 +1511,7 @@ def pin_media_floor(body: dict, store: "EffortPinStore | None" = None,
     result["media"] = len(pos)
     if len(pos) < MEDIA_CAP:
         return result
-    front, last = pos[0], len(msgs) - 1
+    front = pos[0]
     store = store or _get_effort_pins()
     now = time.time() if now is None else now
     key = hashlib.sha256(str(body.get("model", "")).encode() + b"\0"
@@ -1523,11 +1526,14 @@ def pin_media_floor(body: dict, store: "EffortPinStore | None" = None,
             floor = f_floor
         dirty = entry is None or now - entry[1] >= TTL_PIN_SAVE_EVERY
         if floor is None or floor <= front:
-            # first time at the cap, or the CLI's front reached the floor
-            floor = min(max(pos[MEDIA_FLOOR_STEP], front + 1), last)
+            # first time at the cap, or the CLI's front reached the floor. The
+            # floor is the message holding the (STEP+1)-th media: whole
+            # messages before it hold at most STEP media. When that is the
+            # front message itself (it alone holds more than STEP media),
+            # cutting it would drop more than a batch, possibly every image
+            # (V1 finding, 2026-10-25): send as the CLI built it.
+            floor = pos[MEDIA_FLOOR_STEP]
             if floor <= front:
-                # the newest message alone holds the CLI's whole window:
-                # nothing before it to pin, send as the CLI built it
                 return result
             floors = sorted([f for f in floors if f[0] != front] + [[front, floor]])
             floors = floors[-MEDIA_FLOOR_MAX_ENTRIES:]

@@ -54,10 +54,9 @@ from obs_agent.hooks import HookState
 from obs_agent.context_jsonl import find_session_jsonl, session_jsonl_has_conversation
 from obs_agent.jsonl_health import (
     JsonlSessionHealth,
-    content_refusal_after,
+    futile_refusal_streak,
     is_stale_session_head,
     resolve_safe_jsonl_target,
-    session_has_own_answer,
 )
 from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
 from obs_agent import maintenance_restart as _maint
@@ -802,9 +801,6 @@ class TelegramBot:
         self._session_heads: dict[str, str] = {}
         # route -> (session_id, error) already reported, so retries do not spam the topic.
         self._recovery_failure_notified: dict[TelegramRoute, tuple[str | None, str]] = {}
-        # route -> futile content-refusal retries in a row (obs-52); see
-        # _recover_route_session_if_needed.
-        self._content_refusal_futile: dict[TelegramRoute, int] = {}
         self._fork_tasks_by_id: dict[str, _ForkTaskRecord] = {}
         self._fork_task_by_child_route: dict[TelegramRoute, str] = {}
         self._fork_task_tasks: dict[str, asyncio.Task] = {}
@@ -5455,27 +5451,22 @@ class TelegramBot:
             if target is not None and target.target_uuid and not target.health.needs_recovery:
                 self._set_session_head(session_id=session_id, jsonl_uuid=target.target_uuid)
         if target is None or not target.health.needs_recovery or not target.target_uuid:
-            self._content_refusal_futile.pop(state.route, None)
             return None
         # obs-52: a content refusal is driven by what the context holds, so a
         # recovery re-sends it and is refused again (2026-10-25: nine recoveries
         # of the proc-work trunk in 18 minutes, one per wake, none answered).
         # A refused session that answered nothing of its own was a futile retry
         # of that context; after _CONTENT_REFUSAL_FUTILE_LIMIT of them in a row
+        # (read from the session files and fork receipts, so restarts keep it)
         # stop and tell the route. Nothing is reworded; any answer resets it.
-        refusal = content_refusal_after(target.health, target.target_uuid)
-        if refusal is None or session_has_own_answer(target.health):
-            self._content_refusal_futile.pop(state.route, None)
-        else:
-            futile = self._content_refusal_futile.get(state.route, 0) + 1
-            if futile >= _CONTENT_REFUSAL_FUTILE_LIMIT:
-                logger.warning(
-                    "[refusal_loop] route=%s source=%s session_id=%s kind=%s futile=%d "
-                    "recovery_uuid=%s: not recovering into the same context again",
-                    state.route, source, session_id, refusal, futile, target.target_uuid,
-                )
-                raise ContentRefusalLoopError(session_id=session_id, kind=refusal, futile=futile)
-            self._content_refusal_futile[state.route] = futile
+        refusal, futile = futile_refusal_streak(target.health, target.target_uuid)
+        if refusal is not None and futile >= _CONTENT_REFUSAL_FUTILE_LIMIT:
+            logger.warning(
+                "[refusal_loop] route=%s source=%s session_id=%s kind=%s futile=%d "
+                "recovery_uuid=%s: not recovering into the same context again",
+                state.route, source, session_id, refusal, futile, target.target_uuid,
+            )
+            raise ContentRefusalLoopError(session_id=session_id, kind=refusal, futile=futile)
 
         old_model_override = state.session_manager.model_override
         old_effort_override = state.session_manager.effort_override
@@ -10118,7 +10109,10 @@ class TelegramBot:
             )
         except Exception as exc:
             # Dead-topic fix (2026-10-12): never drop the turn silently. Tell the
-            # topic once per (session, error); queued work stays owned by the route.
+            # topic once per (session, error); queued work stays owned by the route,
+            # including messages a caller drained into extra_pending (obs-52 V1:
+            # an idle inbox wake lost them when this preflight raised).
+            state.pending_messages = pending_messages
             error = f"{type(exc).__name__}: {exc}"
             key = (state.session_id, error)
             if self._recovery_failure_notified.get(state.route) != key:

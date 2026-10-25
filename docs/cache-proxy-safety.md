@@ -102,7 +102,10 @@ real break mechanisms in live traffic; none was caught by a unit test:
    request carries 100 media, a per-conversation floor above the CLI's eviction
    front removes every media block before it (image-only results become one
    fixed placeholder, whoever removed the image), and moves about 50 media at a
-   time, so the conversation is re-billed once per ~50 new images. Live scenario
+   time, so the conversation is re-billed once per ~50 new images. Whole
+   messages are cut, at most ~50 media beyond the CLI's own eviction; when the
+   front message alone holds more than 50 media no floor is set (V1 finding: a
+   100-image parallel round would otherwise be dropped whole). Live scenario
    `image_cap`. In that harness a prompt request never reads the previous
    request's entry, only the one before it (ratio ~0.985 in every run, old and
    new proxy), so the request right after the floor first appears or moves can

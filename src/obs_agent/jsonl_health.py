@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import json
 import hashlib
+import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -609,6 +610,47 @@ def session_has_own_answer(health: JsonlSessionHealth) -> bool:
     except OSError:
         return True  # unknown: do not count it as a futile retry
     return False
+
+
+def _fork_source_path(session_id: str) -> Path | None:
+    """The JSONL a session was forked or recovered from (jsonl_fork's receipt), if any."""
+    root = Path(os.environ.get("OBS_SESSION_REPLAY_PROVENANCE_DIR", "/workspace/runtime/state/session-replay"))
+    try:
+        receipt = json.loads((root / "forks" / f"{session_id}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    source = receipt.get("source_path") if isinstance(receipt, dict) else None
+    return Path(source) if isinstance(source, str) and source else None
+
+
+def futile_refusal_streak(
+    health: JsonlSessionHealth, uuid: str | None, *, max_depth: int = 8,
+) -> tuple[str | None, int]:
+    """(kind, n) for a session whose tail after ``uuid`` is a content refusal (obs-52).
+
+    ``n`` counts this session and the sessions it was forked or recovered
+    from, in a row, that were refused before answering anything of their own.
+    It is read from the session files and fork receipts, so it survives an OBS
+    restart, and a fresh session (/clear, a new launch) starts its own count.
+    (None, 0) when the tail is not a content refusal.
+    """
+    kind = content_refusal_after(health, uuid)
+    if kind is None:
+        return None, 0
+    count = 0
+    current: JsonlSessionHealth | None = health
+    seen: set[str] = set()
+    while current is not None and count < max_depth and current.session_id not in seen:
+        seen.add(current.session_id)
+        if session_has_own_answer(current):
+            break
+        if count and content_refusal_after(current, current.safe_recovery_uuid) is None:
+            break  # an earlier attempt that failed some other way does not count
+        count += 1
+        source = _fork_source_path(current.session_id)
+        current = (analyze_jsonl_path(path=source, session_id=source.stem)
+                   if source is not None and source.exists() else None)
+    return kind, count
 
 
 # CACHE-PREFIX WARNING (M5): safe recovery means a complete API message,

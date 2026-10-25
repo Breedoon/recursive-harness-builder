@@ -177,20 +177,79 @@ async def test_an_answer_in_between_resets_the_count(config, project_dir):
     assert fourth and fourth != third  # one futile retry so far, not two
 
 
-async def test_a_healthy_run_start_resets_the_count(config, project_dir):
+async def test_a_healthy_run_in_between_gives_a_new_budget(config, project_dir):
     _trunk(project_dir)
     bot, state = _bot(config, "sid-trunk")
     first = await bot._recover_route_session_if_needed(state=state, source="run_start")
     _refused_retry(project_dir, first)
     second = await bot._recover_route_session_if_needed(state=state, source="run_start")
-    assert bot._content_refusal_futile[state.route] == 1
     path = project_dir / f"{second}.jsonl"
     last = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])["uuid"]
     rows = _Rows(path, second, parent=last)
     rows.user("wake")
     rows.answer("fine now")
     assert await bot._recover_route_session_if_needed(state=state, source="run_start") is None
-    assert state.route not in bot._content_refusal_futile
+    # refused again later: two more retries before the stop, as for any new refusal
+    rows.user("later wake")
+    rows.refusal()
+    third = await bot._recover_route_session_if_needed(state=state, source="run_start")
+    _refused_retry(project_dir, third)
+    fourth = await bot._recover_route_session_if_needed(state=state, source="run_start")
+    assert third and fourth and fourth != third
+    _refused_retry(project_dir, fourth)
+    with pytest.raises(ContentRefusalLoopError):
+        await bot._recover_route_session_if_needed(state=state, source="run_start")
+
+
+async def _stopped(config, project_dir):
+    _trunk(project_dir)
+    bot, state = _bot(config, "sid-trunk")
+    first = await bot._recover_route_session_if_needed(state=state, source="run_start")
+    _refused_retry(project_dir, first)
+    second = await bot._recover_route_session_if_needed(state=state, source="run_start")
+    _refused_retry(project_dir, second)
+    with pytest.raises(ContentRefusalLoopError):
+        await bot._recover_route_session_if_needed(state=state, source="run_start")
+    return bot, state
+
+
+async def test_the_stop_survives_an_obs_restart(config, project_dir):
+    _, state = await _stopped(config, project_dir)
+    # fresh daemon objects over the same stored session: the count comes from
+    # the session files and fork receipts, not from memory (V1 finding)
+    again, restored = _bot(config, state.session_id)
+    with pytest.raises(ContentRefusalLoopError):
+        await again._recover_route_session_if_needed(state=restored, source="run_start")
+    assert restored.session_id == state.session_id
+
+
+async def test_a_fresh_context_gets_its_own_budget(config, project_dir):
+    bot, state = await _stopped(config, project_dir)
+    await bot._reset_route_state(state)  # what /clear does
+    assert await bot._recover_route_session_if_needed(state=state, source="run_start") is None
+    fresh = _Rows(project_dir / "sid-unrelated.jsonl", "sid-unrelated")
+    fresh.user("an unrelated fresh task")
+    fresh.refusal()
+    state.session_manager.set_session_id("sid-unrelated")
+    bot._bind_state_session(state)
+    retry = await bot._recover_route_session_if_needed(state=state, source="run_start")
+    assert retry and retry != "sid-unrelated"
+
+
+async def test_an_inbox_wake_keeps_queued_work_when_the_loop_stops(config, project_dir):
+    bot, state = await _stopped(config, project_dir)
+    state.last_bot = MagicMock()
+    state.hook_state.message_queue.put_nowait(QueuedMessage(text="queued-before-inbox-wake"))
+    bot._send_system_message = AsyncMock()
+    bot._send_system_html_message = AsyncMock(return_value=[])
+    with pytest.raises(ContentRefusalLoopError):
+        await bot._start_idle_route_inbox_wake(
+            state=state, team_name="fixture-team", agent_name="fixture-agent",
+            sender="fixture-sender", summary="wake", content="new inbox message")
+    remaining = [m.text for m in state.pending_messages]
+    while not state.hook_state.message_queue.empty():
+        remaining.append(state.hook_state.message_queue.get_nowait().text)
+    assert "queued-before-inbox-wake" in remaining
 
 
 async def test_other_api_errors_keep_recovering(config, project_dir):

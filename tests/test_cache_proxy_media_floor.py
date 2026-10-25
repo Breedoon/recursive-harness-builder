@@ -247,17 +247,59 @@ def test_newest_message_is_never_touched():
     assert _n_media(body) == 100
 
 
+def test_a_large_batch_in_one_message_is_never_dropped_whole():
+    # V1 counterexamples (2026-10-25): 100 images read in one parallel round,
+    # then an ordinary text turn; and 90 in one round plus 10 in the newest.
+    # Cutting whole messages there would leave 0 or 10 images: no floor instead.
+    history = _history(1, per_turn=100)
+    history += [{"role": "assistant", "content": [{"type": "text", "text": "images read"}]},
+                {"role": "user", "content": [{"type": "text", "text": "compare those images"}]}]
+    body, res = _proxy(_request(history), _store())
+    assert res["floor"] is None and _n_media(body) == 100
+    history = _history(1, per_turn=90)
+    history += [{"role": "assistant", "content": [{"type": "text", "text": "ten more"}]},
+                {"role": "user", "content": [_img(90 + i) for i in range(10)]}]
+    body, res = _proxy(_request(history), _store())
+    assert res["floor"] is None and _n_media(body) == 100
+    # at most one batch is ever cut beyond the CLI's own eviction
+    for per_turn in (6, 25, 40, 50):
+        store = _store()
+        for turns in range(100 // per_turn, 100 // per_turn + 12):
+            body, res = _proxy(_request(_history(turns, per_turn=per_turn)), store, now=T0 + turns)
+            assert _n_media(body) >= 100 - cache_proxy.MEDIA_FLOOR_STEP, (per_turn, turns, res)
+
+
+def _markers(value):
+    """Every cache_control value, nested ones included (prefix_diff.breakpoints sees top-level only)."""
+    found = []
+    if isinstance(value, dict):
+        if isinstance(value.get("cache_control"), dict):
+            found.append(json.dumps(value["cache_control"], sort_keys=True))
+        for key, child in value.items():
+            if key != "cache_control":
+                found += _markers(child)
+    elif isinstance(value, list):
+        for child in value:
+            found += _markers(child)
+    return sorted(found)
+
+
 def test_breakpoints_are_never_dropped():
-    store = _store()
-    body = _request(_history(30))
-    # an (unusual) marker on an old image that the floor removes
-    first_img = next(r for m in body["messages"] for r in m["content"]
-                     if r.get("type") == "tool_result" and r["content"])
-    first_img["content"][0]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-    before = len(prefix_diff.breakpoints(body))
-    out, res = _proxy(body, store)
-    assert res["removed"] > 0
-    assert len(prefix_diff.breakpoints(out)) == before
+    for nested in ("image", "image+text"):
+        store = _store()
+        body = _request(_history(30))
+        # unusual markers on old images that the floor removes, nested in tool results
+        olds = [r for m in body["messages"] for r in m["content"]
+                if r.get("type") == "tool_result" and r["content"]][:2]
+        olds[0]["content"][0]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        olds[1]["content"][0]["cache_control"] = {"type": "ephemeral"}
+        if nested == "image+text":
+            olds[1]["content"].append({"type": "text", "text": "caption"})
+        before = _markers(body)
+        out, res = _proxy(body, store)
+        assert res["removed"] > 0
+        assert _markers(out) == before
+        assert len(prefix_diff.breakpoints(out)) == len(prefix_diff.breakpoints(body))
 
 
 def test_tool_less_side_calls_and_documents():
