@@ -6676,9 +6676,10 @@ class TelegramBot:
             return {"ok": False, "error": "parent agent has no current route binding"}
         task_id = str(args["expected_task_id"])
         raw_generation = args["expected_launch_parent_message_id"]
-        # obs-54: a launch whose parent confirmation never reached Telegram goes on
-        # without a launch message, so its generation is None (obs-agentctl and the
-        # rounds watchdog spell it "None"); it still matches only that record.
+        # obs-54: runs whose parent notice never reached Telegram get a negative
+        # synthetic generation (_run_generation). Records written before that, or
+        # by other paths, may still hold None; obs-agentctl and the rounds watchdog
+        # spell it "None". It matches only a record whose generation is None.
         generation = (
             None if raw_generation is None or str(raw_generation).strip() in ("None", "null")
             else int(raw_generation)
@@ -7706,6 +7707,27 @@ class TelegramBot:
         if isinstance(candidate, int):
             return candidate
         return None
+
+    def _run_generation(self, parent_message_id: int | None) -> int:
+        """The run generation of a launch, resume or wake: its parent message id.
+
+        obs-54: a run whose parent notice never reached Telegram still needs a
+        distinct, durable generation, or a stale control-stop timer for one run
+        could stop the next (`_control_stop_child` matches by equality). It gets
+        a negative, strictly decreasing id from the clock instead, which no
+        Telegram message has; `_reply_anchor` keeps it out of reply targets.
+        """
+        if parent_message_id is not None:
+            return parent_message_id
+        last = self.__dict__.get("_last_synthetic_generation", 0)
+        generation = min(-(time.time_ns() // 1000), last - 1)
+        self._last_synthetic_generation = generation
+        return generation
+
+    @staticmethod
+    def _reply_anchor(message_id: int | None) -> int | None:
+        """A message id to reply to, or None for a synthetic run generation."""
+        return message_id if isinstance(message_id, int) and message_id > 0 else None
 
     def _record_or_defer_message_bindings(
         self,
@@ -11823,7 +11845,7 @@ class TelegramBot:
                 bot=parent_state.last_bot,
                 html_text=html_text,
                 disable_notification=True,
-                reply_to_message_id=record.launch_parent_message_id,
+                reply_to_message_id=self._reply_anchor(record.launch_parent_message_id),
                 priority=_PRIORITY_SYSTEM,
             )
             self._remember_system_message_ids(route=record.parent_route, sent_messages=sent_messages)
@@ -12347,7 +12369,7 @@ class TelegramBot:
         record.launch_tool_name = "AgentTask"
         if not owed_callback:
             # An owed callback replies to the parent's original launch message.
-            record.launch_parent_message_id = wake_message_id
+            record.launch_parent_message_id = self._run_generation(wake_message_id)
         record.launch_child_message_id = wake_message_id
         record.idle_ready = False
         record.wake_requested = False
@@ -12878,7 +12900,7 @@ class TelegramBot:
             html_text=parent_html,
             purpose="parent resume notice",
         )
-        record.launch_parent_message_id = (
+        record.launch_parent_message_id = self._run_generation(
             self._sent_message_id(parent_messages[0]) if parent_messages else None
         )
         await self._schedule_fork_task(task_id=task_id, parent_state=state)
@@ -13250,7 +13272,7 @@ class TelegramBot:
             description=description,
             timeout_ms=timeout_ms,
             max_turns=max_turns,
-            launch_parent_message_id=confirmation_id,
+            launch_parent_message_id=self._run_generation(confirmation_id),
             launch_child_message_id=child_service_message_id,
             is_fork=is_fork,
             launch_tool_name=launch_tool_name,
@@ -13505,7 +13527,7 @@ class TelegramBot:
                     bot=parent_state.last_bot,
                     html_text=parent_marker,
                     disable_notification=True,
-                    reply_to_message_id=record.launch_parent_message_id,
+                    reply_to_message_id=self._reply_anchor(record.launch_parent_message_id),
                 )
                 record.parent_callback_message_id = (
                     self._sent_message_id(marker_messages[0]) if marker_messages else None

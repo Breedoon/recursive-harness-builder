@@ -334,12 +334,62 @@ class TestScopedStop:
         bot._interrupt_live_client.assert_not_awaited()
         assert record.terminal_request is None
 
+    @pytest.mark.parametrize("stop_first", [False, True])
+    async def test_runs_without_parent_notices_get_distinct_generations(
+        self, stop_first, config, monkeypatch, tmp_path,
+    ):
+        # obs-54 V1 re-check: two explicit runs of one task whose parent notices both
+        # failed shared generation None, so a stale timer for the first could stop the
+        # second, and a second stop reused the first's receipt.
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        record.launch_parent_message_id = None  # a legacy run without a parent message
+        args["expected_launch_parent_message_id"] = "None"
+        if stop_first:
+            assert (await bot._control_dispatch("stop", "rounds-watchdog", dict(args)))["ok"]
+            assert bot._interrupt_live_client.await_count == 1
+        else:
+            record.status = "completed"
+            record.idle_ready = True
+        child.busy = False
+        parent = bot._control_agent_state(TEAM, "parent-agent")
+        parent.last_bot = object()
+        monkeypatch.setattr(bot, "_send_task_launch_notice", AsyncMock(return_value=[]))
+        monkeypatch.setattr(bot, "_schedule_fork_task", AsyncMock())
+        resumed = await bot._resume_fork_task(
+            route=parent.route, state=parent, task_id=record.task_id,
+            args={"prompt": "a different explicit run", "task_tool_name": "AgentTask"},
+        )
+        assert not resumed.get("is_error"), resumed
+        generation = record.launch_parent_message_id
+        assert isinstance(generation, int) and generation < 0  # synthetic, not None
+        bot._clear_stop_latch(child, "test_explicit_resume")
+        child.busy = True
+        before = bot._interrupt_live_client.await_count
+        stale = await bot._control_dispatch("stop", "rounds-watchdog", dict(args))  # the old "None" timer
+        assert not stale["ok"] and "generation mismatch" in str(stale)
+        assert bot._interrupt_live_client.await_count == before
+        current = await bot._control_dispatch(
+            "stop", "rounds-watchdog", {**args, "expected_launch_parent_message_id": str(generation)},
+        )
+        assert current["ok"], current
+        assert record.terminal_request == "stopped"
+        assert bot._interrupt_live_client.await_count == before + 1
+
+    def test_synthetic_generations_are_distinct_negative_and_never_reply_targets(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        generations = [bot._run_generation(None) for _ in range(1000)]
+        assert len(set(generations)) == 1000 and all(g < 0 for g in generations)
+        assert generations == sorted(generations, reverse=True)
+        assert bot._run_generation(902) == 902
+        assert bot._reply_anchor(generations[0]) is None and bot._reply_anchor(902) == 902
+        assert bot._reply_anchor(None) is None
+
     @pytest.mark.parametrize("spelling", ["None", None])
     async def test_launch_without_a_parent_message_is_stoppable_by_its_none_generation(
         self, spelling, config, monkeypatch, tmp_path,
     ):
-        # obs-54: a launch whose parent confirmation timed out goes on with no
-        # launch_parent_message_id; obs-agentctl/rounds pass str(None).
+        # A record from before synthetic generations (or another path) can still
+        # hold None; obs-agentctl/rounds pass str(None).
         bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
         record.launch_parent_message_id = None
         stale = await bot._control_dispatch("stop", "rounds-watchdog", args)  # integer 900

@@ -619,7 +619,9 @@ async def test_launch_goes_on_when_every_notice_times_out(config, caplog):
     task_id = launched["content"][0]["text"].split("agentId: ", 1)[1].splitlines()[0]
     record = bot._fork_tasks_by_id[task_id]
     assert record.child_route.thread_id == 445
-    assert record.launch_child_message_id is None and record.launch_parent_message_id is None
+    assert record.launch_child_message_id is None
+    # No parent message: a synthetic run generation keeps control stops exact.
+    assert isinstance(record.launch_parent_message_id, int) and record.launch_parent_message_id < 0
     assert task_id in state.active_fork_task_ids
     # child notice, session marker, parent confirmation: 6 bounded attempts each
     assert state.last_bot.send_message.await_count == 18
