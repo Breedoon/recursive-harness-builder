@@ -188,6 +188,42 @@ def test_append_scan_still_raises_on_undecodable_bytes_like_a_text_read(tmp_path
     assert AppendScanCache(_collect, (), errors="replace").scan(path) == ("ok", "\ufffd\ufffd")
 
 
+def test_append_scan_sees_a_same_size_middle_rewrite_at_once(tmp_path):
+    path = tmp_path / "s.jsonl"
+    head, tail = "H" * 300, "T" * 300
+    path.write_text(f"{head}\nmiddle-one\n{tail}\n", encoding="utf-8")
+    cache: AppendScanCache[tuple] = AppendScanCache(_collect, ())
+    assert cache.scan(path) == (head, "middle-one", tail)
+    stat = path.stat()
+    with path.open("r+b") as handle:  # same inode, same size, same first and last 256 bytes
+        handle.seek(len(head) + 1)
+        handle.write(b"middle-two")
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))  # even with the old mtime back
+    assert path.stat().st_size == stat.st_size and path.stat().st_mtime_ns == stat.st_mtime_ns
+    assert cache.scan(path) == (head, "middle-two", tail)
+    assert cache.full_scans == 2
+
+
+def test_append_scan_rescans_in_full_after_the_revalidation_interval(tmp_path, monkeypatch):
+    from obs_agent import append_scan
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(append_scan, "_monotonic", lambda: clock["now"])
+    path = tmp_path / "s.jsonl"
+    path.write_text("one\ntwo\n", encoding="utf-8")
+    cache: AppendScanCache[tuple] = AppendScanCache(_collect, (), revalidate_seconds=300)
+    assert cache.scan(path) == ("one", "two")
+    # Stand-in for a rewrite no cheap check can see: corrupt the stored fold.
+    key = str(path)
+    entry = cache._entries[key]
+    cache._entries[key] = (*entry[:5], ("stale",), *entry[6:])
+    clock["now"] += 299
+    assert cache.scan(path) == ("stale",)  # still trusted inside the interval
+    clock["now"] += 2
+    assert cache.scan(path) == ("one", "two")
+    assert cache.full_scans == 2
+
+
 def test_append_scan_matches_a_full_scan_under_random_appends(tmp_path, monkeypatch):
     from obs_agent import append_scan
 
@@ -253,6 +289,18 @@ def test_bootstrap_scan_follows_appends_like_the_full_scan(tmp_path):
     with path.open("a", encoding="utf-8") as handle:
         handle.write(filler + "\n")
     assert lineage.find_latest_obs_bootstrap_in_jsonl(path) == second
+
+
+def test_bootstrap_scan_finds_a_block_spelled_with_json_unicode_escapes(tmp_path):
+    path = tmp_path / "s.jsonl"
+    row = _bootstrap_row("Escaped")
+    # Valid JSON for the same text, with the tag name's letters escaped.
+    escaped = row.replace("obs-bootstrap", "\\u006fbs-bootstrap")
+    assert json.loads(escaped) == json.loads(row)
+    path.write_text(escaped + "\n", encoding="utf-8")
+    found = lineage.find_latest_obs_bootstrap_in_jsonl(path)
+    assert found == _old_find_latest_bootstrap(path)
+    assert found is not None and found.lineage[-1] == "Escaped"
 
 
 def test_bootstrap_scan_without_any_block(tmp_path):
@@ -374,15 +422,22 @@ def test_team_status_takes_one_pass_over_the_routes(config):
 # --- inbox wake poller cache --------------------------------------------------
 
 
+_SETTLE = 0.3  # the tests shorten _INBOX_CACHE_SETTLE_SECONDS (2 s) to this
+
+
 def _write_inbox(path: Path, items: list[dict], *, age_seconds: float) -> None:
+    """Write an inbox with an old mtime; its ctime is now, so wait for it to settle."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(items), encoding="utf-8")
     stamp = time.time() - age_seconds
     os.utime(path, (stamp, stamp))
+    if age_seconds:
+        time.sleep(_SETTLE + 0.1)
 
 
 def test_inbox_poll_reuses_a_settled_unchanged_inbox(config, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("obs_agent.telegram._INBOX_CACHE_SETTLE_SECONDS", _SETTLE)
     bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
     bot._daemon_started_at = time.time() - 3600
     inbox = bot._team_inbox_path("team", "agent")
@@ -410,6 +465,7 @@ def test_inbox_poll_reuses_a_settled_unchanged_inbox(config, monkeypatch, tmp_pa
 
 def test_inbox_poll_does_not_store_a_just_written_inbox(config, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("obs_agent.telegram._INBOX_CACHE_SETTLE_SECONDS", _SETTLE)
     bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
     bot._daemon_started_at = time.time() - 3600
     inbox = bot._team_inbox_path("team", "agent")
@@ -422,6 +478,23 @@ def test_inbox_poll_does_not_store_a_just_written_inbox(config, monkeypatch, tmp
     inbox.write_text(json.dumps([{"from": "b", "text": "y", "timestamp": fresh, "read": False}]), encoding="utf-8")
     os.utime(inbox, ns=(stat.st_atime_ns, stat.st_mtime_ns))
     assert bot._cached_latest_unread_team_inbox_message(team_name="team", agent_name="agent") == ("b", None, "y")
+
+
+def test_inbox_poll_sees_a_same_size_rewrite_that_restores_the_old_mtime(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("obs_agent.telegram._INBOX_CACHE_SETTLE_SECONDS", _SETTLE)
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    bot._daemon_started_at = time.time() - 3600
+    inbox = bot._team_inbox_path("team", "agent")
+    fresh = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    _write_inbox(inbox, [{"from": "a", "text": "old", "timestamp": fresh, "read": False}], age_seconds=60)
+    assert bot._cached_latest_unread_team_inbox_message(team_name="team", agent_name="agent") == ("a", None, "old")
+    assert inbox in bot._inbox_latest_cache
+    stat = inbox.stat()
+    inbox.write_text(json.dumps([{"from": "b", "text": "new", "timestamp": fresh, "read": False}]), encoding="utf-8")
+    os.utime(inbox, ns=(stat.st_atime_ns, stat.st_mtime_ns))  # same size, same mtime as before
+    assert inbox.stat().st_size == stat.st_size and inbox.stat().st_mtime_ns == stat.st_mtime_ns
+    assert bot._cached_latest_unread_team_inbox_message(team_name="team", agent_name="agent") == ("b", None, "new")
 
 
 # --- team projection config ---------------------------------------------------
@@ -458,9 +531,8 @@ def test_team_projection_upsert_is_not_rewritten_every_event(config, monkeypatch
         team_name="team", agent_name="agent", child_session_id="sid2", obs_metadata=meta,
     )
     assert writes["n"] == 2 and config_path.exists()  # file gone: written again
-    bot._team_projection_written[("team", "agent")] = (
-        bot._team_projection_written[("team", "agent")][0], time.monotonic() - 31,
-    )
+    fingerprint, _written_at, size = bot._team_projection_written[("team", "agent")]
+    bot._team_projection_written[("team", "agent")] = (fingerprint, time.monotonic() - 31, size)
     bot._upsert_team_projection_config(
         team_name="team", agent_name="agent", child_session_id="sid2", obs_metadata=meta,
     )
@@ -468,6 +540,34 @@ def test_team_projection_upsert_is_not_rewritten_every_event(config, monkeypatch
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     names = [member["name"] for member in payload["members"]]
     assert names == ["team-lead", "agent"]
+
+
+def test_team_projection_member_removed_outside_obs_is_written_back_at_once(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    config_path = tmp_path / ".claude" / "teams" / "team" / "config.json"
+    meta = {"display_name": "Agent", "lineage": ["Trunk", "Agent"], "updated_at": 1}
+    bot._upsert_team_projection_config(team_name="team", agent_name="agent", child_session_id="sid", obs_metadata=meta)
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["members"] = [m for m in payload["members"] if m["name"] != "agent"]
+    config_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")  # smaller now
+    bot._upsert_team_projection_config(team_name="team", agent_name="agent", child_session_id="sid", obs_metadata=meta)
+    names = [m["name"] for m in json.loads(config_path.read_text(encoding="utf-8"))["members"]]
+    assert names == ["team-lead", "agent"]
+
+
+def test_team_projection_other_members_upserts_do_not_force_rewrites(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+    config_path = tmp_path / ".claude" / "teams" / "team" / "config.json"
+    meta = {"display_name": "A", "lineage": ["Trunk", "A"], "updated_at": 1}
+    bot._upsert_team_projection_config(team_name="team", agent_name="a", child_session_id="sa", obs_metadata=meta)
+    bot._upsert_team_projection_config(team_name="team", agent_name="b", child_session_id="sb", obs_metadata=meta)
+    before = config_path.read_text(encoding="utf-8")
+    bot._upsert_team_projection_config(team_name="team", agent_name="a", child_session_id="sa", obs_metadata=meta)
+    assert config_path.read_text(encoding="utf-8") == before  # a's entry is still current
+    names = [m["name"] for m in json.loads(before)["members"]]
+    assert names == ["team-lead", "a", "b"]
 
 
 # --- launch notices ---------------------------------------------------------
@@ -557,3 +657,31 @@ def test_stall_monitor_summary_reports_window_and_totals(caplog):
     assert line is not None and "stalls=1" in line and "blocked=4.0s" in line and "max=4.0s" in line
     assert monitor.blocked_seconds == pytest.approx(4.0)
     assert monitor.summary_once(now=start + 1200).startswith("[loop_stall_summary] last 600s: stalls=0 blocked=0.0s")
+
+
+def test_stall_monitor_splits_a_stall_across_the_windows_it_spans():
+    monitor = LoopStallMonitor(MagicMock(), threshold=2.0, interval=0.5, summary=600.0)
+    start = monitor._window_started_at
+    monitor._last_beat = start + 590  # the loop stops beating here
+    assert monitor.check_once(now=start + 595) == "stall"
+    first = monitor.summary_once(now=start + 600)
+    assert "blocked=10.0s (1.7%)" in first and "(a stall is in progress)" in first
+    monitor._last_beat = start + 1300  # recovered: a 710 s stall
+    assert monitor.check_once(now=start + 1300.1) == "recovered"
+    second = monitor.summary_once(now=start + 1301)
+    assert "last 701s: stalls=0 blocked=700.0s (99.9%) max=710.0s" in second
+    assert monitor.blocked_seconds == pytest.approx(710.0)
+    third = monitor.summary_once(now=start + 1901)
+    assert "blocked=0.0s (0.0%)" in third
+
+
+def test_stall_monitor_does_not_charge_a_closed_window_for_a_late_detected_stall():
+    monitor = LoopStallMonitor(MagicMock(), threshold=2.0, interval=0.5, summary=600.0)
+    start = monitor._window_started_at
+    monitor._last_beat = start + 599.5  # stall starts just before the window closes
+    assert monitor.summary_once(now=start + 600) is not None  # not detected yet
+    assert monitor.check_once(now=start + 601.6) == "stall"
+    monitor._last_beat = start + 604
+    assert monitor.check_once(now=start + 604.1) == "recovered"
+    line = monitor.summary_once(now=start + 1200)
+    assert "blocked=4.0s" in line and "max=4.5s" in line

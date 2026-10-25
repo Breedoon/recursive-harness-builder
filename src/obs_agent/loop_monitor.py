@@ -80,6 +80,8 @@ class LoopStallMonitor:
         self._window_stalls = 0
         self._window_blocked = 0.0
         self._window_max = 0.0
+        # Blocked time before this point is already counted in some window.
+        self._charged_until: float | None = None
 
     async def _heartbeat(self) -> None:
         self._loop_thread_id = threading.get_ident()
@@ -102,6 +104,8 @@ class LoopStallMonitor:
         if self._stalled_since is None:
             if lag >= self._threshold:
                 self._stalled_since = self._last_beat
+                # A window that closed before the stall was detected keeps none of it.
+                self._charged_until = max(self._last_beat, self._window_started_at)
                 self.stall_count += 1
                 self._window_stalls += 1
                 logger.warning(
@@ -112,23 +116,37 @@ class LoopStallMonitor:
             return None
         if lag < self._threshold:
             total = self._last_beat - self._stalled_since
+            self._charge(self._last_beat)
             self._stalled_since = None
+            self._charged_until = None
             self.blocked_seconds += total
             self.max_blocked_seconds = max(self.max_blocked_seconds, total)
-            self._window_blocked += total
             self._window_max = max(self._window_max, total)
             logger.warning("[loop_stall] event loop recovered after ~%.1fs blocked", total)
             return "recovered"
         return None
 
+    def _charge(self, until: float) -> None:
+        """Count blocked time up to ``until`` in the current window, once."""
+        if self._charged_until is not None and until > self._charged_until:
+            self._window_blocked += until - self._charged_until
+            self._charged_until = until
+
     def summary_once(self, now: float | None = None) -> str | None:
-        """Log and reset the window's totals once it is ``summary`` long (for tests)."""
+        """Log and reset the window's totals once it is ``summary`` long (for tests).
+
+        A stall's blocked time is split across the windows it spans, so a
+        window's share never exceeds 100%; its ``max`` is the longest stall
+        that ended in it, whole.
+        """
         if self._summary <= 0:
             return None
         now = time.monotonic() if now is None else now
         window = now - self._window_started_at
         if window < self._summary:
             return None
+        if self._stalled_since is not None:
+            self._charge(now)
         share = 100.0 * self._window_blocked / window if window > 0 else 0.0
         line = (
             f"[loop_stall_summary] last {window:.0f}s: stalls={self._window_stalls} "

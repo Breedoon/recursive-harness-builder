@@ -334,6 +334,25 @@ class TestScopedStop:
         bot._interrupt_live_client.assert_not_awaited()
         assert record.terminal_request is None
 
+    @pytest.mark.parametrize("spelling", ["None", None])
+    async def test_launch_without_a_parent_message_is_stoppable_by_its_none_generation(
+        self, spelling, config, monkeypatch, tmp_path,
+    ):
+        # obs-54: a launch whose parent confirmation timed out goes on with no
+        # launch_parent_message_id; obs-agentctl/rounds pass str(None).
+        bot, child, record, args = self._setup(config, monkeypatch, tmp_path)
+        record.launch_parent_message_id = None
+        stale = await bot._control_dispatch("stop", "rounds-watchdog", args)  # integer 900
+        assert not stale["ok"] and "generation mismatch" in str(stale)
+        args["expected_launch_parent_message_id"] = spelling
+        assert control.validate_request({"op": "stop", "caller": "rounds-watchdog", "args": args}) is None
+        absent = {key: value for key, value in args.items() if key != "expected_launch_parent_message_id"}
+        assert "needs expected_launch_parent_message_id" in control.validate_request(
+            {"op": "stop", "caller": "rounds-watchdog", "args": absent})
+        result = await bot._control_dispatch("stop", "rounds-watchdog", args)
+        assert result["ok"], result
+        assert record.terminal_request == "stopped"
+
     @pytest.mark.parametrize("parent_sid", ["sid-parent", None])
     async def test_maintenance_session_change_does_not_reset_generation(self, config, monkeypatch, tmp_path, parent_sid):
         bot, child, record, args = self._setup(config, monkeypatch, tmp_path)

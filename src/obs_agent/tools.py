@@ -874,7 +874,10 @@ def create_obs_tools(
                         f"'file_path::function_name', got: {spec!r}"
                     )
                 try:
-                    resolved_hooks[str(event_name)] = _resolve_hook_spec_path(spec, config.vault_path)
+                    # obs-54: validation runs Git subprocesses; keep them off the event loop.
+                    resolved_hooks[str(event_name)] = await asyncio.to_thread(
+                        _resolve_hook_spec_path, spec, config.vault_path,
+                    )
                 except ValueError as exc:
                     return _error_result(f"Cannot launch {tool_name}: {exc}")
             user_hooks = resolved_hooks

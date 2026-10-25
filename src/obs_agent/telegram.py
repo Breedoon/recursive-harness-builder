@@ -800,11 +800,11 @@ class TelegramBot:
         # inbox messages are ignored after daemon restart.
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
         # inbox path -> (file identity, wake floor, latest unread); see
-        # _latest_unread_team_inbox_message (obs-54).
-        self._inbox_latest_cache: dict[Path, tuple[tuple[int, int, int, int], float, Any]] = {}
-        # (team, agent) -> (member data fingerprint, monotonic write time); see
-        # _upsert_team_projection_config (obs-54).
-        self._team_projection_written: dict[tuple[str, str], tuple[str, float]] = {}
+        # _cached_latest_unread_team_inbox_message (obs-54).
+        self._inbox_latest_cache: dict[Path, tuple[tuple[int, ...], float, Any]] = {}
+        # (team, agent) -> (member data fingerprint, monotonic write time, config
+        # size after the write); see _upsert_team_projection_config (obs-54).
+        self._team_projection_written: dict[tuple[str, str], tuple[str, float, int]] = {}
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._pending_schedule_owners: dict[str, tuple[_TopicScheduleRecord, Any]] = {}
         self._pending_schedule_owner_retirements: set[str] = set()
@@ -5192,7 +5192,10 @@ class TelegramBot:
         # obs-54: this ran on every stream event of every run (_bind_state_session),
         # re-reading and rewriting team configs of up to 1.5 MB on the event loop.
         # Skip it while the same member data was written within the refresh
-        # interval; only the joinedAt/updated_at stamps would differ.
+        # interval; only the joinedAt/updated_at stamps would differ. OBS's other
+        # upserts read-modify-write and keep every member, so the config only
+        # grows; a smaller file than this process last wrote means a member was
+        # removed outside OBS, and the entry is written again at once.
         memo_key = (normalized_team, normalized_agent)
         fingerprint = self._team_projection_fingerprint(child_session_id, obs_metadata)
         written = self._team_projection_written.get(memo_key)
@@ -5200,10 +5203,13 @@ class TelegramBot:
             written is not None
             and written[0] == fingerprint
             and time.monotonic() - written[1] < _TEAM_PROJECTION_REFRESH_SECONDS
-            and config_path.exists()
             and (team_dir / "inboxes" / f"{normalized_agent}.json").exists()
         ):
-            return
+            try:
+                if config_path.stat().st_size >= written[2]:
+                    return
+            except OSError:
+                pass
         team_dir.mkdir(parents=True, exist_ok=True)
 
         payload: dict[str, Any] = {}
@@ -5273,14 +5279,16 @@ class TelegramBot:
         )
 
         payload["members"] = members
-        config_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+        serialized = json.dumps(payload, indent=2, ensure_ascii=True)
+        config_path.write_text(serialized, encoding="utf-8")
 
         inbox_dir = team_dir / "inboxes"
         inbox_dir.mkdir(parents=True, exist_ok=True)
         inbox_path = inbox_dir / f"{normalized_agent}.json"
         if not inbox_path.exists():
             inbox_path.write_text("[]", encoding="utf-8")
-        self._team_projection_written[memo_key] = (fingerprint, time.monotonic())
+        # ensure_ascii output: characters are bytes.
+        self._team_projection_written[memo_key] = (fingerprint, time.monotonic(), len(serialized))
 
     @staticmethod
     def _team_projection_fingerprint(
@@ -6667,7 +6675,14 @@ class TelegramBot:
         if parent is None:
             return {"ok": False, "error": "parent agent has no current route binding"}
         task_id = str(args["expected_task_id"])
-        generation = int(args["expected_launch_parent_message_id"])
+        raw_generation = args["expected_launch_parent_message_id"]
+        # obs-54: a launch whose parent confirmation never reached Telegram goes on
+        # without a launch message, so its generation is None (obs-agentctl and the
+        # rounds watchdog spell it "None"); it still matches only that record.
+        generation = (
+            None if raw_generation is None or str(raw_generation).strip() in ("None", "null")
+            else int(raw_generation)
+        )
         key = hashlib.sha256(json.dumps([args["parent_team"], args["parent_agent"], task_id, generation]).encode()).hexdigest()
         locks = self.__dict__.setdefault("_control_stop_locks", {})
         async with locks.setdefault(key, asyncio.Lock()):
@@ -6899,8 +6914,9 @@ class TelegramBot:
             from obs_agent.tools import _resolve_hook_spec_path
 
             try:
+                # obs-54: validation runs Git subprocesses; keep them off the event loop.
                 hooks = {
-                    str(event): _resolve_hook_spec_path(spec, self._config.vault_path)
+                    str(event): await asyncio.to_thread(_resolve_hook_spec_path, spec, self._config.vault_path)
                     for event, spec in hooks.items()
                 }
             except ValueError as exc:
@@ -12084,10 +12100,12 @@ class TelegramBot:
         (~19k on 2026-10-25) every 3 s, and reading and parsing each file
         blocked the event loop. The answer is a function of the file bytes and
         the wake floor, so it is reused while the file's identity (device,
-        inode, size, mtime) is unchanged. It is stored only for a file last
-        modified more than ``_INBOX_CACHE_SETTLE_SECONDS`` before it was read:
-        a later write then gets a later mtime even on a coarse filesystem
-        clock, so a same-size rewrite cannot hide behind the stored identity.
+        inode, size, mtime, ctime) is unchanged. Any write, and any utime that
+        restores an old mtime, sets ctime to the current time, which userspace
+        cannot set back. The answer is stored only for a file whose last
+        change (the later of mtime and ctime) is more than
+        ``_INBOX_CACHE_SETTLE_SECONDS`` old when it is read, so a later write
+        gets a later timestamp even on a coarse filesystem clock.
         """
         inbox_path = self._team_inbox_path(team_name, agent_name)
         try:
@@ -12095,19 +12113,19 @@ class TelegramBot:
         except OSError:
             self._inbox_latest_cache.pop(inbox_path, None)
             return None
-        identity = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        identity = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
         floor = self._inbox_wake_floor
         cached = self._inbox_latest_cache.get(inbox_path)
         if cached is not None and cached[0] == identity and cached[1] == floor:
             return cached[2]
-        settled = time.time() - st.st_mtime > _INBOX_CACHE_SETTLE_SECONDS
+        settled = time.time() - max(st.st_mtime, st.st_ctime) > _INBOX_CACHE_SETTLE_SECONDS
         result = self._latest_unread_team_inbox_message(team_name=team_name, agent_name=agent_name)
         try:
             after = inbox_path.stat()
         except OSError:
             after = None
         if settled and after is not None and (
-            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
         ) == identity:
             self._inbox_latest_cache[inbox_path] = (identity, floor, result)
         else:

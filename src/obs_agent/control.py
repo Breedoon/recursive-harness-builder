@@ -117,7 +117,14 @@ def validate_request(request: Any) -> str | None:
         "stop": ("parent_team", "parent_agent", "team_name", "agent_name", "expected_task_id", "expected_launch_parent_message_id"),
         "new_tree": ("title",),
     }.get(op, ())
-    missing = [key for key in required if not str(args.get(key) or "").strip()]
+    # A stop's generation may be null: a launch whose parent confirmation never
+    # reached Telegram has no launch message id (obs-54). It must still be given.
+    nullable = {"expected_launch_parent_message_id"} if op == "stop" else set()
+    missing = [
+        key for key in required
+        if not (key in nullable and key in args and args[key] is None)
+        and not str(args.get(key) or "").strip()
+    ]
     if missing:
         return f"{op} needs {', '.join(missing)}"
     if op in ("launch", "new_tree") and not (

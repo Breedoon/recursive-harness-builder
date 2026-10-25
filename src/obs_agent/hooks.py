@@ -734,6 +734,11 @@ _TRUSTED_HOOK_FUNCTIONS = {
         frozenset({"check", "recovery_check"}),
     "Projects/Personal Projects/Agentic/Agent Operations/scripts/ops/rounds.py":
         frozenset({"recovery_handoff"}),
+    # Registry high availability (ops-114): standby roots launch with this guard
+    # (procedures/registry/high-availability.md, scripts/ops/registry_ha.py). It
+    # postdates the 13:00Z inventory; the obs-54 V1 hook census found it.
+    "Projects/Personal Projects/Agentic/Agent Operations/scripts/ops/registry_ha_guard.py":
+        frozenset({"check"}),
     "Projects/Personal Projects/Personal Intelligence/scripts/pi_runner_guard.py": frozenset({"check"}),
 }
 _TRUSTED_HOOK_FILES = frozenset(_TRUSTED_HOOK_FUNCTIONS)
