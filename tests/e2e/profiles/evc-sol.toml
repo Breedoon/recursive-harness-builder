@@ -1,0 +1,19 @@
+# Planning-only lifecycle probe profile: existing Codex route, no Claude calls.
+name = "evc-sol"
+credential_class = "sub"
+route = "gpt"
+model = "sol"
+claude_credentials = "shared-lane-copy"
+bot_pool = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+bot_pool_exclude = ["env:OBS_TEST_TELEGRAM_BOT_TOKEN"]
+userbot_id_ref = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
+needs_cliproxy = true
+subcredential = "codex-oauth-1"
+spend_cap_usd = 5.0
+
+[lane_env]
+OBS_AGENT_MODEL = "sol"
+OBS_DEFAULT_MODEL = "sol"
+OBS_EFFORT_LEVEL = "low"
+OBS_NEW_SESSION_EFFORT_LEVEL = "low"
+OBS_CLAUDE_KILL_ON_IDLE = "1"
