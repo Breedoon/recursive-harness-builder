@@ -18,7 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
-from telegram.error import BadRequest, Conflict, TelegramError
+from telegram.error import BadRequest, Conflict, InvalidToken, NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.request import HTTPXRequest
 
 from obs_agent.config import normalize_model_for_claude_code, resolve_model
 from obs_agent.events import StatusEvent
@@ -8608,6 +8609,145 @@ class TestTelegramTransport:
         assert route.chat_id not in bot._chat_pending_ops
         assert route.chat_id not in bot._typing_tasks
         await bot.shutdown()
+
+
+class TestTelegramPollingRetry:
+    @pytest.fixture
+    def polling_request(self, config):
+        config.telegram_bot_token = "fake-token"
+        app = create_telegram_app(config)
+        return app.bot._request[0]
+
+    @pytest.mark.parametrize("error", [Conflict("stale poll"), NetworkError("connection reset"), TimedOut()])
+    async def test_transient_poll_failure_retries_without_restarting(self, polling_request, error):
+        kwargs = {"url": "https://example.invalid/getUpdates", "request_data": object(), "read_timeout": 15}
+        with (
+            patch.object(HTTPXRequest, "post", new_callable=AsyncMock, side_effect=[error, []]) as post,
+            patch("obs_agent.telegram.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            assert await polling_request.post(**kwargs) == []
+        assert post.call_count == 2
+        assert all(call.kwargs == kwargs for call in post.call_args_list)
+        assert [call.args[0] for call in sleep.await_args_list] == [2.0]
+        assert polling_request.exhausted_error is None
+
+    async def test_real_ptb_409_response_recovers_to_an_empty_poll(self, polling_request):
+        responses = [
+            (409, b'{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request"}'),
+            (200, b'{"ok":true,"result":[]}'),
+        ]
+        with (
+            patch.object(HTTPXRequest, "do_request", new_callable=AsyncMock, side_effect=responses) as do_request,
+            patch("obs_agent.telegram.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            assert await polling_request.post(url="https://example.invalid/getUpdates") == []
+        assert do_request.call_count == 2
+        sleep.assert_awaited_once_with(2.0)
+
+    async def test_mixed_failures_share_one_bounded_backoff(self, polling_request):
+        with (
+            patch.object(HTTPXRequest, "post", new_callable=AsyncMock,
+                         side_effect=[Conflict("stale poll"), NetworkError("reset"), TimedOut(), []]),
+            patch("obs_agent.telegram.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            assert await polling_request.post(url="https://example.invalid/getUpdates") == []
+        assert [call.args[0] for call in sleep.await_args_list] == [2.0, 4.0, 8.0]
+
+    @pytest.mark.parametrize("error", [Conflict("persistent poller"), NetworkError("offline"), TimedOut()])
+    async def test_exhaustion_is_latched_and_does_not_hot_loop(self, polling_request, error):
+        with (
+            patch.object(HTTPXRequest, "post", new_callable=AsyncMock, side_effect=error) as post,
+            patch("obs_agent.telegram.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            with pytest.raises(TelegramError, match="polling retry budget exhausted"):
+                await polling_request.post(url="https://example.invalid/getUpdates")
+            with pytest.raises(TelegramError, match="polling retry budget exhausted"):
+                await polling_request.post(url="https://example.invalid/getUpdates")
+        assert post.call_count == 6
+        assert [call.args[0] for call in sleep.await_args_list] == [2.0, 4.0, 8.0, 16.0, 30.0]
+        assert polling_request.exhausted_error is error
+
+    @pytest.mark.parametrize("error", [BadRequest("bad input"), InvalidToken("bad token"), RetryAfter(30)])
+    async def test_non_transport_errors_are_left_to_ptb(self, polling_request, error):
+        with (
+            patch.object(HTTPXRequest, "post", new_callable=AsyncMock, side_effect=error) as post,
+            patch("obs_agent.telegram.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            with pytest.raises(type(error)):
+                await polling_request.post(url="https://example.invalid/getUpdates")
+        assert post.call_count == 1
+        sleep.assert_not_awaited()
+        assert polling_request.exhausted_error is None
+
+    async def test_success_resets_budget_for_the_next_poll(self, polling_request):
+        with (
+            patch.object(HTTPXRequest, "post", new_callable=AsyncMock,
+                         side_effect=[Conflict("first"), [], Conflict("second"), []]),
+            patch("obs_agent.telegram.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            assert await polling_request.post(url="https://example.invalid/getUpdates") == []
+            assert await polling_request.post(url="https://example.invalid/getUpdates") == []
+        assert [call.args[0] for call in sleep.await_args_list] == [2.0, 2.0]
+
+    async def test_shutdown_cancels_the_retry_backoff(self, polling_request):
+        with (
+            patch.object(HTTPXRequest, "post", new_callable=AsyncMock, side_effect=Conflict("stale")) as post,
+            patch("obs_agent.telegram.asyncio.sleep", new_callable=AsyncMock,
+                  side_effect=asyncio.CancelledError) as sleep,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await polling_request.post(url="https://example.invalid/getUpdates")
+        assert post.call_count == 1
+        sleep.assert_awaited_once_with(2.0)
+        assert polling_request.exhausted_error is None
+
+    @pytest.mark.parametrize("error", [Conflict("persistent"), NetworkError("offline"), TimedOut()])
+    async def test_exhausted_polling_budget_exits_runtime_even_without_timeout_callback(
+        self, config, polling_request, error
+    ):
+        bot = SimpleNamespace(
+            initialize_runtime=AsyncMock(), _ensure_background_poller=AsyncMock(),
+            start_maintenance_resume=MagicMock(), start_crash_snapshot_writer=MagicMock(),
+            shutdown=AsyncMock(),
+        )
+
+        async def start_polling(**_kwargs):
+            with pytest.raises(TelegramError, match="polling retry budget exhausted"):
+                await polling_request.post(url="https://example.invalid/getUpdates")
+
+        app = SimpleNamespace(
+            bot=AsyncMock(), bot_data={"obs_telegram_bot": bot, "obs_polling_request": polling_request},
+            running=True, initialize=AsyncMock(), start=AsyncMock(), stop=AsyncMock(), shutdown=AsyncMock(),
+            updater=SimpleNamespace(running=True, start_polling=AsyncMock(side_effect=start_polling), stop=AsyncMock()),
+        )
+        original_sleep = asyncio.sleep
+
+        async def yield_sleep(_seconds):
+            await original_sleep(0)
+
+        with (
+            patch("obs_agent.telegram.create_telegram_app", return_value=app),
+            patch("obs_agent.telegram._clear_secondary_bot_commands", new_callable=AsyncMock),
+            patch("obs_agent.telegram._set_bot_commands", new_callable=AsyncMock),
+            patch("obs_agent.telegram._install_maintenance_signal_handler"),
+            patch("obs_agent.telegram._start_orphan_cli_reaper"),
+            patch("obs_agent.telegram._PROCESS_CRASH_RESUME_ATTEMPTED", False),
+            patch("obs_agent.telegram.asyncio.sleep", side_effect=yield_sleep),
+            patch.object(HTTPXRequest, "post", new_callable=AsyncMock, side_effect=error) as post,
+        ):
+            with pytest.raises(TelegramError, match="polling retry budget exhausted"):
+                await asyncio.wait_for(run_telegram_bot(config), timeout=3)
+        assert post.call_count == 6
+        app.updater.stop.assert_awaited_once()
+        app.shutdown.assert_awaited_once()
+        bot.shutdown.assert_awaited_once()
+
+    def test_only_get_updates_uses_the_retry_request(self, config):
+        config.telegram_bot_token = "fake-token"
+        app = create_telegram_app(config)
+        assert type(app.bot.request) is HTTPXRequest
+        assert type(app.bot._request[0]) is not HTTPXRequest
+        assert app.bot_data["obs_polling_request"] is app.bot._request[0]
 
 
 class TestCreateTelegramApp:

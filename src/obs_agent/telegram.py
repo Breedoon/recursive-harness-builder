@@ -36,8 +36,9 @@ except Exception:  # pragma: no cover - optional import error surfaced on cron c
 
 from telegram import Bot, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, Conflict, RetryAfter, TelegramError
+from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest
 
 from obs_agent.context_stats import (
     build_context_snapshot,
@@ -13823,6 +13824,44 @@ class TelegramBot:
         )
 
 
+_TELEGRAM_POLL_RETRY_DELAYS = (2.0, 4.0, 8.0, 16.0, 30.0)
+
+
+class _TelegramPollingRetryExhaustedError(TelegramError):
+    pass
+
+
+class _TelegramPollingRequest(HTTPXRequest):
+    def __init__(self) -> None:
+        super().__init__(connection_pool_size=1)
+        self.exhausted_error: TelegramError | None = None
+
+    async def post(self, *args: Any, **kwargs: Any) -> Any:
+        if self.exhausted_error is not None:
+            raise _TelegramPollingRetryExhaustedError("Telegram polling retry budget exhausted")
+        for attempt in range(len(_TELEGRAM_POLL_RETRY_DELAYS) + 1):
+            try:
+                result = await super().post(*args, **kwargs)
+            except BadRequest:
+                raise
+            except (Conflict, NetworkError) as exc:
+                if attempt == len(_TELEGRAM_POLL_RETRY_DELAYS):
+                    self.exhausted_error = exc
+                    raise _TelegramPollingRetryExhaustedError(
+                        "Telegram polling retry budget exhausted"
+                    ) from exc
+                delay = _TELEGRAM_POLL_RETRY_DELAYS[attempt]
+                logger.warning(
+                    "[polling_retry] error=%s retry=%s/%s backoff=%.1fs",
+                    type(exc).__name__, attempt + 1, len(_TELEGRAM_POLL_RETRY_DELAYS), delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                if attempt:
+                    logger.info("[polling_retry] recovered after %s retries", attempt)
+                return result
+
+
 def create_telegram_app(config: OBSConfig) -> Application:
     """Create and configure a python-telegram-bot Application."""
     primary_token = config.telegram_primary_bot_token
@@ -13835,13 +13874,16 @@ def create_telegram_app(config: OBSConfig) -> Application:
         )
 
     bot = TelegramBot(config)
+    polling_request = _TelegramPollingRequest()
     app = (
         Application.builder()
         .token(primary_token)
+        .get_updates_request(polling_request)
         .concurrent_updates(True)
         .build()
     )
     app.bot_data["obs_telegram_bot"] = bot
+    app.bot_data["obs_polling_request"] = polling_request
     app.add_handler(MessageHandler(filters.COMMAND, bot.log_command_update), group=-1)
     app.add_handler(
         MessageHandler(
@@ -14027,6 +14069,11 @@ async def _run_telegram_bot_once(config: OBSConfig, *, first_start: bool = True)
         while True:
             await asyncio.sleep(_TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS)
             updater_running = app.updater.running if app.updater is not None else False
+            polling_request = app.bot_data.get("obs_polling_request")
+            if isinstance(polling_request, _TelegramPollingRequest) and polling_request.exhausted_error is not None:
+                raise _TelegramPollingRetryExhaustedError(
+                    "Telegram polling retry budget exhausted"
+                ) from polling_request.exhausted_error
             if not polling_error.empty():
                 raise _TelegramPollingConflictError(
                     "Telegram polling conflict: another getUpdates consumer is active"
@@ -14134,7 +14181,7 @@ def _install_maintenance_signal_handler(tg_bot: "TelegramBot") -> None:
 
 def _is_fatal_telegram_runtime_error(exc: Exception) -> bool:
     """Errors that should fail fast rather than trigger restart loops."""
-    return isinstance(exc, (ValueError, _TelegramPollingConflictError))
+    return isinstance(exc, (ValueError, _TelegramPollingConflictError, _TelegramPollingRetryExhaustedError))
 
 
 async def run_telegram_bot(config: OBSConfig) -> None:
