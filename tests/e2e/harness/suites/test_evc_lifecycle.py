@@ -53,9 +53,28 @@ async def _shape(lane, shape, nonce, root, signals, proof):
         # The fixture is in the throwaway lane vault, not the protected OBS source tree.
         command = shlex.join(["python3", "./evc_fixture.py", "hold", "--root", root])
         prompt = f"Call Bash once with command `{command}`, timeout120000, foreground only. Wait for its result."
-    sent = await lane.send(topic, prompt)
+    if shape in {"S2", "S5m"}:
+        from types import SimpleNamespace
+        hooks = {"PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/executor_guard.py::check"}
+        mark = lane.events.mark()
+        result = await lane.control("--json", "--as", "evc-fixture", "launch",
+            "--parent-team", ready.end["team"], "--parent", ready.end["agent_name"],
+            "--name", f"EV-C fixture {nonce}", "--fresh", "--model", "sol", "--effort", "low",
+            "--hooks", json.dumps(hooks),
+            "--prompt", "Role: executor. Isolated E2E lifecycle fixture only; no exploration, registration or helpers. " + prompt)
+        proof["fixture_child_control"] = result
+        assert result["rc"] == 0, result
+        response = json.loads(result["stdout"])
+        child = response["result"]
+        proof["fixture_child"] = child
+        start = await lane.wait("turn_start", agent=child["agent_name"], after=mark)
+        topic = int(start["topic_id"])
+        proof["topic_id"] = topic
+        sent = SimpleNamespace(message_id=start.get("trigger_message_id"))
+    else:
+        sent = await lane.send(topic, prompt)
+        start = await lane.wait("turn_start", match={"trigger_message_id": sent.message_id})
     proof["trigger_message_id"] = sent.message_id
-    start = await lane.wait("turn_start", match={"trigger_message_id": sent.message_id})
     proof["turn_start"] = start
     if shape == "S3":
         # Thinking is emitted from a real model stream before the final assistant
@@ -106,7 +125,7 @@ async def _run(lane, config, shape, path):
             proof["stop_sent"] = (await lane.command(topic, "/stop")).message_id
             ack, end, cleanup = await asyncio.gather(
                 lane.wait("telegram_send", agent=topic, match=lambda e: "interrupt sent" in (e.get("text_head") or "").lower(), after=observed["ts"]),
-                lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start),
+                lane.wait("turn_end", agent=topic, after=start),
                 lane.wait("stop_cleanup", agent=topic, after=start, timeout=45),
             )
             proof.update(interrupt_ack=ack, turn_end=end, stop_cleanup=cleanup)
