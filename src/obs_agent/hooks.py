@@ -23,6 +23,7 @@ import asyncio
 import importlib.util
 import inspect
 import logging
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Awaitable
@@ -706,21 +707,104 @@ def _make_stop_check(state: HookState) -> CheckFn:
 _log = logging.getLogger(__name__)
 
 
-def load_hook_function(file_path: str, function_name: str) -> Callable:
-    """Dynamically load a Python function from a file path.
+# Explicit inventory, not an arbitrary **/hooks glob: uploads must never become
+# daemon code just by being put in a directory named "hooks".
+_TRUSTED_HOOK_DIRS = (
+    "Projects/Personal Projects/Agentic/Agentic Fractals/hooks",
+    "Projects/Personal Projects/Agentic/Agentic Fractals/procedures/hooks",
+)
+_TRUSTED_HOOK_FUNCTIONS = {
+    **{f"{_TRUSTED_HOOK_DIRS[0]}/{name}.py": frozenset({"check"}) for name in (
+        "assembler_eval_guard", "assembler_guard", "executor_guard", "holder_guard",
+        "level_context_guard", "new_chat_guard", "reporter_spawn_guard", "router_guard",
+        "service_writer_guard", "session_scope_guard_v1", "session_scope_guard_v2",
+        "supervisor_guard", "verifier_guard", "watchdog_check_guard", "watchdog_check_guard_v2",
+    )},
+    **{f"{_TRUSTED_HOOK_DIRS[1]}/{name}_guard.py": frozenset({"check"})
+       for name in ("assembler", "router", "verifier")},
+    f"{_TRUSTED_HOOK_DIRS[0]}/feedback_stop_hook.py": frozenset({"spawn_feedback"}),
+    f"{_TRUSTED_HOOK_DIRS[0]}/reporter_stop_hook.py": frozenset({"spawn_reporter"}),
+    f"{_TRUSTED_HOOK_DIRS[0]}/service_stop_hook.py": frozenset({"spawn_services"}),
+    f"{_TRUSTED_HOOK_DIRS[0]}/level_composite.py": frozenset({
+        "worker_pre", "checkin_pre", "verifier_pre", "assembler_pre", "holder_pre", "stop",
+        "worker_precompact", "holder_precompact", "assembler_precompact", "verifier_precompact",
+        "checkin_precompact",
+    }),
+    "Projects/Personal Projects/Agentic/Agent Operations/scripts/ops/ops_admin_guard.py":
+        frozenset({"check", "recovery_check"}),
+    "Projects/Personal Projects/Agentic/Agent Operations/scripts/ops/rounds.py":
+        frozenset({"recovery_handoff"}),
+    "Projects/Personal Projects/Personal Intelligence/scripts/pi_runner_guard.py": frozenset({"check"}),
+}
+_TRUSTED_HOOK_FILES = frozenset(_TRUSTED_HOOK_FUNCTIONS)
 
-    Uses ``importlib.util.spec_from_file_location`` — the standard pattern
-    for loading arbitrary Python files (same as pytest/pluggy).
 
-    Raises on all failure modes with clear messages so the caller can
-    decide how to handle (log + skip, or fail fast).
-    """
-    path = Path(file_path).expanduser().resolve()
+class HookValidationError(ValueError):
+    """A hook is not trusted daemon code; do not start an unguarded session."""
 
-    if not path.suffix == ".py":
-        raise ValueError(f"Hook file must be a .py file, got: {path}")
-    if not path.exists():
-        raise FileNotFoundError(f"Hook file not found: {path}")
+
+def _trusted_hook_source(file_path: str, vault_path: Path, function_name: str) -> tuple[Path, bytes]:
+    try:
+        root = vault_path.resolve(strict=True)
+        path = Path(file_path).expanduser()
+        if not path.is_absolute():
+            path = root / path
+        path = path.resolve(strict=True)
+        if not path.is_relative_to(root):
+            raise HookValidationError("path resolves outside the configured vault")
+        relative = path.relative_to(root)
+        if not (
+            relative.as_posix() in _TRUSTED_HOOK_FILES
+            or any(relative.is_relative_to(directory) for directory in _TRUSTED_HOOK_DIRS)
+        ):
+            raise HookValidationError("path is not in a trusted hook directory or guard inventory")
+        if path.suffix != ".py":
+            raise HookValidationError("Hook file must be a .py file")
+        if not path.is_file():
+            raise HookValidationError("hook path is not a regular file")
+        if function_name not in _TRUSTED_HOOK_FUNCTIONS.get(relative.as_posix(), ()):
+            raise HookValidationError("path/function pair is not a trusted hook capability")
+
+        def git(*args: str) -> bytes:
+            return subprocess.run(
+                ["git", "--no-optional-locks", "--literal-pathspecs", "-C", str(root), *args],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+            ).stdout
+
+        if Path(git("rev-parse", "--show-toplevel").decode().strip()).resolve() != root:
+            raise HookValidationError("configured vault must be the Git repository root")
+        entry = git("ls-tree", "-z", "HEAD", "--", relative.as_posix())
+        metadata = entry.split(b"\t", 1)[0].split()
+        if len(metadata) != 3 or metadata[0] not in {b"100644", b"100755"} or metadata[1] != b"blob":
+            raise HookValidationError("hook must be a regular file tracked in Git HEAD")
+        committed = git("cat-file", "blob", metadata[2].decode("ascii"))
+        with path.open("rb") as handle:
+            source = handle.read(len(committed) + 1)
+        if source != committed:
+            raise HookValidationError("hook has uncommitted modifications; commit reviewed hook code first")
+        return path, source
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        reason = str(exc) if isinstance(exc, HookValidationError) else "hook path or Git verification failed"
+        _log.warning("Rejected user hook path=%r reason=%s", file_path, reason)
+        raise HookValidationError(f"Rejected user hook {file_path!r}: {reason}") from exc
+
+
+def validate_hook_spec(spec: str, vault_path: Path) -> str:
+    """Validate without importing, before AgentTask creates a child topic."""
+    if not isinstance(spec, str) or "::" not in spec:
+        _log.warning("Rejected user hook spec=%r: expected file_path::function_name", spec)
+        raise HookValidationError("Hook spec must be 'file_path::function_name'")
+    file_path, function_name = spec.rsplit("::", 1)
+    if not file_path or not function_name.isidentifier():
+        _log.warning("Rejected user hook spec=%r: invalid path or function name", spec)
+        raise HookValidationError("Hook spec requires a path and a Python function name")
+    path, _ = _trusted_hook_source(file_path, vault_path, function_name)
+    return f"{path}::{function_name}"
+
+
+def load_hook_function(file_path: str, function_name: str, *, vault_path: Path) -> Callable:
+    """Load only unchanged Git-tracked code in the vault hook allowlist."""
+    path, source = _trusted_hook_source(file_path, vault_path, function_name)
 
     module_name = f"_obs_user_hook_{path.stem}_{id(path)}"
     spec = importlib.util.spec_from_file_location(module_name, str(path))
@@ -729,7 +813,9 @@ def load_hook_function(file_path: str, function_name: str) -> Callable:
 
     module = importlib.util.module_from_spec(spec)
     try:
-        spec.loader.exec_module(module)
+        # Execute the bytes we verified, never an unchecked .pyc or a second
+        # source read that could race with a replacement after validation.
+        exec(compile(source, str(path), "exec", dont_inherit=True), module.__dict__)
     except SyntaxError as exc:
         raise SyntaxError(f"Syntax error in hook file {path}: {exc}") from exc
     except Exception as exc:
@@ -962,8 +1048,8 @@ def create_hook_matchers(
 
     If *user_hooks* is provided (mapping of event name to
     ``"file_path::function_name"``), the user-supplied check is appended
-    **after** OBS built-in guards so it cannot bypass them.  Loading failures
-    are logged and silently skipped — they never prevent session startup.
+    **after** OBS built-in guards so it cannot bypass them. Hook validation and
+    loading failures are logged and prevent session startup (fail closed).
     """
     interrupt_check = _make_interrupt_check(state)
     immutable_check = _make_immutable_check(config)
@@ -971,26 +1057,22 @@ def create_hook_matchers(
     notification_check = _make_notification_check(state)
     stop_check = _make_stop_check(state)
 
-    # --- resolve user hooks (best-effort, never crash) ---
+    # Validate the entire mapping before importing any hook, including restored
+    # and inherited hooks that did not come through the AgentTask tool handler.
+    validated = {
+        event: validate_hook_spec(spec, config.vault_path)
+        for event, spec in (user_hooks or {}).items()
+    }
     _resolved_user_checks: dict[str, CheckFn] = {}
-    for event_name, spec in (user_hooks or {}).items():
+    for event_name, spec in validated.items():
         try:
-            if "::" not in spec:
-                _log.warning("Invalid user hook spec for %s (missing '::'): %s", event_name, spec)
-                continue
             fpath, fname = spec.rsplit("::", 1)
-            hook_path = Path(fpath)
-            if fpath.startswith("~"):
-                hook_path = hook_path.expanduser()
-            elif not hook_path.is_absolute():
-                hook_path = config.vault_path / hook_path
-            fn = load_hook_function(str(hook_path), fname)
+            fn = load_hook_function(fpath, fname, vault_path=config.vault_path)
             _resolved_user_checks[event_name] = _make_user_hook_check(fn, state)
         except Exception:
-            _log.warning(
-                "Failed to load user hook for %s from '%s' — skipping",
-                event_name, spec, exc_info=True,
-            )
+            _log.error("Failed to load user hook event=%r spec=%r; refusing session startup",
+                       event_name, spec, exc_info=True)
+            raise
 
     def _pipeline(builtin: list[CheckFn], event: str) -> HookPipeline:
         checks = list(builtin)

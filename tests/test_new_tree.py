@@ -76,11 +76,14 @@ def bot(config, tmp_path, monkeypatch):
 
 
 class TestCreateNewTree:
-    async def test_new_root_in_named_chat_returns_identity(self, bot, tmp_path):
+    async def test_new_root_in_named_chat_returns_identity(self, bot, tmp_path, commit_hook):
+        hook = commit_hook(bot._config.vault_path,
+                           "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/new_chat_guard.py",
+                           "def check(a,b,c): pass\n")
         with patch("obs_agent.telegram.Path.home", return_value=tmp_path):
             result = await bot._create_new_tree(
                 trigger_label="t", notice_text="n", chat="procedures", title="Budget to Dot",
-                prompt="do it", hooks={"PreToolUse": "/abs/guard.py::check"},
+                prompt="do it", hooks={"PreToolUse": f"{hook}::check"},
                 model="haiku", effort="high", env={"FOO": "bar"},
                 origin={"kind": "agent", "origin_team": "2026-10-17-11-36-proc-work", "origin_agent": "entry"},
             )
@@ -95,7 +98,7 @@ class TestCreateNewTree:
         assert bootstrap.origin == "new_trunk" and not bootstrap.is_fork
         assert res["root_team_key"] == bootstrap.root_team_key and res["agent_name"] == bootstrap.agent_name
         assert res["agent_name"] == res["root_team_key"]  # a trunk's agent_name is its team key
-        assert state.session_manager.user_hooks == {"PreToolUse": "/abs/guard.py::check"}
+        assert state.session_manager.user_hooks == {"PreToolUse": f"{hook}::check"}
         assert state.session_manager.model_override and "haiku" in state.session_manager.model_override
         assert state.session_manager.effort_override == "high"
         assert state.session_manager.sdk_env_overrides["FOO"] == "bar"
@@ -129,6 +132,12 @@ class TestCreateNewTree:
         assert result["ok"]
         text = bot._run_and_send.call_args.kwargs["user_text"]
         assert '<prompt_file_context path="procedures/x.md">' in text and "FILE BODY" in text and text.endswith("go")
+
+    async def test_untrusted_hook_refused_before_topic_creation(self, bot):
+        result = await bot._create_new_tree(trigger_label="t", notice_text="n", chat=PROC_CHAT,
+                                            title="X", prompt="p", hooks={"PreToolUse": "/tmp/upload.py::check"})
+        assert result["ok"] is False and "Rejected user hook" in result["error"]
+        bot._enqueue_create_topic.assert_not_awaited()
 
     async def test_bad_hooks_refused(self, bot, tmp_path):
         result = await bot._create_new_tree(trigger_label="t", notice_text="n", chat=PROC_CHAT,

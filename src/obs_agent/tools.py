@@ -120,13 +120,9 @@ def _error_result(text: str) -> dict:
 
 
 def _resolve_hook_spec_path(spec: str, vault_path: Path) -> str:
-    file_part, function_name = spec.rsplit("::", 1)
-    file_path = Path(file_part)
-    if file_part.startswith("~"):
-        file_path = file_path.expanduser()
-    elif not file_path.is_absolute():
-        file_path = vault_path / file_path
-    return f"{file_path}::{function_name}"
+    from obs_agent.hooks import validate_hook_spec
+
+    return validate_hook_spec(spec, vault_path)
 
 
 def validate_must_reply_recipient(
@@ -829,7 +825,10 @@ def create_obs_tools(
                         f"Cannot launch {tool_name}: hooks['{event_name}'] must be "
                         f"'file_path::function_name', got: {spec!r}"
                     )
-                resolved_hooks[str(event_name)] = _resolve_hook_spec_path(spec, config.vault_path)
+                try:
+                    resolved_hooks[str(event_name)] = _resolve_hook_spec_path(spec, config.vault_path)
+                except ValueError as exc:
+                    return _error_result(f"Cannot launch {tool_name}: {exc}")
             user_hooks = resolved_hooks
 
         # --- inherit_hooks ---

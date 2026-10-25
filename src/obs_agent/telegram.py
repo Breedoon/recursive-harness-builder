@@ -6840,10 +6840,13 @@ class TelegramBot:
                 return {"ok": False, "error": "hooks must map event names to 'file_path::function_name'"}
             from obs_agent.tools import _resolve_hook_spec_path
 
-            hooks = {
-                str(event): _resolve_hook_spec_path(spec, self._config.vault_path)
-                for event, spec in hooks.items()
-            }
+            try:
+                hooks = {
+                    str(event): _resolve_hook_spec_path(spec, self._config.vault_path)
+                    for event, spec in hooks.items()
+                }
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
         if env is not None and not isinstance(env, dict):
             return {"ok": False, "error": "env must be a JSON object"}
         resolved_model: str | None = None

@@ -492,7 +492,7 @@ class TestAgentTaskTools:
         assert "telegram_topic: https://t.me/c/1/2" in result["content"][0]["text"]
 
     @pytest.mark.asyncio
-    async def test_agent_task_resolves_relative_hook_paths_against_vault(self, monkeypatch, skill_config):
+    async def test_agent_task_resolves_relative_hook_paths_against_vault(self, monkeypatch, skill_config, commit_hook):
         from obs_agent.tools import create_obs_tools
 
         captured = _capture_tools(monkeypatch)
@@ -500,16 +500,13 @@ class TestAgentTaskTools:
         state.fork_task_launcher = AsyncMock(return_value={"content": [{"type": "text", "text": "ok"}]})
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
         handler = _tool_handler(captured["tools"], "AgentTask")
+        relative = "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/router_guard.py"
+        hook = commit_hook(skill_config.vault_path, relative, "def check(a,b,c): pass\n")
 
         result = await handler(
             {
                 "prompt": "Do work",
-                "hooks": json.dumps(
-                    {
-                        "PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/router_guard.py::check",
-                        "Stop": "~/obs-hooks/feedback.py::spawn_feedback",
-                    }
-                ),
+                "hooks": json.dumps({"PreToolUse": relative + "::check", "Stop": str(hook) + "::check"}),
             }
         )
 
@@ -519,7 +516,26 @@ class TestAgentTaskTools:
             skill_config.vault_path
             / "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/router_guard.py"
         ) + "::check"
-        assert launch_args["hooks"]["Stop"].endswith("/obs-hooks/feedback.py::spawn_feedback")
+        assert launch_args["hooks"]["Stop"] == str(hook) + "::check"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("spec", [
+        "/tmp/upload.py::check", "/workspace/runtime/tmp/upload.py::check",
+        "/workspace/runtime/uploads/upload.py::check",
+        "/workspace/runtime/git/obs-artifacts/hook.py::check", "~/obs-hooks/feedback.py::check",
+    ])
+    async def test_agent_task_rejects_untrusted_hook_without_launch(self, monkeypatch, skill_config, spec):
+        from obs_agent.tools import create_obs_tools
+
+        captured = _capture_tools(monkeypatch)
+        state = HookState(fork_task_launcher=AsyncMock())
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        result = await _tool_handler(captured["tools"], "AgentTask")({
+            "prompt": "Do work", "hooks": json.dumps({"PreToolUse": spec}),
+        })
+        assert result["is_error"] is True
+        assert "Cannot launch AgentTask: Rejected user hook" in result["content"][0]["text"]
+        state.fork_task_launcher.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_agent_task_alias_maps_to_transport_description(self, monkeypatch, skill_config):
@@ -3213,7 +3229,7 @@ class TestHooksParameter:
         state.fork_task_launcher.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_hooks_valid_format_passes_through(self, monkeypatch, skill_config):
+    async def test_hooks_valid_format_passes_through(self, monkeypatch, skill_config, commit_hook):
         """Valid hooks dict in file.py::function_name format passes validation."""
         from obs_agent.tools import create_obs_tools
 
@@ -3225,10 +3241,14 @@ class TestHooksParameter:
         create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
         handler = _tool_handler(captured["tools"], "AgentTask")
 
+        directory = "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/"
+        commit_hook(skill_config.vault_path, directory + "router_guard.py", "def check(a,b,c): pass\n")
+        commit_hook(skill_config.vault_path, directory + "new_chat_guard.py", "def check(a,b,c): pass\n")
         result = await handler(
             {
                 "prompt": "test",
-                "hooks": '{"PreToolUse": "guard.py::check_access", "PostToolUse": "log.py::log_result"}',
+                "hooks": json.dumps({"PreToolUse": directory + "router_guard.py::check",
+                                     "PostToolUse": directory + "new_chat_guard.py::check"}),
             }
         )
 
@@ -3236,8 +3256,8 @@ class TestHooksParameter:
         state.fork_task_launcher.assert_awaited_once()
         launch_args = state.fork_task_launcher.await_args.args[0]
         assert launch_args["hooks"] == {
-            "PreToolUse": str(skill_config.vault_path / "guard.py") + "::check_access",
-            "PostToolUse": str(skill_config.vault_path / "log.py") + "::log_result",
+            "PreToolUse": str(skill_config.vault_path / directory / "router_guard.py") + "::check",
+            "PostToolUse": str(skill_config.vault_path / directory / "new_chat_guard.py") + "::check",
         }
 
     @pytest.mark.asyncio

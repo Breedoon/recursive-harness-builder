@@ -316,110 +316,40 @@ class TestIsClaudeModel:
 # ---------------------------------------------------------------------------
 
 class TestHookSpecParsing:
-    """Test hook spec parsing via actual load_hook_function."""
+    """Hook specs select reviewed code, not arbitrary uploaded Python."""
 
-    def test_valid_spec_loads_function(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_file = tmp_path / "guard.py"
-        hook_file.write_text(
-            "def check_access(hook_input, tool_use_id, context):\n"
-            "    return None\n"
-        )
-        fn = load_hook_function(str(hook_file), "check_access")
+    @pytest.mark.parametrize("filename", ["new_chat_guard.py", "router_guard.py"])
+    def test_valid_spec_loads_function(self, tmp_path, commit_hook, filename):
+        from obs_agent.hooks import load_hook_function, _TRUSTED_HOOK_DIRS
+        hook_file = commit_hook(tmp_path, _TRUSTED_HOOK_DIRS[0] + "/" + filename,
+                                "def check(hook_input, tool_use_id, context): return None\n")
+        fn = load_hook_function(str(hook_file), "check", vault_path=tmp_path)
         assert callable(fn)
-        assert fn.__name__ == "check_access"
+        assert fn.__name__ == "check"
 
-    def test_missing_double_colon_in_spec_format(self):
-        """Verify the spec format validation catches single colon."""
-        spec = "/tmp/guard.py:check_access"
-        assert "::" not in spec  # Format check before load
+    def test_missing_double_colon_in_spec_format(self, tmp_path):
+        from obs_agent.hooks import validate_hook_spec, HookValidationError
+        with pytest.raises(HookValidationError, match="file_path::function_name"):
+            validate_hook_spec("/tmp/guard.py:check_access", tmp_path)
 
-    def test_path_with_spaces(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_dir = tmp_path / "my hooks"
-        hook_dir.mkdir()
-        hook_file = hook_dir / "guard file.py"
-        hook_file.write_text("def func(h, t, c): return None\n")
-        fn = load_hook_function(str(hook_file), "func")
-        assert callable(fn)
-
-    def test_function_not_found_lists_available(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("def real_func(h, t, c): return None\n")
-        with pytest.raises(AttributeError, match="Available:.*real_func"):
-            load_hook_function(str(hook_file), "nonexistent")
-
-    def test_syntax_error_in_file(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_file = tmp_path / "bad.py"
-        hook_file.write_text("def func(:\n    invalid\n")
-        with pytest.raises(SyntaxError):
-            load_hook_function(str(hook_file), "func")
-
-    def test_non_py_file_rejected(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_file = tmp_path / "hook.txt"
-        hook_file.write_text("not python")
-        with pytest.raises(ValueError, match=".py"):
-            load_hook_function(str(hook_file), "func")
-
-    def test_not_callable_rejected(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("my_var = 42\n")
-        with pytest.raises(TypeError, match="not callable"):
-            load_hook_function(str(hook_file), "my_var")
-
-
-# ---------------------------------------------------------------------------
-# Hook function loading (integration with importlib)
-# ---------------------------------------------------------------------------
 
 class TestHookFunctionLoading:
-    def test_load_valid_hook(self, tmp_path):
-        hook_file = tmp_path / "good_hook.py"
-        hook_file.write_text(
-            "def my_hook(hook_input, tool_use_id, context):\n"
-            "    return None\n"
-        )
-        from obs_agent.hooks import load_hook_function
-        fn = load_hook_function(str(hook_file), "my_hook")
-        assert callable(fn)
-        assert fn.__name__ == "my_hook"
+    @pytest.mark.parametrize("filename,source,name,error,match", [
+        ("new_chat_guard.py", "def real_func(h,t,c): return None\n", "check", AttributeError, "Available:.*real_func"),
+        ("new_chat_guard.py", "def func(:\n    invalid\n", "check", SyntaxError, "Syntax error"),
+        ("hook.txt", "not python", "check", ValueError, ".py"),
+        ("new_chat_guard.py", "check = 42\n", "check", TypeError, "not callable"),
+    ])
+    def test_loading_errors(self, tmp_path, commit_hook, filename, source, name, error, match):
+        from obs_agent.hooks import load_hook_function, _TRUSTED_HOOK_DIRS
+        hook_file = commit_hook(tmp_path, _TRUSTED_HOOK_DIRS[0] + "/" + filename, source)
+        with pytest.raises(error, match=match):
+            load_hook_function(str(hook_file), name, vault_path=tmp_path)
 
     def test_load_nonexistent_file(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        with pytest.raises(FileNotFoundError):
-            load_hook_function(str(tmp_path / "nonexistent.py"), "func")
-
-    def test_load_nonexistent_function(self, tmp_path):
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("def other_func(): pass\n")
-        from obs_agent.hooks import load_hook_function
-        with pytest.raises(AttributeError, match="Available:"):
-            load_hook_function(str(hook_file), "nonexistent")
-
-    def test_load_syntax_error(self, tmp_path):
-        hook_file = tmp_path / "bad.py"
-        hook_file.write_text("def func(:\n    this is not valid\n")
-        from obs_agent.hooks import load_hook_function
-        with pytest.raises(SyntaxError):
-            load_hook_function(str(hook_file), "func")
-
-    def test_load_non_py_file(self, tmp_path):
-        hook_file = tmp_path / "hook.txt"
-        hook_file.write_text("not python")
-        from obs_agent.hooks import load_hook_function
-        with pytest.raises(ValueError, match=".py"):
-            load_hook_function(str(hook_file), "func")
-
-    def test_load_not_callable(self, tmp_path):
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("my_var = 42\n")
-        from obs_agent.hooks import load_hook_function
-        with pytest.raises(TypeError, match="not callable"):
-            load_hook_function(str(hook_file), "my_var")
+        from obs_agent.hooks import load_hook_function, HookValidationError
+        with pytest.raises(HookValidationError):
+            load_hook_function(str(tmp_path / "nonexistent.py"), "func", vault_path=tmp_path)
 
 
 # ---------------------------------------------------------------------------
