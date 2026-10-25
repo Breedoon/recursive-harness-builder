@@ -51,8 +51,14 @@ async def _shape(lane, shape, nonce, root, signals, proof):
         prompt = "Write every integer from1 through8000, one per line, no other text and no tools."
     elif shape == "S1":
         command = shlex.join(["python3", "./evc_fixture.py", "hold", "--root", root])
-        prompt = (f"Call Bash exactly once with command `{command}`, timeout120000 and run_in_background=true. "
-                  "After it returns, write every integer from1 through8000, one per line, with no further tools.")
+        if proof.get("idle_completion_barrier"):
+            barrier = shlex.join(["python3", "./evc_fixture.py", "hold", "--root", proof["idle_completion_barrier"]])
+            prompt = (f"Call Bash with command `{command}`, timeout120000 and run_in_background=true. "
+                      f"Then call Bash once with command `{barrier}`, timeout120000, foreground only. "
+                      "After that foreground call returns, reply DONE and use no further tools.")
+        else:
+            prompt = (f"Call Bash exactly once with command `{command}`, timeout120000 and run_in_background=true. "
+                      "After it returns, write every integer from1 through8000, one per line, with no further tools.")
     elif shape == "S5m":
         prompt = "Call the `mcp__evc-hold__hold_probe` tool exactly once now; no other tool, then reply DONE."
     else:
