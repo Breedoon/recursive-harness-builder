@@ -35,10 +35,18 @@ def hold(root: Path, kind: str) -> str:
     descriptor = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
     try:
         record(root, kind)
-        readable, _, _ = select.select([descriptor], [], [], 180)
-        if not readable:
-            raise TimeoutError("EV-C bounded shape fixture was never released")
-        os.read(descriptor, 4096)
+        deadline = time.monotonic() + 180
+        heartbeat = (root / "heartbeat-enabled").exists()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("EV-C bounded shape fixture was never released")
+            if heartbeat:
+                record(root, "heartbeat")
+            readable, _, _ = select.select([descriptor], [], [], min(0.5, remaining) if heartbeat else remaining)
+            if readable:
+                os.read(descriptor, 4096)
+                break
     finally:
         os.close(descriptor)
     return "EV-C fixture released"
@@ -46,7 +54,7 @@ def hold(root: Path, kind: str) -> str:
 
 def _safe_cli_flags(args: list[bytes]) -> dict:
     tokens = [value.decode(errors="replace") for value in args if value]
-    safe_values = {"--input-format", "--output-format", "--model", "--permission-mode", "--setting-sources"}
+    safe_values = {"--input-format", "--output-format", "--model", "--permission-mode", "--setting-sources", "--resume", "--session-id"}
     result = {"flag_names": [value for value in tokens if value.startswith("--")]}
     for index, value in enumerate(tokens[:-1]):
         if value in safe_values:
