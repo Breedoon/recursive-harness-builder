@@ -31,7 +31,7 @@ def _user_rows(path: Path) -> list[dict]:
     return rows
 
 
-def _native_tool_session(directory: Path, root: str) -> dict:
+def _native_tool_session(directory: Path, root: str, mcp_name: str | None = None) -> dict:
     hits = {}
     for path in directory.glob("*.jsonl"):
         for line in path.read_text().splitlines():
@@ -41,10 +41,11 @@ def _native_tool_session(directory: Path, root: str) -> dict:
                 continue
             for block in content:
                 if (isinstance(block, dict) and block.get("type") == "tool_use"
-                        and root in str((block.get("input") or {}).get("command", ""))):
+                        and (root in str((block.get("input") or {}).get("command", ""))
+                             or (mcp_name is not None and block.get("name") == mcp_name))):
                     hits[path.stem] = {"session_id": path.stem, "source": str(path),
-                        "row_uuid": row.get("uuid"), "tool_use_id": block.get("id"),
-                        "basis": "native own-session assistant tool request with exact unique fixture root"}
+                        "row_uuid": row.get("uuid"), "tool_use_id": block.get("id"), "tool_name": block.get("name"),
+                        "basis": "native own-session tool request; exact unique command root or caller-verified lane MCP descriptor"}
     assert len(hits) == 1, {"matching_native_session_count": len(hits)}
     return next(iter(hits.values()))
 
@@ -125,7 +126,12 @@ async def run_latch(lane, config: str, shape: str):
         if row and row[0]:
             binding = {"session_id": row[0], "basis": "native route_state.session_id"}
         else:
-            binding = _native_tool_session(directory, root)
+            mcp_name = None
+            if shape == "S5m":
+                descriptor = json.loads((vault / ".mcp.json").read_text())["mcpServers"]["evc-hold"]
+                assert descriptor["args"][-2:] == ["--root", root], descriptor
+                mcp_name = "mcp__evc-hold__hold_probe"
+            binding = _native_tool_session(directory, root, mcp_name)
         proof["native_subject_session_binding"] = binding
         proof["subject_session_id"] = session = binding["session_id"]
         session_file = directory / (session + ".jsonl")

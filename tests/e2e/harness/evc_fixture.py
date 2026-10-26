@@ -178,12 +178,31 @@ def zombie_control(root: Path) -> None:
         os.waitpid(child, 0)
 
 
+def delete_test_topic(expected_bot: str, chat: int, topic: int) -> dict:
+    from obs_agent.config import OBSConfig
+    token = OBSConfig.from_env().telegram_primary_bot_token
+    assert token and token.partition(":")[0] == expected_bot, "lane test-bot identity mismatch"
+    import httpx
+    with httpx.Client(timeout=30) as client:
+        response = client.post("https://api.telegram.org/bot" + token + "/deleteForumTopic",
+                               json={"chat_id": chat, "message_thread_id": topic})
+    payload = response.json()
+    result = {"method": "deleteForumTopic", "bot_id": expected_bot, "chat_id": chat, "topic_id": topic,
+              "http_status": response.status_code, "ok": payload.get("ok"), "error_code": payload.get("error_code"),
+              "completed_epoch": time.time(), "scope": "only this case's owned isolated fixture topic"}
+    assert response.status_code == 200 and result["ok"] is True, result
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("hold", "hook", "mcp", "snapshot", "setup", "release", "zombie"))
+    parser.add_argument("mode", choices=("hold", "hook", "mcp", "snapshot", "setup", "release", "zombie", "delete-topic"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--shape", default="S2")
     parser.add_argument("--identities", type=json.loads, default={})
+    parser.add_argument("--expected-bot")
+    parser.add_argument("--chat", type=int)
+    parser.add_argument("--topic", type=int)
     args = parser.parse_args()
     if args.mode == "hold":
         (args.root / "tool-started").touch()
@@ -199,6 +218,8 @@ def main() -> int:
         def hold_probe() -> str:
             return hold(args.root, "mcp_running")
         server.run(transport="stdio")
+    elif args.mode == "delete-topic":
+        print(json.dumps(delete_test_topic(args.expected_bot, args.chat, args.topic)))
     elif args.mode == "zombie":
         zombie_control(args.root)
     elif args.mode == "snapshot":
