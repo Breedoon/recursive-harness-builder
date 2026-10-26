@@ -226,6 +226,9 @@ class StateStore:
         CREATE TABLE IF NOT EXISTS telegram_cooldowns (
           chat_id INTEGER PRIMARY KEY, retry_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS telegram_delivery_cooldowns (
+          chat_id INTEGER PRIMARY KEY, retry_at REAL NOT NULL
+        );
         """)
         self._ensure_column("error_code", "TEXT")
         self._scrub_legacy_content()
@@ -327,15 +330,17 @@ class StateStore:
         matches = self.db.execute("SELECT * FROM jobs WHERE job_id LIKE ? AND user_id=? ORDER BY created_at DESC", (reference + "%", user_id)).fetchall()
         return matches[0] if len(matches) == 1 else None
 
-    def telegram_retry_at(self, chat_id: int) -> float:
-        row = self.db.execute("SELECT retry_at FROM telegram_cooldowns WHERE chat_id=?", (chat_id,)).fetchone()
+    def telegram_retry_at(self, chat_id: int, *, status_edit: bool = False) -> float:
+        table = "telegram_cooldowns" if status_edit else "telegram_delivery_cooldowns"
+        row = self.db.execute(f"SELECT retry_at FROM {table} WHERE chat_id=?", (chat_id,)).fetchone()
         return float(row[0]) if row else 0.0
 
-    def defer_telegram(self, chat_id: int, error: RetryAfter) -> None:
+    def defer_telegram(self, chat_id: int, error: RetryAfter, *, status_edit: bool = False) -> None:
         delay = error.retry_after
         seconds = delay.total_seconds() if hasattr(delay, "total_seconds") else float(delay)
         retry_at = time.time() + seconds + 1
-        self.db.execute("INSERT INTO telegram_cooldowns(chat_id,retry_at) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET retry_at=MAX(retry_at,excluded.retry_at)", (chat_id, retry_at))
+        table = "telegram_cooldowns" if status_edit else "telegram_delivery_cooldowns"
+        self.db.execute(f"INSERT INTO {table}(chat_id,retry_at) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET retry_at=MAX(retry_at,excluded.retry_at)", (chat_id, retry_at))
         self.db.commit()
 
     def pending_deliveries(self):
@@ -856,12 +861,12 @@ class MediaBot:
                 previous_state = state
             self.state.update_job(job_id, state=state, last_status=state)
             now = time.monotonic()
-            if now - last_update >= 30 and self.application and status_message_id and state != announced_state and self.state.telegram_retry_at(chat_id) <= time.time():
+            if now - last_update >= 30 and self.application and status_message_id and state != announced_state and self.state.telegram_retry_at(chat_id, status_edit=True) <= time.time():
                 try:
                     await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: {state} ({backend_id})")
                     announced_state = state
                 except RetryAfter as exc:
-                    self.state.defer_telegram(chat_id, exc)
+                    self.state.defer_telegram(chat_id, exc, status_edit=True)
                     self.state.record_diagnostics(job_id, stage="status", error=exc)
                 except Exception:
                     LOG.debug("status edit failed job=%s", job_id)

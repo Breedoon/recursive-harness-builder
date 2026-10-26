@@ -361,6 +361,7 @@ def test_retry_after_retains_video_and_retries_once_after_restart(tmp_path):
     asyncio.run(bot._deliver_backend_result(job, "backend-retry", 99))
     assert store.get_job(job)["state"] == "delivery_pending"
     assert store.telegram_retry_at(99) > __import__("time").time() + 25950
+    assert store.telegram_retry_at(99, status_edit=True) == 0
     api.purge.assert_not_awaited()
     assert store.cleanup_candidates() == []
     assert store.nonterminal() == []
@@ -373,7 +374,7 @@ def test_retry_after_retains_video_and_retries_once_after_restart(tmp_path):
     bot.application = SimpleNamespace(bot=sender)
     asyncio.run(bot._retry_pending_deliveries())
     sender.send_video.assert_not_awaited()
-    reopened.db.execute("UPDATE telegram_cooldowns SET retry_at=0")
+    reopened.db.execute("UPDATE telegram_delivery_cooldowns SET retry_at=0")
     reopened.db.commit()
     asyncio.run(bot._retry_pending_deliveries())
     asyncio.run(bot._retry_pending_deliveries())
@@ -411,7 +412,7 @@ def test_ambiguous_network_send_retains_result_without_automatic_replay(tmp_path
     assert store.get_job(job)["state"] == "delivered"
 
 
-def test_status_retry_after_suppresses_later_edits_and_defers_result(tmp_path, monkeypatch):
+def test_status_retry_after_suppresses_edits_without_blocking_video_delivery(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
     from telegram.error import RetryAfter
@@ -420,7 +421,7 @@ def test_status_retry_after_suppresses_later_edits_and_defers_result(tmp_path, m
     store = StateStore(tmp_path / "state.sqlite3")
     job = store.create_job(user_id=5129431382, chat_id=99, message_id=1, prompt="synthetic", request={})
     store.update_job(job, backend_job_id="backend-status", state="queued", status_message_id=7)
-    api = SimpleNamespace(status=AsyncMock(side_effect=[{"state":"running"}, {"state":"running"}, {"state":"succeeded"}]), result=AsyncMock(), purge=AsyncMock())
+    api = SimpleNamespace(status=AsyncMock(side_effect=[{"state":"running"}, {"state":"running"}, {"state":"succeeded"}]), result=AsyncMock(return_value=(b"synthetic-video", "video/mp4")), purge=AsyncMock())
     sender = SimpleNamespace(edit_message_text=AsyncMock(side_effect=RetryAfter(25958)), send_video=AsyncMock())
     bot = MediaBot(token="", state=store, api=api, result_root=tmp_path / "results")
     bot.application = SimpleNamespace(bot=sender)
@@ -429,10 +430,36 @@ def test_status_retry_after_suppresses_later_edits_and_defers_result(tmp_path, m
     monkeypatch.setattr(module.asyncio, "sleep", no_wait)
     asyncio.run(bot._watch(job, "backend-status", 99))
     sender.edit_message_text.assert_awaited_once()
-    sender.send_video.assert_not_awaited()
-    api.result.assert_not_awaited()
-    api.purge.assert_not_awaited()
-    assert store.get_job(job)["state"] == "delivery_pending"
+    sender.send_video.assert_awaited_once()
+    api.result.assert_awaited_once()
+    api.purge.assert_awaited_once()
+    assert store.telegram_retry_at(99, status_edit=True) > __import__("time").time()
+    assert store.telegram_retry_at(99) == 0
+    assert store.get_job(job)["state"] == "delivered"
+
+
+def test_existing_status_edit_deadline_does_not_block_retained_video_after_restart(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import time
+
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path)
+    job = store.create_job(user_id=5129431382, chat_id=99, message_id=1, prompt="synthetic", request={})
+    store.update_job(job, backend_job_id="backend-held", state="delivery_pending")
+    store.db.execute("INSERT INTO telegram_cooldowns(chat_id,retry_at) VALUES(?,?)", (99, time.time() + 25958))
+    store.db.commit()
+    store.db.close()
+    reopened = StateStore(path)
+    api = SimpleNamespace(result=AsyncMock(return_value=(b"synthetic-video", "video/mp4")), purge=AsyncMock())
+    sender = SimpleNamespace(send_video=AsyncMock())
+    bot = MediaBot(token="", state=reopened, api=api, result_root=tmp_path / "results")
+    bot.application = SimpleNamespace(bot=sender)
+    asyncio.run(bot._retry_pending_deliveries())
+    sender.send_video.assert_awaited_once()
+    assert reopened.get_job(job)["state"] == "delivered"
+    assert reopened.telegram_retry_at(99, status_edit=True) > time.time()
+    assert reopened.telegram_retry_at(99) == 0
 
 
 def test_concurrent_pending_and_explicit_delivery_do_not_send_twice(tmp_path):
