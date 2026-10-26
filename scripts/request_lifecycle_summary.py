@@ -200,45 +200,68 @@ def create_manifest(
     source_census = []
     candidates, scan_errors = _source_candidates(source_root)
     for scope, source in candidates:
-        disposition, reason = _file_disposition(source, start_ts, end_ts)
+        candidate_class = "canonical" if _is_canonical_source(source) else "unrecognized"
         census_entry = {
             "source": str(source),
             "source_scope": scope,
-            "candidate_class": "canonical" if _is_canonical_source(source) else "unrecognized",
-            "disposition": disposition,
-            "reason": reason,
+            "candidate_class": candidate_class,
         }
+        target: Path | None = None
         try:
-            stat = source.stat()
-            census_entry.update({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+            before = source.stat()
+            before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            disposition, reason = _file_disposition(source, start_ts, end_ts)
+            snapshot_sha256 = None
+            if disposition == "included":
+                target = snapshot / scope / source.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+                snapshot_sha256 = _sha256(target)
+            source_sha256 = _sha256(source)
+            after = source.stat()
+            after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            stable = before_identity == after_identity and (
+                snapshot_sha256 is None or snapshot_sha256 == source_sha256
+            )
+            if not stable:
+                census_entry.update({
+                    "disposition": "unavailable",
+                    "reason": "source_changed_during_snapshot",
+                    "size_before": before.st_size,
+                    "mtime_ns_before": before.st_mtime_ns,
+                    "size_after": after.st_size,
+                    "mtime_ns_after": after.st_mtime_ns,
+                })
+                if target is not None:
+                    target.unlink(missing_ok=True)
+            else:
+                census_entry.update({
+                    "disposition": disposition,
+                    "reason": reason,
+                    "size": before.st_size,
+                    "mtime_ns": before.st_mtime_ns,
+                    "source_sha256": source_sha256,
+                })
+                if target is not None and snapshot_sha256 is not None:
+                    entry = {
+                        "kind": "lifecycle_source",
+                        "source": str(source),
+                        "source_scope": scope,
+                        "snapshot": str(target.relative_to(snapshot)),
+                        "size": target.stat().st_size,
+                        "sha256": snapshot_sha256,
+                    }
+                    entries.append(entry)
+                    census_entry.update({
+                        "snapshot": entry["snapshot"],
+                        "sha256": entry["sha256"],
+                    })
         except OSError:
             census_entry.update({
                 "disposition": "unavailable",
-                "reason": "source_stat_failed",
+                "reason": "source_snapshot_failed",
             })
-        if census_entry["disposition"] == "included":
-            target = snapshot / scope / source.name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copyfile(source, target)
-                entry = {
-                    "kind": "lifecycle_source",
-                    "source": str(source),
-                    "source_scope": scope,
-                    "snapshot": str(target.relative_to(snapshot)),
-                    "size": target.stat().st_size,
-                    "sha256": _sha256(target),
-                }
-                entries.append(entry)
-                census_entry.update({
-                    "snapshot": entry["snapshot"],
-                    "sha256": entry["sha256"],
-                })
-            except OSError:
-                census_entry.update({
-                    "disposition": "unavailable",
-                    "reason": "source_copy_failed",
-                })
+            if target is not None:
                 target.unlink(missing_ok=True)
         source_census.append(census_entry)
     retention_state = source_root / "retention-state.json"
@@ -266,7 +289,9 @@ def create_manifest(
             "max_count": MANIFEST_MAX_COUNT,
         },
         "source_census_complete": not scan_errors and all(
-            entry["disposition"] != "unavailable" for entry in source_census
+            entry["disposition"] != "unavailable"
+            and entry["candidate_class"] == "canonical"
+            for entry in source_census
         ),
         "source_census_scan_errors": scan_errors,
         "source_census": source_census,
@@ -581,6 +606,10 @@ def summarize_evidence(
     manifest_census_complete = (
         manifest.get("source_census_complete") is True if manifest else True
     )
+    unrecognized_source_candidates = sum(
+        entry.get("candidate_class") == "unrecognized"
+        for entry in (manifest.get("source_census") or [])
+    )
     complete = (
         conservation_ok
         and manifest_census_complete
@@ -653,6 +682,7 @@ def summarize_evidence(
             "retention_state": retention or None,
             "manifest_census_complete": manifest_census_complete,
             "manifest_census_scan_errors": manifest.get("source_census_scan_errors") or [],
+            "unrecognized_source_candidates": unrecognized_source_candidates,
             "transmission_starts": len(starts),
             "unique_rows": len(rows),
             "transmitted_rows": len(transmitted_row_ids),

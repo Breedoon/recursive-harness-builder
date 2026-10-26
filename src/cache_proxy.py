@@ -2697,17 +2697,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         route_label = "anthropic"
         pin_beta = False
         rlog = REQUEST_LOGGER
-        # Capture receive time and immutable id before parsing/body normalization.
-        req_id = ""
+        # Lifecycle transmission identity exists before parsing. The diagnostic
+        # request log keeps its established session-keyed id after parsing.
+        lifecycle_req_id = ""
         try:
-            if rlog is not None:
-                req_id = rlog.new_request_id("")
-            elif _new_lifecycle_req_id is not None:
-                req_id = _new_lifecycle_req_id("")
+            if _new_lifecycle_req_id is not None:
+                lifecycle_req_id = _new_lifecycle_req_id("")
         except Exception:
             pass
         self._rl = {"t0": ingress_wall, "receive_mono": ingress_mono,
-                    "session_id": "", "req_id": req_id,
+                    "session_id": "", "req_id": "",
+                    "lifecycle_req_id": lifecycle_req_id,
                     "status": None, "usage": None, "error": None}
         self._lc_row = None  # lifecycle row for local requests
         post_bytes = None
@@ -2724,11 +2724,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 self._rl["session_id"] = extract_session_id(data)
                 self._rl["obs"] = extract_obs_fork_context(data)
-                if not self._rl.get("req_id"):
-                    if rlog is not None:
-                        self._rl["req_id"] = rlog.new_request_id(self._rl["session_id"])
-                    elif _new_lifecycle_req_id is not None:
-                        self._rl["req_id"] = _new_lifecycle_req_id(self._rl["session_id"])
+                if rlog is not None:
+                    self._rl["req_id"] = rlog.new_request_id(self._rl["session_id"])
+                elif not self._rl.get("req_id"):
+                    self._rl["req_id"] = self._rl.get("lifecycle_req_id") or (
+                        _new_lifecycle_req_id(self._rl["session_id"])
+                        if _new_lifecycle_req_id is not None else ""
+                    )
             except Exception:
                 pass
 
@@ -2759,8 +2761,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # text is never an attribution authority.
             if is_local and _LifecycleRow is not None and LIFECYCLE_LOGGER is not None:
                 try:
-                    lc_req_id = self._rl.get("req_id") or _new_lifecycle_req_id(
+                    lc_req_id = self._rl.get("lifecycle_req_id") or _new_lifecycle_req_id(
                         self._rl.get("session_id", ""))
+                    self._rl["lifecycle_req_id"] = lc_req_id
                     client_kind = ("claude-cli"
                                    if "claude-cli" in str(self.headers.get("User-Agent", ""))
                                    else "other")
@@ -2918,7 +2921,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         proxy_port = int(getattr(self.server, "server_port", 0) or 0)
                         pool, engine = _local_pool_engine("local-unknown", proxy_port)
                         self._lc_row = _LifecycleRow(
-                            request_id=self._rl.get("req_id") or _new_lifecycle_req_id(""),
+                            request_id=(
+                                self._rl.get("lifecycle_req_id")
+                                or _new_lifecycle_req_id("")
+                            ),
                             session_id="",
                             model="local-unknown-malformed",
                             pool=pool,
@@ -3251,11 +3257,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     }
                     failure_code = "transmission_start_persist_failed"
                 else:
-                    fallback_request_id = rl.get("req_id") or (
+                    fallback_request_id = rl.get("lifecycle_req_id") or (
                         _new_lifecycle_req_id(rl.get("session_id", ""))
                         if _new_lifecycle_req_id is not None else ""
                     )
-                    rl["req_id"] = fallback_request_id
+                    rl["lifecycle_req_id"] = fallback_request_id
                     pool, _engine = _local_pool_engine(log_model or "local-unknown", proxy_port)
                     binding = (
                         LIFECYCLE_BINDINGS.get(rl.get("session_id", ""), at_ts=rl.get("t0"))

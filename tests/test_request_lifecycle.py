@@ -363,6 +363,24 @@ class TestProxyRegressions:
         assert rows[0]["model"] == "local-unknown-malformed"
         assert rows[0]["outcome"] == "error"
 
+    def test_lifecycle_id_is_separate_from_session_keyed_request_log(
+        self, proxy_factory, monkeypatch, tmp_path
+    ):
+        port, _stub, logger, root = proxy_factory()
+        request_root = tmp_path / "request-log"
+        request_logger = cache_proxy.RequestLogger(str(request_root), max_bytes=1_000_000)
+        monkeypatch.setattr(cache_proxy, "REQUEST_LOGGER", request_logger)
+        response = _send(port, body=_body())
+        assert response.status_code == 200
+        logger.flush()
+        request_logger.flush()
+        lifecycle_row = _jsonl(root, "requests-")[0]
+        index_paths = sorted(request_root.glob("*/index.jsonl"))
+        request_row = json.loads(index_paths[0].read_text().splitlines()[0])
+        assert lifecycle_row["request_id"] != request_row["req_id"]
+        assert lifecycle_row["request_id"].endswith("nosessio")
+        assert request_row["req_id"].endswith(SID[:8])
+
     def test_upstream_private_error_is_not_persisted(self, proxy_factory):
         port, _stub, logger, root = proxy_factory(mode="http_error")
         response = _send(port, body=_body())
@@ -581,6 +599,55 @@ class TestSummaryAndReplay:
             tmp_path, start_ts=100.0, end_ts=200.0, manifest_path=manifest_path
         )
         assert summary["coverage"]["malformed_lines"] == 1
+        assert summary["coverage"]["complete"] is False
+
+    def test_manifest_unrecognized_valid_source_forces_incomplete(self, tmp_path):
+        source = tmp_path / "mystery.jsonl"
+        row = self._record("mystery", "vault-gsku.1", "s1", ts=150.0)
+        start = {
+            "schema": COVERAGE_SCHEMA, "ts": 150.0, "kind": "transmission_start",
+            "request_id": "mystery", "attempt_id": "vault-gsku.1",
+            "task_id": "vault-gsku", "category": "obs", "pool": "sparks",
+        }
+        source.write_text(json.dumps(row) + "\n" + json.dumps(start) + "\n", encoding="utf-8")
+        manifest_path = summary_mod.create_manifest(tmp_path, start_ts=100.0, end_ts=200.0)
+        manifest = json.loads(manifest_path.read_text())
+        summary, _ = summary_mod.analyze(
+            tmp_path, start_ts=100.0, end_ts=200.0, manifest_path=manifest_path
+        )
+        assert manifest["source_census_complete"] is False
+        assert summary["coverage"]["complete"] is False
+        assert summary["coverage"]["unrecognized_source_candidates"] == 1
+
+    def test_manifest_detects_excluded_source_append_race(self, tmp_path, monkeypatch):
+        source = tmp_path / "coverage-race.jsonl"
+        source.write_text(json.dumps({
+            "schema": COVERAGE_SCHEMA, "ts": 50.0, "kind": "transmission_start",
+            "request_id": "old", "attempt_id": "vault-gsku.1",
+        }) + "\n", encoding="utf-8")
+        original = summary_mod._file_disposition
+
+        def append_after_classification(path, start_ts, end_ts):
+            disposition = original(path, start_ts, end_ts)
+            if path == source:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "schema": COVERAGE_SCHEMA, "ts": 150.0,
+                        "kind": "transmission_start", "request_id": "late",
+                        "attempt_id": "vault-gsku.1",
+                    }) + "\n")
+            return disposition
+
+        monkeypatch.setattr(summary_mod, "_file_disposition", append_after_classification)
+        manifest_path = summary_mod.create_manifest(tmp_path, start_ts=100.0, end_ts=200.0)
+        manifest = json.loads(manifest_path.read_text())
+        entry = next(item for item in manifest["source_census"] if Path(item["source"]) == source)
+        summary, _ = summary_mod.analyze(
+            tmp_path, start_ts=100.0, end_ts=200.0, manifest_path=manifest_path
+        )
+        assert entry["disposition"] == "unavailable"
+        assert entry["reason"] == "source_changed_during_snapshot"
+        assert manifest["source_census_complete"] is False
         assert summary["coverage"]["complete"] is False
 
     def test_manifest_replay_is_immutable(self, tmp_path):
