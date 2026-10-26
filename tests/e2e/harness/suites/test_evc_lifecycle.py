@@ -70,7 +70,8 @@ async def _shape(lane, shape, nonce, root, signals, proof):
         from types import SimpleNamespace
         hooks = {"PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/executor_guard.py::check"}
         mark = lane.events.mark()
-        child_prompt = "Role: executor. Isolated E2E lifecycle fixture only; no exploration, registration or helpers. " + prompt
+        child_prompt = "Role: executor. Isolated E2E lifecycle fixture only; no exploration, registration or helpers. " + (
+            f"Reply exactly CHILD-READY-{nonce}; do not call any tools." if proof.get("prime_child_before_shape") else prompt)
         if is_alt:
             payload = {"display_name": f"EV-C fixture {nonce}", "fork": False, "model": "sol", "effort": "low",
                        "hooks": json.dumps(hooks), "env": json.dumps({"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"}),
@@ -115,7 +116,14 @@ async def _shape(lane, shape, nonce, root, signals, proof):
         proof["fixture_child_hooks"] = hooks
         topic = int(start["topic_id"])
         proof["topic_id"] = topic
-        sent = SimpleNamespace(message_id=start.get("trigger_message_id"))
+        if proof.get("prime_child_before_shape"):
+            primed = await lane.wait("turn_end", agent=child["agent_name"], after=start)
+            assert primed.get("session_id"), primed
+            proof["child_priming_turn_end"] = primed
+            sent = await lane.send(topic, "Isolated fixture follow-up only; no exploration, registration or helpers. " + prompt)
+            start = await lane.wait("turn_start", match={"trigger_message_id": sent.message_id})
+        else:
+            sent = SimpleNamespace(message_id=start.get("trigger_message_id"))
     else:
         sent = await lane.send(topic, prompt)
         start = await lane.wait("turn_start", match={"trigger_message_id": sent.message_id})

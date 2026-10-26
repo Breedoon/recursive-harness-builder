@@ -45,6 +45,8 @@ async def run_midturn(lane, kind):
     proof = {"cell_id": "NAMED/" + names[kind], "run_id": lane.manifest["run_id"], "lane": lane.name,
              "profile": lane.info["profile"], "model": lane.info["model"], "bot_id": lane.info["bot_id"],
              "started_utc_epoch": time.time(), "require_child": True, "injection_kind": kind,
+             "prime_child_before_shape": True,
+             "priming_reason": "first-turn kill exposed SessionManager session_id absent before the first Result; complete a real child turn before faulting its normal follow-up, never fake a resume id",
              "trigger": {"reconnect": "24cf5ca:runner.py448-495/session.py811-828 real CLI ProcessError -> SDK disconnect/reconnect",
                          "soft-reset": "24cf5ca:runner.py494-495 second stream failure propagates -> telegram.py10271-10298 -> session.py890-897",
                          "route-drop": "24cf5ca:telegram.py1221-1226 TopicDeletedError ->11037-11082 drop route/SDK disconnect"}[kind],
@@ -96,8 +98,7 @@ async def run_midturn(lane, kind):
                                             (start["chat_id"], start["topic_id"])).fetchone()[0]
             finally:
                 connection.close()
-            proof["route_rows_after_drop"] = count
-            assert count == 0, count
+            proof["route_rows_at_drop_log_before_async_teardown"] = count
             proof["route_drop_phase_limit"] = "native route-drop log after owned topic deletion and helper release; SDK Result timing untapped, so not a claim that a model/tool was still active at SDK disconnect"
         else:
             fault_at = time.time()
@@ -131,6 +132,15 @@ async def run_midturn(lane, kind):
         epoch = proof["native_close_event"]["observed_epoch"] + 10
         proof["required_observation_epoch"] = epoch
         await _at_epoch(epoch)
+        if kind == "route-drop":
+            connection = lane.state_db()
+            try:
+                count = connection.execute("SELECT COUNT(*) FROM route_state WHERE chat_id=? AND thread_id=?",
+                                            (start["chat_id"], start["topic_id"])).fetchone()[0]
+            finally:
+                connection.close()
+            proof["route_rows_after_drop_at_observation"] = count
+            assert count == 0, count
         proof["post_cleanup_proc_states"] = after = await _helper(lane, "snapshot", root,
             identities={int(key): value for key, value in identity["owned"].items()})
         proof["owned_original_survivors_at_observation"] = [row for row in after["identity_checks"]
