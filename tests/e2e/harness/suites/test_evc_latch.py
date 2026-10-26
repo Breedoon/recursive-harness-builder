@@ -50,6 +50,24 @@ def _native_tool_session(directory: Path, root: str, mcp_name: str | None = None
     return next(iter(hits.values()))
 
 
+def _native_bootstrap_session(directory: Path, actor: str) -> dict:
+    hits = {}
+    marker = "<agent_name>" + actor + "</agent_name>"
+    for path in directory.glob("*.jsonl"):
+        for line in path.read_text().splitlines():
+            row = json.loads(line)
+            if row.get("type") != "user" or row.get("sessionId") != path.stem:
+                continue
+            content = (row.get("message") or {}).get("content", "")
+            text = content if isinstance(content, str) else "\n".join(
+                block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text") if isinstance(content, list) else ""
+            if "<obs-bootstrap" in text and marker in text:
+                hits[path.stem] = {"session_id": path.stem, "source": str(path), "row_uuid": row.get("uuid"),
+                    "native_actor": actor, "basis": "existing own-session user bootstrap contains exact native fixture actor; read-only metadata, never bootstrap insertion or real-worker identity repair"}
+    assert len(hits) == 1, {"matching_native_bootstrap_sessions": len(hits)}
+    return next(iter(hits.values()))
+
+
 def _ancestry(processes: list[dict], child: int, cli: int) -> list[dict]:
     table = {row["pid"]: row for row in processes}
     result, visited = [], set()
@@ -126,6 +144,8 @@ async def run_latch(lane, config: str, shape: str, *, stream_prompt: str | None 
         directory = lane.lane_dir / "home/.claude/projects/-workspace-runtime-git-obs-vault-active"
         if row and row[0]:
             binding = {"session_id": row[0], "basis": "native route_state.session_id"}
+        elif shape == "S3":
+            binding = _native_bootstrap_session(directory, proof["fixture_child"]["agent_name"])
         else:
             mcp_name = None
             if shape == "S5m":
@@ -136,6 +156,14 @@ async def run_latch(lane, config: str, shape: str, *, stream_prompt: str | None 
         proof["native_subject_session_binding"] = binding
         proof["subject_session_id"] = session = binding["session_id"]
         session_file = directory / (session + ".jsonl")
+        if shape == "S3":
+            own_rows = [json.loads(line) for line in session_file.read_text().splitlines()]
+            tool_count = sum(block.get("type") == "tool_use" for row in own_rows
+                if row.get("type") == "assistant" and row.get("sessionId") == session
+                and isinstance((row.get("message") or {}).get("content"), list)
+                for block in row["message"]["content"] if isinstance(block, dict))
+            proof["pre_event_native_tool_use_count"] = tool_count
+            assert tool_count == 0, tool_count
         proof["user_rows_before_stop"] = user_before = _user_rows(session_file)
         log = lane.lane_dir / "logs/telegram-prod.log"
         offset = log.stat().st_size

@@ -16,6 +16,6 @@ REASONED_STREAM = (
     ("RC-prod", "S2", None),
     ("RC-prod", "S3", REASONED_STREAM),
     ("RC-alt", "S3", REASONED_STREAM),
-])
+], ids=["rp-foreground", "rp-reasoned-stream", "ra-reasoned-stream"])
 async def test_corrected_latch_targets(lane, config, shape, stream_prompt):
     await run_latch(lane, config, shape, stream_prompt=stream_prompt)
