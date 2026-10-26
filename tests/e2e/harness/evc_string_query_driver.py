@@ -25,7 +25,7 @@ async def exercise(root: Path):
     manager.set_sdk_env_overrides({"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"})
     base_options = manager._build_options()
     assert base_options.model.startswith("gpt-6.1-sol"), "never allow a default Claude model"
-    options = dataclasses.replace(base_options, hooks={})
+    options = dataclasses.replace(base_options, hooks={}, mcp_servers={})
     command = shlex.join(["python3", "./evc_fixture.py", "hold", "--root", str(root)])
     prompt = ("Isolated lifecycle component only; no exploration, registration, AgentTask, messaging or other tools. "
               f"Call Bash exactly once with command `{command}`, timeout120000 and run_in_background=true. "
@@ -33,9 +33,9 @@ async def exercise(root: Path):
     transport = SubprocessCLITransport(prompt=prompt, options=options)
     proof = {"input_type": "str", "model": options.model, "component_query_started_epoch": time.time(),
              "normal_OBS_entry": "UNAVAILABLE: pinned ForkRunner.run is the only production string-query definition; static callers absent",
-             "declared_policy": "P6 decision(b): SDK PreToolUse callbacks OFF; existing project settings retained",
+             "declared_policy": "P6 decision(b): SDK callback/MCP channel unavailable after str end_input; SDK hooks OFF and SDK obs-agent MCP omitted for this component only; existing project settings retained",
              "sdk_hook_names": list(options.hooks or {}), "sdk_mcp_names": sorted(options.mcp_servers),
-             "component_not_reference_parity": "CLI parent is this driver, not OBS daemon; normal option factory with explicit Sol/env0 and SDK hooks removed; RC void-rule judgment external",
+             "component_not_reference_parity": "CLI parent is this driver, not OBS daemon; normal option factory auth/env/flags with explicit Sol/env0; SDK hooks and SDK obs-agent MCP absent in this component only, as string-only ForkRunner options also supply neither; NOT_RC_ATTESTED, void-rule judgment external",
              "EOF_time": "not directly instrumented; unmodified SDK internal/client.py133-134 writes str then end_input before yielding messages; epoch below is actual QUERY END"}
     messages, calls = [], []
     result = None
