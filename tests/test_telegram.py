@@ -9579,7 +9579,10 @@ class TestTelegramStatePersistence:
         state.session_manager.set_session_id("sid-existing-attribution")
         monkeypatch.setattr(_start_step, "known_bead_rows", lambda _vault: {
             "vault-gsku": {"id": "vault-gsku", "labels": ["system:obs"]},
-            "vault-gsku.1": {"id": "vault-gsku.1", "labels": ["attempt"]},
+            "vault-gsku.1": {
+                "id": "vault-gsku.1", "labels": ["attempt"],
+                "metadata": {"brief": "/workspace/runtime/git/obs-artifacts/Drafts/Artifacts/briefs/2026-10/vault-gsku.md"},
+            },
         })
         applied = bot._apply_registration_binding_from_text(
             state,

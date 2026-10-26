@@ -88,20 +88,24 @@ def _file_overlaps_window(path: Path, start_ts: float | None, end_ts: float | No
     try:
         with path.open(encoding="utf-8", errors="replace") as handle:
             for line in handle:
+                if not line.strip():
+                    return True
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
-                    continue
-                ts = row.get("ts") if isinstance(row, dict) else None
+                    return True
+                if not isinstance(row, dict):
+                    return True
+                ts = row.get("ts")
                 if not isinstance(ts, (int, float)):
-                    continue
+                    return True
                 if start_ts is not None and float(ts) < start_ts:
                     continue
                 if end_ts is not None and float(ts) >= end_ts:
                     continue
                 return True
     except OSError:
-        return False
+        return True
     return False
 
 
@@ -460,6 +464,7 @@ def summarize_evidence(
     ]
     startup_failures = sum(event.get("kind") == "startup_failure" for event in evidence["coverage"])
     loss_by_id = {event.get("request_id"): event for event in losses if event.get("request_id")}
+    loss_events_without_id = sum(not event.get("request_id") for event in losses)
     row_ids = {row["request_id"] for row in rows}
     transmitted_row_ids = {
         row["request_id"] for row in rows
@@ -495,7 +500,9 @@ def summarize_evidence(
         and stats["schema_errors"] == 0
         and dedupe["missing_request_id"] == 0
         and not dedupe["duplicate_conflicts"]
+        and not classified_loss_ids
         and not unclassified_loss_ids
+        and loss_events_without_id == 0
         and startup_failures == 0
     )
 
@@ -559,6 +566,7 @@ def summarize_evidence(
             "rows_with_start": len(rows_with_start),
             "rows_without_start": len(rows_without_start),
             "classified_losses": len(classified_loss_ids),
+            "loss_events_without_request_id": loss_events_without_id,
             "derived_crash_gap_losses": len(unclassified_loss_ids),
             "unclassified_losses": len(unclassified_loss_ids),
             "loss_codes": dict(sorted(loss_codes.items())),

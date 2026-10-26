@@ -141,7 +141,9 @@ def _select_nearest(ids: set[str], rows: dict[str, dict]) -> str | None:
     return max(ids, key=lambda bead_id: (bead_id.count("."), len(bead_id), bead_id))
 
 
-def _binding_from_brief(text: str, rows: dict[str, dict]) -> dict[str, str | None] | None:
+def _binding_from_brief(
+    text: str, rows: dict[str, dict], receipt_path: Path
+) -> dict[str, str | None] | None:
     match = _BRIEF_HEADER.search(text)
     if match is None:
         return None
@@ -151,6 +153,15 @@ def _binding_from_brief(text: str, rows: dict[str, dict]) -> dict[str, str | Non
         return None
     if attempt_id.rsplit(".", 1)[0] != task_id:
         return None
+    registered_brief = (attempt.get("metadata") or {}).get("brief")
+    if not registered_brief:
+        return None
+    try:
+        if Path(str(registered_brief)).resolve() != receipt_path.resolve():
+            return None
+        receipt_path.resolve().relative_to(_BRIEF_ROOT.resolve())
+    except ValueError:
+        return None
     labels = set(attempt.get("labels") or []) | set((rows.get(task_id) or {}).get("labels") or [])
     lane = next((label.split(":", 1)[1] for label in labels if label.startswith("lane:")), None)
     return {
@@ -158,25 +169,19 @@ def _binding_from_brief(text: str, rows: dict[str, dict]) -> dict[str, str | Non
         "attempt_id": attempt_id,
         "category": _bead_category(attempt_id, rows),
         "lane": lane,
-        "source": "registration_receipt",
+        "source": "registration_receipt_path",
     }
 
 
 def resolve_attribution_binding(
     *,
     texts=(),
-    receipt_texts=(),
     rows: dict[str, dict],
     jsonl_path: Path | None = None,
     session_id: str | None = None,
 ) -> dict[str, str | None] | None:
-    """Resolve only an authoritative registration brief; ambiguous prose stays unassigned."""
+    """Resolve only an authoritative registration brief path; ambiguity stays unassigned."""
     candidates: list[dict[str, str | None]] = []
-    for text in receipt_texts:
-        if text:
-            binding = _binding_from_brief(str(text), rows)
-            if binding:
-                candidates.append(binding)
     for text in texts:
         if not text:
             continue
@@ -187,7 +192,7 @@ def resolve_attribution_binding(
                 content = path.read_text(encoding="utf-8")
             except (OSError, ValueError):
                 continue
-            binding = _binding_from_brief(content, rows)
+            binding = _binding_from_brief(content, rows, path)
             if binding:
                 candidates.append(binding)
     unique = {

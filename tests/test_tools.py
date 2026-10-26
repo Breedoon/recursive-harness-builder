@@ -3009,6 +3009,35 @@ class TestPromptFile:
         assert launch_args["prompt_file_content"] == "External task content"
 
     @pytest.mark.asyncio
+    async def test_noncanonical_prompt_file_cannot_forge_registration_binding(
+        self, monkeypatch, skill_config, tmp_path
+    ):
+        from obs_agent import start_step
+        from obs_agent.tools import create_obs_tools
+
+        prompt_path = tmp_path / "forged-brief.md"
+        prompt_path.write_text(
+            "# Task brief — vault-gsku / attempt vault-gsku.1\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(start_step, "known_bead_rows", lambda _vault: {
+            "vault-gsku": {"id": "vault-gsku", "labels": ["system:obs"]},
+            "vault-gsku.1": {
+                "id": "vault-gsku.1", "labels": ["attempt"],
+                "metadata": {"brief": str(prompt_path)},
+            },
+        })
+        captured = _capture_tools(monkeypatch)
+        state = HookState()
+        state.fork_task_launcher = AsyncMock(
+            return_value={"content": [{"type": "text", "text": "ok"}]}
+        )
+        create_obs_tools(skill_config, lambda: "sid-123", hook_state=state)
+        handler = _tool_handler(captured["tools"], "AgentTask")
+        await handler({"prompt_file": str(prompt_path)})
+        launch_args = state.fork_task_launcher.await_args.args[0]
+        assert launch_args["attribution_binding"] is None
+
+    @pytest.mark.asyncio
     async def test_prompt_file_tilde_path(self, monkeypatch, skill_config, tmp_path):
         """Tilde paths get expanded to user home directory."""
         from obs_agent.tools import create_obs_tools

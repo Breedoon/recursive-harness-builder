@@ -3220,8 +3220,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 deadline = time.monotonic() + LOCAL_HEADER_WAIT_SECONDS
             if lc is not None:
                 lc.mark_upstream_send()
-                if LIFECYCLE_LOGGER is not None:
+                start_persisted = (
                     LIFECYCLE_LOGGER.record_transmission_start(lc)
+                    if LIFECYCLE_LOGGER is not None else False
+                )
+                if not start_persisted and _record_lifecycle_direct_loss is not None:
+                    proxy_port = int(getattr(self.server, "server_port", 0) or 0)
+                    binding = lc.binding or {}
+                    fallback_root = LIFECYCLE_ROOT or (
+                        _lifecycle_root_for_proxy(proxy_port, LOG_DIR)
+                        if _lifecycle_root_for_proxy is not None
+                        else os.path.join(LOG_DIR, "request-lifecycle")
+                    )
+                    _record_lifecycle_direct_loss(
+                        fallback_root,
+                        request_id=lc.request_id,
+                        code="transmission_start_persist_failed",
+                        proxy_port=proxy_port,
+                        attributes={
+                            "session_id": lc.session_id or None,
+                            "task_id": binding.get("task_id"),
+                            "attempt_id": binding.get("attempt_id"),
+                            "category": binding.get("category"),
+                            "pool": lc.pool,
+                        },
+                    )
             elif _record_lifecycle_direct_loss is not None:
                 fallback_request_id = rl.get("req_id") or _new_lifecycle_req_id(
                     rl.get("session_id", "")

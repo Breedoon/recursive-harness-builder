@@ -865,6 +865,7 @@ class RequestLifecycleLogger:
         line = json.dumps(event, separators=(",", ":"), sort_keys=True).encode() + b"\n"
         try:
             with self._lock:
+                new_segment = False
                 if (
                     self._coverage_path is None
                     or (self._coverage_bytes and self._coverage_bytes + len(line) > self._coverage_segment_limit)
@@ -872,13 +873,22 @@ class RequestLifecycleLogger:
                     self._coverage_seq += 1
                     self._coverage_path = self._segment_name("coverage", self._coverage_seq)
                     self._coverage_bytes = 0
+                    new_segment = True
                 fd = os.open(self._coverage_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o640)
                 try:
-                    os.write(fd, line)
+                    view = memoryview(line)
+                    while view:
+                        view = view[os.write(fd, view):]
                     if sync:
                         os.fsync(fd)
                 finally:
                     os.close(fd)
+                if sync and new_segment:
+                    directory_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
                 self._coverage_bytes += len(line)
                 self._account(len(line))
             return True
@@ -886,11 +896,12 @@ class RequestLifecycleLogger:
             self.errors += 1
             return False
 
-    def record_transmission_start(self, row: LifecycleRow) -> None:
+    def record_transmission_start(self, row: LifecycleRow) -> bool:
         binding = row.binding or {}
         row.transmission_start_persisted = self._append_coverage(
             "transmission_start",
             request_id=row.request_id,
+            sync=True,
             attributes={
                 "session_id": row.session_id or None,
                 "task_id": binding.get("task_id"),
@@ -899,6 +910,7 @@ class RequestLifecycleLogger:
                 "pool": row.pool,
             },
         )
+        return bool(row.transmission_start_persisted)
 
     def record_loss(
         self,
@@ -1005,10 +1017,17 @@ def record_startup_failure(
         target = path / f"coverage-startup-{int(time.time())}-{os.getpid()}.jsonl"
         fd = os.open(target, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o640)
         try:
-            os.write(fd, line)
+            view = memoryview(line)
+            while view:
+                view = view[os.write(fd, view):]
             os.fsync(fd)
         finally:
             os.close(fd)
+        directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         pass
 
@@ -1050,10 +1069,17 @@ def record_direct_loss(
         target = path / f"coverage-fallback-{int(now)}-{os.getpid()}.jsonl"
         fd = os.open(target, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o640)
         try:
-            os.write(fd, payload)
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(fd, view):]
             os.fsync(fd)
         finally:
             os.close(fd)
+        directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
         return True
     except Exception:
         return False

@@ -727,6 +727,7 @@ def create_obs_tools(
         prompt = str(args.get("prompt", "")).strip()
         prompt_file = str(args.get("prompt_file", "")).strip()
         prompt_file_content = ""
+        resolved_prompt_file = ""
 
         # --- prompt_file resolution ---
         if prompt_file:
@@ -736,7 +737,9 @@ def create_obs_tools(
                     file_path = file_path.expanduser()
                 elif not file_path.is_absolute():
                     file_path = config.vault_path / file_path
+                file_path = file_path.resolve()
                 file_content = file_path.read_text(encoding="utf-8")
+                resolved_prompt_file = str(file_path)
             except FileNotFoundError:
                 return _error_result(f"Cannot launch {tool_name}: prompt_file not found: {file_path}")
             except PermissionError:
@@ -964,8 +967,7 @@ def create_obs_tools(
             try:
                 bead_rows = _start_step.known_bead_rows(config.vault_path)
                 payload["attribution_binding"] = _start_step.resolve_attribution_binding(
-                    texts=(prompt,),
-                    receipt_texts=(prompt_file_content,),
+                    texts=(prompt, resolved_prompt_file),
                     rows=bead_rows,
                 )
             except Exception:

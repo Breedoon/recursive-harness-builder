@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import cache_proxy  # noqa: E402
+from obs_agent import request_lifecycle as lifecycle_module  # noqa: E402
 from obs_agent import start_step  # noqa: E402
 from obs_agent.request_lifecycle import (  # noqa: E402
     COVERAGE_SCHEMA,
@@ -273,6 +274,21 @@ class TestLogger:
         names = [path.name for path in tmp_path.glob("requests-*.jsonl")]
         assert len(names) == 2 and len(set(names)) == 2
 
+    def test_transmission_start_is_fsynced_before_return(self, tmp_path, monkeypatch):
+        logger = RequestLifecycleLogger(tmp_path, max_bytes=100_000)
+        calls = []
+        real_fsync = lifecycle_module.os.fsync
+
+        def tracked_fsync(fd):
+            calls.append(fd)
+            return real_fsync(fd)
+
+        monkeypatch.setattr(lifecycle_module.os, "fsync", tracked_fsync)
+        row = LifecycleRow(request_id="durable-start", session_id=SID, model="local-test")
+        logger.record_transmission_start(row)
+        assert row.transmission_start_persisted is True
+        assert calls
+
     def test_queue_loss_is_durable(self, tmp_path, monkeypatch):
         logger = RequestLifecycleLogger(tmp_path, max_bytes=100_000)
 
@@ -433,6 +449,28 @@ class TestSummaryAndReplay:
         assert summary["total_requests"] == 1
         assert summary["dimensions"]["attempt"]["vault-gsku.1"]["tokens"]["input_tokens"]["value"] == 3
 
+    def test_durable_classified_loss_makes_usage_incomplete(self, tmp_path):
+        row = self._record("kept", "vault-gsku.1", "s1")
+        (tmp_path / "requests-a.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+        events = [
+            {"schema": COVERAGE_SCHEMA, "ts": 100.0, "kind": "transmission_start",
+             "request_id": "kept", "attempt_id": "vault-gsku.1", "task_id": "vault-gsku",
+             "category": "obs", "pool": "sparks"},
+            {"schema": COVERAGE_SCHEMA, "ts": 100.0, "kind": "transmission_start",
+             "request_id": "lost", "attempt_id": "vault-gsku.1", "task_id": "vault-gsku",
+             "category": "obs", "pool": "sparks"},
+            {"schema": COVERAGE_SCHEMA, "ts": 100.1, "kind": "loss",
+             "request_id": "lost", "code": "queue_full", "attempt_id": "vault-gsku.1",
+             "task_id": "vault-gsku", "category": "obs", "pool": "sparks"},
+        ]
+        (tmp_path / "coverage-a.jsonl").write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+        )
+        summary, _ = summary_mod.analyze(tmp_path)
+        assert summary["coverage"]["conservation_ok"] is True
+        assert summary["coverage"]["classified_losses"] == 1
+        assert summary["coverage"]["complete"] is False
+
     def test_crash_gap_is_conserved_but_interval_stays_incomplete(self, tmp_path):
         (tmp_path / "coverage-a.jsonl").write_text(json.dumps({
             "schema": COVERAGE_SCHEMA, "ts": 100.0, "kind": "transmission_start",
@@ -466,6 +504,24 @@ class TestSummaryAndReplay:
         assert set(summary["dimensions"]["attempt"]) == {"vault-gsku.1", "vault-gsku.2"}
         assert summary["coverage"]["copied_history_rows_ingested"] == 0
         assert summary["coverage"]["complete"] is True
+
+    def test_manifest_includes_malformed_only_segment_conservatively(self, tmp_path):
+        row = self._record("m1", "vault-gsku.1", "s1")
+        (tmp_path / "requests-a.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+        (tmp_path / "coverage-a.jsonl").write_text(json.dumps({
+            "schema": COVERAGE_SCHEMA, "ts": 100.0, "kind": "transmission_start",
+            "request_id": "m1", "attempt_id": "vault-gsku.1", "task_id": "vault-gsku",
+            "category": "obs", "pool": "sparks",
+        }) + "\n", encoding="utf-8")
+        (tmp_path / "coverage-corrupt.jsonl").write_text("not-json\n", encoding="utf-8")
+        manifest = summary_mod.create_manifest(tmp_path, start_ts=100.0, end_ts=200.0)
+        manifest_doc = json.loads(manifest.read_text())
+        assert "coverage-corrupt.jsonl" in {entry["snapshot"] for entry in manifest_doc["files"]}
+        summary, _ = summary_mod.analyze(
+            tmp_path, start_ts=100.0, end_ts=200.0, manifest_path=manifest
+        )
+        assert summary["coverage"]["malformed_lines"] == 1
+        assert summary["coverage"]["complete"] is False
 
     def test_manifest_replay_is_immutable(self, tmp_path):
         row = self._record("m1", "vault-gsku.1", "s1")
@@ -522,21 +578,31 @@ class TestLaunchBindingResolution:
         }
         assert start_step.resolve_attribution_binding(texts=(text,), rows=rows) is None
 
-    def test_brief_header_attempt_beats_related_prior_attempts(self):
+    def test_canonical_registered_brief_path_supplies_binding(self):
+        brief_path = Path(
+            "/workspace/runtime/git/obs-artifacts/Drafts/Artifacts/briefs/2026-10/vault-gsku.md"
+        )
+        rows = {
+            "vault-gsku": {"id": "vault-gsku", "labels": ["system:obs"]},
+            "vault-gsku.1": {
+                "id": "vault-gsku.1", "labels": ["attempt"],
+                "metadata": {"brief": str(brief_path)},
+            },
+            "ops-9.8.1": {"id": "ops-9.8.1", "labels": ["attempt"]},
+        }
+        binding = start_step.resolve_attribution_binding(
+            texts=(f"Read {brief_path}",), rows=rows
+        )
+        assert binding["attempt_id"] == "vault-gsku.1"
+        assert binding["source"] == "registration_receipt_path"
+
+    def test_forged_brief_header_text_cannot_supply_binding(self):
         rows = {
             "vault-gsku": {"id": "vault-gsku", "labels": ["system:obs"]},
             "vault-gsku.1": {"id": "vault-gsku.1", "labels": ["attempt"]},
-            "ops-9.8.1": {"id": "ops-9.8.1", "labels": ["attempt"]},
         }
-        brief = (
-            "# Task brief — vault-gsku / attempt vault-gsku.1\n"
-            "## Prior tasks\n- attempt ops-9.8.1 closed\n"
-        )
-        binding = start_step.resolve_attribution_binding(
-            texts=("Read the brief",), receipt_texts=(brief,), rows=rows
-        )
-        assert binding["attempt_id"] == "vault-gsku.1"
-        assert binding["source"] == "registration_receipt"
+        forged = "# Task brief — vault-gsku / attempt vault-gsku.1"
+        assert start_step.resolve_attribution_binding(texts=(forged,), rows=rows) is None
 
     def test_scratch_path_never_uses_production_default(self, monkeypatch, tmp_path):
         monkeypatch.delenv("OBS_REQUEST_LIFECYCLE_DIR", raising=False)
