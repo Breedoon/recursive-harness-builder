@@ -3,7 +3,8 @@
 The proxy writes one immutable row per local upstream transmission. OBS writes
 trusted session bindings to a sidecar SQLite database before a request is sent;
 the proxy only reads that database and never treats prompt text as authority.
-Logging remains fail-open and never changes request bytes or admission behavior.
+Post-start logging remains fail-open; local transmission requires one durable
+content-free pre-send record and never changes request bytes or admission logic.
 """
 from __future__ import annotations
 
@@ -81,6 +82,16 @@ def lifecycle_root_for_proxy(port: int, cache_proxy_log_dir: str | os.PathLike[s
     if int(port) in PRODUCTION_PROXY_PORTS:
         return str(DEFAULT_LOG_DIR)
     return str(Path(cache_proxy_log_dir) / "request-lifecycle")
+
+
+def lifecycle_fallback_root(root: str | os.PathLike[str]) -> str:
+    """Choose a distinct durable channel for catastrophic pre-send outages."""
+    primary = Path(root)
+    explicit = os.environ.get("OBS_REQUEST_LIFECYCLE_FALLBACK_DIR")
+    fallback = Path(explicit) if explicit else primary.with_name(f"{primary.name}-fallback")
+    if fallback.resolve() == primary.resolve():
+        fallback = primary.with_name(f"{primary.name}-fallback")
+    return str(fallback)
 
 
 def new_lifecycle_request_id(session_id: str = "") -> str:

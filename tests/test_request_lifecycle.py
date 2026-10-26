@@ -27,6 +27,7 @@ from obs_agent.request_lifecycle import (  # noqa: E402
     LifecycleRow,
     RequestLifecycleLogger,
     SessionBindingStore,
+    lifecycle_fallback_root,
     lifecycle_root_for_proxy,
 )
 
@@ -180,6 +181,8 @@ def proxy_factory(tmp_path, monkeypatch):
         monkeypatch.setattr(cache_proxy, "USAGE_LOG", str(proxy_log / "usage.jsonl"))
         monkeypatch.setattr(cache_proxy, "REQUEST_LOGGER", None)
         monkeypatch.setattr(cache_proxy, "LIFECYCLE_LOGGER", logger)
+        monkeypatch.setattr(cache_proxy, "LIFECYCLE_ROOT", str(log_root))
+        monkeypatch.setattr(cache_proxy, "LIFECYCLE_FALLBACK_ROOT", lifecycle_fallback_root(log_root))
         monkeypatch.setattr(cache_proxy, "LIFECYCLE_BINDINGS", SessionBindingStore(binding_db, writable=False))
         monkeypatch.setattr(cache_proxy, "_effort_pins", cache_proxy.EffortPinStore(None))
         server = cache_proxy.ThreadedHTTPServer(("127.0.0.1", _free_port()), cache_proxy.ProxyHandler)
@@ -393,14 +396,35 @@ class TestProxyRegressions:
         self, proxy_factory, monkeypatch
     ):
         port, _stub, _logger, root = proxy_factory()
+        fallback_root = Path(lifecycle_fallback_root(root))
         monkeypatch.setattr(cache_proxy, "LIFECYCLE_LOGGER", None)
-        monkeypatch.setattr(cache_proxy, "LIFECYCLE_ROOT", str(root))
         response = _send(port, body=_body())
         assert response.status_code == 200
-        events = _jsonl(root, "coverage-fallback-")
+        assert fallback_root != root
+        events = _jsonl(fallback_root, "coverage-fallback-")
         assert [event["kind"] for event in events] == ["transmission_start", "loss"]
         assert events[1]["code"] == "lifecycle_unavailable"
         assert events[1]["attempt_id"] == "vault-gsku.1"
+        manifest_path = summary_mod.create_manifest(root)
+        manifest = json.loads(manifest_path.read_text())
+        assert any(entry["source_scope"] == "fallback" for entry in manifest["source_census"])
+        summary, _ = summary_mod.analyze(root, manifest_path=manifest_path)
+        assert summary["coverage"]["classified_losses"] == 1
+        assert summary["coverage"]["complete"] is False
+
+    def test_dual_presend_fsync_failure_blocks_upstream(
+        self, proxy_factory, monkeypatch
+    ):
+        port, stub, _logger, _root = proxy_factory()
+
+        def fail_fsync(_fd):
+            raise OSError("forced dual-journal fsync failure")
+
+        monkeypatch.setattr(lifecycle_module.os, "fsync", fail_fsync)
+        response = _send(port, body=_body())
+        assert response.status_code == 529
+        assert response.json()["error"]["type"] == "overloaded_error"
+        assert stub.received == []
 
 
 class TestSummaryAndReplay:
@@ -516,9 +540,45 @@ class TestSummaryAndReplay:
         (tmp_path / "coverage-corrupt.jsonl").write_text("not-json\n", encoding="utf-8")
         manifest = summary_mod.create_manifest(tmp_path, start_ts=100.0, end_ts=200.0)
         manifest_doc = json.loads(manifest.read_text())
-        assert "coverage-corrupt.jsonl" in {entry["snapshot"] for entry in manifest_doc["files"]}
+        assert "coverage-corrupt.jsonl" in {
+            Path(entry["snapshot"]).name for entry in manifest_doc["files"]
+        }
         summary, _ = summary_mod.analyze(
             tmp_path, start_ts=100.0, end_ts=200.0, manifest_path=manifest
+        )
+        assert summary["coverage"]["malformed_lines"] == 1
+        assert summary["coverage"]["complete"] is False
+
+    def test_manifest_census_records_outside_window_exclusion(self, tmp_path):
+        inside = self._record("inside", "vault-gsku.1", "s1", ts=150.0)
+        outside = self._record("outside", "vault-gsku.1", "s1", ts=50.0)
+        (tmp_path / "requests-inside.jsonl").write_text(
+            json.dumps(inside) + "\n", encoding="utf-8"
+        )
+        (tmp_path / "requests-old.jsonl").write_text(
+            json.dumps(outside) + "\n", encoding="utf-8"
+        )
+        manifest_path = summary_mod.create_manifest(tmp_path, start_ts=100.0, end_ts=200.0)
+        manifest = json.loads(manifest_path.read_text())
+        census = {Path(entry["source"]).name: entry for entry in manifest["source_census"]}
+        assert census["requests-inside.jsonl"]["disposition"] == "included"
+        assert census["requests-old.jsonl"]["disposition"] == "excluded"
+        assert census["requests-old.jsonl"]["reason"] == "outside_window"
+        assert manifest["source_census_complete"] is True
+        assert "requests-old.jsonl" not in {
+            Path(entry["snapshot"]).name for entry in manifest["files"]
+        }
+
+    def test_manifest_captures_unrecognized_corrupt_candidate(self, tmp_path):
+        source = tmp_path / "unknown-lifecycle.jsonl"
+        source.write_text("not-json\n", encoding="utf-8")
+        manifest_path = summary_mod.create_manifest(tmp_path, start_ts=100.0, end_ts=200.0)
+        manifest = json.loads(manifest_path.read_text())
+        census = {Path(entry["source"]).name: entry for entry in manifest["source_census"]}
+        assert census[source.name]["disposition"] == "included"
+        assert census[source.name]["reason"] == "unrecognized_source_conservative"
+        summary, _ = summary_mod.analyze(
+            tmp_path, start_ts=100.0, end_ts=200.0, manifest_path=manifest_path
         )
         assert summary["coverage"]["malformed_lines"] == 1
         assert summary["coverage"]["complete"] is False

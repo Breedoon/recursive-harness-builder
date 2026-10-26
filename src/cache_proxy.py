@@ -96,6 +96,7 @@ try:
         LifecycleRow as _LifecycleRow,
         RequestLifecycleLogger as _LifecycleLogger,
         SessionBindingStore as _SessionBindingStore,
+        lifecycle_fallback_root as _lifecycle_fallback_root,
         lifecycle_root_for_proxy as _lifecycle_root_for_proxy,
         new_lifecycle_request_id as _new_lifecycle_req_id,
         record_direct_loss as _record_lifecycle_direct_loss,
@@ -106,6 +107,7 @@ except Exception:  # pragma: no cover - keep proxy usable without the module
     _LifecycleRow = None  # type: ignore[assignment,misc]
     _SessionBindingStore = None  # type: ignore[assignment,misc]
     _DEFAULT_LIFECYCLE_BINDING_DB = None  # type: ignore[assignment]
+    _lifecycle_fallback_root = None  # type: ignore[assignment]
     _lifecycle_root_for_proxy = None  # type: ignore[assignment]
     _new_lifecycle_req_id = None  # type: ignore[assignment]
     _record_lifecycle_direct_loss = None  # type: ignore[assignment]
@@ -2310,6 +2312,7 @@ REQUEST_LOGGER: RequestLogger | None = None
 LIFECYCLE_LOGGER: _LifecycleLogger | None = None  # type: ignore[valid-type]
 LIFECYCLE_BINDINGS: _SessionBindingStore | None = None  # type: ignore[valid-type]
 LIFECYCLE_ROOT: str | None = None
+LIFECYCLE_FALLBACK_ROOT: str | None = None
 
 
 def parse_sse_usage(sse_chunks: list[bytes]) -> dict:
@@ -3218,62 +3221,72 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     lc.mark_hold_end()
                 log("LOCAL: upstream recovered; forwarding held request")
                 deadline = time.monotonic() + LOCAL_HEADER_WAIT_SECONDS
-            if lc is not None:
-                lc.mark_upstream_send()
-                start_persisted = (
-                    LIFECYCLE_LOGGER.record_transmission_start(lc)
-                    if LIFECYCLE_LOGGER is not None else False
-                )
-                if not start_persisted and _record_lifecycle_direct_loss is not None:
-                    proxy_port = int(getattr(self.server, "server_port", 0) or 0)
+            proxy_port = int(getattr(self.server, "server_port", 0) or 0)
+            primary_root = LIFECYCLE_ROOT or (
+                _lifecycle_root_for_proxy(proxy_port, LOG_DIR)
+                if _lifecycle_root_for_proxy is not None
+                else os.path.join(LOG_DIR, "request-lifecycle")
+            )
+            fallback_root = LIFECYCLE_FALLBACK_ROOT or (
+                _lifecycle_fallback_root(primary_root)
+                if _lifecycle_fallback_root is not None
+                else os.path.join(LOG_DIR, "request-lifecycle-fallback")
+            )
+            start_persisted = False
+            if lc is not None and LIFECYCLE_LOGGER is not None:
+                try:
+                    start_persisted = bool(LIFECYCLE_LOGGER.record_transmission_start(lc))
+                except Exception:
+                    start_persisted = False
+            if not start_persisted and _record_lifecycle_direct_loss is not None:
+                if lc is not None:
+                    fallback_request_id = lc.request_id
                     binding = lc.binding or {}
-                    fallback_root = LIFECYCLE_ROOT or (
-                        _lifecycle_root_for_proxy(proxy_port, LOG_DIR)
-                        if _lifecycle_root_for_proxy is not None
-                        else os.path.join(LOG_DIR, "request-lifecycle")
+                    attributes = {
+                        "session_id": lc.session_id or None,
+                        "task_id": binding.get("task_id"),
+                        "attempt_id": binding.get("attempt_id"),
+                        "category": binding.get("category"),
+                        "pool": lc.pool,
+                    }
+                    failure_code = "transmission_start_persist_failed"
+                else:
+                    fallback_request_id = rl.get("req_id") or (
+                        _new_lifecycle_req_id(rl.get("session_id", ""))
+                        if _new_lifecycle_req_id is not None else ""
                     )
-                    _record_lifecycle_direct_loss(
-                        fallback_root,
-                        request_id=lc.request_id,
-                        code="transmission_start_persist_failed",
-                        proxy_port=proxy_port,
-                        attributes={
-                            "session_id": lc.session_id or None,
-                            "task_id": binding.get("task_id"),
-                            "attempt_id": binding.get("attempt_id"),
-                            "category": binding.get("category"),
-                            "pool": lc.pool,
-                        },
-                    )
-            elif _record_lifecycle_direct_loss is not None:
-                fallback_request_id = rl.get("req_id") or _new_lifecycle_req_id(
-                    rl.get("session_id", "")
-                )
-                rl["req_id"] = fallback_request_id
-                proxy_port = int(getattr(self.server, "server_port", 0) or 0)
-                pool, _engine = _local_pool_engine(log_model or "local-unknown", proxy_port)
-                binding = (
-                    LIFECYCLE_BINDINGS.get(rl.get("session_id", ""), at_ts=rl.get("t0"))
-                    if LIFECYCLE_BINDINGS is not None else None
-                ) or {}
-                fallback_root = LIFECYCLE_ROOT or (
-                    _lifecycle_root_for_proxy(proxy_port, LOG_DIR)
-                    if _lifecycle_root_for_proxy is not None
-                    else os.path.join(LOG_DIR, "request-lifecycle")
-                )
-                _record_lifecycle_direct_loss(
-                    fallback_root,
-                    request_id=fallback_request_id,
-                    code="lifecycle_unavailable",
-                    proxy_port=proxy_port,
-                    attributes={
+                    rl["req_id"] = fallback_request_id
+                    pool, _engine = _local_pool_engine(log_model or "local-unknown", proxy_port)
+                    binding = (
+                        LIFECYCLE_BINDINGS.get(rl.get("session_id", ""), at_ts=rl.get("t0"))
+                        if LIFECYCLE_BINDINGS is not None else None
+                    ) or {}
+                    attributes = {
                         "session_id": rl.get("session_id") or None,
                         "task_id": binding.get("task_id"),
                         "attempt_id": binding.get("attempt_id"),
                         "category": binding.get("category"),
                         "pool": pool,
-                    },
-                )
+                    }
+                    failure_code = "lifecycle_unavailable"
+                if fallback_request_id:
+                    try:
+                        start_persisted = bool(_record_lifecycle_direct_loss(
+                            fallback_root,
+                            request_id=fallback_request_id,
+                            code=failure_code,
+                            proxy_port=proxy_port,
+                            attributes=attributes,
+                        ))
+                    except Exception:
+                        start_persisted = False
+            if not start_persisted:
+                if lc is not None:
+                    lc.mark_terminal("not_transmitted", error_class="logging_loss", http_status=529)
+                fail("local pre-send evidence unavailable; retry without transmitting upstream")
+                return
+            if lc is not None:
+                lc.mark_upstream_send()
             upstream.start()
             while True:
                 wait = (LOCAL_KEEPALIVE_SECONDS if committed
@@ -3558,12 +3571,17 @@ def main():
         log("request_log: OFF (non-production port or CACHE_PROXY_REQUEST_LOG=0; "
             "set CACHE_PROXY_REQUEST_LOG=1 to force)")
     # Local-request lifecycle logger (content-free, isolated for scratch ports).
-    global LIFECYCLE_LOGGER, LIFECYCLE_BINDINGS, LIFECYCLE_ROOT
+    global LIFECYCLE_LOGGER, LIFECYCLE_BINDINGS, LIFECYCLE_ROOT, LIFECYCLE_FALLBACK_ROOT
     lifecycle_root = (
         _lifecycle_root_for_proxy(port, LOG_DIR)
         if _lifecycle_root_for_proxy is not None else os.path.join(LOG_DIR, "request-lifecycle")
     )
     LIFECYCLE_ROOT = lifecycle_root
+    LIFECYCLE_FALLBACK_ROOT = (
+        _lifecycle_fallback_root(lifecycle_root)
+        if _lifecycle_fallback_root is not None
+        else os.path.join(LOG_DIR, "request-lifecycle-fallback")
+    )
     if _SessionBindingStore is not None:
         try:
             LIFECYCLE_BINDINGS = _SessionBindingStore(

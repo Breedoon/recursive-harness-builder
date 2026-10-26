@@ -18,7 +18,7 @@ import uuid
 
 ROW_SCHEMA = "obs-local-request-lifecycle/2"
 COVERAGE_SCHEMA = "obs-local-request-coverage/1"
-MANIFEST_SCHEMA = "obs-local-request-replay-manifest/1"
+MANIFEST_SCHEMA = "obs-local-request-replay-manifest/2"
 SUMMARY_SCHEMA = "obs-local-request-summary/2"
 DEFAULT_DIR = os.environ.get(
     "OBS_REQUEST_LIFECYCLE_DIR", "/workspace/runtime/state/local-gpu/requests"
@@ -71,42 +71,92 @@ def _parse_time(value: str | float | int | None) -> float | None:
     return parsed.timestamp()
 
 
-def _source_files(root: str | os.PathLike[str]) -> list[Path]:
-    path = Path(root)
-    if not path.exists():
-        return []
-    return sorted(
-        item for item in path.iterdir()
-        if item.is_file() and item.suffix == ".jsonl"
-        and (item.name.startswith(("requests-", "coverage-")) or item.name[:4].isdigit())
+def _fallback_root(root: str | os.PathLike[str]) -> Path:
+    primary = Path(root)
+    explicit = os.environ.get("OBS_REQUEST_LIFECYCLE_FALLBACK_DIR")
+    fallback = Path(explicit) if explicit else primary.with_name(f"{primary.name}-fallback")
+    if fallback.resolve() == primary.resolve():
+        fallback = primary.with_name(f"{primary.name}-fallback")
+    return fallback
+
+
+def _is_canonical_source(path: Path) -> bool:
+    return path.suffix == ".jsonl" and (
+        path.name.startswith(("requests-", "coverage-")) or path.name[:4].isdigit()
     )
 
 
-def _file_overlaps_window(path: Path, start_ts: float | None, end_ts: float | None) -> bool:
+def _is_candidate_source(path: Path) -> bool:
+    return (
+        path.suffix == ".jsonl"
+        or path.name.startswith(("requests-", "coverage-"))
+        or path.name[:4].isdigit()
+    )
+
+
+def _source_candidates(
+    root: str | os.PathLike[str],
+) -> tuple[list[tuple[str, Path]], list[str]]:
+    primary = Path(root)
+    roots = [("primary", primary), ("fallback", _fallback_root(primary))]
+    candidates: list[tuple[str, Path]] = []
+    scan_errors: list[str] = []
+    seen_roots: set[Path] = set()
+    for scope, path in roots:
+        resolved = path.resolve()
+        if resolved in seen_roots:
+            continue
+        seen_roots.add(resolved)
+        if not path.exists():
+            continue
+        try:
+            candidates.extend(
+                (scope, item) for item in path.iterdir()
+                if item.is_file() and _is_candidate_source(item)
+            )
+        except OSError:
+            scan_errors.append(f"{scope}_source_scan_failed")
+    return sorted(candidates, key=lambda item: (item[0], item[1].name)), scan_errors
+
+
+def _source_files(root: str | os.PathLike[str]) -> list[Path]:
+    candidates, _scan_errors = _source_candidates(root)
+    return [path for _scope, path in candidates]
+
+
+def _file_disposition(
+    path: Path, start_ts: float | None, end_ts: float | None
+) -> tuple[str, str]:
+    if not _is_canonical_source(path):
+        return "included", "unrecognized_source_conservative"
     if start_ts is None and end_ts is None:
-        return True
+        return "included", "no_window_filter"
+    saw_line = False
     try:
         with path.open(encoding="utf-8", errors="replace") as handle:
             for line in handle:
+                saw_line = True
                 if not line.strip():
-                    return True
+                    return "included", "indeterminate_content_conservative"
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
-                    return True
+                    return "included", "indeterminate_content_conservative"
                 if not isinstance(row, dict):
-                    return True
+                    return "included", "indeterminate_content_conservative"
                 ts = row.get("ts")
                 if not isinstance(ts, (int, float)):
-                    return True
+                    return "included", "indeterminate_content_conservative"
                 if start_ts is not None and float(ts) < start_ts:
                     continue
                 if end_ts is not None and float(ts) >= end_ts:
                     continue
-                return True
+                return "included", "overlaps_window"
     except OSError:
-        return True
-    return False
+        return "included", "unreadable_source_conservative"
+    if not saw_line:
+        return "included", "empty_source_conservative"
+    return "excluded", "outside_window"
 
 
 def _directory_bytes(path: Path) -> int:
@@ -147,20 +197,50 @@ def create_manifest(
     snapshot = base / f"{stamp}-{uuid.uuid4().hex[:8]}"
     snapshot.mkdir(parents=True, exist_ok=False)
     entries = []
-    for source in _source_files(source_root):
-        if not _file_overlaps_window(source, start_ts, end_ts):
-            continue
-        target = snapshot / source.name
-        shutil.copyfile(source, target)
-        entries.append(
-            {
-                "kind": "jsonl",
-                "source": str(source),
-                "snapshot": target.name,
-                "size": target.stat().st_size,
-                "sha256": _sha256(target),
-            }
-        )
+    source_census = []
+    candidates, scan_errors = _source_candidates(source_root)
+    for scope, source in candidates:
+        disposition, reason = _file_disposition(source, start_ts, end_ts)
+        census_entry = {
+            "source": str(source),
+            "source_scope": scope,
+            "candidate_class": "canonical" if _is_canonical_source(source) else "unrecognized",
+            "disposition": disposition,
+            "reason": reason,
+        }
+        try:
+            stat = source.stat()
+            census_entry.update({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+        except OSError:
+            census_entry.update({
+                "disposition": "unavailable",
+                "reason": "source_stat_failed",
+            })
+        if census_entry["disposition"] == "included":
+            target = snapshot / scope / source.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copyfile(source, target)
+                entry = {
+                    "kind": "lifecycle_source",
+                    "source": str(source),
+                    "source_scope": scope,
+                    "snapshot": str(target.relative_to(snapshot)),
+                    "size": target.stat().st_size,
+                    "sha256": _sha256(target),
+                }
+                entries.append(entry)
+                census_entry.update({
+                    "snapshot": entry["snapshot"],
+                    "sha256": entry["sha256"],
+                })
+            except OSError:
+                census_entry.update({
+                    "disposition": "unavailable",
+                    "reason": "source_copy_failed",
+                })
+                target.unlink(missing_ok=True)
+        source_census.append(census_entry)
     retention_state = source_root / "retention-state.json"
     if retention_state.is_file():
         target = snapshot / retention_state.name
@@ -185,6 +265,11 @@ def create_manifest(
             "max_bytes": MANIFEST_MAX_BYTES,
             "max_count": MANIFEST_MAX_COUNT,
         },
+        "source_census_complete": not scan_errors and all(
+            entry["disposition"] != "unavailable" for entry in source_census
+        ),
+        "source_census_scan_errors": scan_errors,
+        "source_census": source_census,
         "files": entries,
     }
     canonical = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
@@ -300,7 +385,7 @@ def load_evidence(
     retention_error = None
     if manifest_path:
         manifest, declared_files = verify_manifest(manifest_path)
-        files = [path for path in declared_files if path.suffix == ".jsonl"]
+        files = [path for path in declared_files if path.name != "retention-state.json"]
         retention_path = next(
             (path for path in declared_files if path.name == "retention-state.json"), None
         )
@@ -492,8 +577,13 @@ def summarize_evidence(
         or float(latest_pruned_ts) >= float(requested_start)
     )
     retention_error = evidence.get("retention_error")
+    manifest = evidence.get("manifest") or {}
+    manifest_census_complete = (
+        manifest.get("source_census_complete") is True if manifest else True
+    )
     complete = (
         conservation_ok
+        and manifest_census_complete
         and not retention_truncated
         and not retention_error
         and stats["malformed_lines"] == 0
@@ -548,6 +638,8 @@ def summarize_evidence(
             "manifest_sha256": manifest.get("manifest_sha256"),
             "summary_code_sha256": manifest.get("summary_code_sha256") or _code_sha256(),
             "row_schema": manifest.get("row_schema") or ROW_SCHEMA,
+            "source_census_complete": manifest.get("source_census_complete") if manifest else None,
+            "source_census_entries": len(manifest.get("source_census") or []),
         },
         "coverage": {
             "complete": complete,
@@ -559,6 +651,8 @@ def summarize_evidence(
             "retention_truncated": retention_truncated,
             "retention_error": retention_error,
             "retention_state": retention or None,
+            "manifest_census_complete": manifest_census_complete,
+            "manifest_census_scan_errors": manifest.get("source_census_scan_errors") or [],
             "transmission_starts": len(starts),
             "unique_rows": len(rows),
             "transmitted_rows": len(transmitted_row_ids),
