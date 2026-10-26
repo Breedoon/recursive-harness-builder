@@ -21,7 +21,8 @@ FLAGS = ("OBS_STOP_KILL_GRACE_SECONDS", "OBS_ORPHAN_CLI_REAP", "OBS_CLI_HANG_WAT
 def record(root: Path, kind: str, **fields) -> None:
     root.mkdir(parents=True, exist_ok=True)
     with (root / "signals.jsonl").open("a") as handle:
-        handle.write(json.dumps({"kind": kind, "ts": time.time(), "pid": os.getpid(),
+        stat = (Path("/proc") / str(os.getpid()) / "stat").read_text().rsplit(")", 1)[1].split()
+        handle.write(json.dumps({"kind": kind, "ts": time.time(), "pid": os.getpid(), "start": int(stat[19]),
                                  "ppid": os.getppid(), "pgid": os.getpgrp(), "sid": os.getsid(0), **fields}) + "\n")
         handle.flush()
 
