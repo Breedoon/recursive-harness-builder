@@ -90,6 +90,21 @@ except Exception:  # pragma: no cover - keep proxy usable as a standalone script
     def _resolve_obs_model(model: str) -> str:
         return model
 
+try:
+    from obs_agent.request_lifecycle import (
+        RequestLifecycleLogger as _LifecycleLogger,
+        LifecycleRow as _LifecycleRow,
+        new_lifecycle_request_id as _new_lifecycle_req_id,
+        extract_identity_from_body as _extract_lifecycle_identity,
+        _identity_cache as _lifecycle_identity_cache,
+    )
+except Exception:  # pragma: no cover - keep proxy usable without the module
+    _LifecycleLogger = None  # type: ignore[assignment,misc]
+    _LifecycleRow = None  # type: ignore[assignment,misc]
+    _new_lifecycle_req_id = None  # type: ignore[assignment]
+    _extract_lifecycle_identity = None  # type: ignore[assignment]
+    _lifecycle_identity_cache = None  # type: ignore[assignment]
+
 ANTHROPIC_UPSTREAM = "https://api.anthropic.com"
 CLI_PROXY_UPSTREAM = os.environ.get("CLI_PROXY_BASE_URL", "http://127.0.0.1:8317")
 CLI_PROXY_API_KEY = os.environ.get("CLI_PROXY_API_KEY", "sk-anything")
@@ -2260,6 +2275,7 @@ class RequestLogger:
 
 
 REQUEST_LOGGER: RequestLogger | None = None
+LIFECYCLE_LOGGER: _LifecycleLogger | None = None  # type: ignore[valid-type]
 
 
 def parse_sse_usage(sse_chunks: list[bytes]) -> dict:
@@ -2645,6 +2661,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Per-request capture context. Filled best-effort; never affects forwarding.
         self._rl = {"t0": time.time(), "session_id": "", "req_id": "",
                     "status": None, "usage": None, "error": None}
+        self._lc_row = None  # lifecycle row for local requests
         post_bytes = None
         info = {}
         try:
@@ -2661,6 +2678,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._rl["obs"] = extract_obs_fork_context(data)
                 if rlog is not None:
                     self._rl["req_id"] = rlog.new_request_id(self._rl["session_id"])
+                elif _new_lifecycle_req_id is not None:
+                    # Generate a request id even when the body logger is off
+                    self._rl["req_id"] = _new_lifecycle_req_id(self._rl["session_id"])
             except Exception:
                 pass
 
@@ -2686,6 +2706,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 stats["routed_anthropic"] += 1
             else:
                 stats["routed_cli_proxy"] += 1
+
+            # Create lifecycle row for local requests (content-free logging)
+            if is_local and _LifecycleRow is not None and LIFECYCLE_LOGGER is not None:
+                try:
+                    lc_req_id = self._rl.get("req_id") or _new_lifecycle_req_id(
+                        self._rl.get("session_id", ""))
+                    client_kind = ("claude-cli"
+                                   if "claude-cli" in str(self.headers.get("User-Agent", ""))
+                                   else "other")
+                    max_tokens = data.get("max_tokens")
+                    if isinstance(max_tokens, str):
+                        try:
+                            max_tokens = int(max_tokens)
+                        except ValueError:
+                            max_tokens = None
+                    self._lc_row = _LifecycleRow(
+                        request_id=lc_req_id,
+                        session_id=self._rl.get("session_id", ""),
+                        model=_normalize_model_name(raw_model),
+                        route="local",
+                        client_kind=client_kind,
+                        max_tokens=max_tokens if isinstance(max_tokens, int) else None,
+                        stream=bool(is_streaming),
+                    )
+                    # Extract identity from bootstrap XML (out of band, no body logging)
+                    self._lc_row.resolve_identity(data)
+                except Exception:
+                    self._lc_row = None
 
             # Resolve OBS shorthand and strip context-window suffix before sending upstream.
             clean_model = _normalize_model_name(raw_model)
@@ -2829,6 +2877,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                                route_label, is_streaming)
                 except Exception:
                     pass
+            # Submit lifecycle row for local requests (fail-open)
+            lc_row = getattr(self, "_lc_row", None)
+            if lc_row is not None and LIFECYCLE_LOGGER is not None:
+                try:
+                    rl = self._rl
+                    # If terminal wasn't marked, mark it now from _rl state
+                    if lc_row.outcome is None:
+                        usage = rl.get("usage")
+                        status = rl.get("status")
+                        error = rl.get("error")
+                        if status and status < 400 and usage:
+                            lc_row.mark_terminal("success", usage=usage,
+                                                 http_status=status)
+                        elif status and status >= 400:
+                            lc_row.mark_terminal("error", error_class="upstream_error",
+                                                 error_message=error,
+                                                 http_status=status)
+                        else:
+                            lc_row.mark_terminal("unknown",
+                                                 error_message=error,
+                                                 http_status=status)
+                    LIFECYCLE_LOGGER.submit(lc_row.to_record())
+                except Exception:
+                    pass
 
     def _submit_request_index(self, rlog, raw_body, post_bytes, body, headers,
                               info, model, route, is_streaming):
@@ -2941,6 +3013,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         rl = getattr(self, "_rl", None)
         if rl is None:
             rl = self._rl = {}
+        lc = getattr(self, "_lc_row", None)  # lifecycle row (may be None)
         events: queue.Queue = queue.Queue()
         upstream = _LocalUpstreamCall(url, body, headers, events, bool(is_streaming))
         committed = False      # we have sent response headers to the client
@@ -3027,6 +3100,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             deadline = time.monotonic() + LOCAL_HEADER_WAIT_SECONDS
             doc = _local_liveness()
             if _local_upstream_bad(doc):
+                if lc is not None:
+                    lc.mark_hold_start()
                 stats["local_recovery_holds"] += 1
                 log(f"LOCAL: upstream {doc.get('state')} ({str(doc.get('reason'))[:200]}); "
                     f"holding request until the watchdog reports it healthy")
@@ -3035,6 +3110,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 while _local_upstream_bad(doc):
                     now = time.monotonic()
                     if now >= hold_until:
+                        if lc is not None:
+                            lc.mark_hold_end()
+                            lc.mark_terminal("timeout", error_class="recovery_timeout",
+                                             error_message=f"local upstream not recovered after {LOCAL_RECOVERY_WAIT_SECONDS:.0f}s")
                         fail(f"local upstream {doc.get('state')}: {doc.get('reason')}; not "
                              f"recovered after {LOCAL_RECOVERY_WAIT_SECONDS:.0f}s")
                         return
@@ -3047,8 +3126,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         last_ka = now
                     time.sleep(LOCAL_LIVENESS_POLL_SECONDS)
                     doc = _local_liveness()
+                if lc is not None:
+                    lc.mark_hold_end()
                 log("LOCAL: upstream recovered; forwarding held request")
                 deadline = time.monotonic() + LOCAL_HEADER_WAIT_SECONDS
+            if lc is not None:
+                lc.mark_upstream_send()
             upstream.start()
             while True:
                 wait = (LOCAL_KEEPALIVE_SECONDS if committed
@@ -3063,6 +3146,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                f"(watchdog recovering; retry)")
                         log(f"LOCAL: failing in-flight request: {msg[:300]}")
                         upstream.cancel()
+                        if lc is not None:
+                            lc.mark_terminal("cancelled", error_class="wedge",
+                                             error_message=msg[:500], http_status=529)
                         fail(msg, code=529)
                         return
                     if not committed:
@@ -3077,11 +3163,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if kind == "headers":
                     status, resp_headers = ev[1], ev[2]
                     rl["status"] = status
+                    if lc is not None:
+                        lc.mark_headers(status)
                     if status >= 400:
                         error_body = upstream.read_rest(events)
                         rl["error"] = error_body[:500].decode("utf-8", errors="replace")
                         log(f"LOCAL: upstream error status={status} "
                             f"{error_body[:300].decode('utf-8', errors='replace')}")
+                        if lc is not None:
+                            lc.mark_terminal("error", error_class="upstream_error",
+                                             error_message=rl["error"],
+                                             http_status=status)
                         if not committed:
                             if self._send_translated_overflow(status, error_body):
                                 return
@@ -3107,6 +3199,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         commit(status, resp_headers)
                 elif kind == "chunk":
                     chunk = ev[1]
+                    if lc is not None:
+                        lc.mark_first_event()
                     if fixer is not None:
                         chunk = fixer.feed(chunk)
                     if chunk:
@@ -3122,9 +3216,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         msg = (f"local upstream sent nothing for "
                                f"{LOCAL_UPSTREAM_SILENCE_SECONDS:.0f}s")
                         log(f"LOCAL: {msg}")
+                        if lc is not None:
+                            lc.mark_terminal("timeout", error_class="upstream_silence",
+                                             error_message=msg)
                         fail(msg)
                     else:
                         log(f"upstream error: {exc}")
+                        if lc is not None:
+                            lc.mark_terminal("error", error_class="upstream_error",
+                                             error_message=str(exc)[:500],
+                                             http_status=502)
                         fail(f"proxy upstream error: {exc}", error_type="api_error", code=502)
                     return
 
@@ -3142,10 +3243,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                     req_id=rl.get("req_id", ""),
                                     session_id=rl.get("session_id", ""),
                                     http_status=status)
+                    if lc is not None:
+                        lc.mark_terminal("success", usage=usage, http_status=status)
                 else:
                     raw_preview = b"".join(chunks)[:500].decode("utf-8", errors="replace")
                     rl["error"] = raw_preview
                     log(f"STREAM: no usage in {len(chunks)} chunks. Preview: {raw_preview[:200]}")
+                    if lc is not None:
+                        lc.mark_terminal("success", http_status=status)
             else:
                 content = b"".join(chunks)
                 if content:
@@ -3160,15 +3265,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                         req_id=rl.get("req_id", ""),
                                         session_id=rl.get("session_id", ""),
                                         http_status=status)
+                        if lc is not None:
+                            lc.mark_terminal("success", usage=usage, http_status=status)
                     else:
                         log(f"NON-STREAM: no usage in response (status={status})")
+                        if lc is not None:
+                            lc.mark_terminal("success", http_status=status)
                 except Exception as e:
                     log(f"NON-STREAM: response parse error: {e}")
+                    if lc is not None:
+                        lc.mark_terminal("success", http_status=status)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
             stats["local_client_gone"] += 1
             rl["status"] = rl.get("status") or 499
             rl["error"] = f"client disconnected: {e}"
             log(f"LOCAL: client disconnected ({e}); closing upstream request")
+            if lc is not None:
+                lc.mark_terminal("client_gone", error_class="client_disconnected",
+                                 error_message=str(e)[:500], http_status=499)
         finally:
             upstream.cancel()
 
@@ -3280,6 +3394,17 @@ def main():
     else:
         log("request_log: OFF (non-production port or CACHE_PROXY_REQUEST_LOG=0; "
             "set CACHE_PROXY_REQUEST_LOG=1 to force)")
+    # Local-request lifecycle logger (content-free, always on when the module exists)
+    global LIFECYCLE_LOGGER
+    if _LifecycleLogger is not None and LOCAL_UPSTREAM:
+        try:
+            LIFECYCLE_LOGGER = _LifecycleLogger()
+            log(f"lifecycle_log: ON dir={LIFECYCLE_LOGGER.root}")
+        except Exception as e:
+            LIFECYCLE_LOGGER = None
+            log(f"lifecycle_log: FAILED to start ({e})")
+    else:
+        log("lifecycle_log: OFF (no local upstream or module unavailable)")
     log(f"normalizations: billing, string→list, strip all system reminders, "
         f"git status, tool sort, metadata (cache_control: passthrough)")
     log(f"Set ANTHROPIC_BASE_URL=http://localhost:{port}")
