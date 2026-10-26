@@ -69,7 +69,7 @@ def _live(checks: list[dict]) -> list[dict]:
     return [row for row in checks if row["outcome"] == "SAME_IDENTITY" and row["state"] not in {"Z", "X"}]
 
 
-async def run_latch(lane, config: str, shape: str):
+async def run_latch(lane, config: str, shape: str, *, stream_prompt: str | None = None):
     nonce = uuid.uuid4().hex[:8]
     root = "/workspace/runtime/state/evc-latch-" + nonce
     local = lane.lane_dir / "state" / ("evc-latch-" + nonce)
@@ -87,8 +87,9 @@ async def run_latch(lane, config: str, shape: str):
              "added_hook": shape in {"S4", "S5h"}, "mcp_lane_copy_mechanism": shape == "S5m",
              "shape_binding_limit": "CURRENT cells.yaml labels retained: S2 foreground heartbeat is the original delta466 S4 ledger variant, NOT silently renamed; current S4 remains tool-not-started with blocking hook heartbeat; S3 has no sentinel heartbeat",
              "full_vm_obs_5_foreground_variant": shape == "S2",
-             "stream_prompt": "Write the integers 1 through 3000, one per line, no explanation, code or ellipsis; no tools. Start with 1 now.",
-             "stream_workload_reason": "old 8000-integer sample ended in an output-limit refusal before the latch; this 3000-number construction must still prove active=True at the native latch, never call an idle stop a race"}
+             "stream_prompt": stream_prompt or "Write the integers 1 through 3000, one per line, no explanation, code or ellipsis; no tools. Start with 1 now.",
+             "stream_workload_reason": ("explicit reasoned-stream workload, not just a working notification; actual thinking event and active=True native latch remain required" if stream_prompt else
+                 "old 8000-integer sample ended in an output-limit refusal before the latch; this 3000-number construction must still prove active=True at the native latch, never call an idle stop a race")}
     watcher = None
     try:
         proof["configuration_before_turn"] = await _helper(lane, "setup", root, shape)
