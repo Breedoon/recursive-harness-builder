@@ -31,6 +31,7 @@ from obs_agent.lineage import (
     format_root_display_name,
     root_team_key_for_lineage,
 )
+from obs_agent import start_step as _start_step
 from obs_agent.queueing import QueuedMessage
 from obs_agent.runner import DoneEvent, TextEvent, TurnEndEvent
 from obs_agent.telegram import (
@@ -9547,6 +9548,47 @@ class TestTelegramStatePersistence:
             agent_name=agent_name_for_lineage(("General", "Worker")),
         ) is restored_topic
         await restored.shutdown()
+
+    async def test_bind_state_session_writes_trusted_local_attribution(self, config):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=991)
+        state = bot._get_state(route)
+        assert state is not None
+        state.agent_lineage = ("Root", "Worker")
+        state.attribution_task_id = "vault-gsku"
+        state.attribution_attempt_id = "vault-gsku.1"
+        state.attribution_category = "obs"
+        state.attribution_source = "launch_prompt"
+        state.session_manager.set_session_id("sid-attribution")
+        bot._bind_state_session(state)
+        binding = bot._attribution_store.get("sid-attribution", at_ts=10_000_000_000)
+        assert binding["task_id"] == "vault-gsku"
+        assert binding["attempt_id"] == "vault-gsku.1"
+        assert binding["root_team_key"]
+        assert binding["agent_name"]
+        assert binding["lineage"] == [binding["root_team_key"], binding["agent_name"]]
+        assert "Root" not in json.dumps(binding) and "Worker" not in json.dumps(binding)
+        await bot.shutdown()
+
+    async def test_existing_session_can_bind_from_registration_receipt(self, config, monkeypatch):
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=67890, thread_id=992)
+        state = bot._get_state(route)
+        assert state is not None
+        state.agent_lineage = ("Root", "Scheduled Worker")
+        state.session_manager.set_session_id("sid-existing-attribution")
+        monkeypatch.setattr(_start_step, "known_bead_rows", lambda _vault: {
+            "vault-gsku": {"id": "vault-gsku", "labels": ["system:obs"]},
+            "vault-gsku.1": {"id": "vault-gsku.1", "labels": ["attempt"]},
+        })
+        applied = bot._apply_registration_binding_from_text(
+            state,
+            "Brief: /workspace/runtime/git/obs-artifacts/Drafts/Artifacts/briefs/2026-10/vault-gsku.md",
+        )
+        assert applied is True
+        binding = bot._attribution_store.get("sid-existing-attribution", at_ts=10_000_000_000)
+        assert binding["attempt_id"] == "vault-gsku.1"
+        await bot.shutdown()
 
     async def test_initialize_runtime_restores_trunk_agent_name_from_persisted_team_key(self, config):
         route = TelegramRoute(chat_id=67890, thread_id=None)

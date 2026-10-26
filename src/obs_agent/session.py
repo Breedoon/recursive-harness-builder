@@ -23,6 +23,7 @@ from pathlib import Path
 import logging
 import os
 import time
+import uuid
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -164,6 +165,7 @@ class SessionManager:
         self.config = config
         self.hook_state = hook_state if hook_state is not None else HookState()
         self._session_id: str | None = None
+        self._preassigned_session_id: str | None = None
         self.last_activity: float | None = None
         self._client: ClaudeSDKClient | None = None
         self._connected: bool = False
@@ -209,6 +211,7 @@ class SessionManager:
     def set_session_id(self, session_id: str) -> None:
         """Store the session ID from SDK init and record activity."""
         self._session_id = session_id
+        self._preassigned_session_id = None
         self.last_activity = time.time()
 
     def touch(self) -> None:
@@ -638,11 +641,24 @@ class SessionManager:
             },
         )
 
-        # Resume if within cache window, otherwise fresh
-        if self.should_resume() and not self._session_is_unborn():
+        # Resume if within cache window. Fresh sessions receive their UUID before
+        # the CLI starts, so OBS can persist a trusted session attribution binding
+        # before the first model request instead of learning the id from that turn.
+        if self._preassigned_session_id and self._preassigned_session_id == self._session_id:
+            options.resume = None
+            options.extra_args = {
+                **(options.extra_args or {}),
+                "session-id": self._preassigned_session_id,
+            }
+        elif self.should_resume() and not self._session_is_unborn():
             options.resume = self._session_id
         else:
             options.resume = None
+            fresh_session_id = str(uuid.uuid4())
+            self._session_id = fresh_session_id
+            self._preassigned_session_id = fresh_session_id
+            self.last_activity = time.time()
+            options.extra_args = {**(options.extra_args or {}), "session-id": fresh_session_id}
 
         return options
 
@@ -677,6 +693,7 @@ class SessionManager:
             session_id,
         )
         self._session_id = None
+        self._preassigned_session_id = None
         return True
 
     # CACHE-PREFIX WARNING: every reconnect/wake resumes from JSONL (prepare_session_replay
@@ -838,6 +855,7 @@ class SessionManager:
     def reset(self) -> None:
         """Reset for a fresh start after memory flush."""
         self._session_id = None
+        self._preassigned_session_id = None
         self.last_activity = None
         # Mark client as stale — next get_client() will create fresh
         self._connected = False
@@ -935,4 +953,5 @@ class SessionManager:
         """Async reset that also disconnects the client cleanly."""
         await self.disconnect()
         self._session_id = None
+        self._preassigned_session_id = None
         self.last_activity = None

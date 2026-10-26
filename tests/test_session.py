@@ -247,6 +247,8 @@ class TestCreateOptions:
         mgr.last_activity = time.time() - 3600
         options = mgr.create_options()
         assert options.resume is None
+        assert mgr.session_id != "sess-old"
+        assert options.extra_args["session-id"] == mgr.session_id
 
     def test_unborn_session_is_not_resumed(self, config, tmp_path):
         """vault-1i53: an id known from init whose JSONL has only queue rows."""
@@ -261,7 +263,16 @@ class TestCreateOptions:
         with patch("obs_agent.context_jsonl.find_session_jsonl", return_value=jsonl):
             options = mgr.create_options()
         assert options.resume is None
-        assert mgr.session_id is None  # the fresh CLI's init names the new session
+        assert mgr.session_id and mgr.session_id != "sess-unborn"
+        assert options.extra_args["session-id"] == mgr.session_id
+
+    def test_fresh_session_id_is_preassigned_before_first_request(self, config):
+        mgr = SessionManager(config=config)
+        options = mgr.create_options()
+        assert options.resume is None
+        assert mgr.session_id
+        assert options.extra_args["session-id"] == mgr.session_id
+        assert mgr.last_activity is not None
 
     def test_session_with_conversation_is_resumed(self, config, tmp_path):
         jsonl = tmp_path / "session.jsonl"

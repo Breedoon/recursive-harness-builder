@@ -961,6 +961,16 @@ def create_obs_tools(
             if prompt_file:
                 payload["prompt_file"] = prompt_file
                 payload["prompt_file_content"] = prompt_file_content
+            try:
+                bead_rows = _start_step.known_bead_rows(config.vault_path)
+                payload["attribution_binding"] = _start_step.resolve_attribution_binding(
+                    texts=(prompt,),
+                    receipt_texts=(prompt_file_content,),
+                    rows=bead_rows,
+                )
+            except Exception:
+                logger.debug("attribution binding resolution failed", exc_info=True)
+                payload["attribution_binding"] = None
             start_warning = None
             if not resume:
                 start_warning = _start_step_warning(

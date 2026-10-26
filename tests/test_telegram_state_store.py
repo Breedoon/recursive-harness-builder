@@ -40,6 +40,11 @@ def test_state_store_roundtrip_snapshot(tmp_path):
             "<obs-node name='General' /><obs-node name='Worker' />"
             "</obs-lineage></obs-bootstrap>"
         ),
+        attribution_task_id="vault-gsku",
+        attribution_attempt_id="vault-gsku.1",
+        attribution_category="obs",
+        attribution_lane="must",
+        attribution_source="launch_prompt",
     )
     store.upsert_message_binding(
         chat_id=-1001,
@@ -138,6 +143,11 @@ def test_state_store_roundtrip_snapshot(tmp_path):
     assert route_state.agent_lineage == ("General", "Worker")
     assert route_state.pending_obs_bootstrap is not None
     assert "<obs-bootstrap" in route_state.pending_obs_bootstrap
+    assert route_state.attribution_task_id == "vault-gsku"
+    assert route_state.attribution_attempt_id == "vault-gsku.1"
+    assert route_state.attribution_category == "obs"
+    assert route_state.attribution_lane == "must"
+    assert route_state.attribution_source == "launch_prompt"
 
     assert len(snapshot.message_bindings) == 1
     binding = snapshot.message_bindings[0]

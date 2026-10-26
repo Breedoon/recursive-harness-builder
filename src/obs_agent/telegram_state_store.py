@@ -28,6 +28,11 @@ class PersistedRouteState:
     last_inbound_message_id: int | None
     agent_lineage: tuple[str, ...] | None = None
     pending_obs_bootstrap: str | None = None
+    attribution_task_id: str | None = None
+    attribution_attempt_id: str | None = None
+    attribution_category: str | None = None
+    attribution_lane: str | None = None
+    attribution_source: str | None = None
     model_override: str | None = None
     user_hooks_json: str | None = None
     effort_override: str | None = None
@@ -202,6 +207,11 @@ class TelegramStateStore:
                 last_inbound_message_id INTEGER,
                 agent_lineage_json TEXT,
                 pending_obs_bootstrap TEXT,
+                attribution_task_id TEXT,
+                attribution_attempt_id TEXT,
+                attribution_category TEXT,
+                attribution_lane TEXT,
+                attribution_source TEXT,
                 model_override TEXT,
                 user_hooks_json TEXT,
                 effort_override TEXT,
@@ -370,6 +380,18 @@ class TelegramStateStore:
             column="pending_obs_bootstrap",
             declaration="TEXT",
         )
+        for column in (
+            "attribution_task_id",
+            "attribution_attempt_id",
+            "attribution_category",
+            "attribution_lane",
+            "attribution_source",
+        ):
+            self._ensure_column_exists(
+                table="route_state",
+                column=column,
+                declaration="TEXT",
+            )
         self._ensure_column_exists(
             table="route_state",
             column="model_override",
@@ -439,6 +461,11 @@ class TelegramStateStore:
                 last_inbound_message_id,
                 agent_lineage_json,
                 pending_obs_bootstrap,
+                attribution_task_id,
+                attribution_attempt_id,
+                attribution_category,
+                attribution_lane,
+                attribution_source,
                 model_override,
                 user_hooks_json,
                 effort_override,
@@ -583,6 +610,21 @@ class TelegramStateStore:
                     str(row["pending_obs_bootstrap"])
                     if row["pending_obs_bootstrap"]
                     else None
+                ),
+                attribution_task_id=(
+                    str(row["attribution_task_id"]) if row["attribution_task_id"] else None
+                ),
+                attribution_attempt_id=(
+                    str(row["attribution_attempt_id"]) if row["attribution_attempt_id"] else None
+                ),
+                attribution_category=(
+                    str(row["attribution_category"]) if row["attribution_category"] else None
+                ),
+                attribution_lane=(
+                    str(row["attribution_lane"]) if row["attribution_lane"] else None
+                ),
+                attribution_source=(
+                    str(row["attribution_source"]) if row["attribution_source"] else None
                 ),
                 model_override=(
                     str(row["model_override"])
@@ -793,6 +835,11 @@ class TelegramStateStore:
         last_inbound_message_id: int | None,
         agent_lineage: tuple[str, ...] | None = None,
         pending_obs_bootstrap: str | None = None,
+        attribution_task_id: str | None = None,
+        attribution_attempt_id: str | None = None,
+        attribution_category: str | None = None,
+        attribution_lane: str | None = None,
+        attribution_source: str | None = None,
         model_override: str | None = None,
         user_hooks_json: str | None = None,
         effort_override: str | None = None,
@@ -816,12 +863,17 @@ class TelegramStateStore:
                 last_inbound_message_id,
                 agent_lineage_json,
                 pending_obs_bootstrap,
+                attribution_task_id,
+                attribution_attempt_id,
+                attribution_category,
+                attribution_lane,
+                attribution_source,
                 model_override,
                 user_hooks_json,
                 effort_override,
                 explicit_env_json,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(route_key) DO UPDATE SET
                 session_id=excluded.session_id,
                 topic_title=excluded.topic_title,
@@ -832,6 +884,11 @@ class TelegramStateStore:
                 last_inbound_message_id=excluded.last_inbound_message_id,
                 agent_lineage_json=excluded.agent_lineage_json,
                 pending_obs_bootstrap=excluded.pending_obs_bootstrap,
+                attribution_task_id=excluded.attribution_task_id,
+                attribution_attempt_id=excluded.attribution_attempt_id,
+                attribution_category=excluded.attribution_category,
+                attribution_lane=excluded.attribution_lane,
+                attribution_source=excluded.attribution_source,
                 model_override=excluded.model_override,
                 user_hooks_json=excluded.user_hooks_json,
                 effort_override=excluded.effort_override,
@@ -858,6 +915,11 @@ class TelegramStateStore:
                     else None
                 ),
                 pending_obs_bootstrap,
+                attribution_task_id,
+                attribution_attempt_id,
+                attribution_category,
+                attribution_lane,
+                attribution_source,
                 model_override,
                 user_hooks_json,
                 effort_override,

@@ -108,6 +108,8 @@ def isolated_proxy_env() -> dict[str, str]:
     env["CACHE_PROXY_LOG_DIR"] = TEST_LOG_DIR
     env["CACHE_PROXY_REQUEST_LOG_DIR"] = os.path.join(TEST_LOG_DIR, "requests")
     env["CACHE_PROXY_REQUEST_LOG"] = "0"
+    env["OBS_REQUEST_LIFECYCLE_DIR"] = os.path.join(TEST_LOG_DIR, "request-lifecycle")
+    env["OBS_REQUEST_BINDING_DB"] = os.path.join(TEST_LOG_DIR, "attribution-bindings.sqlite3")
     return env
 
 # Proxy port range: pick something unlikely to collide

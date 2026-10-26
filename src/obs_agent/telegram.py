@@ -61,6 +61,7 @@ from obs_agent.jsonl_health import (
 )
 from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
 from obs_agent import maintenance_restart as _maint
+from obs_agent import start_step as _start_step
 from obs_agent.lineage import (
     AgentIdentity,
     ConversationBranch,
@@ -74,6 +75,7 @@ from obs_agent.lineage import (
     slugify_projection_label,
 )
 from obs_agent.queueing import QueuedMessage, coerce_queued_message
+from obs_agent.request_lifecycle import SessionBindingStore
 from obs_agent.runner import ConversationRunner, DoneEvent, TextEvent, TurnEndEvent
 from obs_agent.session import SessionManager
 from obs_agent.session_info import (
@@ -312,6 +314,11 @@ class TelegramSessionState:
     active_fork_task_ids: set[str] = field(default_factory=set)
     agent_lineage: tuple[str, ...] | None = None
     pending_obs_bootstrap: str | None = None
+    attribution_task_id: str | None = None
+    attribution_attempt_id: str | None = None
+    attribution_category: str | None = None
+    attribution_lane: str | None = None
+    attribution_source: str | None = None
     # Inbox wake queueing: when a message arrives while the agent is busy,
     # store the wake request so it fires when the turn completes.
     inbox_wake_pending: bool = False
@@ -912,6 +919,19 @@ class TelegramBot:
         self._topic_metadata_by_route: dict[TelegramRoute, _TopicMetadata] = {}
         self._state_store = TelegramStateStore(config.telegram_state_db_path)
         self._state_store.initialize()
+        self._attribution_binding_signatures: dict[str, tuple] = {}
+        configured_binding_db = os.environ.get("OBS_REQUEST_BINDING_DB")
+        if configured_binding_db:
+            attribution_db = configured_binding_db
+        elif str(config.telegram_state_db_path).startswith("/workspace/runtime/state/"):
+            attribution_db = "/workspace/runtime/state/local-gpu/attribution-bindings.sqlite3"
+        else:
+            attribution_db = str(Path(config.telegram_state_db_path).with_name("local-attribution-bindings.sqlite3"))
+        try:
+            self._attribution_store: SessionBindingStore | None = SessionBindingStore(attribution_db)
+        except Exception:
+            logger.warning("Unable to initialize local attribution binding store", exc_info=True)
+            self._attribution_store = None
         self._transport_base_chat_interval_seconds = max(
             float(config.telegram_transport_base_chat_interval_seconds),
             0.0,
@@ -1749,6 +1769,11 @@ class TelegramBot:
             last_inbound_message_id=last_inbound,
             agent_lineage=state.agent_lineage,
             pending_obs_bootstrap=state.pending_obs_bootstrap,
+            attribution_task_id=state.attribution_task_id,
+            attribution_attempt_id=state.attribution_attempt_id,
+            attribution_category=state.attribution_category,
+            attribution_lane=state.attribution_lane,
+            attribution_source=state.attribution_source,
             model_override=state.session_manager.model_override,
             user_hooks_json=user_hooks_json,
             effort_override=state.session_manager.effort_override,
@@ -1786,6 +1811,11 @@ class TelegramBot:
             state.notify_on_completion = entry.notify_on_completion
             state.agent_lineage = entry.agent_lineage
             state.pending_obs_bootstrap = entry.pending_obs_bootstrap
+            state.attribution_task_id = entry.attribution_task_id
+            state.attribution_attempt_id = entry.attribution_attempt_id
+            state.attribution_category = entry.attribution_category
+            state.attribution_lane = entry.attribution_lane
+            state.attribution_source = entry.attribution_source
             # Restore model_override and user_hooks for non-Claude sessions
             if entry.model_override:
                 state.session_manager.model_override = entry.model_override
@@ -3263,7 +3293,85 @@ class TelegramBot:
             self._route_by_session_id[session_id] = state.route
             self._upsert_route_inbox_target(state)
             self._persist_state_for_route(state.route)
+            self._persist_local_attribution_binding(state, session_id)
             self._record_task_session(state, session_id)
+
+    def _apply_registration_binding_from_text(
+        self, state: TelegramSessionState, text: str
+    ) -> bool:
+        try:
+            binding = _start_step.resolve_attribution_binding(
+                texts=(text,),
+                rows=_start_step.known_bead_rows(self._config.vault_path),
+            )
+        except Exception:
+            logger.debug("Unable to resolve registration receipt binding", exc_info=True)
+            return False
+        if binding is None:
+            return False
+        state.attribution_task_id = binding.get("task_id")
+        state.attribution_attempt_id = binding.get("attempt_id")
+        state.attribution_category = binding.get("category")
+        state.attribution_lane = binding.get("lane")
+        state.attribution_source = binding.get("source")
+        self._persist_state_for_route(state.route)
+        if state.session_id:
+            self._attribution_binding_signatures.pop(state.session_id, None)
+            self._persist_local_attribution_binding(state, state.session_id)
+        return True
+
+    def _persist_local_attribution_binding(
+        self, state: TelegramSessionState, session_id: str
+    ) -> None:
+        if self._attribution_store is None:
+            return
+        projection = self._state_inbox_projection(
+            state, allow_jsonl_lookup=False, allow_default_projection=True
+        )
+        team_name, agent_name = projection if projection is not None else (None, None)
+        display_lineage = tuple(state.agent_lineage or ())
+        machine_lineage: list[str] = []
+        if team_name:
+            machine_lineage.append(team_name)
+        for index in range(1, len(display_lineage)):
+            machine_lineage.append(agent_name_for_lineage(display_lineage[: index + 1]))
+        if agent_name:
+            if machine_lineage:
+                machine_lineage[-1] = agent_name
+            else:
+                machine_lineage.append(agent_name)
+        lineage = tuple(machine_lineage)
+        binding = {
+            "root_team_key": team_name,
+            "agent_name": agent_name,
+            "lineage": lineage,
+            "task_id": state.attribution_task_id,
+            "attempt_id": state.attribution_attempt_id,
+            "category": state.attribution_category,
+            "lane": state.attribution_lane,
+            "source": state.attribution_source or "runtime_state",
+        }
+        signature = (
+            team_name,
+            agent_name,
+            lineage,
+            state.attribution_task_id,
+            state.attribution_attempt_id,
+            state.attribution_category,
+            state.attribution_lane,
+            binding["source"],
+        )
+        if self._attribution_binding_signatures.get(session_id) == signature:
+            return
+        try:
+            self._attribution_store.upsert(session_id, binding)
+        except Exception:
+            logger.warning(
+                "Unable to persist local attribution binding session_id=%s", session_id,
+                exc_info=True,
+            )
+            return
+        self._attribution_binding_signatures[session_id] = signature
 
     def _record_task_session(self, state: TelegramSessionState, session_id: str) -> None:
         """Put the route's current session id on its AgentTask handle, durably (vault-1i53).
@@ -6950,6 +7058,7 @@ class TelegramBot:
         effort: str | None = None,
         env: dict[str, str] | None = None,
         origin: dict[str, Any] | None = None,
+        attribution_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create a new root tree as a new topic in an EXISTING group chat (vault-h667, ops-61).
 
@@ -7025,6 +7134,12 @@ class TelegramBot:
         state = self._get_state(route, topic_title=title, apply_default_new_chat_hooks=hooks is None)
         assert state is not None
         state.last_bot = bot
+        if isinstance(attribution_binding, dict):
+            state.attribution_task_id = attribution_binding.get("task_id")
+            state.attribution_attempt_id = attribution_binding.get("attempt_id")
+            state.attribution_category = attribution_binding.get("category")
+            state.attribution_lane = attribution_binding.get("lane")
+            state.attribution_source = attribution_binding.get("source") or "new_tree_prompt"
         self._set_topic_metadata(route=route, title=title, icon_custom_emoji_id=None)
         if hooks is not None:
             state.session_manager.user_hooks = hooks
@@ -10104,6 +10219,7 @@ class TelegramBot:
         if not proceed:
             state.pending_messages = []
             return _RunOutcome(assistant_text="")
+        self._apply_registration_binding_from_text(state, user_text)
         logger.info(
             "[run_and_send] preflight route=%s session_id=%s trigger_message_id=%s schedule_id=%s pending=%d msg=%.80s",
             state.route,
@@ -11420,6 +11536,7 @@ class TelegramBot:
         user_hooks: dict[str, str] | None = None,
         inherit_hooks: bool = False,
         launcher_lineage: bool = False,
+        attribution_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         from obs_agent.effort import child_effort_override, build_effort_env, resolve_effort
 
@@ -11622,6 +11739,18 @@ class TelegramBot:
                             f"Agent name collision: '{agent_name}' already exists in team '{team_name}'. "
                             f"Choose a different name for this child agent."
                         )
+        binding = attribution_binding or {
+            "task_id": parent_state.attribution_task_id,
+            "attempt_id": parent_state.attribution_attempt_id,
+            "category": parent_state.attribution_category,
+            "lane": parent_state.attribution_lane,
+            "source": "parent_runtime_binding" if parent_state.attribution_task_id else None,
+        }
+        child_state.attribution_task_id = binding.get("task_id")
+        child_state.attribution_attempt_id = binding.get("attempt_id")
+        child_state.attribution_category = binding.get("category")
+        child_state.attribution_lane = binding.get("lane")
+        child_state.attribution_source = binding.get("source")
         # Clear dropped key if name is being reused (respawn)
         await self._activate_route_session(child_state, child_session_id or None)
         team_env = self._build_team_worker_env(
@@ -12880,6 +13009,14 @@ class TelegramBot:
         child_state = self._get_state(record.child_route, create=False)
         if child_state is None or state.last_bot is None:
             return self._task_not_found_result(task_id)
+        binding = args.get("attribution_binding")
+        if isinstance(binding, dict) and binding.get("task_id"):
+            child_state.attribution_task_id = binding.get("task_id")
+            child_state.attribution_attempt_id = binding.get("attempt_id")
+            child_state.attribution_category = binding.get("category")
+            child_state.attribution_lane = binding.get("lane")
+            child_state.attribution_source = binding.get("source") or "resume_prompt"
+            self._persist_state_for_route(child_state.route)
         record.parent_route = route
         record.parent_session_id_at_launch = state.session_id or record.parent_session_id_at_launch
         record.parent_source_uuid = self._session_heads.get(state.session_id or "") or record.parent_source_uuid
@@ -13035,6 +13172,7 @@ class TelegramBot:
             effort=args.get("effort") if args.get("effort") not in (None, "inherit") else None,
             env=args.get("env"),
             origin=origin,
+            attribution_binding=args.get("attribution_binding"),
         )
         if not result.get("ok"):
             text = f"AgentTask new tree failed: {result.get('error')}"
@@ -13288,6 +13426,7 @@ class TelegramBot:
             temperature=temperature,
             user_hooks=user_hooks,
             inherit_hooks=inherit_hooks,
+            attribution_binding=args.get("attribution_binding"),
         )
         child_route: TelegramRoute = created["child_route"]
         child_service_message_id: int | None = created["child_service_message_id"]

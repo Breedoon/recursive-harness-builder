@@ -92,18 +92,24 @@ except Exception:  # pragma: no cover - keep proxy usable as a standalone script
 
 try:
     from obs_agent.request_lifecycle import (
-        RequestLifecycleLogger as _LifecycleLogger,
+        DEFAULT_BINDING_DB as _DEFAULT_LIFECYCLE_BINDING_DB,
         LifecycleRow as _LifecycleRow,
+        RequestLifecycleLogger as _LifecycleLogger,
+        SessionBindingStore as _SessionBindingStore,
+        lifecycle_root_for_proxy as _lifecycle_root_for_proxy,
         new_lifecycle_request_id as _new_lifecycle_req_id,
-        extract_identity_from_body as _extract_lifecycle_identity,
-        _identity_cache as _lifecycle_identity_cache,
+        record_direct_loss as _record_lifecycle_direct_loss,
+        record_startup_failure as _record_lifecycle_startup_failure,
     )
 except Exception:  # pragma: no cover - keep proxy usable without the module
     _LifecycleLogger = None  # type: ignore[assignment,misc]
     _LifecycleRow = None  # type: ignore[assignment,misc]
+    _SessionBindingStore = None  # type: ignore[assignment,misc]
+    _DEFAULT_LIFECYCLE_BINDING_DB = None  # type: ignore[assignment]
+    _lifecycle_root_for_proxy = None  # type: ignore[assignment]
     _new_lifecycle_req_id = None  # type: ignore[assignment]
-    _extract_lifecycle_identity = None  # type: ignore[assignment]
-    _lifecycle_identity_cache = None  # type: ignore[assignment]
+    _record_lifecycle_direct_loss = None  # type: ignore[assignment]
+    _record_lifecycle_startup_failure = None  # type: ignore[assignment]
 
 ANTHROPIC_UPSTREAM = "https://api.anthropic.com"
 CLI_PROXY_UPSTREAM = os.environ.get("CLI_PROXY_BASE_URL", "http://127.0.0.1:8317")
@@ -338,6 +344,32 @@ def _route_label(upstream: str, is_local: bool) -> str:
 def _is_local_model(model: str) -> bool:
     """True if *model* names a local Anthropic-compatible provider."""
     return _normalize_model_name(model).lower().startswith("local-")
+
+
+def _local_pool_engine(model: str, proxy_port: int | None = None) -> tuple[str, str]:
+    clean = _normalize_model_name(model).lower()
+    if clean.startswith("local-sparks-") or proxy_port == 28931:
+        return "sparks", "tensorfold"
+    return "rtx3090", "vllm"
+
+
+def _local_epoch_metadata() -> dict[str, str | None]:
+    """Return only content-free epoch identifiers; missing native facts stay null."""
+    result = {
+        "engine_instance": os.environ.get("OBS_LOCAL_ENGINE_INSTANCE"),
+        "engine_epoch": os.environ.get("OBS_LOCAL_ENGINE_EPOCH"),
+        "config_epoch": os.environ.get("OBS_LOCAL_CONFIG_EPOCH"),
+    }
+    if LOCAL_LIVENESS_FILE:
+        try:
+            doc = _local_liveness()
+        except Exception:
+            doc = {}
+        if isinstance(doc, dict):
+            result["engine_instance"] = result["engine_instance"] or doc.get("engine_instance") or doc.get("instance_id")
+            result["engine_epoch"] = result["engine_epoch"] or doc.get("engine_epoch") or doc.get("last_restart_at")
+            result["config_epoch"] = result["config_epoch"] or doc.get("config_epoch") or doc.get("config_sha256")
+    return result
 
 
 def _resolve_upstream(model: str) -> str:
@@ -2276,6 +2308,8 @@ class RequestLogger:
 
 REQUEST_LOGGER: RequestLogger | None = None
 LIFECYCLE_LOGGER: _LifecycleLogger | None = None  # type: ignore[valid-type]
+LIFECYCLE_BINDINGS: _SessionBindingStore | None = None  # type: ignore[valid-type]
+LIFECYCLE_ROOT: str | None = None
 
 
 def parse_sse_usage(sse_chunks: list[bytes]) -> dict:
@@ -2648,6 +2682,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _forward_messages(self):
         stats["requests"] += 1
+        ingress_wall = time.time()
+        ingress_mono = time.monotonic()
         length = int(self.headers.get("Content-Length", 0) or 0)
         raw_body = self.rfile.read(length)
 
@@ -2658,8 +2694,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         route_label = "anthropic"
         pin_beta = False
         rlog = REQUEST_LOGGER
-        # Per-request capture context. Filled best-effort; never affects forwarding.
-        self._rl = {"t0": time.time(), "session_id": "", "req_id": "",
+        # Capture receive time and immutable id before parsing/body normalization.
+        req_id = ""
+        try:
+            if rlog is not None:
+                req_id = rlog.new_request_id("")
+            elif _new_lifecycle_req_id is not None:
+                req_id = _new_lifecycle_req_id("")
+        except Exception:
+            pass
+        self._rl = {"t0": ingress_wall, "receive_mono": ingress_mono,
+                    "session_id": "", "req_id": req_id,
                     "status": None, "usage": None, "error": None}
         self._lc_row = None  # lifecycle row for local requests
         post_bytes = None
@@ -2676,11 +2721,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 self._rl["session_id"] = extract_session_id(data)
                 self._rl["obs"] = extract_obs_fork_context(data)
-                if rlog is not None:
-                    self._rl["req_id"] = rlog.new_request_id(self._rl["session_id"])
-                elif _new_lifecycle_req_id is not None:
-                    # Generate a request id even when the body logger is off
-                    self._rl["req_id"] = _new_lifecycle_req_id(self._rl["session_id"])
+                if not self._rl.get("req_id"):
+                    if rlog is not None:
+                        self._rl["req_id"] = rlog.new_request_id(self._rl["session_id"])
+                    elif _new_lifecycle_req_id is not None:
+                        self._rl["req_id"] = _new_lifecycle_req_id(self._rl["session_id"])
             except Exception:
                 pass
 
@@ -2707,7 +2752,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 stats["routed_cli_proxy"] += 1
 
-            # Create lifecycle row for local requests (content-free logging)
+            # Create lifecycle row from trusted runtime binding state only. Prompt
+            # text is never an attribution authority.
             if is_local and _LifecycleRow is not None and LIFECYCLE_LOGGER is not None:
                 try:
                     lc_req_id = self._rl.get("req_id") or _new_lifecycle_req_id(
@@ -2721,17 +2767,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             max_tokens = int(max_tokens)
                         except ValueError:
                             max_tokens = None
+                    proxy_port = int(getattr(self.server, "server_port", 0) or 0)
+                    pool, engine = _local_pool_engine(raw_model, proxy_port)
+                    epochs = _local_epoch_metadata()
                     self._lc_row = _LifecycleRow(
                         request_id=lc_req_id,
                         session_id=self._rl.get("session_id", ""),
                         model=_normalize_model_name(raw_model),
+                        pool=pool,
+                        engine=engine,
                         route="local",
                         client_kind=client_kind,
                         max_tokens=max_tokens if isinstance(max_tokens, int) else None,
                         stream=bool(is_streaming),
+                        receive_wall=self._rl.get("t0"),
+                        receive_mono=self._rl.get("receive_mono"),
+                        proxy_instance_id=LIFECYCLE_LOGGER.proxy_instance_id,
+                        proxy_source_sha256=_LOADED_SOURCE_SHA256,
+                        proxy_port=proxy_port,
+                        **epochs,
                     )
-                    # Extract identity from bootstrap XML (out of band, no body logging)
-                    self._lc_row.resolve_identity(data)
+                    binding = (
+                        LIFECYCLE_BINDINGS.get(
+                            self._rl.get("session_id", ""), at_ts=self._rl.get("t0")
+                        )
+                        if LIFECYCLE_BINDINGS is not None else None
+                    )
+                    self._lc_row.bind(binding)
                 except Exception:
                     self._lc_row = None
 
@@ -2848,6 +2910,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     return
                 upstream = LOCAL_UPSTREAM
                 route_label = "local"
+                if _LifecycleRow is not None and LIFECYCLE_LOGGER is not None:
+                    try:
+                        proxy_port = int(getattr(self.server, "server_port", 0) or 0)
+                        pool, engine = _local_pool_engine("local-unknown", proxy_port)
+                        self._lc_row = _LifecycleRow(
+                            request_id=self._rl.get("req_id") or _new_lifecycle_req_id(""),
+                            session_id="",
+                            model="local-unknown-malformed",
+                            pool=pool,
+                            engine=engine,
+                            route="local",
+                            client_kind=("claude-cli" if "claude-cli" in str(
+                                self.headers.get("User-Agent", "")) else "other"),
+                            max_tokens=None,
+                            stream=bool(is_streaming),
+                            receive_wall=self._rl.get("t0"),
+                            receive_mono=self._rl.get("receive_mono"),
+                            proxy_instance_id=LIFECYCLE_LOGGER.proxy_instance_id,
+                            proxy_source_sha256=_LOADED_SOURCE_SHA256,
+                            proxy_port=proxy_port,
+                            **_local_epoch_metadata(),
+                        )
+                    except Exception:
+                        self._lc_row = None
 
         headers = self._upstream_headers(upstream)
         headers["content-length"] = str(len(body))
@@ -2886,17 +2972,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if lc_row.outcome is None:
                         usage = rl.get("usage")
                         status = rl.get("status")
-                        error = rl.get("error")
-                        if status and status < 400 and usage:
+                        if lc_row.t_upstream_send is None:
+                            lc_row.mark_terminal("not_transmitted", error_class="unknown",
+                                                 http_status=status)
+                        elif status and status < 400 and usage:
                             lc_row.mark_terminal("success", usage=usage,
                                                  http_status=status)
                         elif status and status >= 400:
-                            lc_row.mark_terminal("error", error_class="upstream_error",
-                                                 error_message=error,
+                            lc_row.mark_terminal("error", error_class="upstream_http_error",
+                                                 http_status=status)
+                        elif status and status < 400:
+                            lc_row.mark_terminal("invalid_response", error_class="missing_usage",
                                                  http_status=status)
                         else:
-                            lc_row.mark_terminal("unknown",
-                                                 error_message=error,
+                            lc_row.mark_terminal("unknown", error_class="unknown",
                                                  http_status=status)
                     LIFECYCLE_LOGGER.submit(lc_row.to_record())
                 except Exception:
@@ -3112,8 +3201,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if now >= hold_until:
                         if lc is not None:
                             lc.mark_hold_end()
-                            lc.mark_terminal("timeout", error_class="recovery_timeout",
-                                             error_message=f"local upstream not recovered after {LOCAL_RECOVERY_WAIT_SECONDS:.0f}s")
+                            lc.mark_terminal("timeout", error_class="recovery_timeout")
                         fail(f"local upstream {doc.get('state')}: {doc.get('reason')}; not "
                              f"recovered after {LOCAL_RECOVERY_WAIT_SECONDS:.0f}s")
                         return
@@ -3132,6 +3220,37 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 deadline = time.monotonic() + LOCAL_HEADER_WAIT_SECONDS
             if lc is not None:
                 lc.mark_upstream_send()
+                if LIFECYCLE_LOGGER is not None:
+                    LIFECYCLE_LOGGER.record_transmission_start(lc)
+            elif _record_lifecycle_direct_loss is not None:
+                fallback_request_id = rl.get("req_id") or _new_lifecycle_req_id(
+                    rl.get("session_id", "")
+                )
+                rl["req_id"] = fallback_request_id
+                proxy_port = int(getattr(self.server, "server_port", 0) or 0)
+                pool, _engine = _local_pool_engine(log_model or "local-unknown", proxy_port)
+                binding = (
+                    LIFECYCLE_BINDINGS.get(rl.get("session_id", ""), at_ts=rl.get("t0"))
+                    if LIFECYCLE_BINDINGS is not None else None
+                ) or {}
+                fallback_root = LIFECYCLE_ROOT or (
+                    _lifecycle_root_for_proxy(proxy_port, LOG_DIR)
+                    if _lifecycle_root_for_proxy is not None
+                    else os.path.join(LOG_DIR, "request-lifecycle")
+                )
+                _record_lifecycle_direct_loss(
+                    fallback_root,
+                    request_id=fallback_request_id,
+                    code="lifecycle_unavailable",
+                    proxy_port=proxy_port,
+                    attributes={
+                        "session_id": rl.get("session_id") or None,
+                        "task_id": binding.get("task_id"),
+                        "attempt_id": binding.get("attempt_id"),
+                        "category": binding.get("category"),
+                        "pool": pool,
+                    },
+                )
             upstream.start()
             while True:
                 wait = (LOCAL_KEEPALIVE_SECONDS if committed
@@ -3147,8 +3266,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         log(f"LOCAL: failing in-flight request: {msg[:300]}")
                         upstream.cancel()
                         if lc is not None:
-                            lc.mark_terminal("cancelled", error_class="wedge",
-                                             error_message=msg[:500], http_status=529)
+                            lc.mark_cancel_requested("wedge")
+                            lc.mark_terminal("cancel_requested", error_class="wedge",
+                                             http_status=529)
                         fail(msg, code=529)
                         return
                     if not committed:
@@ -3164,15 +3284,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     status, resp_headers = ev[1], ev[2]
                     rl["status"] = status
                     if lc is not None:
-                        lc.mark_headers(status)
+                        lc.mark_headers(
+                            status,
+                            native_request_id=(
+                                resp_headers.get("x-request-id")
+                                or resp_headers.get("request-id")
+                                or resp_headers.get("x-correlation-id")
+                            ),
+                        )
                     if status >= 400:
                         error_body = upstream.read_rest(events)
                         rl["error"] = error_body[:500].decode("utf-8", errors="replace")
                         log(f"LOCAL: upstream error status={status} "
                             f"{error_body[:300].decode('utf-8', errors='replace')}")
                         if lc is not None:
-                            lc.mark_terminal("error", error_class="upstream_error",
-                                             error_message=rl["error"],
+                            lc.mark_terminal("error", error_class="upstream_http_error",
                                              http_status=status)
                         if not committed:
                             if self._send_translated_overflow(status, error_body):
@@ -3199,8 +3325,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         commit(status, resp_headers)
                 elif kind == "chunk":
                     chunk = ev[1]
-                    if lc is not None:
-                        lc.mark_first_event()
+                    if lc is not None and is_streaming:
+                        lc.observe_stream_chunk(chunk)
                     if fixer is not None:
                         chunk = fixer.feed(chunk)
                     if chunk:
@@ -3217,14 +3343,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                f"{LOCAL_UPSTREAM_SILENCE_SECONDS:.0f}s")
                         log(f"LOCAL: {msg}")
                         if lc is not None:
-                            lc.mark_terminal("timeout", error_class="upstream_silence",
-                                             error_message=msg)
+                            lc.mark_cancel_requested("upstream_silence")
+                            lc.mark_terminal("timeout", error_class="upstream_silence")
                         fail(msg)
                     else:
                         log(f"upstream error: {exc}")
                         if lc is not None:
-                            lc.mark_terminal("error", error_class="upstream_error",
-                                             error_message=str(exc)[:500],
+                            lc.mark_cancel_requested("proxy_upstream_error")
+                            lc.mark_terminal("error", error_class="proxy_upstream_error",
                                              http_status=502)
                         fail(f"proxy upstream error: {exc}", error_type="api_error", code=502)
                     return
@@ -3243,14 +3369,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                     req_id=rl.get("req_id", ""),
                                     session_id=rl.get("session_id", ""),
                                     http_status=status)
-                    if lc is not None:
-                        lc.mark_terminal("success", usage=usage, http_status=status)
-                else:
-                    raw_preview = b"".join(chunks)[:500].decode("utf-8", errors="replace")
-                    rl["error"] = raw_preview
-                    log(f"STREAM: no usage in {len(chunks)} chunks. Preview: {raw_preview[:200]}")
-                    if lc is not None:
-                        lc.mark_terminal("success", http_status=status)
+                if lc is not None:
+                    if lc.stream_error_seen:
+                        lc.mark_terminal("error", error_class="stream_error_event",
+                                         usage=usage or None, http_status=status)
+                    elif not lc.stream_terminal_seen:
+                        lc.mark_terminal("invalid_response", error_class="invalid_response",
+                                         usage=usage or None, http_status=status)
+                    elif not usage:
+                        lc.mark_terminal("invalid_response", error_class="missing_usage",
+                                         http_status=status, native_terminal=True)
+                    else:
+                        lc.mark_terminal("success", usage=usage, http_status=status,
+                                         native_terminal=True)
             else:
                 content = b"".join(chunks)
                 if content:
@@ -3258,31 +3389,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
                 try:
-                    usage = json.loads(content).get("usage", {})
-                    if usage:
-                        rl["usage"] = usage
-                        log_usage_entry(norm_action, usage, model=log_model, route="local",
-                                        req_id=rl.get("req_id", ""),
-                                        session_id=rl.get("session_id", ""),
-                                        http_status=status)
-                        if lc is not None:
-                            lc.mark_terminal("success", usage=usage, http_status=status)
+                    parsed = json.loads(content)
+                    valid = isinstance(parsed, dict)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    parsed, valid = None, False
+                if lc is not None:
+                    lc_valid, _lc_parsed = lc.observe_nonstream_payload(content)
+                    valid = valid and lc_valid
+                usage = parsed.get("usage") if valid and isinstance(parsed, dict) else None
+                content_valid = valid and isinstance(parsed.get("content"), list)
+                if isinstance(usage, dict) and usage:
+                    rl["usage"] = usage
+                    log_usage_entry(norm_action, usage, model=log_model, route="local",
+                                    req_id=rl.get("req_id", ""),
+                                    session_id=rl.get("session_id", ""),
+                                    http_status=status)
+                if lc is not None:
+                    if not valid or not content_valid:
+                        lc.mark_terminal("invalid_response", error_class="invalid_response",
+                                         http_status=status)
+                    elif not isinstance(usage, dict) or not usage:
+                        lc.mark_terminal("invalid_response", error_class="missing_usage",
+                                         http_status=status, native_terminal=True)
                     else:
-                        log(f"NON-STREAM: no usage in response (status={status})")
-                        if lc is not None:
-                            lc.mark_terminal("success", http_status=status)
-                except Exception as e:
-                    log(f"NON-STREAM: response parse error: {e}")
-                    if lc is not None:
-                        lc.mark_terminal("success", http_status=status)
+                        lc.mark_terminal("success", usage=usage, http_status=status,
+                                         native_terminal=True)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
             stats["local_client_gone"] += 1
             rl["status"] = rl.get("status") or 499
             rl["error"] = f"client disconnected: {e}"
             log(f"LOCAL: client disconnected ({e}); closing upstream request")
             if lc is not None:
+                lc.mark_cancel_requested("client_disconnected")
                 lc.mark_terminal("client_gone", error_class="client_disconnected",
-                                 error_message=str(e)[:500], http_status=499)
+                                 http_status=499)
         finally:
             upstream.cancel()
 
@@ -3394,15 +3534,35 @@ def main():
     else:
         log("request_log: OFF (non-production port or CACHE_PROXY_REQUEST_LOG=0; "
             "set CACHE_PROXY_REQUEST_LOG=1 to force)")
-    # Local-request lifecycle logger (content-free, always on when the module exists)
-    global LIFECYCLE_LOGGER
+    # Local-request lifecycle logger (content-free, isolated for scratch ports).
+    global LIFECYCLE_LOGGER, LIFECYCLE_BINDINGS, LIFECYCLE_ROOT
+    lifecycle_root = (
+        _lifecycle_root_for_proxy(port, LOG_DIR)
+        if _lifecycle_root_for_proxy is not None else os.path.join(LOG_DIR, "request-lifecycle")
+    )
+    LIFECYCLE_ROOT = lifecycle_root
+    if _SessionBindingStore is not None:
+        try:
+            LIFECYCLE_BINDINGS = _SessionBindingStore(
+                os.environ.get("OBS_REQUEST_BINDING_DB") or _DEFAULT_LIFECYCLE_BINDING_DB,
+                writable=False,
+            )
+        except Exception:
+            LIFECYCLE_BINDINGS = None
     if _LifecycleLogger is not None and LOCAL_UPSTREAM:
         try:
-            LIFECYCLE_LOGGER = _LifecycleLogger()
+            LIFECYCLE_LOGGER = _LifecycleLogger(
+                root=lifecycle_root,
+                proxy_port=port,
+                proxy_source_sha256=_LOADED_SOURCE_SHA256,
+                cache_proxy_log_dir=LOG_DIR,
+            )
             log(f"lifecycle_log: ON dir={LIFECYCLE_LOGGER.root}")
         except Exception as e:
             LIFECYCLE_LOGGER = None
-            log(f"lifecycle_log: FAILED to start ({e})")
+            if _record_lifecycle_startup_failure is not None:
+                _record_lifecycle_startup_failure(lifecycle_root, proxy_port=port)
+            log(f"lifecycle_log: FAILED to start ({type(e).__name__})")
     else:
         log("lifecycle_log: OFF (no local upstream or module unavailable)")
     log(f"normalizations: billing, string→list, strip all system reminders, "

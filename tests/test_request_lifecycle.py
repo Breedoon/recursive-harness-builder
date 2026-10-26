@@ -1,20 +1,16 @@
-"""Tests for content-free local-model request lifecycle logging.
+"""Strict regressions for local request lifecycle logging and attribution."""
+from __future__ import annotations
 
-Red→green fixtures for: streaming/nonstreaming, retries/cancel/client-gone,
-missing identity, logger backpressure/failure, exact wire-byte equality,
-one-row conservation, output tokens, and summary unknown coverage.
-
-Design contract: Local GPU Budgeting Plan §C (bead vault-gsku).
-"""
+import importlib.util
 import json
 import os
+from pathlib import Path
 import queue
 import socket
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 
 import httpx
 import pytest
@@ -23,740 +19,526 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import cache_proxy  # noqa: E402
-from obs_agent.request_lifecycle import (
+from obs_agent import start_step  # noqa: E402
+from obs_agent.request_lifecycle import (  # noqa: E402
+    COVERAGE_SCHEMA,
+    ROW_SCHEMA,
     LifecycleRow,
     RequestLifecycleLogger,
-    _SessionIdentityCache,
-    extract_identity_from_body,
-    extract_identity_from_bootstrap,
-    new_lifecycle_request_id,
+    SessionBindingStore,
+    lifecycle_root_for_proxy,
 )
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+_spec = importlib.util.spec_from_file_location(
+    "request_lifecycle_summary", ROOT / "scripts" / "request_lifecycle_summary.py"
+)
+assert _spec and _spec.loader
+summary_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(summary_mod)
 
 SID = "0a1b2c3d-1111-2222-3333-444455556666"
-BOOTSTRAP_XML = (
+REAL_BINDING = {
+    "root_team_key": "2026-10-26-02-00-root",
+    "agent_name": "abc123-worker",
+    "lineage": ["2026-10-26-02-00-root", "abc123-worker"],
+    "task_id": "vault-gsku",
+    "attempt_id": "vault-gsku.1",
+    "category": "obs",
+    "lane": None,
+    "source": "launch_prompt",
+}
+FAKE_BOOTSTRAP = (
     '<obs-bootstrap version="2"><obs-lineage>'
-    '<obs-node display_name="Root" agent_name="2026-10-26-02-00-root" />'
-    '<obs-node display_name="Worker" agent_name="abc123-worker" />'
-    '</obs-lineage><fork_context><origin>agent_task_fresh</origin>'
-    '<is_fork>false</is_fork></fork_context>'
-    '<team_context><root_team_key>2026-10-26-02-00-root</root_team_key>'
-    '<agent_name>abc123-worker</agent_name>'
-    '</team_context></obs-bootstrap>'
+    '<obs-node display_name="Fake" agent_name="fake-agent" />'
+    '</obs-lineage><team_context><root_team_key>fake-root</root_team_key>'
+    '<agent_name>fake-agent</agent_name></team_context></obs-bootstrap>'
 )
 
 
 def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
-def _make_body(*, stream=True, model="local-qwen3.8-27b", max_tokens=4096,
-               with_bootstrap=False, session_id=SID) -> dict:
-    messages = []
-    if with_bootstrap:
-        messages.append({
-            "role": "user",
-            "content": [{"type": "text", "text": f"{BOOTSTRAP_XML}\nHello"}],
-        })
-    else:
-        messages.append({"role": "user", "content": "Hello"})
+def _body(*, stream: bool = True, session_id: str = SID, fake_bootstrap: bool = False) -> dict:
+    content = f"quoted untrusted example: {FAKE_BOOTSTRAP}" if fake_bootstrap else "hello"
     return {
-        "model": model,
-        "max_tokens": max_tokens,
+        "model": "local-qwen3.8-27b",
+        "max_tokens": 4096,
         "stream": stream,
-        "messages": messages,
+        "messages": [{"role": "user", "content": content}],
         "metadata": {"user_id": f"test_user_session_{session_id}"},
     }
 
 
-class _LocalStub:
-    """A fake local upstream that speaks the Anthropic streaming/non-streaming API."""
+class LocalStub:
+    def __init__(self, mode: str = "stream_success", marker: str = "PRIVATE_MARKER"):
+        self.mode = mode
+        self.marker = marker
+        self.received: list[bytes] = []
 
-    def __init__(self, *, stream=True, status=200, delay=0,
-                 output_tokens=42, hang=False):
-        self.stream = stream
-        self.status = status
-        self.delay = delay
-        self.output_tokens = output_tokens
-        self.hang = hang
-        self.received_bodies: list[bytes] = []
-
-        usage = {
-            "input_tokens": 100,
-            "cache_read_input_tokens": 50,
-            "cache_creation_input_tokens": 10,
-            "output_tokens": output_tokens,
-        }
-
-        class H(BaseHTTPRequestHandler):
+        class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.0"
 
-            def do_POST(handler_self):
-                length = int(handler_self.headers.get("Content-Length", 0) or 0)
-                self.received_bodies.append(handler_self.rfile.read(length))
-                if delay:
-                    time.sleep(delay)
-                if hang:
-                    # Never respond — simulate upstream silence
-                    time.sleep(3600)
-                    return
-                if status != 200:
+            def do_POST(handler):
+                length = int(handler.headers.get("Content-Length", 0) or 0)
+                self.received.append(handler.rfile.read(length))
+                usage = {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 50,
+                    "cache_creation_input_tokens": 10,
+                    "output_tokens": 7,
+                }
+                if self.mode == "http_error":
                     payload = json.dumps({
                         "type": "error",
-                        "error": {"type": "overloaded_error", "message": "busy"},
+                        "error": {"type": "api_error", "message": self.marker},
                     }).encode()
-                    handler_self.send_response(status)
-                    handler_self.send_header("Content-Type", "application/json")
-                    handler_self.send_header("Content-Length", str(len(payload)))
-                    handler_self.end_headers()
-                    handler_self.wfile.write(payload)
+                    handler.send_response(400)
+                    handler.send_header("Content-Type", "application/json")
+                    handler.send_header("Content-Length", str(len(payload)))
+                    handler.end_headers()
+                    handler.wfile.write(payload)
                     return
-                if stream:
-                    start_ev = {"type": "message_start", "message": {"usage": usage}}
-                    delta_ev = {
-                        "type": "content_block_delta",
-                        "delta": {"type": "text_delta", "text": "hi"},
-                    }
-                    stop_ev = {
-                        "type": "message_delta",
-                        "usage": {"output_tokens": output_tokens},
-                    }
-                    payload = (
-                        f"event: message_start\ndata: {json.dumps(start_ev)}\n\n"
-                        f"event: content_block_delta\ndata: {json.dumps(delta_ev)}\n\n"
-                        f"event: message_delta\ndata: {json.dumps(stop_ev)}\n\n"
-                    ).encode()
-                    handler_self.send_response(200)
-                    handler_self.send_header("Content-Type", "text/event-stream")
-                    handler_self.end_headers()
-                    handler_self.wfile.write(payload)
-                else:
+                if self.mode == "invalid_200":
+                    payload = b"not-json-private-response"
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "application/json")
+                    handler.send_header("Content-Length", str(len(payload)))
+                    handler.end_headers()
+                    handler.wfile.write(payload)
+                    return
+                if self.mode == "nonstream_success":
                     payload = json.dumps({
                         "usage": usage,
                         "content": [{"type": "text", "text": "hi"}],
                     }).encode()
-                    handler_self.send_response(200)
-                    handler_self.send_header("Content-Type", "application/json")
-                    handler_self.send_header("Content-Length", str(len(payload)))
-                    handler_self.end_headers()
-                    handler_self.wfile.write(payload)
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "application/json")
+                    handler.send_header("Content-Length", str(len(payload)))
+                    handler.send_header("x-request-id", "native-test-1")
+                    handler.end_headers()
+                    handler.wfile.write(payload)
+                    return
+                events = [
+                    {"type": "message_start", "message": {"usage": usage}},
+                    {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
+                    {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}},
+                    {"type": "message_delta", "usage": {"output_tokens": 7}},
+                    {"type": "message_stop"},
+                ]
+                payload = b"".join(
+                    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                    for event in events
+                )
+                handler.send_response(200)
+                handler.send_header("Content-Type", "text/event-stream")
+                handler.send_header("x-request-id", "native-stream-1")
+                handler.end_headers()
+                handler.wfile.write(payload)
 
-            def log_message(self, *a):
+            def log_message(self, *_args):
                 pass
 
-        port = _free_port()
-        self.srv = HTTPServer(("127.0.0.1", port), H)
-        self.url = f"http://127.0.0.1:{port}"
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.server = HTTPServer(("127.0.0.1", _free_port()), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def shutdown(self):
-        self.srv.shutdown()
-
-
-@pytest.fixture
-def lifecycle_dir(tmp_path):
-    d = tmp_path / "lifecycle"
-    d.mkdir()
-    return str(d)
+    def close(self) -> None:
+        self.server.shutdown()
 
 
-@pytest.fixture
-def logger(lifecycle_dir):
-    lg = RequestLifecycleLogger(root=lifecycle_dir, max_bytes=10**9)
-    yield lg
-    lg.flush()
+def _jsonl(root: Path, prefix: str) -> list[dict]:
+    rows = []
+    for path in sorted(root.glob(f"{prefix}*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
 
 
 @pytest.fixture
-def local_stub():
-    stub = _LocalStub(stream=True)
-    yield stub
-    stub.shutdown()
+def proxy_factory(tmp_path, monkeypatch):
+    resources = []
+
+    def make(mode="stream_success", *, binding=True):
+        stub = LocalStub(mode)
+        log_root = tmp_path / f"lifecycle-{len(resources)}"
+        proxy_log = tmp_path / f"proxy-{len(resources)}"
+        binding_db = tmp_path / f"bindings-{len(resources)}.sqlite3"
+        writer = SessionBindingStore(binding_db)
+        if binding:
+            writer.upsert(SID, REAL_BINDING, bound_at=time.time() - 10)
+        logger = RequestLifecycleLogger(
+            root=log_root, max_bytes=2_000_000, proxy_port=28925,
+            proxy_source_sha256="a" * 64,
+        )
+        monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", stub.url)
+        monkeypatch.setattr(cache_proxy, "LOG_DIR", str(proxy_log))
+        monkeypatch.setattr(cache_proxy, "USAGE_LOG", str(proxy_log / "usage.jsonl"))
+        monkeypatch.setattr(cache_proxy, "REQUEST_LOGGER", None)
+        monkeypatch.setattr(cache_proxy, "LIFECYCLE_LOGGER", logger)
+        monkeypatch.setattr(cache_proxy, "LIFECYCLE_BINDINGS", SessionBindingStore(binding_db, writable=False))
+        monkeypatch.setattr(cache_proxy, "_effort_pins", cache_proxy.EffortPinStore(None))
+        server = cache_proxy.ThreadedHTTPServer(("127.0.0.1", _free_port()), cache_proxy.ProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        resources.append((server, stub, logger))
+        return server.server_port, stub, logger, log_root
+
+    yield make
+    for server, stub, logger in resources:
+        server.shutdown()
+        stub.close()
+        logger.flush()
 
 
-@pytest.fixture
-def local_stub_nonstream():
-    stub = _LocalStub(stream=False)
-    yield stub
-    stub.shutdown()
-
-
-@pytest.fixture
-def proxy_with_lifecycle(tmp_path, local_stub, lifecycle_dir, monkeypatch):
-    """Start a proxy with lifecycle logging pointed at a local stub."""
-    log_dir = str(tmp_path / "proxy-log")
-    os.makedirs(log_dir, exist_ok=True)
-    monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", local_stub.url)
-    monkeypatch.setattr(cache_proxy, "LOG_DIR", log_dir)
-    monkeypatch.setattr(cache_proxy, "USAGE_LOG", os.path.join(log_dir, "usage.jsonl"))
-    monkeypatch.setattr(cache_proxy, "REQUEST_LOGGER", None)
-    lc_logger = RequestLifecycleLogger(root=lifecycle_dir, max_bytes=10**9)
-    monkeypatch.setattr(cache_proxy, "LIFECYCLE_LOGGER", lc_logger)
-    monkeypatch.setattr(cache_proxy, "_effort_pins", cache_proxy.EffortPinStore(None))
-    port = _free_port()
-    srv = cache_proxy.ThreadedHTTPServer(("127.0.0.1", port), cache_proxy.ProxyHandler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield port, lc_logger, lifecycle_dir
-    srv.shutdown()
-    lc_logger.flush()
-
-
-def _send_request(proxy_port: int, body: dict) -> httpx.Response:
-    """Send a /v1/messages request to the proxy."""
+def _send(port: int, *, body: dict | None = None, raw: bytes | None = None) -> httpx.Response:
     return httpx.post(
-        f"http://127.0.0.1:{proxy_port}/v1/messages",
-        json=body,
+        f"http://127.0.0.1:{port}/v1/messages",
+        json=body if raw is None else None,
+        content=raw,
         headers={"x-api-key": "sk-test", "anthropic-version": "2023-06-01"},
         timeout=30,
     )
 
 
-def _read_lifecycle_rows(lifecycle_dir: str) -> list[dict]:
-    rows = []
-    for name in sorted(os.listdir(lifecycle_dir)):
-        if not name.endswith(".jsonl"):
-            continue
-        with open(os.path.join(lifecycle_dir, name)) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
-    return rows
+class TestBindingStore:
+    def test_restart_persistence_and_nearest_binding(self, tmp_path):
+        path = tmp_path / "bindings.sqlite3"
+        writer = SessionBindingStore(path)
+        writer.upsert(SID, {**REAL_BINDING, "attempt_id": "vault-gsku.1"}, bound_at=100)
+        writer.upsert(SID, {**REAL_BINDING, "attempt_id": "vault-gsku.2"}, bound_at=200)
+        restarted = SessionBindingStore(path, writable=False)
+        assert restarted.get(SID, at_ts=150)["attempt_id"] == "vault-gsku.1"
+        assert restarted.get(SID, at_ts=250)["attempt_id"] == "vault-gsku.2"
 
+    def test_two_sessions_fork_resume_keep_trusted_identity(self, tmp_path):
+        path = tmp_path / "bindings.sqlite3"
+        store = SessionBindingStore(path)
+        store.upsert("parent-session", REAL_BINDING, bound_at=100)
+        store.upsert("child-session", {**REAL_BINDING, "agent_name": "child-agent",
+                                       "lineage": [*REAL_BINDING["lineage"], "child-agent"]}, bound_at=100)
+        reader = SessionBindingStore(path, writable=False)
+        assert reader.get("parent-session", at_ts=200)["attempt_id"] == "vault-gsku.1"
+        assert reader.get("child-session", at_ts=200)["root_team_key"] == REAL_BINDING["root_team_key"]
 
-# ---------------------------------------------------------------------------
-# Identity extraction tests
-# ---------------------------------------------------------------------------
-
-class TestIdentityExtraction:
-    def test_extract_from_bootstrap_xml(self):
-        identity = extract_identity_from_bootstrap(BOOTSTRAP_XML)
-        assert identity is not None
-        assert identity["agent_name"] == "abc123-worker"
-        assert identity["root_team_key"] == "2026-10-26-02-00-root"
-        assert identity["lineage"] == ["2026-10-26-02-00-root", "abc123-worker"]
-
-    def test_extract_from_body_with_bootstrap(self):
-        body = _make_body(with_bootstrap=True)
-        identity = extract_identity_from_body(body)
-        assert identity is not None
-        assert identity["agent_name"] == "abc123-worker"
-
-    def test_extract_from_body_without_bootstrap(self):
-        body = _make_body(with_bootstrap=False)
-        identity = extract_identity_from_body(body)
-        assert identity is None
-
-    def test_no_bootstrap_in_text(self):
-        assert extract_identity_from_bootstrap("just plain text") is None
-
-    def test_empty_messages(self):
-        assert extract_identity_from_body({"messages": []}) is None
-        assert extract_identity_from_body({}) is None
-
-
-# ---------------------------------------------------------------------------
-# Session identity cache tests
-# ---------------------------------------------------------------------------
-
-class TestSessionIdentityCache:
-    def test_put_and_get(self):
-        cache = _SessionIdentityCache(max_size=10)
-        identity = {"agent_name": "test", "root_team_key": "team1"}
-        cache.put("sess1", identity)
-        assert cache.get("sess1") == identity
-
-    def test_miss(self):
-        cache = _SessionIdentityCache(max_size=10)
-        assert cache.get("nonexistent") is None
-
-    def test_ttl_expiry(self):
-        cache = _SessionIdentityCache(max_size=10, ttl=0.01)
-        cache.put("sess1", {"agent_name": "test"})
-        time.sleep(0.02)
-        assert cache.get("sess1") is None
-
-    def test_lru_eviction(self):
-        cache = _SessionIdentityCache(max_size=2)
-        cache.put("a", {"agent_name": "a"})
-        cache.put("b", {"agent_name": "b"})
-        cache.put("c", {"agent_name": "c"})
-        # 'a' should have been evicted
-        assert cache.get("a") is None
-        assert cache.get("b") is not None
-        assert cache.get("c") is not None
-
-    def test_empty_key(self):
-        cache = _SessionIdentityCache()
-        cache.put("", {"agent_name": "test"})
-        assert cache.get("") is None
-
-
-# ---------------------------------------------------------------------------
-# LifecycleRow tests
-# ---------------------------------------------------------------------------
 
 class TestLifecycleRow:
-    def test_basic_record(self):
-        row = LifecycleRow(
-            request_id="lc-test-001",
-            session_id=SID,
-            model="local-qwen3.8-27b",
-            stream=True,
-            max_tokens=4096,
-        )
+    def test_missing_usage_categories_remain_null(self):
+        row = LifecycleRow(request_id="r1", session_id=SID, model="local-test", max_tokens=5)
         row.mark_upstream_send()
-        time.sleep(0.01)
-        row.mark_headers(200)
-        row.mark_first_event()
-        row.mark_terminal("success", usage={
-            "input_tokens": 100,
-            "cache_read_input_tokens": 50,
-            "cache_creation_input_tokens": 10,
-            "output_tokens": 42,
-        }, http_status=200)
+        row.mark_terminal("success", usage={"input_tokens": 3, "output_tokens": 2})
         record = row.to_record()
+        assert record["usage"]["cache_read_input_tokens"] is None
+        assert record["usage_available"]["cache_read_input_tokens"] is False
+        assert record["accounting"]["reservation_tokens"] is None
 
-        assert record["request_id"] == "lc-test-001"
-        assert record["session_id"] == SID
-        assert record["model"] == "local-qwen3.8-27b"
-        assert record["stream"] is True
-        assert record["max_tokens"] == 4096
-        assert record["outcome"] == "success"
-        assert record["http_status"] == 200
-        assert record["usage"]["output_tokens"] == 42
-        assert record["durations"]["total_ms"] > 0
-        assert record["t_receive"] is not None
-        assert record["t_terminal"] is not None
+    def test_safe_error_taxonomy_contains_no_raw_error(self):
+        row = LifecycleRow(request_id="r2", session_id=SID, model="local-test")
+        row.mark_terminal("error", error_class="upstream_http_error", http_status=400)
+        encoded = json.dumps(row.to_record())
+        assert "error_message" not in encoded
+        assert "private" not in encoded
 
-    def test_missing_fields_are_explicit(self):
-        row = LifecycleRow(
-            request_id="lc-test-002",
-            session_id="",
-            model="local-test",
+    def test_stream_semantics_and_cancel_requested(self):
+        row = LifecycleRow(request_id="r3", session_id=SID, model="local-test", stream=True)
+        row.observe_stream_chunk(
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}\n\n'
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
         )
-        row.mark_terminal("error", error_class="upstream_error")
+        assert row.t_first_event and row.t_first_content and row.t_first_text
+        assert row.stream_terminal_seen
+        row.mark_cancel_requested("wedge")
+        row.mark_terminal("cancel_requested", error_class="wedge")
         record = row.to_record()
-
-        assert record["session_id"] is None  # empty string -> None in logic? actually ""
-        # But the contract says explicit missing/unknown
-        assert record["t_hold_start"] is None
-        assert record["t_hold_end"] is None
-        assert record["t_first_event"] is None
-        assert record["t_first_delta"] is None
-        assert record["durations"]["hold_ms"] is None
-        assert record["durations"]["ttfd_ms"] is None
-        assert record["identity"] is None
-        assert record["identity_source"] == "unknown"
-
-    def test_hold_duration(self):
-        row = LifecycleRow(
-            request_id="lc-test-003",
-            session_id=SID,
-            model="local-test",
-        )
-        row.mark_hold_start()
-        time.sleep(0.02)
-        row.mark_hold_end()
-        row.mark_terminal("success")
-        record = row.to_record()
-
-        assert record["t_hold_start"] is not None
-        assert record["t_hold_end"] is not None
-        hold_ms = record["durations"]["hold_ms"]
-        assert hold_ms is not None and hold_ms >= 15  # at least ~15ms
-
-    def test_identity_from_bootstrap(self):
-        body = _make_body(with_bootstrap=True)
-        row = LifecycleRow(
-            request_id="lc-test-004",
-            session_id=SID,
-            model="local-test",
-        )
-        row.resolve_identity(body)
-        record = row.to_record()
-
-        assert record["identity_source"] == "bootstrap"
-        assert record["identity"]["agent_name"] == "abc123-worker"
-
-    def test_identity_from_session_cache(self):
-        # Pre-populate cache
-        from obs_agent.request_lifecycle import _identity_cache
-        _identity_cache.put(SID, {
-            "agent_name": "cached-agent",
-            "root_team_key": "cached-team",
-        })
-        row = LifecycleRow(
-            request_id="lc-test-005",
-            session_id=SID,
-            model="local-test",
-        )
-        row.resolve_identity(None)
-        record = row.to_record()
-
-        assert record["identity_source"] == "session_cache"
-        assert record["identity"]["agent_name"] == "cached-agent"
-
-    def test_identity_unknown(self):
-        row = LifecycleRow(
-            request_id="lc-test-006",
-            session_id="unknown-session-never-seen",
-            model="local-test",
-        )
-        row.resolve_identity(None)
-        record = row.to_record()
-
-        assert record["identity_source"] == "unknown"
-        assert record["identity"] is None
-
-    def test_first_event_only_set_once(self):
-        row = LifecycleRow(
-            request_id="lc-test-007",
-            session_id=SID,
-            model="local-test",
-        )
-        row.mark_first_event()
-        t1 = row.t_first_event
-        time.sleep(0.01)
-        row.mark_first_event()  # should not change
-        assert row.t_first_event == t1
+        assert record["outcome"] == "cancel_requested"
+        assert record["correlation"]["native_cancel_acknowledged"] is False
 
 
-# ---------------------------------------------------------------------------
-# Logger tests
-# ---------------------------------------------------------------------------
+class TestLogger:
+    def test_process_safe_unique_segments(self, tmp_path):
+        first = RequestLifecycleLogger(tmp_path, max_bytes=100_000)
+        second = RequestLifecycleLogger(tmp_path, max_bytes=100_000)
+        for logger, request_id in ((first, "first"), (second, "second")):
+            row = LifecycleRow(request_id=request_id, session_id=SID, model="local-test")
+            row.mark_upstream_send()
+            logger.record_transmission_start(row)
+            row.mark_terminal("success", usage={
+                "input_tokens": 1, "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0, "output_tokens": 1,
+            })
+            logger.submit(row.to_record())
+            logger.flush()
+        names = [path.name for path in tmp_path.glob("requests-*.jsonl")]
+        assert len(names) == 2 and len(set(names)) == 2
 
-class TestRequestLifecycleLogger:
-    def test_write_and_read(self, lifecycle_dir):
-        lg = RequestLifecycleLogger(root=lifecycle_dir)
-        row = LifecycleRow(
-            request_id="lc-log-001",
-            session_id=SID,
-            model="local-test",
-        )
-        row.mark_terminal("success", usage={
-            "input_tokens": 100,
-            "output_tokens": 10,
-        })
-        lg.submit(row.to_record())
-        lg.flush()
+    def test_queue_loss_is_durable(self, tmp_path, monkeypatch):
+        logger = RequestLifecycleLogger(tmp_path, max_bytes=100_000)
 
-        rows = _read_lifecycle_rows(lifecycle_dir)
-        assert len(rows) == 1
-        assert rows[0]["request_id"] == "lc-log-001"
-        assert rows[0]["outcome"] == "success"
+        def full(_item):
+            raise queue.Full
 
-    def test_one_row_per_request(self, lifecycle_dir):
-        """Conservation: exactly one row per submit call."""
-        lg = RequestLifecycleLogger(root=lifecycle_dir)
-        for i in range(5):
-            row = LifecycleRow(
-                request_id=f"lc-cons-{i:03d}",
-                session_id=SID,
-                model="local-test",
-            )
-            row.mark_terminal("success")
-            lg.submit(row.to_record())
-        lg.flush()
+        monkeypatch.setattr(logger._q, "put_nowait", full)
+        row = LifecycleRow(request_id="lost", session_id=SID, model="local-test")
+        row.bind(REAL_BINDING)
+        row.mark_upstream_send()
+        logger.record_transmission_start(row)
+        logger.submit(row.to_record())
+        events = _jsonl(tmp_path, "coverage-")
+        assert any(event.get("kind") == "loss" and event.get("code") == "queue_full" for event in events)
+        assert any(event.get("attempt_id") == "vault-gsku.1" for event in events)
 
-        rows = _read_lifecycle_rows(lifecycle_dir)
-        assert len(rows) == 5
-        ids = {r["request_id"] for r in rows}
-        assert len(ids) == 5
-
-    def test_backpressure_drops(self, lifecycle_dir):
-        """When the queue is full, records are dropped, never blocking."""
-        lg = RequestLifecycleLogger(root=lifecycle_dir, queue_size=2)
-        # Fill the queue and the writer
-        for i in range(20):
-            row = LifecycleRow(
-                request_id=f"lc-bp-{i:03d}",
-                session_id=SID,
-                model="local-test",
-            )
-            row.mark_terminal("success")
-            lg.submit(row.to_record())
-        lg.flush()
-
-        rows = _read_lifecycle_rows(lifecycle_dir)
-        # Some rows written, some dropped; total should be <= 20
-        assert lg.written + lg.dropped == 20 or lg.written <= 20
-        assert lg.dropped >= 0  # may or may not have dropped
-
-    def test_rotation(self, lifecycle_dir):
-        """Old files are pruned when max_bytes is exceeded."""
-        lg = RequestLifecycleLogger(root=lifecycle_dir, max_bytes=500)
-        for i in range(50):
-            row = LifecycleRow(
-                request_id=f"lc-rot-{i:03d}",
-                session_id=SID,
-                model="local-test",
-            )
-            row.mark_terminal("success")
-            lg.submit(row.to_record())
-        lg.flush()
-        time.sleep(0.1)
-
-        total = sum(
-            os.path.getsize(os.path.join(lifecycle_dir, f))
-            for f in os.listdir(lifecycle_dir) if f.endswith(".jsonl")
-        )
-        # Should be around or under max_bytes (rotation may lag by one write)
-        assert total < 5000  # generous bound
+    def test_tiny_rotation_retains_newest_classified_evidence_within_bound(self, tmp_path):
+        logger = RequestLifecycleLogger(tmp_path, max_bytes=500)
+        for index in range(20):
+            row = LifecycleRow(request_id=f"tiny-{index}", session_id=SID, model="local-test")
+            row.mark_upstream_send()
+            logger.record_transmission_start(row)
+            row.mark_terminal("success", usage={
+                "input_tokens": 1, "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0, "output_tokens": 1,
+            })
+            logger.submit(row.to_record())
+        logger.flush()
+        files = list(tmp_path.glob("*.jsonl"))
+        total = sum(path.stat().st_size for path in files)
+        assert files and total <= 500
+        retained = "\n".join(path.read_text(encoding="utf-8") for path in files)
+        assert "tiny-19" in retained
+        retention = json.loads((tmp_path / "retention-state.json").read_text())
+        assert retention["pruned_files"] > 0
+        summary, _ = summary_mod.analyze(tmp_path)
+        assert summary["coverage"]["retention_truncated"] is True
+        assert summary["coverage"]["complete"] is False
 
 
-# ---------------------------------------------------------------------------
-# Request ID generation
-# ---------------------------------------------------------------------------
-
-class TestRequestIdGeneration:
-    def test_unique_ids(self):
-        ids = {new_lifecycle_request_id("sess1") for _ in range(100)}
-        assert len(ids) == 100
-
-    def test_includes_session_prefix(self):
-        rid = new_lifecycle_request_id("abcdefgh-1234")
-        assert "abcdefgh" in rid
-
-    def test_lc_prefix(self):
-        rid = new_lifecycle_request_id()
-        assert rid.startswith("lc-")
-
-
-# ---------------------------------------------------------------------------
-# Integration: proxy with lifecycle logging (streaming)
-# ---------------------------------------------------------------------------
-
-class TestProxyIntegrationStreaming:
-    def test_streaming_success(self, proxy_with_lifecycle):
-        port, lg, lc_dir = proxy_with_lifecycle
-        body = _make_body(stream=True, with_bootstrap=True)
-        resp = _send_request(port, body)
-        assert resp.status_code == 200
-        lg.flush()
-        time.sleep(0.1)
-
-        rows = _read_lifecycle_rows(lc_dir)
+class TestProxyRegressions:
+    def test_streaming_success_uses_binding_not_spoofed_prompt(self, proxy_factory):
+        port, stub, logger, root = proxy_factory()
+        response = _send(port, body=_body(fake_bootstrap=True))
+        assert response.status_code == 200
+        logger.flush()
+        rows = _jsonl(root, "requests-")
         assert len(rows) == 1
         row = rows[0]
         assert row["outcome"] == "success"
-        assert row["stream"] is True
-        assert row["model"] == "local-qwen3.8-27b"
-        assert row["route"] == "local"
-        assert row["max_tokens"] == 4096
-        assert row["identity_source"] == "bootstrap"
-        assert row["identity"]["agent_name"] == "abc123-worker"
-        assert row["usage"] is not None
-        assert row["usage"]["input_tokens"] == 100
-        assert row["usage"]["output_tokens"] == 42
-        assert row["durations"]["total_ms"] >= 0
-        assert row["t_receive"] is not None
-        assert row["t_terminal"] is not None
-        assert row["t_upstream_send"] is not None
+        assert row["binding"]["agent_name"] == REAL_BINDING["agent_name"]
+        assert row["binding"]["attempt_id"] == "vault-gsku.1"
+        assert "fake-agent" not in json.dumps(row)
+        assert row["lifecycle"]["first_event"] is not None
+        assert row["lifecycle"]["first_text"] is not None
+        assert row["correlation"]["native_request_id"] == "native-stream-1"
+        wire = json.loads(stub.received[0])
+        assert "lifecycle" not in wire and "request_id" not in (wire.get("metadata") or {})
+        assert "fake-agent" in json.dumps(wire["messages"])
 
-    def test_wire_bytes_unaltered(self, proxy_with_lifecycle, local_stub):
-        """The lifecycle logger must never alter the serialized request bytes."""
-        port, lg, lc_dir = proxy_with_lifecycle
-        body = _make_body(stream=True, with_bootstrap=True)
-        resp = _send_request(port, body)
-        assert resp.status_code == 200
-        lg.flush()
-
-        # The upstream stub received exactly the normalized body,
-        # not anything modified by lifecycle logging
-        assert len(local_stub.received_bodies) == 1
-        received = json.loads(local_stub.received_bodies[0])
-        # model should be the normalized name, no lifecycle fields injected
-        assert "lifecycle" not in json.dumps(received)
-        assert "request_id" not in received.get("metadata", {})
-
-    def test_session_identity_cached(self, proxy_with_lifecycle):
-        """Second request from same session uses cached identity."""
-        port, lg, lc_dir = proxy_with_lifecycle
-        body1 = _make_body(stream=True, with_bootstrap=True)
-        _send_request(port, body1)
-
-        body2 = _make_body(stream=True, with_bootstrap=False)
-        _send_request(port, body2)
-        lg.flush()
-        time.sleep(0.1)
-
-        rows = _read_lifecycle_rows(lc_dir)
-        assert len(rows) == 2
-        assert rows[0]["identity_source"] == "bootstrap"
-        assert rows[1]["identity_source"] == "session_cache"
-        assert rows[1]["identity"]["agent_name"] == "abc123-worker"
-
-
-# ---------------------------------------------------------------------------
-# Integration: proxy with lifecycle logging (non-streaming)
-# ---------------------------------------------------------------------------
-
-class TestProxyIntegrationNonStreaming:
-    def test_nonstreaming_success(self, tmp_path, lifecycle_dir, monkeypatch):
-        stub = _LocalStub(stream=False)
-        log_dir = str(tmp_path / "proxy-log")
-        os.makedirs(log_dir, exist_ok=True)
-        monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", stub.url)
-        monkeypatch.setattr(cache_proxy, "LOG_DIR", log_dir)
-        monkeypatch.setattr(cache_proxy, "USAGE_LOG", os.path.join(log_dir, "usage.jsonl"))
-        monkeypatch.setattr(cache_proxy, "REQUEST_LOGGER", None)
-        lc_logger = RequestLifecycleLogger(root=lifecycle_dir, max_bytes=10**9)
-        monkeypatch.setattr(cache_proxy, "LIFECYCLE_LOGGER", lc_logger)
-        monkeypatch.setattr(cache_proxy, "_effort_pins", cache_proxy.EffortPinStore(None))
-        port = _free_port()
-        srv = cache_proxy.ThreadedHTTPServer(("127.0.0.1", port), cache_proxy.ProxyHandler)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-
-        try:
-            body = _make_body(stream=False, with_bootstrap=True)
-            resp = _send_request(port, body)
-            assert resp.status_code == 200
-            lc_logger.flush()
-            time.sleep(0.1)
-
-            rows = _read_lifecycle_rows(lifecycle_dir)
-            assert len(rows) == 1
-            row = rows[0]
-            assert row["outcome"] == "success"
-            assert row["stream"] is False
-            assert row["usage"] is not None
-            assert row["usage"]["output_tokens"] == 42
-        finally:
-            srv.shutdown()
-            stub.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Integration: error responses
-# ---------------------------------------------------------------------------
-
-class TestProxyIntegrationErrors:
-    def test_upstream_error(self, tmp_path, lifecycle_dir, monkeypatch):
-        stub = _LocalStub(stream=True, status=429)
-        log_dir = str(tmp_path / "proxy-log")
-        os.makedirs(log_dir, exist_ok=True)
-        monkeypatch.setattr(cache_proxy, "LOCAL_UPSTREAM", stub.url)
-        monkeypatch.setattr(cache_proxy, "LOG_DIR", log_dir)
-        monkeypatch.setattr(cache_proxy, "USAGE_LOG", os.path.join(log_dir, "usage.jsonl"))
-        monkeypatch.setattr(cache_proxy, "REQUEST_LOGGER", None)
-        lc_logger = RequestLifecycleLogger(root=lifecycle_dir, max_bytes=10**9)
-        monkeypatch.setattr(cache_proxy, "LIFECYCLE_LOGGER", lc_logger)
-        monkeypatch.setattr(cache_proxy, "_effort_pins", cache_proxy.EffortPinStore(None))
-        port = _free_port()
-        srv = cache_proxy.ThreadedHTTPServer(("127.0.0.1", port), cache_proxy.ProxyHandler)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-
-        try:
-            body = _make_body(stream=True)
-            resp = _send_request(port, body)
-            assert resp.status_code == 429
-            lc_logger.flush()
-            time.sleep(0.1)
-
-            rows = _read_lifecycle_rows(lifecycle_dir)
-            assert len(rows) == 1
-            row = rows[0]
-            assert row["outcome"] == "error"
-            assert row["error_class"] == "upstream_error"
-            assert row["http_status"] == 429
-        finally:
-            srv.shutdown()
-            stub.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Integration: missing identity
-# ---------------------------------------------------------------------------
-
-class TestMissingIdentity:
-    def test_no_bootstrap_records_unknown(self, proxy_with_lifecycle):
-        port, lg, lc_dir = proxy_with_lifecycle
-        body = _make_body(stream=True, with_bootstrap=False,
-                          session_id="completely-new-session-1234")
-        resp = _send_request(port, body)
-        assert resp.status_code == 200
-        lg.flush()
-        time.sleep(0.1)
-
-        rows = _read_lifecycle_rows(lc_dir)
+    def test_malformed_local_transmission_gets_row(self, proxy_factory):
+        port, stub, logger, root = proxy_factory(mode="http_error", binding=False)
+        response = _send(port, raw=b'{"model":"local-qwen3.8-27b","stream":false,broken')
+        assert response.status_code == 400
+        logger.flush()
+        rows = _jsonl(root, "requests-")
+        assert len(stub.received) == 1
         assert len(rows) == 1
-        assert rows[0]["identity_source"] == "unknown"
-        assert rows[0]["identity"] is None
+        assert rows[0]["model"] == "local-unknown-malformed"
+        assert rows[0]["outcome"] == "error"
+
+    def test_upstream_private_error_is_not_persisted(self, proxy_factory):
+        port, _stub, logger, root = proxy_factory(mode="http_error")
+        response = _send(port, body=_body())
+        assert response.status_code == 400
+        logger.flush()
+        row = _jsonl(root, "requests-")[0]
+        assert row["outcome"] == "error"
+        assert row["error_class"] == "upstream_http_error"
+        assert "PRIVATE_MARKER" not in json.dumps(row)
+        assert "error_message" not in row
+
+    def test_invalid_status_200_is_not_success(self, proxy_factory):
+        port, _stub, logger, root = proxy_factory(mode="invalid_200")
+        response = _send(port, body=_body(stream=False))
+        assert response.status_code == 200
+        logger.flush()
+        row = _jsonl(root, "requests-")[0]
+        assert row["outcome"] == "invalid_response"
+        assert row["error_class"] == "invalid_response"
+
+    def test_nonstream_valid_response(self, proxy_factory):
+        port, _stub, logger, root = proxy_factory(mode="nonstream_success")
+        response = _send(port, body=_body(stream=False))
+        assert response.status_code == 200
+        logger.flush()
+        row = _jsonl(root, "requests-")[0]
+        assert row["outcome"] == "success"
+        assert row["correlation"]["native_request_id"] == "native-test-1"
+
+    def test_logger_unavailable_records_transmission_and_classified_loss(
+        self, proxy_factory, monkeypatch
+    ):
+        port, _stub, _logger, root = proxy_factory()
+        monkeypatch.setattr(cache_proxy, "LIFECYCLE_LOGGER", None)
+        monkeypatch.setattr(cache_proxy, "LIFECYCLE_ROOT", str(root))
+        response = _send(port, body=_body())
+        assert response.status_code == 200
+        events = _jsonl(root, "coverage-fallback-")
+        assert [event["kind"] for event in events] == ["transmission_start", "loss"]
+        assert events[1]["code"] == "lifecycle_unavailable"
+        assert events[1]["attempt_id"] == "vault-gsku.1"
 
 
-# ---------------------------------------------------------------------------
-# Summary script tests
-# ---------------------------------------------------------------------------
+class TestSummaryAndReplay:
+    @staticmethod
+    def _record(request_id: str, attempt: str, session: str, *, ts: float = 100.0) -> dict:
+        row = LifecycleRow(
+            request_id=request_id, session_id=session, model="local-test",
+            pool="sparks", engine="tensorfold", max_tokens=5,
+            receive_wall=ts, receive_mono=10.0,
+        )
+        row.bind({**REAL_BINDING, "attempt_id": attempt, "bound_at": ts, "binding_id": 1})
+        row.t_upstream_send = (ts + 0.1, 10.1)
+        row.mark_terminal("success", usage={
+            "input_tokens": 3, "cache_read_input_tokens": 4,
+            "cache_creation_input_tokens": 1, "output_tokens": 2,
+        }, native_terminal=True)
+        return row.to_record()
 
-class TestSummaryScript:
-    def test_summary_groups_by_agent_and_tree(self, lifecycle_dir):
-        # Write some test rows directly
-        sys.path.insert(0, str(ROOT / "scripts"))
-        from request_lifecycle_summary import load_rows, summarize
-
-        rows = [
-            {
-                "request_id": f"lc-sum-{i}",
-                "ts": time.time(),
-                "session_id": f"sess-{i % 2}",
-                "model": "local-test",
-                "outcome": "success",
-                "identity": {
-                    "agent_name": f"agent-{i % 3}",
-                    "root_team_key": f"tree-{i % 2}",
-                },
-                "identity_source": "bootstrap",
-                "usage": {
-                    "input_tokens": 100,
-                    "cache_read_input_tokens": 50,
-                    "cache_creation_input_tokens": 10,
-                    "output_tokens": 20,
-                },
-                "durations": {
-                    "total_ms": 500,
-                    "generation_ms": 200,
-                    "hold_ms": 0,
-                },
-            }
-            for i in range(6)
+    def test_duplicate_malformed_and_loss_are_accounted(self, tmp_path):
+        row = self._record("same", "vault-gsku.1", "s1")
+        (tmp_path / "requests-a.jsonl").write_text(
+            "not json\n" + json.dumps(row) + "\n" + json.dumps(row) + "\n",
+            encoding="utf-8",
+        )
+        events = [
+            {"schema": COVERAGE_SCHEMA, "ts": 100.0, "kind": "transmission_start", "request_id": "same",
+             "attempt_id": "vault-gsku.1", "task_id": "vault-gsku", "category": "obs", "pool": "sparks"},
+            {"schema": COVERAGE_SCHEMA, "ts": 100.0, "kind": "transmission_start", "request_id": "lost",
+             "attempt_id": "vault-gsku.1", "task_id": "vault-gsku", "category": "obs", "pool": "sparks"},
+            {"schema": COVERAGE_SCHEMA, "ts": 100.1, "kind": "loss", "request_id": "lost", "code": "queue_full",
+             "attempt_id": "vault-gsku.1", "task_id": "vault-gsku", "category": "obs", "pool": "sparks"},
         ]
-        day = time.strftime("%Y-%m-%d", time.gmtime())
-        with open(os.path.join(lifecycle_dir, f"{day}.jsonl"), "w") as f:
-            for row in rows:
-                f.write(json.dumps(row) + "\n")
+        (tmp_path / "coverage-a.jsonl").write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+        )
+        summary, _ = summary_mod.analyze(tmp_path, filters={
+            "agent": None, "tree": None, "task": None, "attempt": "vault-gsku.1",
+            "category": None, "pool": None,
+        })
+        coverage = summary["coverage"]
+        assert coverage["duplicate_exact"] == 1
+        assert coverage["malformed_lines"] == 1
+        assert coverage["classified_losses"] == 1
+        assert coverage["conservation_ok"] is True
+        assert coverage["complete"] is False
+        assert summary["total_requests"] == 1
+        assert summary["dimensions"]["attempt"]["vault-gsku.1"]["tokens"]["input_tokens"]["value"] == 3
 
-        loaded = load_rows(lifecycle_dir)
-        assert len(loaded) == 6
+    def test_crash_gap_is_conserved_but_interval_stays_incomplete(self, tmp_path):
+        (tmp_path / "coverage-a.jsonl").write_text(json.dumps({
+            "schema": COVERAGE_SCHEMA, "ts": 100.0, "kind": "transmission_start",
+            "request_id": "crash", "attempt_id": "vault-gsku.1",
+            "task_id": "vault-gsku", "category": "obs", "pool": "sparks",
+        }) + "\n", encoding="utf-8")
+        summary, _ = summary_mod.analyze(tmp_path)
+        assert summary["coverage"]["conservation_ok"] is True
+        assert summary["coverage"]["derived_crash_gap_losses"] == 1
+        assert summary["coverage"]["loss_codes"]["crash_gap_or_incomplete"] == 1
+        assert summary["coverage"]["complete"] is False
 
-        summary = summarize(loaded)
-        assert summary["total_requests"] == 6
-        assert summary["unknown_identity_requests"] == 0
-        assert summary["unknown_coverage_pct"] == 0
-        assert len(summary["by_tree"]) == 2
-        assert len(summary["by_agent"]) == 3
-        # Token totals
-        for tree in summary["by_tree"].values():
-            assert tree["input_tokens"] > 0
-        assert summary["canonical_source"] == "lifecycle_log"
-
-    def test_summary_unknown_coverage(self, lifecycle_dir):
-        sys.path.insert(0, str(ROOT / "scripts"))
-        from request_lifecycle_summary import summarize
-
+    def test_two_attempts_and_fork_history_excluded(self, tmp_path):
         rows = [
-            {"request_id": "a", "ts": time.time(), "identity_source": "unknown",
-             "identity": None, "outcome": "success",
-             "usage": None, "durations": None},
-            {"request_id": "b", "ts": time.time(), "identity_source": "bootstrap",
-             "identity": {"agent_name": "x", "root_team_key": "t"},
-             "outcome": "success", "usage": None, "durations": None},
+            self._record("p1", "vault-gsku.1", "parent"),
+            self._record("c1", "vault-gsku.2", "child", ts=101.0),
         ]
-        summary = summarize(rows)
-        assert summary["unknown_identity_requests"] == 1
-        assert summary["unknown_coverage_pct"] == 50.0
+        (tmp_path / "requests-a.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        events = [
+            {"schema": COVERAGE_SCHEMA, "ts": row["ts"], "kind": "transmission_start",
+             "request_id": row["request_id"], "attempt_id": row["binding"]["attempt_id"],
+             "task_id": "vault-gsku", "category": "obs", "pool": "sparks"}
+            for row in rows
+        ]
+        (tmp_path / "coverage-a.jsonl").write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+        )
+        summary, _ = summary_mod.analyze(tmp_path)
+        assert set(summary["dimensions"]["attempt"]) == {"vault-gsku.1", "vault-gsku.2"}
+        assert summary["coverage"]["copied_history_rows_ingested"] == 0
+        assert summary["coverage"]["complete"] is True
+
+    def test_manifest_replay_is_immutable(self, tmp_path):
+        row = self._record("m1", "vault-gsku.1", "s1")
+        source = tmp_path / "requests-a.jsonl"
+        source.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        (tmp_path / "coverage-a.jsonl").write_text(json.dumps({
+            "schema": COVERAGE_SCHEMA, "ts": 100.0, "kind": "transmission_start",
+            "request_id": "m1", "attempt_id": "vault-gsku.1", "task_id": "vault-gsku",
+            "category": "obs", "pool": "sparks",
+        }) + "\n", encoding="utf-8")
+        manifest = summary_mod.create_manifest(tmp_path)
+        source.write_text("corrupted later\n", encoding="utf-8")
+        summary, _ = summary_mod.analyze(tmp_path, manifest_path=manifest)
+        assert summary["total_requests"] == 1
+        assert summary["manifest"]["available"] is True
+        assert summary["coverage"]["complete"] is True
+
+    def test_manifest_refuses_changed_analyzer_identity(self, tmp_path):
+        manifest_path = summary_mod.create_manifest(tmp_path)
+        manifest = json.loads(manifest_path.read_text())
+        manifest["summary_code_sha256"] = "0" * 64
+        digest_source = dict(manifest)
+        digest_source.pop("manifest_sha256", None)
+        import hashlib
+        manifest["manifest_sha256"] = hashlib.sha256(
+            json.dumps(digest_source, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match="analyzer identity"):
+            summary_mod.analyze(tmp_path, manifest_path=manifest_path)
+
+    def test_manifest_store_is_bounded(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(summary_mod, "MANIFEST_MAX_COUNT", 2)
+        monkeypatch.setattr(summary_mod, "MANIFEST_MAX_BYTES", 10_000_000)
+        output = tmp_path / "manifests"
+        created = [summary_mod.create_manifest(tmp_path, output_root=output) for _ in range(3)]
+        snapshots = [path for path in output.iterdir() if path.is_dir()]
+        assert len(snapshots) == 2
+        assert created[-1].parent in snapshots
+        assert not created[0].parent.exists()
+
+
+class TestLaunchBindingResolution:
+    @pytest.mark.parametrize("text", [
+        "Read prior attempt ops-9.8.1 for context. Repair current attempt vault-gsku.1.",
+        "Repair current attempt vault-gsku.1. Read prior attempt ops-9.8.1 for context.",
+    ])
+    def test_arbitrary_attempt_references_remain_unassigned(self, text):
+        rows = {
+            "vault-gsku": {"id": "vault-gsku", "labels": ["system:obs"]},
+            "vault-gsku.1": {"id": "vault-gsku.1", "labels": ["attempt"]},
+            "ops-9.8": {"id": "ops-9.8", "labels": ["system:obs"]},
+            "ops-9.8.1": {"id": "ops-9.8.1", "labels": ["attempt"]},
+        }
+        assert start_step.resolve_attribution_binding(texts=(text,), rows=rows) is None
+
+    def test_brief_header_attempt_beats_related_prior_attempts(self):
+        rows = {
+            "vault-gsku": {"id": "vault-gsku", "labels": ["system:obs"]},
+            "vault-gsku.1": {"id": "vault-gsku.1", "labels": ["attempt"]},
+            "ops-9.8.1": {"id": "ops-9.8.1", "labels": ["attempt"]},
+        }
+        brief = (
+            "# Task brief — vault-gsku / attempt vault-gsku.1\n"
+            "## Prior tasks\n- attempt ops-9.8.1 closed\n"
+        )
+        binding = start_step.resolve_attribution_binding(
+            texts=("Read the brief",), receipt_texts=(brief,), rows=rows
+        )
+        assert binding["attempt_id"] == "vault-gsku.1"
+        assert binding["source"] == "registration_receipt"
+
+    def test_scratch_path_never_uses_production_default(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("OBS_REQUEST_LIFECYCLE_DIR", raising=False)
+        assert lifecycle_root_for_proxy(18888, tmp_path) == str(tmp_path / "request-lifecycle")
+        assert lifecycle_root_for_proxy(28925, tmp_path).endswith("/local-gpu/requests")

@@ -33,8 +33,18 @@ import re
 from pathlib import Path
 
 _CANDIDATE = re.compile(r"(?<![A-Za-z0-9_.-])([a-z][a-z0-9]*-[a-z0-9]{1,8}(?:\.[0-9]+)*)(?![A-Za-z0-9_-])")
+_BRIEF_HEADER = re.compile(
+    r"^# Task brief — ([a-z][a-z0-9]*-[a-z0-9]{1,8}(?:\.[0-9]+)*) / attempt "
+    r"([a-z][a-z0-9]*-[a-z0-9]{1,8}(?:\.[0-9]+)*)$",
+    re.MULTILINE,
+)
+_BRIEF_PATH = re.compile(
+    r"(/workspace/runtime/git/obs-artifacts/Drafts/Artifacts/briefs/[A-Za-z0-9_./-]+\.md)"
+)
+_BRIEF_ROOT = Path("/workspace/runtime/git/obs-artifacts/Drafts/Artifacts/briefs")
 _SCAN_LIMIT = 48 * 1024 * 1024
 _ids_cache: dict[str, tuple[float, frozenset[str]]] = {}
+_rows_cache: dict[str, tuple[float, dict[str, dict]]] = {}
 START_PROCEDURE = "Projects/Personal Projects/Agentic/Agent Operations/procedures/task/start.md"
 REGISTER = 'python3 "Projects/Personal Projects/Agentic/Agent Operations/scripts/ops/register.py" task'
 
@@ -77,6 +87,116 @@ def find_bead_ids(text: str | None, known: frozenset[str]) -> set[str]:
     if not text or not known:
         return set()
     return {m.group(1) for m in _CANDIDATE.finditer(text) if m.group(1) in known}
+
+
+def known_bead_rows(vault_path: Path | None) -> dict[str, dict]:
+    """Load current content-free Beads metadata on the launch path, never per request."""
+    if vault_path is None:
+        return {}
+    path = Path(os.environ.get("OBS_BEADS_ISSUES_FILE") or (Path(vault_path) / ".beads" / "issues.jsonl"))
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    cached = _rows_cache.get(str(path))
+    if cached and cached[0] == mtime:
+        return cached[1]
+    rows: dict[str, dict] = {}
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("id"), str):
+                    rows[row["id"]] = row
+    except OSError:
+        return {}
+    _rows_cache[str(path)] = (mtime, rows)
+    _ids_cache[str(path)] = (mtime, frozenset(rows))
+    return rows
+
+
+def _bead_category(bead_id: str, rows: dict[str, dict]) -> str:
+    row = rows.get(bead_id) or {}
+    task_id = bead_id.rsplit(".", 1)[0] if "attempt" in (row.get("labels") or []) else bead_id
+    task = rows.get(task_id) or row
+    labels = set(row.get("labels") or []) | set(task.get("labels") or [])
+    explicit = next((label.split(":", 1)[1] for label in labels if label.startswith("category:")), None)
+    if explicit:
+        return explicit
+    prefix = task_id.split("-", 1)[0]
+    if prefix == "obs" or labels & {"system:obs", "system:cache-proxy", "system:caching", "system:local-llm", "domain:obs-platform"}:
+        return "obs"
+    if prefix == "ops" or labels & {"system:agent-operations", "agent-operations", "domain:agentic", "domain:stewardship"}:
+        return "agent-ops"
+    return "projects" if prefix == "vault" else "ad-hoc"
+
+
+def _select_nearest(ids: set[str], rows: dict[str, dict]) -> str | None:
+    if not ids:
+        return None
+    # A registered attempt is nearer than its parent task; deeper child ids win.
+    return max(ids, key=lambda bead_id: (bead_id.count("."), len(bead_id), bead_id))
+
+
+def _binding_from_brief(text: str, rows: dict[str, dict]) -> dict[str, str | None] | None:
+    match = _BRIEF_HEADER.search(text)
+    if match is None:
+        return None
+    task_id, attempt_id = match.groups()
+    attempt = rows.get(attempt_id) or {}
+    if task_id not in rows or "attempt" not in (attempt.get("labels") or []):
+        return None
+    if attempt_id.rsplit(".", 1)[0] != task_id:
+        return None
+    labels = set(attempt.get("labels") or []) | set((rows.get(task_id) or {}).get("labels") or [])
+    lane = next((label.split(":", 1)[1] for label in labels if label.startswith("lane:")), None)
+    return {
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "category": _bead_category(attempt_id, rows),
+        "lane": lane,
+        "source": "registration_receipt",
+    }
+
+
+def resolve_attribution_binding(
+    *,
+    texts=(),
+    receipt_texts=(),
+    rows: dict[str, dict],
+    jsonl_path: Path | None = None,
+    session_id: str | None = None,
+) -> dict[str, str | None] | None:
+    """Resolve only an authoritative registration brief; ambiguous prose stays unassigned."""
+    candidates: list[dict[str, str | None]] = []
+    for text in receipt_texts:
+        if text:
+            binding = _binding_from_brief(str(text), rows)
+            if binding:
+                candidates.append(binding)
+    for text in texts:
+        if not text:
+            continue
+        for raw_path in _BRIEF_PATH.findall(str(text)):
+            path = Path(raw_path).resolve()
+            try:
+                path.relative_to(_BRIEF_ROOT.resolve())
+                content = path.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                continue
+            binding = _binding_from_brief(content, rows)
+            if binding:
+                candidates.append(binding)
+    unique = {
+        (binding["task_id"], binding["attempt_id"]): binding
+        for binding in candidates
+    }
+    if len(unique) != 1:
+        return None
+    return next(iter(unique.values()))
 
 
 # Platform-injected context that every root transcript carries (CLAUDE.md and the OBS platform
