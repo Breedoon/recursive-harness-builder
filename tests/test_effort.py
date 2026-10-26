@@ -72,10 +72,10 @@ def test_precedence_and_auto_model_default():
 
 def test_config_env_supports_per_model_defaults(monkeypatch):
     monkeypatch.setenv("OBS_EFFORT_LEVEL", " HIGH ")
-    monkeypatch.setenv("OBS_MODEL_EFFORT_LEVELS", '{"sol":"max","sonnet[200k]":"low"}')
+    monkeypatch.setenv("OBS_MODEL_EFFORT_LEVELS", '{"terra":"max","sonnet[200k]":"low"}')
     config = OBSConfig.from_env()
     assert config.effort_level == "high"
-    assert config.model_effort_levels == {"gpt-6.1-sol": "max", "claude-sonnet-5-5": "low"}
+    assert config.model_effort_levels == {"gpt-6.1-terra": "max", "claude-sonnet-5-5": "low"}
     manager = SessionManager(config=config)
     assert manager.effective_effort == "high"
     manager.effort_override = "auto"
@@ -112,7 +112,7 @@ def test_openai_wire_options_all_levels_with_context_and_no_global_mutation(conf
     assert settings_env[EFFORT_ENV] == level
     assert settings_env[EXTRA_BODY_ENV] == options.env[EXTRA_BODY_ENV]
     assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "200000"
-    assert options.model == "gpt-6.1-sol[200k]"
+    assert options.model == "gpt-6.1-terra[200k]"
     assert manager.sdk_env_overrides == original_env
     assert dict(os.environ) == before
 

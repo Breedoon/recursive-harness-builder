@@ -236,11 +236,13 @@ OBS_TELEGRAM_GROUP_FOLDER_TITLE=Recursive Harness
 
 ### Default model
 
-Sol is the default path. Set:
+GPT-6.1 Terra is the default path for ordinary work. Set:
 
 ```env
-OBS_DEFAULT_MODEL=sol
+OBS_DEFAULT_MODEL=terra
 ```
+
+Use `sol` explicitly for GPT-6.1 Sol when a task needs the stronger Codex tier.
 
 To use Claude Opus 5 explicitly:
 

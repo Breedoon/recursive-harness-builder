@@ -296,4 +296,8 @@ class TestNewTreeModelFamilies:
             origin={"kind": "agent", "origin_team": "t", "origin_agent": "sol-caller"},
         )
         assert result["ok"] is True
-        assert self._state(bot).session_manager.model_override in (None, "")
+        new_root = self._state(bot).session_manager
+        assert new_root.model_override in (None, "")
+        options = new_root.create_options()
+        assert options.model == "gpt-6.1-terra[1m]"
+        assert options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "872000"

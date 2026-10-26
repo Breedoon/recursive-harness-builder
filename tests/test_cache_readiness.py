@@ -40,6 +40,7 @@ class TestFamiliesAndTtls:
         assert cr.model_family("claude-opus-5-5") == "claude"
         assert cr.model_family("opus") == "claude"
         assert cr.model_family("gpt-6.1-sol") == "gpt"
+        assert cr.model_family("gpt-6.1-terra") == "gpt"
         assert cr.model_family("gpt-5.6-luna") == "gpt"
         assert cr.model_family("local-sparks-glm-5.3-flash") == "local"
         assert cr.model_family("glm") == "local"
@@ -59,8 +60,8 @@ class TestAssess:
         assert cold.family == "claude" and cold.context_tokens == 400_015
 
     def test_gpt_cold_after_30_minutes(self, tmp_path):
-        assert cr.assess(jsonl_path=_jsonl(tmp_path, model="gpt-6.1-sol", age_seconds=31 * 60), ttls=cr.DEFAULT_TTLS).cold
-        assert not cr.assess(jsonl_path=_jsonl(tmp_path, model="gpt-6.1-sol", age_seconds=29 * 60, name="b.jsonl"), ttls=cr.DEFAULT_TTLS).cold
+        assert cr.assess(jsonl_path=_jsonl(tmp_path, model="gpt-6.1-terra", age_seconds=31 * 60), ttls=cr.DEFAULT_TTLS).cold
+        assert not cr.assess(jsonl_path=_jsonl(tmp_path, model="gpt-6.1-terra", age_seconds=29 * 60, name="b.jsonl"), ttls=cr.DEFAULT_TTLS).cold
 
     def test_local_never_cold(self, tmp_path):
         r = cr.assess(jsonl_path=_jsonl(tmp_path, model="local-sparks-glm-5.3", age_seconds=10 * 86400), ttls=cr.DEFAULT_TTLS)

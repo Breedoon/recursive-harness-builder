@@ -58,7 +58,7 @@ class TestModelResolution:
         ("astra", "gpt-6-astra"),
         ("sol", "gpt-6.1-sol"),
         ("gpt-sol", "gpt-6.1-sol"),
-        ("terra", "gpt-5.6-terra"),
+        ("terra", "gpt-6.1-terra"),
         ("luna", "gpt-6-luna"),
     ])
     def test_named_gpt_aliases(self, alias, model):
@@ -132,7 +132,7 @@ class TestModelResolution:
         assert result == "gpt-5.4-mini[200k]"
 
     def test_resolution_does_not_add_default_context_suffix(self):
-        assert resolve_model("gpt") == "gpt-6.1-sol"
+        assert resolve_model("gpt") == "gpt-6.1-terra"
         assert resolve_model("claude") == "claude-opus-5-5"
 
 
@@ -142,7 +142,7 @@ class TestModelContextBoundary:
         assert split_context_suffix("gpt-5.4-mini[200k]") == ("gpt-5.4-mini", 200_000)
 
     def test_claude_code_boundary_adds_resolved_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt") == "gpt-6.1-sol[900k]"
+        assert normalize_model_for_claude_code("gpt") == "gpt-6.1-terra[872k]"
         assert normalize_model_for_claude_code("claude") == "claude-opus-5-5[1m]"
         assert normalize_model_for_claude_code("haiku") == "claude-haiku-5-5[1m]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
@@ -154,8 +154,14 @@ class TestModelContextBoundary:
     def test_current_gpt_models_default_to_900k(self, model):
         assert normalize_model_for_claude_code(model) == f"{model}[900k]"
 
+    def test_terra_uses_paid_codex_route_context_budget(self):
+        resolved = resolve_model_context("terra")
+        assert resolved.model == "gpt-6.1-terra"
+        assert resolved.context_tokens == 872_000
+        assert normalize_model_for_claude_code("terra") == "gpt-6.1-terra[872k]"
+
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-6.1-sol[200k]"
+        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-6.1-terra[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
     def test_local_provider_boundary_preserves_canonical_model_id(self):
@@ -185,8 +191,8 @@ class TestModelContextBoundary:
         ) == 262_000
         assert compaction_threshold(resolved.context_tokens) == 229_000
 
-    def test_default_context_estimate_matches_default_sol_budget(self):
-        assert OBSConfig().context_window_estimate_tokens == 900_000
+    def test_default_context_estimate_matches_default_terra_budget(self):
+        assert OBSConfig().context_window_estimate_tokens == 872_000
 
     def test_auto_compact_window_tracks_context_by_default(self):
         assert auto_compact_window_for_context(1_000_000) == 1_000_000

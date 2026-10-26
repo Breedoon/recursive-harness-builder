@@ -53,17 +53,18 @@ MODEL_RESOLUTION: dict[str, str] = {
     "claude-fable": "claude-fable-5-1",
     "haiku": "claude-haiku-5-5",
     "claude-haiku": "claude-haiku-5-5",
-    # OpenAI tiers – "gpt" resolves to main production model
-    "gpt": "gpt-6.1-sol",
+    # OpenAI tiers – "gpt" resolves to the ordinary-work default; explicit
+    # pro/Sol handles retain GPT-6.1 Sol for more complex work.
+    "gpt": "gpt-6.1-terra",
     "gpt-pro": "gpt-6.1-sol",
     "astra": "gpt-6-astra",
     "sol": "gpt-6.1-sol",
     "gpt-sol": "gpt-6.1-sol",
-    "terra": "gpt-5.6-terra",
+    "terra": "gpt-6.1-terra",
     "luna": "gpt-6-luna",
     "gpt-mini": "gpt-5.4-mini",
-    "openai": "gpt-6.1-sol",
-    "chatgpt": "gpt-6.1-sol",
+    "openai": "gpt-6.1-terra",
+    "chatgpt": "gpt-6.1-terra",
     # Google tiers
     "gemini": "gemini-3.1-flash-lite-preview",
     "gemini-pro": "gemini-3.1-pro-preview",
@@ -105,6 +106,9 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "local-gemma4-31b": 48_000,
     "gpt-6-astra": 900_000,
     "gpt-6.1-sol": 900_000,
+    # The API model has a 1.05M total window and 922K maximum input; the paid
+    # Codex route used by OBS advertises an 872K maximum context budget.
+    "gpt-6.1-terra": 872_000,
     "gpt-6-sol": 900_000,
     "gpt-6-luna": 900_000,
     "gpt-5.6-sol": 900_000,
@@ -135,6 +139,7 @@ MODEL_EFFORT_LEVELS: dict[str, str] = {
     SPARK_QWEN_MODEL: "max",
     "gpt-6-astra": "medium",
     "gpt-6.1-sol": "medium",
+    "gpt-6.1-terra": "medium",
     "gpt-6-sol": "medium",
     "gpt-6-luna": "medium",
     "gpt-5.6-sol": "medium",
@@ -369,12 +374,12 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "gpt-6.1-sol"
+    model: str = "gpt-6.1-terra"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
-    # Resolved via MODEL_RESOLUTION (e.g. "sol" → "gpt-6.1-sol");
+    # Resolved via MODEL_RESOLUTION (e.g. "terra" → "gpt-6.1-terra");
     # full model names pass through unchanged.
     # Change this to e.g. "claude" to make root sessions default to Claude.
-    default_model: str = "sol"
+    default_model: str = "terra"
     effort_level: str | None = None
     # Effort stamped onto sessions OBS creates from now on (new topics and
     # fork=false children) when none is chosen. It is saved as that session's
@@ -393,7 +398,7 @@ class OBSConfig:
     max_queue_continuations: int = 3
     bg_fork_timeout: float = 600.0  # seconds to wait for background forks
     max_buffer_size: int = 10 * 1024 * 1024  # 10 MB SDK JSON buffer limit
-    context_window_estimate_tokens: int = 900_000
+    context_window_estimate_tokens: int = 872_000
     auto_compact_window_tokens: int = _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS
     context_probe_claude_cli: bool = False
     claude_idle_process_cap: int | None = None
@@ -450,7 +455,7 @@ class OBSConfig:
         if model := os.environ.get("OBS_AGENT_MODEL") or os.environ.get("OBS_MODEL"):
             kwargs["model"] = resolve_model(model.strip())
         else:
-            dm = kwargs.get("default_model", "sol")
+            dm = kwargs.get("default_model", "terra")
             kwargs["model"] = resolve_model(dm)
         from obs_agent.effort import normalize_effort
 
