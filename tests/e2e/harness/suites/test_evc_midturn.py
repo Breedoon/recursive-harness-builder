@@ -34,6 +34,15 @@ def _retry_user(event):
     return isinstance(content, str) and content.startswith("(System:")
 
 
+def _resumed_cli(snapshot, session, old_pid):
+    candidates = [row for row in snapshot["processes"] if row.get("cli") and row["pid"] != old_pid
+                  and row["state"] not in {"Z", "X"} and (row.get("cli_launch") or {}).get("--resume") == session]
+    assert len(candidates) == 1, {"exact_resumed_CLI_count": len(candidates), "session_id": session}
+    candidate = candidates[0]
+    assert candidate["binary_sha256"] == "7a4a653982b07e0a8157f8d3b2c2f8e442520ab07b2fa2e692ba054dbba210c9", candidate
+    return candidate
+
+
 async def run_midturn(lane, kind):
     names = {"reconnect": "MIDTURN-STREAM-ERROR-RECONNECT", "soft-reset": "MIDTURN-SOFT-RESET", "route-drop": "MIDTURN-ROUTE-DROP"}
     nonce = uuid.uuid4().hex[:8]
@@ -114,15 +123,14 @@ async def run_midturn(lane, kind):
             retry = await jsonl.log.wait("jsonl_append", match=_retry_user, after=row_mark, timeout=45)
             proof["native_retry_user_row"] = {key: retry.get(key) for key in ("session_id", "uuid", "ts", "type")}
             new_identity = await _control_child_stop(lane, proof, observe_only=True)
-            proof["identity_after_reconnect"] = new_identity
-            assert new_identity["capture_known"] and new_identity["root_pid"] != pid and new_identity["route_active"], new_identity
+            proof["pre_stop_capture_after_reconnect_NOT_fresh_client_identity"] = new_identity
+            assert new_identity["route_active"], new_identity
+            proof["fresh_resumed_cli_snapshot"] = current = await _helper(lane, "snapshot", root)
+            proof["identity_after_reconnect"] = new_cli = _resumed_cli(current, session, pid)
             if kind == "soft-reset":
-                new_pid = new_identity["root_pid"]
-                current = await _helper(lane, "snapshot", root, identities={new_pid: new_identity["owned"][str(new_pid)]})
-                check = current["identity_checks"][0]
-                assert check["outcome"] == "SAME_IDENTITY" and check["state"] not in {"Z", "X"}, check
+                new_pid = new_cli["pid"]
                 proof["faults"].append({"type": "ONE_RETRY_TEST_CLI_SIGKILL", "epoch_before": time.time(),
-                    "pid": new_pid, "start": check["observed_start"],
+                    "pid": new_pid, "start": new_cli["start"],
                     "native_signal": await lane._ctl.call("POST", "/signal", {"pid": new_pid, "sig": "KILL"}), "epoch_after": time.time()})
                 event = await asyncio.wait_for(matches["Soft reset after error (session_id preserved)"], 45)
             else:
