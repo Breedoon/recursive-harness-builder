@@ -31,14 +31,23 @@ async def watch(root: Path, pid: int, start: int, chat: int, topic: int, offset:
         if future.done() or not latch_match(line, chat, topic):
             return
         try:
-            current = _process_record(Path("/proc") / str(pid), cli=True)
+            fields = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            current = {"pid": pid, "start": int(fields[19]), "state": fields[0],
+                       "ppid": int(fields[1]), "pgid": int(fields[2]), "sid": int(fields[3])}
             assert current["start"] == start and current["state"] not in {"Z", "X"}, current
+            signal_before = time.time()
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            signal_after = time.time()
             latch_epoch = datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=timezone.utc).timestamp()
             receipt = {"latch_line": line, "latch_log_epoch": latch_epoch, "latch_read_epoch": read_at,
                        "target_pid": pid, "target_start": start, "pre_signal_identity": current,
-                       "signal": "SIGTERM", "signal_method": "pidfd_send_signal", "signal_before_epoch": time.time()}
-            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
-            receipt.update(signal_after_epoch=time.time(), signal_syscall_returned=True)
+                       "pre_signal_identity_scope": "direct stat only; binary hash and safe flags captured before watcher readiness",
+                       "prewatch_binary_sha256": initial["binary_sha256"],
+                       "signal": "SIGTERM", "signal_method": "pidfd_send_signal",
+                       "signal_before_epoch": signal_before, "signal_after_epoch": signal_after,
+                       "log_read_to_signal_seconds": signal_before - read_at,
+                       "signal_syscall_seconds": signal_after - signal_before,
+                       "signal_syscall_returned": True}
             record(root, "active_latch_sigterm", receipt=receipt)
             future.set_result(receipt)
         except Exception as exc:
