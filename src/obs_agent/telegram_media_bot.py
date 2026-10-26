@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, RetryAfter
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 LOG = logging.getLogger("obs_agent.telegram_media_bot")
@@ -67,7 +68,7 @@ PRESET_LONGEST = {"low": 500, "medium": 700, "high": 1000}
 VIDEO_LORAS = {"aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"}
 ABANDONED_JOB_SECONDS = 24 * 60 * 60
 DIAGNOSTIC_STAGES = {"received", "preflight", "rejected", "download", "image_probe", "normalize", "upload", "submit", "queued", "status", "result", "delivery", "cleanup", "delivered", "restart"}
-DIAGNOSTIC_CAUSES = {"generation_failed", "tensor_shape_mismatch", "dtype_mismatch", "device_mismatch", "model_missing", "image_decode_failed", "gpu_memory_exhausted", "gpu_resource_unavailable", "operation_timeout", "invalid_geometry", "invalid_steps", "invalid_fps", "invalid_duration", "image_required", "invalid_prompt", "invalid_image_path", "invalid_upload", "unsupported_model_mode", "unsupported_model", "invalid_request", "job_not_succeeded", "result_missing", "unsafe_output_path", "purge_failed", "unknown_job", "invalid_upload_path", "api_rate_limited", "api_unreachable", "api_transport_error", "image_probe_failed", "image_normalization_failed", "telegram_transport_error", "aborted_restart", "abandoned_timeout", "cleanup_failed", "failed", "cancelled", "delivery_failed"}
+DIAGNOSTIC_CAUSES = {"generation_failed", "tensor_shape_mismatch", "dtype_mismatch", "device_mismatch", "model_missing", "image_decode_failed", "gpu_memory_exhausted", "gpu_resource_unavailable", "operation_timeout", "invalid_geometry", "invalid_steps", "invalid_fps", "invalid_duration", "image_required", "invalid_prompt", "invalid_image_path", "invalid_upload", "unsupported_model_mode", "unsupported_model", "invalid_request", "job_not_succeeded", "result_missing", "unsafe_output_path", "purge_failed", "unknown_job", "invalid_upload_path", "api_rate_limited", "rate_limited", "api_unreachable", "api_transport_error", "image_probe_failed", "image_normalization_failed", "telegram_transport_error", "aborted_restart", "abandoned_timeout", "cleanup_failed", "failed", "cancelled", "delivery_failed"}
 DIAGNOSTIC_NUMBERS = {"width", "height", "steps", "cfg", "seed", "seconds", "fps", "length", "strength", "lora_strength", "longest", "prompt_characters", "prompt_utf8_bytes", "input_bytes", "input_width", "input_height", "normalized_bytes", "normalized_width", "normalized_height", "output_bytes", "http_status", "effective_frame_count", "requested_seconds", "effective_duration_seconds", "rotation_degrees"}
 
 
@@ -222,6 +223,9 @@ class StateStore:
           stage TEXT NOT NULL, occurred_at REAL NOT NULL, details_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS job_events_job ON job_events(job_id,event_id);
+        CREATE TABLE IF NOT EXISTS telegram_cooldowns (
+          chat_id INTEGER PRIMARY KEY, retry_at REAL NOT NULL
+        );
         """)
         self._ensure_column("error_code", "TEXT")
         self._scrub_legacy_content()
@@ -323,10 +327,24 @@ class StateStore:
         matches = self.db.execute("SELECT * FROM jobs WHERE job_id LIKE ? AND user_id=? ORDER BY created_at DESC", (reference + "%", user_id)).fetchall()
         return matches[0] if len(matches) == 1 else None
 
+    def telegram_retry_at(self, chat_id: int) -> float:
+        row = self.db.execute("SELECT retry_at FROM telegram_cooldowns WHERE chat_id=?", (chat_id,)).fetchone()
+        return float(row[0]) if row else 0.0
+
+    def defer_telegram(self, chat_id: int, error: RetryAfter) -> None:
+        delay = error.retry_after
+        seconds = delay.total_seconds() if hasattr(delay, "total_seconds") else float(delay)
+        retry_at = time.time() + seconds + 1
+        self.db.execute("INSERT INTO telegram_cooldowns(chat_id,retry_at) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET retry_at=MAX(retry_at,excluded.retry_at)", (chat_id, retry_at))
+        self.db.commit()
+
+    def pending_deliveries(self):
+        return self.db.execute("SELECT * FROM jobs WHERE state='delivery_pending' AND backend_job_id IS NOT NULL ORDER BY created_at").fetchall()
+
     def nonterminal(self):
         # Delivery is deliberately at-most-once: a crash after Telegram accepts the
         # message but before the delivered mark must not resend it on restart.
-        return self.db.execute("SELECT * FROM jobs WHERE state NOT IN ('delivered','delivering','delivery_failed','failed','cancelled') ORDER BY created_at").fetchall()
+        return self.db.execute("SELECT * FROM jobs WHERE state NOT IN ('delivered','delivering','delivery_pending','delivery_failed','failed','cancelled') ORDER BY created_at").fetchall()
 
     def cleanup_candidates(self):
         return self.db.execute("SELECT * FROM jobs WHERE state IN ('delivery_failed','cleanup_pending') AND backend_job_id IS NOT NULL ORDER BY updated_at").fetchall()
@@ -390,6 +408,7 @@ class MediaBot:
         self.application: Application | None = None
         self.tasks: set[asyncio.Task[Any]] = set()
         self.reaper_task: asyncio.Task[Any] | None = None
+        self.delivery_jobs: set[str] = set()
 
     @staticmethod
     def authorized(update: Update) -> bool:
@@ -586,6 +605,9 @@ class MediaBot:
         if row["state"] == "delivered":
             await update.effective_message.reply_text(f"Job {job_id[:12]} is already delivered; no local media copy is retained.")
             return
+        if row["state"] in {"delivery_pending", "delivering"} and row["backend_job_id"]:
+            await self._deliver_backend_result(job_id, row["backend_job_id"], row["chat_id"], explicit=True)
+            return
         await update.effective_message.reply_text(f"Job {job_id[:12]} has no locally retained result. Check Telegram delivery or resubmit the original request.")
 
     async def message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -628,13 +650,18 @@ class MediaBot:
             self.state.update_job(job_id, state="failed", error_code=f"preflight:{code}")
             await message.reply_text(f"{notice} Reference {job_id[:12]}.")
             return
+        ack = None
         try:
-            ack = await message.reply_text(f"Queued {job_id[:12]} ({settings.model}/{mode}, {settings.preset} {width}x{height})")
+            if self.state.telegram_retry_at(message.chat_id) <= time.time():
+                ack = await message.reply_text(f"Queued {job_id[:12]} ({settings.model}/{mode}, {settings.preset} {width}x{height})")
+        except RetryAfter as exc:
+            self.state.defer_telegram(message.chat_id, exc)
+            self.state.record_diagnostics(job_id, stage="delivery", error=exc)
         except Exception as exc:
             self.state.record_diagnostics(job_id, stage="delivery", error=exc)
             self.state.update_job(job_id, state="failed", error_code="delivery:telegram_transport_error")
             return
-        self.state.update_job(job_id, status_message_id=ack.message_id)
+        self.state.update_job(job_id, status_message_id=ack.message_id if ack else None)
         task = asyncio.create_task(self._submit_and_watch(job_id, update.effective_user.id, message.chat_id, message, effective_settings, has_image, request))
         self.tasks.add(task); task.add_done_callback(self.tasks.discard)
 
@@ -751,14 +778,30 @@ class MediaBot:
         return False
 
     async def _deliver_backend_result(self, job_id: str, backend_id: str, chat_id: int, *, explicit: bool = False) -> None:
-        del explicit
+        if job_id in self.delivery_jobs:
+            return
+        self.delivery_jobs.add(job_id)
+        try:
+            await self._try_deliver_backend_result(job_id, backend_id, chat_id, explicit=explicit)
+        finally:
+            self.delivery_jobs.discard(job_id)
+
+    async def _try_deliver_backend_result(self, job_id: str, backend_id: str, chat_id: int, *, explicit: bool = False) -> None:
+        row = self.state.get_job(job_id)
+        if row["state"] == "delivered" or (row["state"] == "delivering" and not explicit):
+            return
+        if self.state.telegram_retry_at(chat_id) > time.time():
+            self.state.update_job(job_id, state="delivery_pending", last_status="delivery_pending", error_code="delivery:rate_limited")
+            return
         self.state.record_diagnostics(job_id, stage="result")
         try:
             content, content_type = await self.api.result(backend_id)
         except Exception as exc:
             self.state.record_diagnostics(job_id, stage="result", error=exc)
-            self.state.update_job(job_id, state="cleanup_pending", error_code=f"result:{_safe_exception(exc)['code']}")
-            await self._purge_backend(job_id, backend_id)
+            retryable = isinstance(exc, httpx.TransportError) or (isinstance(exc, httpx.HTTPStatusError) and (exc.response.status_code >= 500 or exc.response.status_code == 429))
+            self.state.update_job(job_id, state="delivery_pending" if retryable else "cleanup_pending", error_code=f"result:{_safe_exception(exc)['code']}")
+            if not retryable:
+                await self._purge_backend(job_id, backend_id)
             return
         self.state.update_job(job_id, state="delivering", last_status="delivering")
         self.state.record_diagnostics(job_id, stage="delivery", metadata={"output_bytes": len(content)})
@@ -767,6 +810,13 @@ class MediaBot:
                 await self.application.bot.send_photo(chat_id=chat_id, photo=content, caption=f"Job {job_id[:12]} complete")
             else:
                 await self.application.bot.send_video(chat_id=chat_id, video=content, caption=f"Job {job_id[:12]} complete", supports_streaming=True)
+        except RetryAfter as exc:
+            self.state.defer_telegram(chat_id, exc)
+            self.state.record_diagnostics(job_id, stage="delivery", error=exc)
+            self.state.update_job(job_id, state="delivery_pending", last_status="delivery_pending", error_code="delivery:rate_limited")
+        except NetworkError as exc:
+            self.state.record_diagnostics(job_id, stage="delivery", error=exc)
+            self.state.update_job(job_id, state="delivering", last_status="delivery_ambiguous", error_code="delivery:telegram_transport_error")
         except Exception as exc:
             self.state.record_diagnostics(job_id, stage="delivery", error=exc)
             purged = await self._purge_backend(job_id, backend_id)
@@ -785,11 +835,15 @@ class MediaBot:
         status_message_id = row["status_message_id"]
         last_update = 0.0
         previous_state = None
+        announced_state = None
         while True:
             try:
                 status = await self.api.status(backend_id)
             except Exception as exc:
                 self.state.record_diagnostics(job_id, stage="status", error=exc)
+                if isinstance(exc, httpx.TransportError) or (isinstance(exc, httpx.HTTPStatusError) and (exc.response.status_code >= 500 or exc.response.status_code == 429)):
+                    await asyncio.sleep(5)
+                    continue
                 self.state.update_job(job_id, state="cleanup_pending", last_status="cleanup_pending", error_code=f"status:{_safe_exception(exc)['code']}")
                 if self.application:
                     await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: status unavailable; resubmit from Telegram")
@@ -802,9 +856,13 @@ class MediaBot:
                 previous_state = state
             self.state.update_job(job_id, state=state, last_status=state)
             now = time.monotonic()
-            if now - last_update >= 30 and self.application:
+            if now - last_update >= 30 and self.application and status_message_id and state != announced_state and self.state.telegram_retry_at(chat_id) <= time.time():
                 try:
                     await self.application.bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=f"Job {job_id[:12]}: {state} ({backend_id})")
+                    announced_state = state
+                except RetryAfter as exc:
+                    self.state.defer_telegram(chat_id, exc)
+                    self.state.record_diagnostics(job_id, stage="status", error=exc)
                 except Exception:
                     LOG.debug("status edit failed job=%s", job_id)
                 last_update = now
@@ -826,8 +884,14 @@ class MediaBot:
             return
         await self._deliver_backend_result(job_id, backend_id, chat_id)
 
+    async def _retry_pending_deliveries(self) -> None:
+        for row in self.state.pending_deliveries():
+            if self.state.telegram_retry_at(row["chat_id"]) <= time.time():
+                await self._deliver_backend_result(row["job_id"], row["backend_job_id"], row["chat_id"])
+
     async def _reaper(self) -> None:
         while True:
+            await self._retry_pending_deliveries()
             for row in self.state.cleanup_candidates():
                 if await self._purge_backend(row["job_id"], row["backend_job_id"]):
                     self.state.update_job(row["job_id"], last_status="cleanup_complete", error_code=None)

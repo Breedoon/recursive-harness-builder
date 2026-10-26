@@ -343,3 +343,164 @@ def test_send_failure_leaves_explicitly_recoverable_delivery_state(tmp_path):
     assert api.purged == ["backend-3"]
     assert store.nonterminal() == []
     assert not list((tmp_path / "results").glob("*"))
+
+
+def test_retry_after_retains_video_and_retries_once_after_restart(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from telegram.error import RetryAfter
+
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path)
+    job = store.create_job(user_id=5129431382, chat_id=99, message_id=1, prompt="synthetic", request={"model": "h3"})
+    store.update_job(job, backend_job_id="backend-retry", state="succeeded")
+    api = SimpleNamespace(result=AsyncMock(return_value=(b"synthetic-video", "video/mp4")), purge=AsyncMock())
+    sender = SimpleNamespace(send_video=AsyncMock(side_effect=RetryAfter(25958)))
+    bot = MediaBot(token="", state=store, api=api, result_root=tmp_path / "results")
+    bot.application = SimpleNamespace(bot=sender)
+    asyncio.run(bot._deliver_backend_result(job, "backend-retry", 99))
+    assert store.get_job(job)["state"] == "delivery_pending"
+    assert store.telegram_retry_at(99) > __import__("time").time() + 25950
+    api.purge.assert_not_awaited()
+    assert store.cleanup_candidates() == []
+    assert store.nonterminal() == []
+    store.db.close()
+
+    reopened = StateStore(path)
+    assert reopened.get_job(job)["error_code"] == "delivery:rate_limited"
+    bot = MediaBot(token="", state=reopened, api=api, result_root=tmp_path / "results")
+    sender.send_video = AsyncMock()
+    bot.application = SimpleNamespace(bot=sender)
+    asyncio.run(bot._retry_pending_deliveries())
+    sender.send_video.assert_not_awaited()
+    reopened.db.execute("UPDATE telegram_cooldowns SET retry_at=0")
+    reopened.db.commit()
+    asyncio.run(bot._retry_pending_deliveries())
+    asyncio.run(bot._retry_pending_deliveries())
+    sender.send_video.assert_awaited_once()
+    api.purge.assert_awaited_once_with("backend-retry")
+    assert reopened.get_job(job)["state"] == "delivered"
+    assert api.result.await_count == 2
+    assert not (tmp_path / "results").exists()
+
+
+def test_ambiguous_network_send_retains_result_without_automatic_replay(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from telegram.error import NetworkError
+
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path)
+    job = store.create_job(user_id=5129431382, chat_id=99, message_id=1, prompt="synthetic", request={})
+    store.update_job(job, backend_job_id="backend-ambiguous", state="succeeded")
+    api = SimpleNamespace(result=AsyncMock(return_value=(b"synthetic", "video/mp4")), purge=AsyncMock())
+    sender = SimpleNamespace(send_video=AsyncMock(side_effect=NetworkError("synthetic timeout")))
+    bot = MediaBot(token="", state=store, api=api, result_root=tmp_path / "results")
+    bot.application = SimpleNamespace(bot=sender)
+    asyncio.run(bot._deliver_backend_result(job, "backend-ambiguous", 99))
+    assert store.get_job(job)["state"] == "delivering"
+    assert store.nonterminal() == []
+    assert store.pending_deliveries() == []
+    assert store.cleanup_candidates() == []
+    api.purge.assert_not_awaited()
+    asyncio.run(bot._deliver_backend_result(job, "backend-ambiguous", 99))
+    assert sender.send_video.await_count == 1
+    sender.send_video = AsyncMock()
+    asyncio.run(bot._deliver_backend_result(job, "backend-ambiguous", 99, explicit=True))
+    sender.send_video.assert_awaited_once()
+    assert store.get_job(job)["state"] == "delivered"
+
+
+def test_status_retry_after_suppresses_later_edits_and_defers_result(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from telegram.error import RetryAfter
+    import obs_agent.telegram_media_bot as module
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    job = store.create_job(user_id=5129431382, chat_id=99, message_id=1, prompt="synthetic", request={})
+    store.update_job(job, backend_job_id="backend-status", state="queued", status_message_id=7)
+    api = SimpleNamespace(status=AsyncMock(side_effect=[{"state":"running"}, {"state":"running"}, {"state":"succeeded"}]), result=AsyncMock(), purge=AsyncMock())
+    sender = SimpleNamespace(edit_message_text=AsyncMock(side_effect=RetryAfter(25958)), send_video=AsyncMock())
+    bot = MediaBot(token="", state=store, api=api, result_root=tmp_path / "results")
+    bot.application = SimpleNamespace(bot=sender)
+    async def no_wait(_seconds):
+        pass
+    monkeypatch.setattr(module.asyncio, "sleep", no_wait)
+    asyncio.run(bot._watch(job, "backend-status", 99))
+    sender.edit_message_text.assert_awaited_once()
+    sender.send_video.assert_not_awaited()
+    api.result.assert_not_awaited()
+    api.purge.assert_not_awaited()
+    assert store.get_job(job)["state"] == "delivery_pending"
+
+
+def test_concurrent_pending_and_explicit_delivery_do_not_send_twice(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    job = store.create_job(user_id=5129431382, chat_id=99, message_id=1, prompt="synthetic", request={})
+    store.update_job(job, backend_job_id="backend-once", state="delivery_pending")
+    async def result(_backend):
+        await asyncio.sleep(0)
+        return b"synthetic", "video/mp4"
+    api = SimpleNamespace(result=result, purge=AsyncMock())
+    sender = SimpleNamespace(send_video=AsyncMock())
+    bot = MediaBot(token="", state=store, api=api, result_root=tmp_path / "results")
+    bot.application = SimpleNamespace(bot=sender)
+    async def run():
+        await asyncio.gather(bot._retry_pending_deliveries(), bot._deliver_backend_result(job, "backend-once", 99, explicit=True))
+    asyncio.run(run())
+    sender.send_video.assert_awaited_once()
+    api.purge.assert_awaited_once()
+
+
+def test_transient_result_errors_retain_and_later_deliver(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import httpx
+
+    request = httpx.Request("GET", "http://media.invalid/result")
+    failures = [httpx.ReadTimeout("synthetic"), httpx.HTTPStatusError("synthetic", request=request, response=httpx.Response(503, request=request))]
+    for index, failure in enumerate(failures):
+        store = StateStore(tmp_path / f"state-{index}.sqlite3")
+        job = store.create_job(user_id=5129431382, chat_id=99, message_id=1, prompt="synthetic", request={})
+        store.update_job(job, backend_job_id="backend-transient", state="delivery_pending")
+        api = SimpleNamespace(result=AsyncMock(side_effect=[failure, (b"synthetic", "video/mp4")]), purge=AsyncMock())
+        sender = SimpleNamespace(send_video=AsyncMock())
+        bot = MediaBot(token="", state=store, api=api, result_root=tmp_path / "results")
+        bot.application = SimpleNamespace(bot=sender)
+        asyncio.run(bot._retry_pending_deliveries())
+        assert store.get_job(job)["state"] == "delivery_pending"
+        api.purge.assert_not_awaited()
+        sender.send_video.assert_not_awaited()
+        asyncio.run(bot._retry_pending_deliveries())
+        assert store.get_job(job)["state"] == "delivered"
+        sender.send_video.assert_awaited_once()
+        api.purge.assert_awaited_once()
+
+
+def test_transient_status_errors_do_not_cleanup_running_render(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import httpx
+    import obs_agent.telegram_media_bot as module
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    job = store.create_job(user_id=5129431382, chat_id=99, message_id=1, prompt="synthetic", request={})
+    store.update_job(job, backend_job_id="backend-running", state="running", status_message_id=7)
+    request = httpx.Request("GET", "http://media.invalid/status")
+    failures = [httpx.ReadTimeout("synthetic"), httpx.HTTPStatusError("synthetic", request=request, response=httpx.Response(503, request=request)), {"state":"succeeded"}]
+    api = SimpleNamespace(status=AsyncMock(side_effect=failures), result=AsyncMock(return_value=(b"synthetic", "video/mp4")), purge=AsyncMock())
+    sender = SimpleNamespace(edit_message_text=AsyncMock(), send_video=AsyncMock())
+    bot = MediaBot(token="", state=store, api=api, result_root=tmp_path / "results")
+    bot.application = SimpleNamespace(bot=sender)
+    async def no_wait(_seconds):
+        assert store.get_job(job)["state"] == "running"
+        api.purge.assert_not_awaited()
+    monkeypatch.setattr(module.asyncio, "sleep", no_wait)
+    asyncio.run(bot._watch(job, "backend-running", 99))
+    assert api.status.await_count == 3
+    sender.send_video.assert_awaited_once()
+    api.purge.assert_awaited_once()
