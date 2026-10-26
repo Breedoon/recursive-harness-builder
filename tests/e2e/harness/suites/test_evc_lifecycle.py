@@ -48,7 +48,7 @@ async def _shape(lane, shape, nonce, root, signals, proof):
     assert f"READY-{nonce}" in ready.text, ready.messages
     proof["primed_turn_end"] = ready.end
     if shape == "S3":
-        prompt = "Write every integer from1 through8000, one per line, no other text and no tools."
+        prompt = proof.get("stream_prompt", "Write every integer from1 through8000, one per line, no other text and no tools.")
     elif shape == "S1":
         command = shlex.join(["python3", "./evc_fixture.py", "hold", "--root", root])
         if proof.get("idle_completion_barrier"):
