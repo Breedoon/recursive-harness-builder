@@ -5924,6 +5924,45 @@ class TestForkTaskRuntime:
         assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" in child_options.env
         await bot.shutdown()
 
+    async def test_launch_fresh_child_without_model_uses_default_terra(
+        self,
+        config,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("obs_agent.telegram.Path.home", lambda: tmp_path)
+        bot = TelegramBot(config, fragment_gap=_TEST_GAP, enable_background_poller=False)
+        route = TelegramRoute(chat_id=-10067890, thread_id=None)
+        state = bot._get_state(route)
+        assert state is not None
+        assert state.session_manager.model_override is None
+        assert state.session_manager.effective_model == "gpt-6.1-terra"
+        state.last_bot = MagicMock()
+        state.last_bot.create_forum_topic = AsyncMock(return_value=MagicMock(message_thread_id=336))
+        state.last_bot.send_message = AsyncMock(
+            side_effect=[MagicMock(message_id=950), MagicMock(message_id=951), MagicMock(message_id=952)]
+        )
+        state.session_manager.set_session_id("sid-default-terra-root")
+
+        with patch.object(bot, "_schedule_fork_task", new_callable=AsyncMock):
+            await bot._launch_fork_task(
+                route=route,
+                args={
+                    "prompt": "Start fresh on the current default",
+                    "description": "Default model child",
+                    "fork": False,
+                    "task_tool_name": "AgentTask",
+                },
+            )
+
+        child_state = bot._get_state(TelegramRoute(chat_id=-10067890, thread_id=336))
+        assert child_state is not None
+        assert child_state.session_manager.model_override == "gpt-6.1-terra"
+        child_options = child_state.session_manager.create_options()
+        assert child_options.model == "gpt-6.1-terra[1m]"
+        assert child_options.env["OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"] == "872000"
+        await bot.shutdown()
+
     async def test_launch_agent_task_spark_alias_needs_no_env_and_keeps_backend_by_name(
         self,
         config,
