@@ -116,6 +116,7 @@ Supported shorthands in current code include:
 - `gpt-mini`
 - Local Qwen: `qwen`/`qwen-fn`/`qwen-flash-next`/`qwen3.8-flash-next` → the DGX Sparks Qwen3.8 Flash Next (`local-sparks-qwen3.8-flash-next-abliterated`); `qwen-27b`/`qwen3.8-27b`/`local-qwen` → the 3090 Qwen (`local-qwen3.8-27b`). Plain `qwen` is a single switch, `DEFAULT_QWEN_MODEL` in `config.py`.
 - Local GLM: `glm`/`glm-flash`/`glm-5.3-flash`/`glm-5.3-flash-uncensored` → the Sparks GLM (`local-sparks-glm-5.3-flash-uncensored`). The hosted `glm-5.3` (Z.AI through CLIProxyAPI) is a different model and keeps its own name.
+- Local DeepSeek: `ds`/`deepseek` → the served Sparks DeepSeek (`local-sparks-deepseek-v4.1-flash-1017`) with its native 1,048,576-token window.
 - `gemini`, `gemini-pro`, `gemini-flash`
 
 Claude models route directly to Anthropic through Claude Code. Non-Claude models route through the local cache proxy and then CLIProxyAPI.
@@ -124,7 +125,7 @@ Claude models route directly to Anthropic through Claude Code. Non-Claude models
 
 The Sparks host one model at a time, behind their own cache proxy (default `http://127.0.0.1:28931`). The backend follows the model *name*: `obs_agent.spark` fills `ANTHROPIC_BASE_URL`, the credential (read from `/workspace/runtime/secrets/spark-api-key` at session build; never stored) and the small-model variables for any session whose model resolves to `local-sparks-*`, so children, forks and restores reach the Sparks without an `env`. An explicit per-session `env` still wins. Overrides: `OBS_SPARK_LLM_BASE_URL`, `OBS_SPARK_LLM_KEY_FILE`.
 
-- Default window is 262,000 tokens (the default profile serves 262,144). `[1m]` is valid only while the `qwen-1m` profile serves (≈1,048,576 tokens); OBS then raises the compaction ceiling to the requested window.
+- Spark Qwen defaults to 262,000 tokens (the default profile serves 262,144); its `[1m]` suffix is valid only while the `qwen-1m` profile serves. Spark GLM and DeepSeek use their native 1,048,576-token windows by default. OBS passes local model IDs unsuffixed and carries the context budget separately.
 - When an AgentTask child is created with a Spark model, OBS asks `GET /v1/models` and fails with an actionable message if a different model is being served or the window is larger than the serving profile. Unreachable endpoint = no check (the ordinary connection error surfaces). `OBS_SPARK_PREFLIGHT=0` disables the check.
 - Switching models is a host operation, not an OBS setting: `spark-model switch qwen|qwen-1m|glm` (see the vault DGX Sparks Runbook).
 

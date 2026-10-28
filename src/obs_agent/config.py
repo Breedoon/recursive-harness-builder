@@ -27,6 +27,7 @@ _DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no exp
 LOCAL_QWEN_27B_MODEL = "local-qwen3.8-27b"
 SPARK_QWEN_MODEL = "local-sparks-qwen3.8-flash-next-abliterated"
 SPARK_GLM_MODEL = "local-sparks-glm-5.3-flash-uncensored"
+SPARK_DEEPSEEK_MODEL = "local-sparks-deepseek-v4.1-flash-1017"
 
 # What plain "qwen" means. This is the single switch for the default Qwen:
 # SPARK_QWEN_MODEL (Daniel, 2026-09-29) or LOCAL_QWEN_27B_MODEL to move it back
@@ -84,6 +85,8 @@ MODEL_RESOLUTION: dict[str, str] = {
     "glm-flash": SPARK_GLM_MODEL,
     "glm-5.3-flash": SPARK_GLM_MODEL,
     "glm-5.3-flash-uncensored": SPARK_GLM_MODEL,
+    "ds": SPARK_DEEPSEEK_MODEL,
+    "deepseek": SPARK_DEEPSEEK_MODEL,
 }
 
 # Regex for context-window suffix: [1m], [200k], [128k], etc.
@@ -99,8 +102,9 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # Spark Qwen's default profile serves 262,144 native; qwen-1m serves
     # ~1M, selected explicitly with a [1m] suffix (obs_agent.spark checks it).
     SPARK_QWEN_MODEL: 262_000,
-    # TensorFold GLM serves its native 1,048,576-token window by default.
+    # TensorFold GLM and DeepSeek serve their native 1,048,576-token windows by default.
     SPARK_GLM_MODEL: 1_048_576,
+    SPARK_DEEPSEEK_MODEL: 1_048_576,
     "local-sparks-glm-5.3-flash-exl3-abliterated": 1_048_576,
     "local-sparks-glm-5.3-flash-exl3-4bpw": 1_048_576,
     "local-gemma4-31b": 48_000,

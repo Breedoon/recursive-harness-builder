@@ -34,6 +34,16 @@ def test_glm_explicit_context_and_qwen_default_unchanged():
     assert config_module.resolve_model_context("qwen").context_tokens == 262_000
 
 
+@pytest.mark.parametrize("model", ["ds", "deepseek", config_module.SPARK_DEEPSEEK_MODEL])
+def test_deepseek_aliases_use_native_context(model):
+    resolved = config_module.resolve_model_context(model)
+    assert resolved.model == config_module.SPARK_DEEPSEEK_MODEL
+    assert resolved.context_tokens == 1_048_576
+    assert not resolved.explicit_context
+    assert resolved.model_with_context == config_module.SPARK_DEEPSEEK_MODEL
+    assert resolved.model_for_claude_code == config_module.SPARK_DEEPSEEK_MODEL
+
+
 # --- Vault Path Resolution ---
 
 

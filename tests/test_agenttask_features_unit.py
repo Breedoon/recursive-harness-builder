@@ -85,6 +85,9 @@ class TestModelResolution:
         ("glm-5.3-flash", "local-sparks-glm-5.3-flash-uncensored"),
         ("glm-5.3-flash-uncensored", "local-sparks-glm-5.3-flash-uncensored"),
         ("local-sparks-glm-5.3-flash-uncensored", "local-sparks-glm-5.3-flash-uncensored"),
+        ("ds", "local-sparks-deepseek-v4.1-flash-1017"),
+        ("deepseek", "local-sparks-deepseek-v4.1-flash-1017"),
+        ("local-sparks-deepseek-v4.1-flash-1017", "local-sparks-deepseek-v4.1-flash-1017"),
         # Hosted Z.AI GLM served through CLIProxyAPI is a different backend.
         ("glm-5.3", "glm-5.3"),
         # Unknown names pass through unchanged (the provider rejects them).
@@ -94,7 +97,8 @@ class TestModelResolution:
         assert resolve_model(alias) == model
 
     @pytest.mark.parametrize(("alias", "suffix"), [
-        ("qwen", "[1m]"), ("qwen-fn", "[262k]"), ("glm", "[200k]"), ("qwen-27b", "[262k]"),
+        ("qwen", "[1m]"), ("qwen-fn", "[262k]"), ("glm", "[200k]"), ("deepseek", "[1m]"),
+        ("qwen-27b", "[262k]"),
     ])
     def test_alias_keeps_context_suffix(self, alias, suffix):
         assert resolve_model(alias + suffix) == resolve_model(alias) + suffix
