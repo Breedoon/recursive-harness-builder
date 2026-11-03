@@ -157,12 +157,14 @@ if (( health_parse_rc != 0 )); then
   fail_retryably 'GPU transcription service contract is invalid; retry later'
 fi
 
-if ! /usr/bin/python3 - "$AUDIO_FILE" "$TITLE" "$DEST_DIR" "$CORRELATION_ID" "$REQUEST_TIMEOUT_SECONDS" "$REQUEST_PATH" <<'PY'
+if ! /usr/bin/python3 - "$AUDIO_FILE" "$TITLE" "$DEST_DIR" "$CORRELATION_ID" "$REQUEST_TIMEOUT_SECONDS" "$REQUEST_PATH" "${OBS_TRANSCRIPTION_WINDOWED:-0}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-audio, title, dest, correlation_id, timeout, output = sys.argv[1:]
+audio, title, dest, correlation_id, timeout, output, windowed = sys.argv[1:]
+if windowed not in {"0", "1"}:
+    raise SystemExit(1)
 Path(output).write_text(
     json.dumps(
         {
@@ -171,6 +173,7 @@ Path(output).write_text(
             "dest_dir": dest,
             "correlation_id": correlation_id,
             "timeout_seconds": int(timeout),
+            "windowed": windowed == "1",
         },
         separators=(",", ":"),
     )

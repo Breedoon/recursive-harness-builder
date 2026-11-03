@@ -442,6 +442,9 @@ class Handler(BaseHTTPRequestHandler):
             title = str(data["title"])
             correlation_id = str(data["correlation_id"])
             timeout_seconds = int(data.get("timeout_seconds", 0))
+            windowed = data.get("windowed", False)
+            if type(windowed) is not bool:
+                raise ValueError("invalid windowed transcription setting")
             if not SAFE_CORRELATION_RE.fullmatch(correlation_id):
                 raise ValueError("invalid correlation ID")
             if timeout_seconds != WORKER_TIMEOUT_SECONDS:
@@ -466,7 +469,8 @@ class Handler(BaseHTTPRequestHandler):
                 stderr=subprocess.PIPE,
                 text=True,
                 cwd=str(BASE),
-                env={**os.environ, "OBS_TRANSCRIPTION_CORRELATION_ID": correlation_id},
+                env={**os.environ, "OBS_TRANSCRIPTION_CORRELATION_ID": correlation_id,
+                     "OBS_TRANSCRIPTION_WINDOWED": "1" if windowed else "0"},
                 start_new_session=True,
             )
             with ACTIVE_LOCK:

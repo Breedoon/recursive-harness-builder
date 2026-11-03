@@ -203,6 +203,7 @@ def transcribe(audio_arg: str, title_arg: str, dest_arg: str) -> dict[str, Any]:
             child_env={
                 "OBS_TRANSCRIPTION_LOCK_ALREADY_HELD": "1",
                 "OBS_TRANSCRIPTION_CORRELATION_ID": correlation_id,
+                "OBS_TRANSCRIPTION_WINDOWED": os.environ.get("OBS_TRANSCRIPTION_WINDOWED", "0"),
                 "OBS_TRANSCRIPTION_MODEL": str(MODEL_SNAPSHOT),
                 "OBS_TRANSCRIPTION_MODEL_DIR": str(BASE / "models"),
                 "OBS_TRANSCRIPTION_DEVICE": "cuda",
