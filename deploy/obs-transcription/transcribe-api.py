@@ -443,8 +443,12 @@ class Handler(BaseHTTPRequestHandler):
             correlation_id = str(data["correlation_id"])
             timeout_seconds = int(data.get("timeout_seconds", 0))
             windowed = data.get("windowed", False)
-            if type(windowed) is not bool:
-                raise ValueError("invalid windowed transcription setting")
+            watch_hybrid = data.get('watch_hybrid', False)
+            source_adapter = data.get('source_adapter', '')
+            if (type(windowed) is not bool or type(watch_hybrid) is not bool
+                    or source_adapter not in ('', 'just-press-record', 'voice-memos')
+                    or (watch_hybrid and (not windowed or source_adapter != 'just-press-record'))):
+                raise ValueError('invalid transcription mode or source adapter')
             if not SAFE_CORRELATION_RE.fullmatch(correlation_id):
                 raise ValueError("invalid correlation ID")
             if timeout_seconds != WORKER_TIMEOUT_SECONDS:
@@ -470,7 +474,9 @@ class Handler(BaseHTTPRequestHandler):
                 text=True,
                 cwd=str(BASE),
                 env={**os.environ, "OBS_TRANSCRIPTION_CORRELATION_ID": correlation_id,
-                     "OBS_TRANSCRIPTION_WINDOWED": "1" if windowed else "0"},
+                     "OBS_TRANSCRIPTION_WINDOWED": "1" if windowed else "0",
+                     'OBS_TRANSCRIPTION_HYBRID_WATCH': '1' if watch_hybrid else '0',
+                     'OBS_TRANSCRIPTION_REQUEST_ADAPTER': source_adapter},
                 start_new_session=True,
             )
             with ACTIVE_LOCK:

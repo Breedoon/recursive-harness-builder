@@ -6,6 +6,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -304,6 +305,45 @@ def _collapse_untimed_items(items: list) -> tuple:
     return [{'text': seg.text} for seg in collapsed], details
 
 
+# Experimental only: thresholds are hypotheses requiring matched public/private evaluation.
+STOCK_PHRASES = frozenset({
+    'dzięki za oglądanie', 'dziękuję za oglądanie', 'dziękujemy za oglądanie',
+    'thanks for watching', 'thank you for watching', 'napisy stworzone przez społeczność amara org',
+    'napisy stworzone przez społeczność amara', 'napisy amara org',
+})
+
+
+def _guard_segments(segments: list, no_speech_threshold: float, log_prob_threshold: float) -> tuple:
+    import math
+
+    kept, events = [], []
+    for index, seg in enumerate(segments):
+        def finite(name):
+            try:
+                value = float(getattr(seg, name))
+                return value if math.isfinite(value) else None
+            except (AttributeError, TypeError, ValueError):
+                return None
+
+        no_speech, logprob = finite('no_speech_prob'), finite('avg_logprob')
+        # Missing decoder confidences do not license deletion.
+        both_poor = (no_speech is not None and logprob is not None
+                     and no_speech > no_speech_threshold and logprob < log_prob_threshold)
+        normalized = ' '.join(re.findall(r'\w+', unicodedata.normalize('NFKC', seg.text).casefold()))
+        before = index == 0 or float(seg.start) - float(segments[index - 1].end) >= 2.0
+        after = index == len(segments) - 1 or float(segments[index + 1].start) - float(seg.end) >= 2.0
+        low_confidence = ((no_speech is not None and no_speech > no_speech_threshold)
+                          or (logprob is not None and logprob < log_prob_threshold))
+        stock = normalized in STOCK_PHRASES and before and after and low_confidence
+        reason = 'joint_no_speech_low_logprob' if both_poor else 'isolated_low_confidence_stock_phrase' if stock else None
+        if reason is None:
+            kept.append(seg)
+        else:
+            events.append({'start': round(float(seg.start), 3), 'end': round(float(seg.end), 3),
+                           'reason': reason, 'words': len(normalized.split())})
+    return kept, events
+
+
 def _decode_window_with_retry(model, core, options: dict, *, allow_retry: bool) -> tuple:
     import math
 
@@ -339,6 +379,7 @@ def _decode_window_with_retry(model, core, options: dict, *, allow_retry: bool) 
         retry_options = {**options, 'temperature': (0.2, 0.4, 0.6), 'condition_on_previous_text': False}
         retry, _ = model.transcribe(core, **retry_options)
         retry = list(retry)
+        result['_private_retry_text'] = [seg.text for seg in retry]
         retry_repeats, retry_compression = signals(retry)
         result.update(retry_periodic_words=retry_repeats, retry_high_compression_segments=retry_compression,
                       retry_segments=len(retry), retry_tokens=sum(len(tokens(seg.text)) for seg in retry))
@@ -352,7 +393,7 @@ def _decode_window_with_retry(model, core, options: dict, *, allow_retry: bool) 
     return original, result
 
 
-def _transcribe_windows(model, audio_file: Path, options: dict) -> tuple:
+def _transcribe_windows(model, audio_file: Path, options: dict, *, watch_hybrid: bool = False) -> tuple:
     from types import SimpleNamespace
     import math
     import numpy as np
@@ -369,8 +410,8 @@ def _transcribe_windows(model, audio_file: Path, options: dict) -> tuple:
                    "hard_seams_seconds": [float(x) for x in range(60, math.ceil(duration), 60)],
                    "hard_seam_policy": "no_overlap_coverage_unverified", "vad_empty_windows": [],
                    "exact_zero_windows": [], "repeat_retry_windows": [], "vad_empty_alternatives": [],
+                   "boosted_windows": [], "_private_unselected": [],
                    "extra_decode_limit": 8, "extra_decode_attempts": 0}
-    vad_options = VadOptions(**options["vad_parameters"]) if options["vad_filter"] else None
     language_set = ("en", "pl", "ru", "uk")
     first_info = None
     for window_start in range(0, len(audio), 60 * sample_rate):
@@ -386,11 +427,39 @@ def _transcribe_windows(model, audio_file: Path, options: dict) -> tuple:
             diagnostics["exact_zero_windows"].append({"start": metadata["start"], "end": metadata["end"]})
             windows.append(metadata)
             continue
+        # Experimental 30s gains within each unchanged 60s ASR window.
+        slices, adapted = [], []
+        for part_start in range(0, len(window_audio), 30 * sample_rate):
+            part = window_audio[part_start:part_start + 30 * sample_rate]
+            part_rms = float(np.sqrt(np.mean(np.square(part, dtype=np.float64))))
+            peak = float(np.max(np.abs(part)))
+            gain = max(1.0, min(10 ** (30 / 20), 10 ** (-25 / 20) / part_rms, .98 / peak)) if part_rms >= 10 ** (-80 / 20) and peak else 1.0
+            gain_db = 20 * math.log10(gain)
+            part_boosted = watch_hybrid and options['vad_filter'] and gain_db > 15.0
+            if part_boosted:
+                values = np.clip(part.astype(np.float64) * gain, -1., 32767 / 32768)
+                part = (values * 32768).astype('<i2').astype(np.float32) / 32768
+            adapted.append(part)
+            slices.append({'start': metadata['start'] + part_start / sample_rate,
+                           'end': metadata['start'] + (part_start + len(part)) / sample_rate,
+                           'boosted': part_boosted, 'gain_db': gain_db if part_boosted else 0.0,
+                           'source_rms': part_rms})
+        boosted = any(part['boosted'] for part in slices)
+        window_vad_parameters = {**options['vad_parameters'], **({'threshold': .3} if boosted else {})}
+        if boosted:
+            window_audio = np.concatenate(adapted)
+            diagnostics['boosted_windows'].append({'start': metadata['start'], 'end': metadata['end'],
+                                                   'gain_db': max(part['gain_db'] for part in slices)})
+        if watch_hybrid:
+            metadata['loudness_adaptation'] = {'boosted': boosted, 'gain_db': max(part['gain_db'] for part in slices),
+                                               'source_rms': window_rms, 'vad_threshold': window_vad_parameters['threshold'],
+                                               'slices': slices}
+        vad_options = VadOptions(**window_vad_parameters) if options['vad_filter'] else None
         totals = {}
         votes = []
         for core_start in range(window_start, window_end, 30 * sample_rate):
             core_end = min(window_end, core_start + 30 * sample_rate)
-            core = audio[core_start:core_end]
+            core = window_audio[core_start - window_start:core_end - window_start]
             rms = float(np.sqrt(np.mean(np.square(core, dtype=np.float64))))
             if not math.isfinite(rms):
                 raise RuntimeError("audio has invalid samples")
@@ -450,7 +519,7 @@ def _transcribe_windows(model, audio_file: Path, options: dict) -> tuple:
                         language_set_mass_rounding_corrected=set_mass > 1.0, unrestricted_language=unrestricted_language,
                         unrestricted_probability=round(float(unrestricted_probability), 6))
         windows.append(metadata)
-        core = audio[window_start:window_end]
+        core = window_audio
         if vad_options is not None and not get_speech_timestamps(core, vad_options):
             metadata["vad_empty"] = True
             diagnostics["vad_empty_windows"].append({"start": metadata["start"], "end": metadata["end"]})
@@ -461,6 +530,10 @@ def _transcribe_windows(model, audio_file: Path, options: dict) -> tuple:
                     alternative_options = {**options, "language": language, "vad_filter": False}
                     alternate_segments, _ = model.transcribe(core, **alternative_options)
                     alternate_segments = list(alternate_segments)
+                    if watch_hybrid:
+                        diagnostics['_private_unselected'].append({'kind': 'vad_empty_alternative',
+                            'window_start': metadata['start'], 'window_end': metadata['end'],
+                            'text': [seg.text for seg in alternate_segments]})
                     valid = all(math.isfinite(float(seg.start)) and math.isfinite(float(seg.end))
                                 and 0 <= float(seg.start) <= float(seg.end) <= len(core) / sample_rate
                                 for seg in alternate_segments)
@@ -474,12 +547,16 @@ def _transcribe_windows(model, audio_file: Path, options: dict) -> tuple:
             diagnostics["vad_empty_alternatives"].append(alternative)
             continue
         offset = window_start / sample_rate
-        chunk_options = {**options, "language": language}
+        chunk_options = {**options, "language": language, 'vad_parameters': window_vad_parameters}
         chunk_segments, retry = _decode_window_with_retry(
             model, core, chunk_options,
             allow_retry=diagnostics["extra_decode_attempts"] < diagnostics["extra_decode_limit"])
         if retry is not None:
             diagnostics["extra_decode_attempts"] += retry["attempts"]
+            private_retry = retry.pop('_private_retry_text', None)
+            if watch_hybrid and private_retry is not None:
+                diagnostics['_private_unselected'].append({'kind': 'repeat_retry',
+                    'window_start': metadata['start'], 'window_end': metadata['end'], 'text': private_retry})
             retry.update(start=metadata["start"], end=metadata["end"])
             diagnostics["repeat_retry_windows"].append(retry)
         bounded = []
@@ -520,7 +597,9 @@ def _transcribe_windows(model, audio_file: Path, options: dict) -> tuple:
                 diagnostics["strong_repeat_segments"].append({"start": round(float(seg.start) + offset, 3),
                                                                "end": round(float(seg.end) + offset, 3),
                                                                "periodic_words": repeat_words})
-            segments.append(SimpleNamespace(start=float(seg.start) + offset, end=float(seg.end) + offset, text=seg.text))
+            segments.append(SimpleNamespace(start=float(seg.start) + offset, end=float(seg.end) + offset, text=seg.text,
+                                            no_speech_prob=seg.no_speech_prob, avg_logprob=seg.avg_logprob,
+                                            compression_ratio=seg.compression_ratio))
     if first_info is None:
         first_info = SimpleNamespace(language=None, language_probability=0.0)
     return segments, first_info, duration, dropped, overruns, windows, diagnostics, untimed
@@ -608,6 +687,9 @@ def main() -> int:
     )
     language = os.environ.get("OBS_TRANSCRIPTION_LANGUAGE", "").strip() or None
     vad_threshold = float(os.environ.get("OBS_TRANSCRIPTION_VAD_THRESHOLD", "0.5"))
+    watch_hybrid = (os.environ.get('OBS_TRANSCRIPTION_HYBRID_WATCH', '0') == '1'
+                    and os.environ.get('OBS_TRANSCRIPTION_WINDOWED', '0') == '1'
+                    and language is None and vad_filter and vad_threshold == 0.5)
     vad_min_speech_ms = int(os.environ.get("OBS_TRANSCRIPTION_VAD_MIN_SPEECH_MS", "250"))
     vad_min_silence_ms = int(os.environ.get("OBS_TRANSCRIPTION_VAD_MIN_SILENCE_MS", "2000"))
     vad_speech_pad_ms = int(os.environ.get("OBS_TRANSCRIPTION_VAD_SPEECH_PAD_MS", "200"))
@@ -668,12 +750,26 @@ def main() -> int:
             untimed = []
         else:
             segment_list, info, audio_duration, dropped_past_end, end_overruns, language_windows, diagnostics, untimed = _transcribe_windows(
-                model, audio_file, options
+                model, audio_file, options, watch_hybrid=watch_hybrid
             )
+        unselected = diagnostics.pop('_private_unselected', []) if diagnostics is not None else []
         raw_periodic = _strong_periodic_segments(segment_list) if language_windows is not None else 0
-        raw_segments = [{'start': float(seg.start), 'end': float(seg.end), 'text': seg.text} for seg in segment_list]
+        def raw_confidence(seg, key):
+            try:
+                value = float(getattr(seg, key))
+                return value if math.isfinite(value) else None
+            except (AttributeError, TypeError, ValueError):
+                return None
+
+        raw_segments = [{'start': float(seg.start), 'end': float(seg.end), 'text': seg.text,
+                         **({'no_speech_prob': raw_confidence(seg, 'no_speech_prob'),
+                             'avg_logprob': raw_confidence(seg, 'avg_logprob')} if watch_hybrid else {})}
+                        for seg in segment_list]
         raw_payload = None
         collapse = None
+        guard_events = []
+        if watch_hybrid:
+            segment_list, guard_events = _guard_segments(segment_list, no_speech_threshold, log_prob_threshold)
         if raw_periodic:
             collapsed, collapse = _collapse_periodic_segments(segment_list)
             if collapse['runs_collapsed']:
@@ -682,9 +778,10 @@ def main() -> int:
         untimed_raw_periodic = _strong_periodic_run(' '.join(item['text'] for item in raw_untimed))
         untimed, untimed_collapse = _collapse_untimed_items(raw_untimed)
         untimed_remaining_periodic = _strong_periodic_run(' '.join(item['text'] for item in untimed))
-        if raw_untimed or (collapse is not None and collapse['runs_collapsed']):
+        if raw_untimed or guard_events or unselected or (collapse is not None and collapse['runs_collapsed']):
             raw_payload = json.dumps({'schema': 'raw-asr-before-provisional-processing-v2',
                                       'segments': raw_segments, 'untimed_segments': raw_untimed,
+                                      **({'unselected_hypotheses': unselected} if watch_hybrid else {}),
                                       'display_untimed_text': [item['text'] for item in untimed]}, ensure_ascii=False,
                                      separators=(',', ':')).encode('utf-8')
             raw_sha256 = hashlib.sha256(raw_payload).hexdigest()
@@ -711,6 +808,16 @@ def main() -> int:
             diagnostics['strong_repeat_untimed_after_collapse_words'] = untimed_remaining_periodic
             diagnostics["repeat_contiguity_seconds"] = REPEAT_CONTIGUITY_SECONDS
             quality["decoder_diagnostics"] = diagnostics
+            if diagnostics['boosted_windows']:
+                status = 'degraded'
+                quality['degraded_reason'] = 'provisional_loudness_adaptation'
+                notes.append('> [!warning] Quiet windows were amplified for speech detection and decoding; verify against the original audio.')
+            if watch_hybrid:
+                quality['experimental_guard'] = {'events': guard_events, 'raw_sha256': raw_sha256 if raw_payload else None}
+            if guard_events:
+                status = 'degraded'
+                quality['degraded_reason'] = 'provisional_hallucination_filter'
+                notes.append('> [!warning] Suspected hallucinated segments were provisionally filtered; speech may be missing. Raw ASR and audio must be retained and reviewed.')
             if raw_payload is not None:
                 quality["raw_asr_capture"] = {'raw_sha256': raw_sha256, 'untimed_segments': len(raw_untimed)}
             if raw_untimed:
@@ -770,6 +877,8 @@ def main() -> int:
             quality.update(activity)
             if raw_untimed:
                 text = "[No reliably timed ASR segments were produced; see the untimed text below.]"
+            elif guard_events:
+                text = "[All timed ASR segments were provisionally filtered; raw ASR and source audio require review.]"
             elif language_windows is not None and (diagnostics["vad_empty_windows"] or diagnostics["exact_zero_windows"]):
                 if activity["active_seconds"] >= MIN_ACTIVE_AUDIO_SECONDS:
                     status = "degraded"
@@ -813,6 +922,7 @@ def main() -> int:
                 "whisper_settings": {
                     "beam_size": beam_size,
                     "vad_filter": vad_filter,
+                    **({'watch_loudness_hybrid': True} if watch_hybrid else {}),
                     "condition_on_previous_text": condition_on_previous_text,
                     "temperature": list(temperatures),
                     "no_speech_threshold": no_speech_threshold,
