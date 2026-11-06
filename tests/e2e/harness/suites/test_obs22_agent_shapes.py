@@ -105,9 +105,10 @@ async def test_maintenance_restart_mid_tool_recovers_by_fork(lane):
     sends = lane.find("telegram_send", agent=child["agent_name"], after=mark)
     messages = await lane.telegram.messages(child["topic_id"], since=sent, from_bot=True)
     print(json.dumps({"resumed_end": resumed, "messages": messages}, default=str))
-    # An interrupted Bash call leaves an unsafe transcript tail, so OBS's run-start check forks a new
-    # session from the last completed boundary instead of resuming the old id (state machines v2.3,
-    # OBS Restart and Recovery: "Run start → recovery fork").
+    # An interrupted Bash call can leave an unsafe transcript tail; OBS's run-start check then forks a
+    # new session up to a resolved safe target instead of resuming the old id, unless recovery is
+    # refused or the fork fails (state machines v2.5, OBS Restart and Recovery: "Run start →
+    # recovery fork"). This test pins the forked outcome both CLIs showed; parity is decision D13.
     recoveries = lane.find("recovery", agent=child["agent_name"], after=mark)
     assert any(r.get("outcome") == "forked" and r.get("reason") == "incomplete_tool_use_tail"
                for r in recoveries), recoveries
