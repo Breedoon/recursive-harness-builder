@@ -137,6 +137,7 @@ def lane_env(
     harness_root: Path,
     bot_token: str,
     userbot_id: int,
+    cli_path: Path | None = None,
 ) -> dict[str, str]:
     lane_dir = _lane_path(run_dir, lane)
     # INVARIANT(auth): the lane env is built from scratch from the allow-list, never from the caller's env. Breaking it leaks the agent shell's production secrets into a lane.
@@ -168,6 +169,10 @@ def lane_env(
         "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1",
         "OBS_E2E_CODE_DIR": str(code_dir), "OBS_E2E_HARNESS_ROOT": str(harness_root),
     }
+    if cli_path is not None:
+        # The candidate runs every session in this lane (obs_agent.config.cli_path);
+        # launcher._mounts binds it read-only at the same path.
+        env["OBS_CLI_PATH"] = str(cli_path)
     env.update(profile.lane_env)
     _validate_env(env)
     forbidden = sorted(name for name in env if name in _NEVER_NAMES or name.startswith(_NEVER_PREFIXES))

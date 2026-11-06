@@ -393,6 +393,10 @@ class OBSConfig:
     max_queue_continuations: int = 3
     bg_fork_timeout: float = 600.0  # seconds to wait for background forks
     max_buffer_size: int = 10 * 1024 * 1024  # 10 MB SDK JSON buffer limit
+    # CLI executable for every session OBS builds; None = the SDK's bundled
+    # Claude Code 2.1.59. Unset in production; the E2E harness sets
+    # OBS_CLI_PATH for `obs-e2e run --cli-path` lanes (obs-22 rebuild).
+    cli_path: str | None = None
     context_window_estimate_tokens: int = 900_000
     auto_compact_window_tokens: int = _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS
     context_probe_claude_cli: bool = False
@@ -484,6 +488,8 @@ class OBSConfig:
             kwargs["bg_fork_timeout"] = float(bg_timeout)
         if buf_size := os.environ.get("OBS_MAX_BUFFER_SIZE"):
             kwargs["max_buffer_size"] = int(buf_size)
+        if cli_path := os.environ.get("OBS_CLI_PATH", "").strip():
+            kwargs["cli_path"] = cli_path
         if context_est := os.environ.get("OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS"):
             kwargs["context_window_estimate_tokens"] = int(context_est)
         if compact_window := os.environ.get("OBS_AUTO_COMPACT_WINDOW_TOKENS"):

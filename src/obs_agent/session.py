@@ -634,6 +634,13 @@ class SessionManager:
             },
         )
 
+        # CACHE-PREFIX WARNING: a different CLI sends different request bytes.
+        # Production leaves OBS_CLI_PATH unset (bundled 2.1.59); setting it
+        # outside an E2E lane needs the live cache regression first
+        # (scripts/cache_regression.py, docs/cache-proxy-safety.md).
+        if self.config.cli_path:
+            options.cli_path = self.config.cli_path
+
         # Resume if within cache window, otherwise fresh
         if self.should_resume():
             options.resume = self._session_id

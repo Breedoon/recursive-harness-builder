@@ -320,7 +320,7 @@ def _run_once(args) -> int:
             lane_dir, credentials = prepared[index]
             env = provision.lane_env(profile, run_dir=run_dir, lane=name, lane_index=index - 1,
                                      code_dir=code_dir, harness_root=HARNESS_ROOT,
-                                     bot_token=token, userbot_id=userbot_id)
+                                     bot_token=token, userbot_id=userbot_id, cli_path=cli_path)
             env["PYTHONPATH"] = str(HARNESS_ROOT)
             provision.write_env_file(private / f"{name}.env", env)
             row = {"run_id": run_id, "lane": name, "index": index - 1, "profile": profile.name,

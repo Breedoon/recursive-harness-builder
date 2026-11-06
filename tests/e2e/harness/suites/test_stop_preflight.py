@@ -8,7 +8,7 @@ import pytest
 
 from tests.e2e.harness.suites.test_smoke import _assert_partial_number_answer
 
-pytestmark = [pytest.mark.suite("incident"), pytest.mark.needs(all_lanes=False, credential="dev")]
+pytestmark = [pytest.mark.suite("incident"), pytest.mark.needs(all_lanes=False, credential=("dev", "sub"))]
 
 
 @pytest.mark.known_bug("obs-22.24")

@@ -10,7 +10,7 @@ import pytest
 
 from tests.e2e.harness.inotify import Inotify
 
-pytestmark = [pytest.mark.suite("selftest-tap"), pytest.mark.needs(all_lanes=False, credential="dev")]
+pytestmark = [pytest.mark.suite("selftest-tap"), pytest.mark.needs(all_lanes=False, credential=("dev", "sub"))]
 
 
 async def _until_changed(lane, check):
@@ -58,8 +58,12 @@ async def test_tap_write_failure_keeps_reply_schedule_and_agenttask_alive(lane):
     pong = f"TAP-PONG-{nonce}"
     sent = await lane.send(topic, f"Reply with exactly: {pong}")
     replies = await _until_changed(lane, lambda: _messages(lane, topic, sent, pong))
-    route = _rows(lane, "SELECT session_id FROM route_state WHERE chat_id=? AND thread_id=?",
-                  (topic.chat_id, topic.topic_id))[0]
+    async def persisted_route():
+        rows = _rows(lane, "SELECT session_id FROM route_state WHERE chat_id=? AND thread_id=?",
+                     (topic.chat_id, topic.topic_id))
+        return rows[0] if rows and rows[0]["session_id"] else None
+
+    route = await _until_changed(lane, persisted_route)
     identity_result = await lane.exec(
         "/workspace/obs/.venv/bin/python", "-c",
         "import json,sys;from obs_agent.lineage import find_latest_obs_bootstrap_for_session;"
