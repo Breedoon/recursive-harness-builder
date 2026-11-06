@@ -148,11 +148,14 @@ def pytest_collection_modifyitems(session, config, items):
                 item.add_marker(pytest.mark.xfail(strict=True, reason=f"known bug {bead}"))
             else:
                 item.add_marker(pytest.mark.obs_e2e_unqualified_known_bug(bead=bead, why=why))
+
+
+def pytest_collection_finish(session):
     out = os.environ.get("OBS_E2E_COLLECT_OUT")
     if out:
         Path(out).parent.mkdir(parents=True, exist_ok=True)
         Path(out).write_text(
-            json.dumps([{"nodeid": item.nodeid, **_marker_info(item)} for item in items], indent=1), encoding="utf-8"
+            json.dumps([{"nodeid": item.nodeid, **_marker_info(item)} for item in session.items], indent=1), encoding="utf-8"
         )
 
 
