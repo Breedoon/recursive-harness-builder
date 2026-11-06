@@ -65,7 +65,7 @@ async def test_model_fresh_child_inbox_wake(lane):
     assert not woke.get("failed") and woke.get("session_id") == end["session_id"], (end, woke)
 
 
-async def test_maintenance_restart_resumes_turn(lane):
+async def test_maintenance_restart_mid_tool_recovers_by_fork(lane):
     nonce = _nonce()
     topic = await lane.new_topic(f"obs22 resume {nonce}")
     primed = await lane.turn(topic, f"Reply with exactly: READY-{nonce}")
@@ -105,5 +105,11 @@ async def test_maintenance_restart_resumes_turn(lane):
     sends = lane.find("telegram_send", agent=child["agent_name"], after=mark)
     messages = await lane.telegram.messages(child["topic_id"], since=sent, from_bot=True)
     print(json.dumps({"resumed_end": resumed, "messages": messages}, default=str))
-    assert resumed.get("session_id") == session_id and not resumed.get("failed"), resumed
+    # An interrupted Bash call leaves an unsafe transcript tail, so OBS's run-start check forks a new
+    # session from the last completed boundary instead of resuming the old id (state machines v2.3,
+    # OBS Restart and Recovery: "Run start → recovery fork").
+    recoveries = lane.find("recovery", agent=child["agent_name"], after=mark)
+    assert any(r.get("outcome") == "forked" and r.get("reason") == "incomplete_tool_use_tail"
+               for r in recoveries), recoveries
+    assert resumed.get("session_id") and resumed["session_id"] != session_id and not resumed.get("failed"), resumed
     assert sends and any(f"DONE-{nonce}" in (m.get("text") or "") for m in messages), messages
