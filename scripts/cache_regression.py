@@ -105,6 +105,8 @@ def run_one(args, provider: str, name: str, out_dir: Path) -> dict:
            "--json-out", str(json_out)]
     if args.model and provider == "anthropic":
         cmd += ["--model", args.model]
+    if getattr(args, "cli_path", None) and provider == "anthropic":  # the canary applies to the Claude route only
+        cmd += ["--cli-path", args.cli_path]
     t0 = time.time()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -121,7 +123,7 @@ def run_one(args, provider: str, name: str, out_dir: Path) -> dict:
                    provider_errors=len(r.get("provider_errors") or []),
                    bad_pairs=[{"b": p.get("b"), "class": p.get("class"), "ratio": p.get("ratio")}
                               for p in r.get("pairs", []) if not p.get("ok")],
-                   requests=r.get("requests") or [])
+                   requests=r.get("requests") or [], cli_argv0s=r.get("cli_argv0s") or [])
         if res["status"] == "ERROR":  # driver error without upstream 5xx: treat as a failure
             res["status"] = "FAIL"
     except Exception:
@@ -170,9 +172,13 @@ def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, re
         "code": code,
         "proxy_source": live,
         "base_url": args.base_url,
+        # None = every scenario ran the bundled CLI (the admission gate); a path = a canary run on the Claude route
+        "cli_path": getattr(args, "cli_path", None),
         "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
-    (out_dir / "gate.json").write_text(json.dumps(report, indent=1))
+    # A canary run (--cli-path) is evidence about obs-cli, not the admission gate: it never writes gate.json.
+    gate_name = "gate-canary.json" if report["cli_path"] else "gate.json"
+    (out_dir / gate_name).write_text(json.dumps(report, indent=1))
 
 
 def main(argv=None) -> int:
@@ -183,6 +189,9 @@ def main(argv=None) -> int:
     ap.add_argument("--log-dir", default=DEFAULT_LOG_DIR,
                     help="the request log dir OF THE PROXY UNDER TEST (scratch proxies have their own)")
     ap.add_argument("--model", default=None, help="Claude model for the anthropic route (default: harness Haiku)")
+    ap.add_argument("--cli-path", default=None,
+                    help="run the anthropic route's scenarios on this CLI executable (an obs-cli canary "
+                         "gate); the argv[0] each process had is asserted and recorded. Default: bundled.")
     ap.add_argument("--threshold", type=float, default=0.95)
     ap.add_argument("--scenario-timeout", type=int, default=600)
     ap.add_argument("--max-provider-errors", type=int, default=2,
