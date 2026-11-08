@@ -8,6 +8,7 @@ read from the lane log's ``CLI runtime`` lines (OBS's production log), the runti
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sqlite3
@@ -110,6 +111,35 @@ async def _scenario(lane, p, proof):
     assert proof["B"]["argv0"] == [p.canary], proof["B"]
     runtime_id = lines[-1][0]
     assert p.record(sid) == (runtime_id, p.canary)
+
+    # B3. A Telegram fork continues the conversation on the parent's binary (the fork inherits the record),
+    # and /stop works on obs-cli. The child is named by team here; the file names the parent agent only otherwise.
+    team = second.end["team"]
+    p.write([agent], teams=[team])
+    p.new_window()
+    mark = lane.events.mark()
+    await lane.command(topic, "/fork")
+    child_send = await lane.wait("telegram_send", match=lambda e: e.get("chat_id") == topic.chat_id and e.get("topic_id") not in (None, topic.topic_id), after=mark)
+    child_answer = await lane.turn(int(child_send["topic_id"]), f"What codeword with suffix 2 did I give you earlier? Reply with only the codeword.")
+    fork_lines = [l for l in p.runtime_lines() if l[3] != "None"]
+    proof["B3_fork"] = {"runtime_lines": p.runtime_lines(), "child_session_id": child_answer.end["session_id"], "text": child_answer.text[:80]}
+    assert f"{code}2" in child_answer.text, child_answer.messages
+    assert child_answer.end["session_id"] != sid
+    assert fork_lines and fork_lines[-1][0] == runtime_id and fork_lines[-1][1] == "resume stays on the recorded obs-cli", fork_lines
+    p.write([agent])
+    p.new_window()
+    sent = await lane.send(topic, "Write every integer from 1 through 8000, one number per line, with no other text.")
+    start = await lane.wait("turn_start", match={"trigger_message_id": sent.message_id})
+    await lane.command(topic, "/stop")
+    end, cleanup = await asyncio.gather(
+        lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start),
+        lane.wait("stop_cleanup", agent=topic, after=start),
+    )
+    assert cleanup.get("survivors") == 0, cleanup
+    after_stop = await lane.turn(topic, f"Reply with exactly: S-{code}")
+    assert f"S-{code}" in after_stop.text and after_stop.end["session_id"] == sid, after_stop.messages
+    proof["B3_stop"] = {"cleanup": {k: cleanup.get(k) for k in ("owned", "survivors", "outcome")}, "argv0": await p.argv0s()}
+    assert proof["B3_stop"]["argv0"] == [p.canary]
 
     # B2. Resume after a restart stays on the recorded obs-cli, same session, context intact.
     p.new_window()
