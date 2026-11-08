@@ -191,6 +191,10 @@ class SessionManager:
         # runs with auto-compaction disabled so the handoff turn (and any later
         # turn) cannot be compacted. Cleared when the session id changes.
         self._compaction_handoff_session_id: str | None = None
+        # CLI runtime chosen by the last build (obs-22 canary, see cli_runtime);
+        # recorded against the session id once the CLI reports it.
+        self._pending_cli_runtime: Any = None
+        self.cli_runtime: str | None = None
 
     @property
     def compaction_handoff_active(self) -> bool:
@@ -211,6 +215,16 @@ class SessionManager:
         """Store the session ID from SDK init and record activity."""
         self._session_id = session_id
         self.last_activity = time.time()
+        pending, self._pending_cli_runtime = self._pending_cli_runtime, None
+        if pending is not None and pending.record:
+            from obs_agent import cli_runtime
+
+            cli_runtime.put_record(
+                cli_runtime.runtime_db_path(self.config.telegram_state_db_path),
+                session_id,
+                pending.runtime,
+                pending.cli_path,
+            )
 
     def touch(self) -> None:
         """Update last_activity to current time."""
@@ -410,6 +424,72 @@ class SessionManager:
         return elapsed < self.config.cache_window_seconds
 
     def _build_options(self) -> ClaudeAgentOptions:
+        """Build the options, then apply the per-route CLI runtime selection."""
+        options = self._build_base_options()
+        self._apply_cli_runtime(options)
+        return options
+
+    def _apply_cli_runtime(self, options: ClaudeAgentOptions) -> None:
+        """Choose bundled 2.1.59 or the canary obs-cli for this build (obs-22 inc12).
+
+        CACHE-PREFIX WARNING: a different CLI sends different request bytes; see
+        cli_runtime and docs/cache-proxy-safety.md. With no canary file this does
+        nothing but read it.
+        """
+        from obs_agent import cli_runtime
+        from obs_agent.config import is_claude_model, resolve_model_context
+
+        state_db = self.config.telegram_state_db_path
+        self._pending_cli_runtime = None
+        canary = cli_runtime.load_canary(cli_runtime.canary_path(state_db))
+        if canary.state == "absent":
+            self.cli_runtime = None
+            logger.debug("no obs-cli canary file; bundled CLI")
+            return
+        clean_model = resolve_model_context(self.effective_model).model
+        base_url = (options.env or {}).get("ANTHROPIC_BASE_URL", "")
+        eligible = (
+            is_claude_model(clean_model)
+            and not clean_model.lower().startswith("local-")
+            and _is_cache_proxy_url(base_url, self.config.cache_proxy_port)
+        )
+        env = self._sdk_env_overrides
+        selection = cli_runtime.select_runtime(
+            canary=canary,
+            agent_name=env.get("CLAUDE_CODE_AGENT_NAME", "").strip() or None,
+            team_name=env.get("CLAUDE_CODE_TEAM_NAME", "").strip() or None,
+            eligible=eligible,
+            resume_session_id=options.resume,
+            db_path=cli_runtime.runtime_db_path(state_db),
+        )
+        runtime = selection.runtime
+        if selection.cli_path:
+            options.cli_path = selection.cli_path
+        elif options.cli_path:  # a lane-wide OBS_CLI_PATH stays in force
+            runtime = cli_runtime.runtime_id_for_path(str(options.cli_path))
+        self.cli_runtime = runtime
+        logger.info(
+            "CLI runtime runtime=%s reason=%s model=%s resume=%s agent=%s team=%s",
+            runtime,
+            selection.reason,
+            clean_model,
+            options.resume,
+            env.get("CLAUDE_CODE_AGENT_NAME"),
+            env.get("CLAUDE_CODE_TEAM_NAME"),
+        )
+        if selection.record:
+            recorded = cli_runtime.Selection(
+                runtime, str(options.cli_path) if options.cli_path else None, True, selection.reason
+            )
+            if options.resume:
+                cli_runtime.put_record(
+                    cli_runtime.runtime_db_path(state_db), options.resume, recorded.runtime, recorded.cli_path
+                )
+            # Fresh sessions learn their id from the CLI's init message; a
+            # resumed one may be re-keyed there too.
+            self._pending_cli_runtime = recorded
+
+    def _build_base_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with hooks, MCP tools, and resume."""
         from obs_agent.cache_proxy_lifecycle import should_use_proxy
         from obs_agent.claude_context import (

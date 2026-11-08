@@ -255,4 +255,9 @@ def fork_session_jsonl(
         "source_prefix_unchanged": source_prefix_unchanged, "replay": replay,
         "loaded_fork_source_sha256": LOADED_SOURCE_SHA256,
     }, indent=2) + "\n")
+    # The copy continues the source conversation, so it stays on the CLI binary
+    # that wrote it (obs-22 canary; a no-op unless the source has a record).
+    from obs_agent.cli_runtime import inherit_record
+
+    inherit_record(session_id, fork_session_id)
     return fork_session_id
