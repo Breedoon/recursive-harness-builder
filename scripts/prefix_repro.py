@@ -44,7 +44,7 @@ into the live regression harness):
 
 Usage:
   prefix_repro.py --list
-  prefix_repro.py SCENARIO [SCENARIO ...] [--model M] [--base-url URL]
+  prefix_repro.py SCENARIO [SCENARIO ...] [--model M] [--base-url URL] [--cli-path BIN]
                   [--log-dir DIR] [--gap SECONDS] [--threshold 0.95] [--json]
   prefix_repro.py all
 
@@ -72,11 +72,31 @@ import prefix_diff as pd  # noqa: E402
 from claude_agent_sdk import (  # noqa: E402
     AssistantMessage,
     ClaudeAgentOptions,
-    ClaudeSDKClient,
     HookMatcher,
     ResultMessage,
     ToolUseBlock,
 )
+from claude_agent_sdk import ClaudeSDKClient as _SDKClient  # noqa: E402
+
+# argv[0] of every CLI process a scenario really spawned (read from /proc right after
+# the client connects), so a run can prove which binary sent its requests (obs-22 inc12b).
+CLI_ARGV0S: list[str] = []
+
+
+def _record_cli_argv0(client) -> None:
+    try:
+        pid = client._transport._process.pid
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        CLI_ARGV0S.append(raw.split(b"\0", 1)[0].decode("utf-8", "replace"))
+    except Exception:  # a transport without a /proc entry records nothing; a --cli-path run then fails
+        pass
+
+
+class ClaudeSDKClient(_SDKClient):
+    async def connect(self, *args, **kwargs):
+        result = await super().connect(*args, **kwargs)
+        _record_cli_argv0(self)
+        return result
 
 from obs_agent._sdk_patch import ensure_production_bot_env_patch  # noqa: E402
 
@@ -118,7 +138,9 @@ def _options(args, *, session_id=None, resume=None, env_extra=None, hooks=None, 
     extra = {}
     if session_id:
         extra["session-id"] = session_id
+    cli_path = getattr(args, "cli_path", None)
     return ClaudeAgentOptions(
+        **({"cli_path": cli_path} if cli_path else {}),
         model=args.model,
         cwd=str(cwd),
         env=env,
@@ -1044,6 +1066,27 @@ ANTHROPIC_ONLY = {"volatile_flip", "ws_resume", "recovered_poison", "ttl_flip", 
 
 
 def run(args, name):
+    """Run one scenario, recording the CLI argv[0] values it really spawned.
+
+    With ``--cli-path`` the run fails unless every CLI process was that binary
+    (and at least one was): a run that silently used another CLI proves nothing.
+    Without it nothing is asserted and the default path is unchanged.
+    """
+    CLI_ARGV0S.clear()
+    res = _run(args, name)
+    used = sorted(set(CLI_ARGV0S))
+    res["cli_argv0s"] = used
+    want = getattr(args, "cli_path", None)
+    if want:
+        res["cli_path_expected"] = want
+        if used != [want]:
+            res["ok"] = False
+            res["status"] = "FAIL"
+            res["error"] = f"CLI argv[0] check: expected only {want!r}, saw {used!r}"
+    return res
+
+
+def _run(args, name):
     fn, note = SCENARIOS[name]
     since = time.time() - 1
     try:
@@ -1114,6 +1157,10 @@ def main(argv=None):
     ap.add_argument("--provider", choices=("anthropic", "codex"), default="anthropic",
                     help="explicit codex route uses Sol; legacy Anthropic route stays available")
     ap.add_argument("--model", default=None)
+    ap.add_argument("--cli-path", default=None,
+                    help="run every scenario's CLI from this executable instead of the SDK's bundled "
+                         "Claude Code; the argv[0] each spawned process really had is recorded and "
+                         "asserted (obs-22 canary gate). Default: bundled, nothing asserted.")
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL)
     ap.add_argument("--log-dir", default=pd.DEFAULT_LOG_DIR)
     ap.add_argument("--gap", type=int, default=0, help="idle seconds before resume_new_proc's resume")
@@ -1127,6 +1174,10 @@ def main(argv=None):
                     help="seconds per scenario before it is stopped and reported "
                          "(PROVIDER-ERROR if the proxy logged 5xx upstream errors meanwhile)")
     args = ap.parse_args(argv)
+    if args.cli_path:
+        args.cli_path = str(Path(args.cli_path).expanduser().resolve())
+        if not os.path.isfile(args.cli_path) or not os.access(args.cli_path, os.X_OK):
+            ap.error("--cli-path must be an executable file")
     if args.list or not args.scenarios:
         for k, (_, note) in SCENARIOS.items():
             print(f"{k:16s} {note}")

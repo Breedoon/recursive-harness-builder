@@ -58,6 +58,7 @@ _lock = threading.Lock()
 _seen_paths: set[str] = set()  # canary binaries named since this process started
 _warned: dict[str, str] = {}  # canary file -> signature of the last warning
 _hash_cache: dict[tuple[str, int, int], str] = {}
+_hash_inflight: dict[tuple[str, int, int], threading.Thread] = {}
 
 
 # --------------------------------------------------------------------------
@@ -65,7 +66,24 @@ _hash_cache: dict[tuple[str, int, int], str] = {}
 # --------------------------------------------------------------------------
 
 
+_registered_state_db: Path | None = None
+
+
+def register_state_db_path(state_db_path: Path | str) -> None:
+    """Remember the running process's configured Telegram state DB path.
+
+    ``SessionManager`` registers ``config.telegram_state_db_path`` so that the
+    code that has no config in hand (the orphan reaper, fork and recovery
+    inheritance) finds the same directory as the session builds do, by
+    construction rather than by both reading the same environment variable.
+    """
+    global _registered_state_db
+    _registered_state_db = Path(state_db_path)
+
+
 def _state_dir(state_db_path: Path | str | None = None) -> Path:
+    if state_db_path is None:
+        state_db_path = _registered_state_db
     if state_db_path is None:
         raw = os.environ.get(_STATE_DB_ENV, "").strip()
         if raw:
@@ -120,6 +138,15 @@ def _warn_once(path: Path, signature: str, message: str) -> None:
     logger.warning("%s", message)
 
 
+def warn_fallback(exc: BaseException) -> None:
+    """One warning per distinct failure of the selection code (it falls back to bundled)."""
+    _warn_once(
+        Path("<session-build>"),
+        f"build:{exc.__class__.__name__}:{exc}",
+        f"obs-cli runtime selection failed ({exc.__class__.__name__}: {exc}); using bundled {BUNDLED_RUNTIME}",
+    )
+
+
 def _names(value: Any) -> frozenset[str]:
     if isinstance(value, str):
         value = [value]
@@ -164,6 +191,7 @@ def load_canary(path: Path) -> Canary:
     with _lock:
         _warned.pop(str(path), None)
         _seen_paths.add(cli_path)
+    runtime_id_for_path(cli_path)  # start hashing off-thread so the id is known by the first spawn
     return Canary(
         "valid",
         cli_path=cli_path,
@@ -173,26 +201,107 @@ def load_canary(path: Path) -> Canary:
     )
 
 
-def runtime_id_for_path(cli_path: str) -> str:
-    """``obs-cli:<sha256 prefix>`` of a binary; hashed once per path+mtime+size."""
+def _binary_key(cli_path: str) -> tuple[str, int, int] | None:
     try:
         st = os.stat(cli_path)
-        key = (cli_path, st.st_mtime_ns, st.st_size)
     except OSError:
+        return None
+    return (cli_path, st.st_mtime_ns, st.st_size)
+
+
+def provisional_runtime_id(cli_path: str) -> str:
+    """The runtime id used until the binary's hash is known: ``obs-cli:<basename>``."""
+    return f"obs-cli:{os.path.basename(cli_path)}"
+
+
+def _sha256_file(cli_path: str) -> str:
+    digest = hashlib.sha256()
+    with open(cli_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _hash_worker(key: tuple[str, int, int], db_path: Path) -> None:
+    cli_path, mtime_ns, size = key
+    try:
+        runtime = f"obs-cli:{_sha256_file(cli_path)[:12]}"
+        with _lock:
+            _hash_cache[key] = runtime
+        conn = _connect(db_path, create=True)
+        assert conn is not None
+        try:
+            conn.execute(
+                "INSERT INTO binary_hash(path, mtime_ns, size, runtime) VALUES (?,?,?,?) "
+                "ON CONFLICT(path, mtime_ns, size) DO UPDATE SET runtime=excluded.runtime",
+                (cli_path, mtime_ns, size, runtime),
+            )
+            # sessions recorded under the provisional id get the real one
+            conn.execute(
+                "UPDATE session_runtime SET runtime=? WHERE cli_path=? AND runtime=?",
+                (runtime, cli_path, provisional_runtime_id(cli_path)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        _warn_once(Path("<hash>"), f"hash:{cli_path}:{exc.__class__.__name__}", f"could not hash obs-cli binary ({exc.__class__.__name__}: {exc}); runtime id stays {provisional_runtime_id(cli_path)}")
+    finally:
+        with _lock:
+            _hash_inflight.pop(key, None)
+
+
+def runtime_id_for_path(cli_path: str, *, db_path: Path | None = None, wait: bool = False) -> str:
+    """``obs-cli:<sha256 prefix>`` of a binary, never computed on the caller's thread.
+
+    The 179 MB release binary takes a fraction of a second to hash, which must
+    not happen on OBS's event loop. The hash is computed at most once per
+    path+mtime+size, in a daemon thread, and persisted in the runtime DB; until
+    it is known the id is ``obs-cli:<basename>``. ``wait`` (tests, tooling)
+    joins that thread.
+    """
+    key = _binary_key(cli_path)
+    if key is None:
         return "obs-cli:unreadable"
-    cached = _hash_cache.get(key)
+    with _lock:
+        cached = _hash_cache.get(key)
     if cached is not None:
         return cached
-    digest = hashlib.sha256()
+    db = db_path if db_path is not None else runtime_db_path()
     try:
-        with open(cli_path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1 << 20), b""):
-                digest.update(chunk)
-    except OSError:
-        return "obs-cli:unreadable"
-    runtime = f"obs-cli:{digest.hexdigest()[:12]}"
-    _hash_cache[key] = runtime
-    return runtime
+        conn = _connect(db, create=False)
+        if conn is not None:
+            try:
+                row = conn.execute(
+                    "SELECT runtime FROM binary_hash WHERE path=? AND mtime_ns=? AND size=?", key
+                ).fetchone()
+            finally:
+                conn.close()
+            if row:
+                with _lock:
+                    _hash_cache[key] = row[0]
+                return row[0]
+    except (sqlite3.Error, OSError):
+        pass  # no persisted hash (or no table yet): compute it off-thread
+    with _lock:
+        thread = _hash_inflight.get(key)
+        if thread is None:
+            thread = threading.Thread(target=_hash_worker, args=(key, db), name="obs-cli-hash", daemon=True)
+            _hash_inflight[key] = thread
+            thread.start()
+    if wait:
+        thread.join()
+        with _lock:
+            return _hash_cache.get(key, provisional_runtime_id(cli_path))
+    return provisional_runtime_id(cli_path)
+
+
+def wait_for_hashes() -> None:
+    """Join every in-flight hash thread (tests and tooling)."""
+    with _lock:
+        threads = list(_hash_inflight.values())
+    for thread in threads:
+        thread.join()
 
 
 # --------------------------------------------------------------------------
@@ -221,6 +330,13 @@ def _connect(db_path: Path, *, create: bool) -> sqlite3.Connection | None:
                 cli_path TEXT,
                 updated_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS binary_hash (
+                path TEXT NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                runtime TEXT NOT NULL,
+                PRIMARY KEY (path, mtime_ns, size)
+            );
             CREATE TABLE IF NOT EXISTS cli_path_seen (
                 path TEXT PRIMARY KEY,
                 updated_at REAL NOT NULL
@@ -244,7 +360,7 @@ def get_record(db_path: Path, session_id: str | None) -> RuntimeRecord | None:
             ).fetchone()
         finally:
             conn.close()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError) as exc:
         _warn_once(db_path, f"db:{exc.__class__.__name__}", f"obs-cli runtime records unreadable ({exc}); treating as empty")
         return None
     return RuntimeRecord(row[0], row[1]) if row else None
@@ -316,7 +432,7 @@ def known_cli_paths(state_db_path: Path | str | None = None) -> frozenset[str]:
                 paths.update(row[0] for row in conn.execute("SELECT path FROM cli_path_seen"))
             finally:
                 conn.close()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError) as exc:
         _warn_once(runtime_db_path(state_db_path), f"db:{exc.__class__.__name__}", f"obs-cli runtime records unreadable ({exc}); treating as empty")
     return frozenset(paths)
 
@@ -364,10 +480,10 @@ def select_runtime(
             # a session only while a canary file governs its builds).
             return Selection(BUNDLED_RUNTIME, None, True, "resume stays on the bundled CLI")
         if record.cli_path and os.path.isfile(record.cli_path) and os.access(record.cli_path, os.X_OK):
-            return Selection(runtime_id_for_path(record.cli_path), record.cli_path, True, "resume stays on the recorded obs-cli")
+            return Selection(runtime_id_for_path(record.cli_path, db_path=db_path), record.cli_path, True, "resume stays on the recorded obs-cli")
         logger.warning(
             "recorded obs-cli %s for session %s is gone; resuming on the canary binary",
             record.cli_path,
             resume_session_id,
         )
-    return Selection(runtime_id_for_path(canary.cli_path), canary.cli_path, True, "selected")
+    return Selection(runtime_id_for_path(canary.cli_path, db_path=db_path), canary.cli_path, True, "selected")

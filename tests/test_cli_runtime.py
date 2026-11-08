@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -23,13 +24,18 @@ def isolated(monkeypatch):
     monkeypatch.delenv(cli_runtime.CANARY_PATH_ENV, raising=False)
     monkeypatch.delenv(cli_runtime.RUNTIME_DB_ENV, raising=False)
     monkeypatch.delenv("OBS_CLI_PATH", raising=False)
+    cli_runtime.wait_for_hashes()
     cli_runtime._seen_paths.clear()
     cli_runtime._warned.clear()
+    cli_runtime._hash_cache.clear()
+    monkeypatch.setattr(cli_runtime, "_registered_state_db", None)
     # The sessions below go through the cache proxy, as production Claude does.
     monkeypatch.setattr("obs_agent.cache_proxy_lifecycle.should_use_proxy", lambda **kw: True)
     yield
+    cli_runtime.wait_for_hashes()
     cli_runtime._seen_paths.clear()
     cli_runtime._warned.clear()
+    cli_runtime._hash_cache.clear()
 
 
 def _binary(tmp_path: Path, name: str = "obs-cli", body: bytes = b"#!/bin/sh\nexit 0\n") -> Path:
@@ -56,11 +62,25 @@ def _db(config) -> Path:
     return cli_runtime.runtime_db_path(config.telegram_state_db_path)
 
 
+def _no_session_records(config) -> bool:
+    """No session was recorded (the DB may exist: a valid file also persists the binary's hash)."""
+    cli_runtime.wait_for_hashes()
+    if not _db(config).exists():
+        return True
+    conn = sqlite3.connect(str(_db(config)))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM session_runtime").fetchone()[0] == 0
+    except sqlite3.Error:
+        return True
+    finally:
+        conn.close()
+
+
 def _selected(config, tmp_path, **extra):
     binary = _binary(tmp_path)
     fields = {"cli_path": str(binary), "agents": ["a1"], "teams": [], "new_sessions_only": True, **extra}
     _write(config, **fields)
-    return binary, cli_runtime.runtime_id_for_path(str(binary))
+    return binary, cli_runtime.runtime_id_for_path(str(binary), db_path=_db(config), wait=True)
 
 
 # --- file absent / bad ------------------------------------------------------------------------
@@ -164,7 +184,7 @@ def test_non_claude_route_ignored(config, tmp_path, model):
     assert manager.create_options().cli_path is None
     assert manager.cli_runtime == BUNDLED
     manager.set_session_id("s")
-    assert not _db(config).exists()
+    assert _no_session_records(config)
 
 
 def test_claude_route_not_behind_cache_proxy_ignored(config, tmp_path, monkeypatch):
@@ -194,7 +214,7 @@ def test_new_session_is_recorded_when_its_id_is_learned(config, tmp_path):
     binary, runtime = _selected(config, tmp_path)
     manager = _manager(config)
     manager.create_options()
-    assert not _db(config).exists()  # id unknown yet
+    assert _no_session_records(config)  # id unknown yet
     manager.set_session_id("s-new")
     record = cli_runtime.get_record(_db(config), "s-new")
     assert record == cli_runtime.RuntimeRecord(runtime, str(binary))
@@ -288,15 +308,65 @@ def test_global_cli_path_stays_when_canary_does_not_select(config, tmp_path):
     options.cli_path = str(other)
     manager._apply_cli_runtime(options)
     assert options.cli_path == str(other)
-    assert manager.cli_runtime == cli_runtime.runtime_id_for_path(str(other))
+    assert manager.cli_runtime in (cli_runtime.provisional_runtime_id(str(other)),
+                                   cli_runtime.runtime_id_for_path(str(other), wait=True))
+    manager._apply_cli_runtime(options)  # once the hash is known the real id shows
+    cli_runtime.wait_for_hashes()
+    manager._apply_cli_runtime(options)
+    assert manager.cli_runtime == cli_runtime.runtime_id_for_path(str(other), wait=True)
 
 
 def test_hash_is_cached_per_path_mtime_and_size(tmp_path):
+    db = tmp_path / "rt.sqlite3"
     binary = _binary(tmp_path)
-    first = cli_runtime.runtime_id_for_path(str(binary))
-    assert cli_runtime.runtime_id_for_path(str(binary)) == first
+    first = cli_runtime.runtime_id_for_path(str(binary), db_path=db, wait=True)
+    assert first.startswith("obs-cli:") and first != cli_runtime.provisional_runtime_id(str(binary))
+    assert cli_runtime.runtime_id_for_path(str(binary), db_path=db) == first
     binary.write_bytes(b"#!/bin/sh\nexit 2\n")
-    assert cli_runtime.runtime_id_for_path(str(binary)) != first
+    assert cli_runtime.runtime_id_for_path(str(binary), db_path=db, wait=True) != first
+
+
+def test_hash_is_persisted_and_survives_a_restart(tmp_path):
+    db = tmp_path / "rt.sqlite3"
+    binary = _binary(tmp_path)
+    first = cli_runtime.runtime_id_for_path(str(binary), db_path=db, wait=True)
+    cli_runtime._hash_cache.clear()  # a new OBS process: empty memory
+    original = cli_runtime._sha256_file
+    cli_runtime._sha256_file = lambda p: (_ for _ in ()).throw(AssertionError("hashed again"))
+    try:
+        assert cli_runtime.runtime_id_for_path(str(binary), db_path=db) == first
+    finally:
+        cli_runtime._sha256_file = original
+
+
+def test_a_build_never_hashes_on_its_own_thread_and_fills_the_hash_in_later(config, tmp_path, monkeypatch):
+    import threading
+
+    binary = _binary(tmp_path)
+    _write(config, cli_path=str(binary), agents=["a1"])
+    release, started, threads = threading.Event(), threading.Event(), []
+    real = cli_runtime._sha256_file
+
+    def slow(path):
+        threads.append(threading.current_thread())
+        started.set()
+        assert release.wait(10)
+        return real(path)
+
+    monkeypatch.setattr(cli_runtime, "_sha256_file", slow)
+    manager = _manager(config)
+    provisional = cli_runtime.provisional_runtime_id(str(binary))
+    options = manager.create_options()  # returns while the hash is still blocked
+    assert options.cli_path == str(binary) and manager.cli_runtime == provisional
+    assert started.wait(5) and threads and threads[0] is not threading.current_thread()
+    manager.set_session_id("s-prov")
+    assert cli_runtime.get_record(_db(config), "s-prov").runtime == provisional
+    release.set()
+    cli_runtime.wait_for_hashes()
+    final = cli_runtime.runtime_id_for_path(str(binary), db_path=_db(config))
+    assert final != provisional and final.startswith("obs-cli:")
+    assert cli_runtime.get_record(_db(config), "s-prov").runtime == final  # filled in
+    assert _manager(config).create_options() and _manager(config).cli_runtime in (None, final)
 
 
 # --- reaper -----------------------------------------------------------------------------------
@@ -385,3 +455,75 @@ def test_corrupt_or_missing_runtime_db_is_empty_and_warns_once(config, tmp_path,
     assert len([r for r in caplog.records if r.name == "obs_agent.cli_runtime"]) == 1
     _db(config).unlink()  # losing the file only sends resumed canary sessions back to bundled
     assert manager.create_options().cli_path is None
+
+
+# --- never break a session build (12b, M2) ---------------------------------------------------
+
+
+def test_any_exception_in_selection_falls_back_to_bundled_with_one_warning(config, tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="obs_agent.cli_runtime")
+    _selected(config, tmp_path)
+
+    def boom(**kw):
+        raise RuntimeError("selection exploded")
+
+    monkeypatch.setattr(cli_runtime, "select_runtime", boom)
+    manager = _manager(config)
+    for _ in range(3):
+        assert manager.create_options().cli_path is None
+    assert manager.cli_runtime == BUNDLED
+    manager.set_session_id("s-x")  # nothing pending, nothing recorded
+    assert _no_session_records(config)
+    assert len([r for r in caplog.records if "selection failed" in r.getMessage()]) == 1
+
+
+def test_exception_after_the_choice_restores_a_lane_wide_cli_path(config, tmp_path, monkeypatch):
+    binary, _ = _selected(config, tmp_path)
+    monkeypatch.setattr(SessionManager, "_session_is_unborn", lambda self: False)
+    cli_runtime.put_record(_db(config), "s-r", "obs-cli:x", str(binary))
+    manager = _manager(config)
+    _resumable(manager, "s-r")
+    monkeypatch.setattr(cli_runtime, "put_record", lambda *a, **k: (_ for _ in ()).throw(PermissionError("denied")))
+    options = manager.create_options()
+    assert options.resume == "s-r" and options.cli_path is None
+    assert manager._pending_cli_runtime is None
+
+
+def test_untraversable_record_dir_does_not_escape_the_build(config, tmp_path, monkeypatch):
+    _selected(config, tmp_path)
+    monkeypatch.setattr(SessionManager, "_session_is_unborn", lambda self: False)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    monkeypatch.setenv(cli_runtime.RUNTIME_DB_ENV, str(locked / "obs-cli-runtime.sqlite3"))
+    locked.chmod(0)
+    try:
+        manager = _manager(config)
+        _resumable(manager, "s-l")
+        options = manager.create_options()
+        assert options.resume == "s-l" and options.cli_path is None  # unrecorded resume => bundled
+        manager.set_session_id("s-l2")
+        assert cli_runtime.known_cli_paths() is not None
+    finally:
+        locked.chmod(0o700)
+
+
+# --- one state dir for builds, forks and the reaper (12b, M3) --------------------------------
+
+
+def test_reaper_and_fork_inheritance_use_the_configured_state_dir(config, tmp_path, monkeypatch):
+    elsewhere = tmp_path / "env-elsewhere" / "telegram-state.sqlite3"
+    elsewhere.parent.mkdir()
+    monkeypatch.setenv("OBS_TELEGRAM_STATE_DB_PATH", str(elsewhere))  # a stale or different env
+    binary, runtime = _selected(config, tmp_path)
+    manager = _manager(config)  # registers config.telegram_state_db_path
+    manager.create_options()
+    manager.set_session_id("parent")
+    assert cli_runtime.get_record(_db(config), "parent") is not None
+    cli_runtime.inherit_record("parent", "child")  # no explicit path: must land in the config's dir
+    assert cli_runtime.get_record(_db(config), "child") == cli_runtime.RuntimeRecord(runtime, str(binary))
+    assert not (elsewhere.parent / cli_runtime.RUNTIME_DB_FILENAME).exists()
+    # The reaper's lookup agrees: the file and the persisted table of the configured dir.
+    other = _binary(tmp_path, "obs-cli-old")
+    cli_runtime.put_record(_db(config), "s-old", "obs-cli:y", str(other))
+    assert maint._canary_cli_paths() == {str(binary), str(other)}
+    assert cli_runtime.known_cli_paths() == {str(binary), str(other)}
