@@ -62,6 +62,15 @@ class _Probe:
             conn.close()
         return row
 
+    def final_runtime(self):
+        """The persisted hash of the canary binary (the first build may show obs-cli:<basename> briefly)."""
+        conn = sqlite3.connect(f"file:{self.db}?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT runtime FROM binary_hash WHERE path=?", (self.canary,)).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else None
+
     async def clis(self):
         rows = await self.lane.procs()
         return [r for r in rows if r["args"] and "--output-format" in r["args"]
@@ -109,7 +118,8 @@ async def _scenario(lane, p, proof):
     proof["B"] = {"runtime_lines": lines, "record": p.record(sid), "argv0": await p.argv0s(), "session_id": sid}
     assert lines and lines[-1][0].startswith("obs-cli:") and lines[-1][1] == "selected", lines
     assert proof["B"]["argv0"] == [p.canary], proof["B"]
-    runtime_id = lines[-1][0]
+    runtime_id = p.final_runtime()
+    assert runtime_id and runtime_id.startswith("obs-cli:") and lines[-1][0] in (runtime_id, f"obs-cli:{p.canary.rsplit('/', 1)[-1]}"), (lines, runtime_id)
     assert p.record(sid) == (runtime_id, p.canary)
 
     # B3. A Telegram fork continues the conversation on the parent's binary (the fork inherits the record),
