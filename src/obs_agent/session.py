@@ -477,7 +477,7 @@ class SessionManager:
         if selection.cli_path:
             options.cli_path = selection.cli_path
         elif options.cli_path:  # a lane-wide OBS_CLI_PATH stays in force
-            runtime = cli_runtime.runtime_id_for_path(str(options.cli_path))
+            runtime = cli_runtime.runtime_id_for_path(str(options.cli_path), db_path=cli_runtime.runtime_db_path(state_db))
         self.cli_runtime = runtime
         logger.info(
             "CLI runtime runtime=%s reason=%s model=%s resume=%s agent=%s team=%s",
