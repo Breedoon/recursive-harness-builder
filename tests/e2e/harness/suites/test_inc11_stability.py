@@ -408,9 +408,9 @@ async def test_s5_three_compactions_then_recall(lane):
     words = [f"w{rng.randrange(10**6)}" for _ in range(1500)]
     turns = []
     for i in range(12):
-        big = lane.lane_dir / "state" / f"inc11-big-{nonce}-{i}.txt"
+        big = lane.lane_dir / "vault" / f"inc11-big-{nonce}-{i}.txt"
         big.write_text("\n".join(" ".join(rng.choice(words) for _ in range(12)) for _ in range(300)), encoding="utf-8")
-        result = await lane.turn(topic, f"Call the Read tool once on /workspace/runtime/state/{big.name}. "
+        result = await lane.turn(topic, f"Call the Read tool once on /workspace/runtime/git/obs-vault-active/{big.name}. "
                                  f"Do not summarize it. Reply with exactly: READ-{i}-{nonce}", timeout=240)
         session_id = result.end.get("session_id") or session_id
         compactions = _compaction_rows(_jsonl_rows(lane, session_id))
