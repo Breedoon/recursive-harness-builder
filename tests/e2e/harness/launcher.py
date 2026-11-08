@@ -123,7 +123,7 @@ def _common_env() -> dict[str, str]:
             "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1", "PYTHONPATH": str(HARNESS_ROOT)}
 
 
-def _mounts(code_dir: Path, run_dir: Path, cli_path: Path | None):
+def _mounts(code_dir: Path, run_dir: Path, cli_path: Path | None, extra_ro: tuple[Path, ...] = ()):
     from .docker import Mount
     paths = [code_dir, HARNESS_ROOT, Path("/workspace/obs/.venv"), Path("/workspace/runtime/bin"),
              Path("/workspace/runtime/reference/claude-code-src"),
@@ -131,6 +131,7 @@ def _mounts(code_dir: Path, run_dir: Path, cli_path: Path | None):
              E2E_ROOT / "fixtures"]
     if cli_path is not None and not any(cli_path.is_relative_to(path) for path in paths):
         paths.append(cli_path)
+    paths.extend(extra_ro)
     mounts = [Mount(run_dir, str(run_dir))]
     seen = {str(run_dir)}
     for path in paths:
@@ -244,6 +245,12 @@ def _run_once(args) -> int:
             if not cli_path.is_file() or not os.access(cli_path, os.X_OK):
                 raise HarnessError("--cli-path must be an executable file")
             manifest["cli"] = {"path": str(cli_path), "sha256": _sha_file(cli_path)}
+        canary_cli = args.canary_cli.expanduser().resolve() if getattr(args, "canary_cli", None) else None
+        manifest["canary_cli"] = str(canary_cli) if canary_cli else None
+        if canary_cli:
+            if not canary_cli.is_file() or not os.access(canary_cli, os.X_OK):
+                raise HarnessError("--canary-cli must be an executable file")
+            manifest["canary_cli_sha256"] = _sha_file(canary_cli)
         secret_env = read_env_file()
         userbot_id = _userbot_id(secret_env)
         manifest["userbot_id"] = userbot_id
@@ -346,7 +353,7 @@ def _run_once(args) -> int:
             sentinel = isolation_before["host_sentinel"]["pid"]
             manifest["host_sentinel_pid"] = sentinel
         _atomic_json(run_dir / "manifest.json", manifest)
-        common = _mounts(code_dir, run_dir, cli_path)
+        common = _mounts(code_dir, run_dir, cli_path, (canary_cli,) if canary_cli else ())
         if any(row["needs_cliproxy"] for row in manifest["lanes"]):
             docker.run_container(f"obs-e2e-{run_id}-relay", image, role="relay", run_id=run_id,
                                  env_file=private / "relay.env", mounts=common, network="container:obs-test",

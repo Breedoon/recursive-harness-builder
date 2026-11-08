@@ -30,6 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="launch isolated lanes and run selected E2E suites")
     run.add_argument("--code", required=True, help="Git worktree directory or commit")
     run.add_argument("--cli-path", type=Path, help="replacement CLI executable to test")
+    run.add_argument("--canary-cli", type=Path, help="obs-cli binary a lane's obs-cli-canary.json may name (mounted read-only; does not select it)")
     run.add_argument("--lanes", type=_positive, default=5)
     run.add_argument("--suite", required=True, help="comma-separated suite names or tags (all selects every suite)")
     profiles = run.add_mutually_exclusive_group(required=True)
