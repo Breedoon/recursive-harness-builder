@@ -34,6 +34,8 @@ def test_choose_rules():
     assert fm.choose(None, src, source_label="s") == ("claude-opus-5-5", True)
     assert fm.choose("source", src, source_label="s") == ("claude-opus-5-5", True)
     assert fm.choose("claude-sonnet-5", src, source_label="s") == ("claude-sonnet-5", False)
+    terra = fm.SourceModel("gpt-6.1-terra", "medium", "route")
+    assert fm.choose("gpt-6.1-sol", terra, source_label="s") == ("gpt-6.1-sol", False)
     with pytest.raises(fm.ForkModelError, match="family claude.*family gpt"):
         fm.choose("gpt-6.1-sol", src, source_label="s")
     with pytest.raises(fm.ForkModelError):

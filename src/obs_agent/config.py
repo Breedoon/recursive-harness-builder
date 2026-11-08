@@ -27,6 +27,7 @@ _DEFAULT_CACHE_WINDOW_SECONDS = 1000 * 60 * 60  # 1000 hours; effectively no exp
 LOCAL_QWEN_27B_MODEL = "local-qwen3.8-27b"
 SPARK_QWEN_MODEL = "local-sparks-qwen3.8-flash-next-abliterated"
 SPARK_GLM_MODEL = "local-sparks-glm-5.3-flash-uncensored"
+SPARK_DEEPSEEK_MODEL = "local-sparks-deepseek-v4.1-flash-1017"
 
 # What plain "qwen" means. This is the single switch for the default Qwen:
 # SPARK_QWEN_MODEL (Daniel, 2026-09-29) or LOCAL_QWEN_27B_MODEL to move it back
@@ -53,17 +54,18 @@ MODEL_RESOLUTION: dict[str, str] = {
     "claude-fable": "claude-fable-5-1",
     "haiku": "claude-haiku-5-5",
     "claude-haiku": "claude-haiku-5-5",
-    # OpenAI tiers – "gpt" resolves to main production model
-    "gpt": "gpt-6.1-sol",
+    # OpenAI tiers – "gpt" resolves to the ordinary-work default; explicit
+    # pro/Sol handles retain GPT-6.1 Sol for more complex work.
+    "gpt": "gpt-6.1-terra",
     "gpt-pro": "gpt-6.1-sol",
     "astra": "gpt-6-astra",
     "sol": "gpt-6.1-sol",
     "gpt-sol": "gpt-6.1-sol",
-    "terra": "gpt-5.6-terra",
+    "terra": "gpt-6.1-terra",
     "luna": "gpt-6-luna",
     "gpt-mini": "gpt-5.4-mini",
-    "openai": "gpt-6.1-sol",
-    "chatgpt": "gpt-6.1-sol",
+    "openai": "gpt-6.1-terra",
+    "chatgpt": "gpt-6.1-terra",
     # Google tiers
     "gemini": "gemini-3.1-flash-lite-preview",
     "gemini-pro": "gemini-3.1-pro-preview",
@@ -83,6 +85,8 @@ MODEL_RESOLUTION: dict[str, str] = {
     "glm-flash": SPARK_GLM_MODEL,
     "glm-5.3-flash": SPARK_GLM_MODEL,
     "glm-5.3-flash-uncensored": SPARK_GLM_MODEL,
+    "ds": SPARK_DEEPSEEK_MODEL,
+    "deepseek": SPARK_DEEPSEEK_MODEL,
 }
 
 # Regex for context-window suffix: [1m], [200k], [128k], etc.
@@ -98,13 +102,17 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # Spark Qwen's default profile serves 262,144 native; qwen-1m serves
     # ~1M, selected explicitly with a [1m] suffix (obs_agent.spark checks it).
     SPARK_QWEN_MODEL: 262_000,
-    # TensorFold GLM serves its native 1,048,576-token window by default.
+    # TensorFold GLM and DeepSeek serve their native 1,048,576-token windows by default.
     SPARK_GLM_MODEL: 1_048_576,
+    SPARK_DEEPSEEK_MODEL: 1_048_576,
     "local-sparks-glm-5.3-flash-exl3-abliterated": 1_048_576,
     "local-sparks-glm-5.3-flash-exl3-4bpw": 1_048_576,
     "local-gemma4-31b": 48_000,
     "gpt-6-astra": 900_000,
     "gpt-6.1-sol": 900_000,
+    # The API model has a 1.05M total window and 922K maximum input; the paid
+    # Codex route used by OBS advertises an 872K maximum context budget.
+    "gpt-6.1-terra": 872_000,
     "gpt-6-sol": 900_000,
     "gpt-6-luna": 900_000,
     "gpt-5.6-sol": 900_000,
@@ -135,6 +143,7 @@ MODEL_EFFORT_LEVELS: dict[str, str] = {
     SPARK_QWEN_MODEL: "max",
     "gpt-6-astra": "medium",
     "gpt-6.1-sol": "medium",
+    "gpt-6.1-terra": "medium",
     "gpt-6-sol": "medium",
     "gpt-6-luna": "medium",
     "gpt-5.6-sol": "medium",
@@ -369,12 +378,12 @@ class OBSConfig:
     """Central configuration for OBS Agent."""
 
     vault_path: Path = field(default_factory=lambda: _DEFAULT_VAULT)
-    model: str = "gpt-6.1-sol"
+    model: str = "gpt-6.1-terra"
     # Shorthand default model used when OBS_AGENT_MODEL is not set.
-    # Resolved via MODEL_RESOLUTION (e.g. "sol" → "gpt-6.1-sol");
+    # Resolved via MODEL_RESOLUTION (e.g. "terra" → "gpt-6.1-terra");
     # full model names pass through unchanged.
     # Change this to e.g. "claude" to make root sessions default to Claude.
-    default_model: str = "sol"
+    default_model: str = "terra"
     effort_level: str | None = None
     # Effort stamped onto sessions OBS creates from now on (new topics and
     # fork=false children) when none is chosen. It is saved as that session's
@@ -397,7 +406,7 @@ class OBSConfig:
     # Claude Code 2.1.59. Unset in production; the E2E harness sets
     # OBS_CLI_PATH for `obs-e2e run --cli-path` lanes (obs-22 rebuild).
     cli_path: str | None = None
-    context_window_estimate_tokens: int = 900_000
+    context_window_estimate_tokens: int = 872_000
     auto_compact_window_tokens: int = _DEFAULT_AUTO_COMPACT_WINDOW_TOKENS
     context_probe_claude_cli: bool = False
     claude_idle_process_cap: int | None = None
@@ -454,7 +463,7 @@ class OBSConfig:
         if model := os.environ.get("OBS_AGENT_MODEL") or os.environ.get("OBS_MODEL"):
             kwargs["model"] = resolve_model(model.strip())
         else:
-            dm = kwargs.get("default_model", "sol")
+            dm = kwargs.get("default_model", "terra")
             kwargs["model"] = resolve_model(dm)
         from obs_agent.effort import normalize_effort
 

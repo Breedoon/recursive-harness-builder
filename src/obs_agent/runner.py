@@ -197,6 +197,28 @@ def _is_result_message(message) -> bool:
     return isinstance(num_turns, int) and isinstance(total_cost, (int, float))
 
 
+def _init_session_id(message) -> str | None:
+    """Session id from the CLI's ``system``/``init`` message (vault-1i53).
+
+    Claude Code emits ``system/init`` at the start of every query, before its
+    first API call. The SDK parses it into ``SystemMessage(subtype, data)``,
+    which keeps the id only in ``data``; the messages that carry
+    ``session_id`` as an attribute (``ResultMessage``, ``StreamEvent``) arrive
+    at the end of the turn or only with partial messages enabled. Reading init
+    makes a fresh session's id known within a second of its first turn
+    starting instead of when that turn ends.
+    """
+    if _message_role(message) != "system" or getattr(message, "subtype", None) != "init":
+        return None
+    data = getattr(message, "data", None)
+    if not isinstance(data, dict):
+        return None
+    session_id = data.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    return None
+
+
 def _usage_signal(usage: dict) -> int:
     total = 0
     for key in (
@@ -378,6 +400,16 @@ class ConversationRunner:
                 self._last_result_message = message
             if hasattr(message, "session_id") and message.session_id:
                 self._session_mgr.set_session_id(message.session_id)
+            else:
+                init_session_id = _init_session_id(message)
+                if init_session_id:
+                    if init_session_id != self._session_mgr.session_id:
+                        logger.info(
+                            "[session_init] session_id=%s previous=%s",
+                            init_session_id,
+                            self._session_mgr.session_id,
+                        )
+                    self._session_mgr.set_session_id(init_session_id)
             if message_role == "assistant" and isinstance(raw_uuid, str) and raw_uuid:
                 self._last_assistant_uuid = raw_uuid
             if (_is_result_message(message) and getattr(message, "subtype", None) == "success"

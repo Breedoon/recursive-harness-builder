@@ -66,6 +66,7 @@ Client:
     ANTHROPIC_BASE_URL=http://localhost:18923
 
 """
+import bisect
 import gzip
 import hashlib
 import itertools
@@ -268,6 +269,7 @@ stats = {
     "tool_results_trimmed": 0,
     "volatile_pins_applied": 0,
     "ttl_pins_applied": 0,
+    "media_floor_applied": 0,
     "git_status_normalized": 0,
     "tools_sorted": 0, "metadata_normalized": 0,
     "errors": 0,
@@ -899,6 +901,8 @@ class EffortPinStore:
         self.variants: dict[str, list] = {}
         self.texts: dict[str, str] = {}  # sha256 -> pinned section text (dedup)
         self.ttls: dict[str, list] = {}  # key -> [ttl, last_used]; see pin_cache_ttl
+        # key -> [[[front, floor, fingerprint], ...], last_used]; see pin_media_floor
+        self.media: dict[str, list] = {}
         self._load()
 
     def _load(self):
@@ -912,6 +916,7 @@ class EffortPinStore:
             self.variants = data.get("variants", {})
             self.texts = data.get("texts", {})
             self.ttls = data.get("ttls", {})
+            self.media = data.get("media", {})
         except Exception as e:
             log(f"effort pins unreadable, starting empty: {e}")
 
@@ -920,7 +925,8 @@ class EffortPinStore:
             return
         now = time.time()
         for table, ttl in ((self.bases, EFFORT_PIN_TTL), (self.anchors, EFFORT_PIN_TTL),
-                           (self.variants, VARIANT_PIN_TTL), (self.ttls, VARIANT_PIN_TTL)):
+                           (self.variants, VARIANT_PIN_TTL), (self.ttls, VARIANT_PIN_TTL),
+                           (self.media, VARIANT_PIN_TTL)):
             stale = [k for k, v in table.items() if now - v[1] > ttl]
             for k in stale:
                 del table[k]
@@ -936,7 +942,7 @@ class EffortPinStore:
             self.texts = {h: t for h, t in self.texts.items() if h in live_texts}
             json.dump({"bases": self.bases, "anchors": self.anchors,
                        "variants": self.variants, "texts": self.texts,
-                       "ttls": self.ttls}, f)
+                       "ttls": self.ttls, "media": self.media}, f)
         os.replace(tmp, self.path)
 
 
@@ -1362,6 +1368,238 @@ def pin_cache_ttl(body: dict, store: "EffortPinStore | None" = None,
             _set_ttl(cc, effective)
     if result["applied"]:
         stats["ttl_pins_applied"] += 1
+    return result
+
+
+# ── Batch eviction of old images past the CLI's media cap ───────────────
+#
+# CACHE-PREFIX WARNING (2026-10-25, bead obs-51): the bundled Claude Code CLI
+# 2.1.59 sends at most 100 image/document blocks per request. Its constant
+# (gFI=100, function LS9 in the query path) counts top-level and
+# tool_result-nested media in every message and drops the OLDEST ones beyond
+# 100; the session JSONL keeps them all. Past 100, every request that adds an
+# image drops one more old image, so an early message changes, the cache read
+# falls back to the ~37.6k system/tools prefix and the whole conversation is
+# re-billed on every such request (2026-10-24 06:04-06:22Z: one PDF-review
+# agent, 42 breaks, 15.9M tokens). The API allows more for our 1M-context
+# models (probe 2026-10-25: claude-opus-5-5 accepts 600 images, refuses 601;
+# claude-haiku-4-5 refuses 101), but raising the CLI constant only moves the
+# cliff and meets the 32 MB request limit at about 450 page images.
+# So, per conversation (model + first message without media, like the other
+# pins) and only while the request carries >= MEDIA_CAP media:
+#   * the CLI's eviction front is the first message that still holds media;
+#   * a floor above that front is pinned: every media block in the messages
+#     before the floor is removed, and a tool result left with no content (or
+#     only the reminder placeholder, which is what an image result the CLI
+#     emptied becomes) gets MEDIA_PLACEHOLDER. Those bytes then no longer
+#     depend on how far the CLI's own eviction has got;
+#   * the floor stays until the CLI's front reaches it, then moves to the
+#     message holding the next MEDIA_FLOOR_STEP-th media: one re-bill per ~50
+#     new images instead of one per image. Whole messages are cut, so the
+#     model sees the newest 50-100 images; when the front message alone holds
+#     more than MEDIA_FLOOR_STEP media no floor is set (the request goes as the
+#     CLI built it, so a large parallel batch is never dropped whole).
+# Floors are stored per front with a fingerprint of the history before them
+# (media, markers and emptied results left out), so a resume, a recovery or a
+# fork from an earlier point gets the floor that was in force there and its
+# bytes match the parent's, while a history that differs before a floor never
+# uses it. A stored floor is used only where it lies before the newest message
+# and cuts at most MEDIA_FLOOR_STEP media of this request. The newest message
+# is never touched. Anthropic route only. If the bundled
+# CLI's media cap changes, MEDIA_CAP must change with it.
+# Live check: scripts/cache_regression.py image_cap (docs/cache-proxy-safety.md).
+MEDIA_CAP = 100
+MEDIA_FLOOR_STEP = 50
+MEDIA_FLOOR_MAX_ENTRIES = 64
+MEDIA_PLACEHOLDER = "[older image removed from the prompt; read the file again if you need it]"
+_MEDIA_TYPES = ("image", "document")
+
+
+def _is_media(block) -> bool:
+    return isinstance(block, dict) and block.get("type") in _MEDIA_TYPES
+
+
+def _media_message_indices(msgs: list) -> list[int]:
+    """Message index of every media block, counted like the CLI does."""
+    out = []
+    for i, m in enumerate(msgs):
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if _is_media(b):
+                out.append(i)
+            elif (isinstance(b, dict) and b.get("type") == "tool_result"
+                  and isinstance(b.get("content"), list)):
+                out.extend(i for x in b["content"] if _is_media(x))
+    return out
+
+
+def _placeholder_only(content: list) -> bool:
+    return (len(content) == 1 and isinstance(content[0], dict)
+            and content[0].get("type") == "text"
+            and content[0].get("text") in (REMINDER_PLACEHOLDER, MEDIA_PLACEHOLDER)
+            and set(content[0]) <= {"type", "text", "cache_control"})
+
+
+def _media_placeholder(markers: list) -> dict:
+    block = {"type": "text", "text": MEDIA_PLACEHOLDER}
+    if markers:
+        block["cache_control"] = markers[0]
+    return block
+
+
+def _strip_media_before(msgs: list, floor: int) -> int:
+    """Remove every media block in msgs[:floor]; returns how many were removed.
+
+    A cache_control marker never disappears with a removed block: it moves to
+    the placeholder (or, for a second marker, a placeholder of its own).
+    """
+    removed = 0
+    for m in msgs[:floor]:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        kept = []
+        for b in content:
+            if _is_media(b):
+                removed += 1
+                if "cache_control" in b:
+                    kept.append(_media_placeholder([b["cache_control"]]))
+                continue
+            if (isinstance(b, dict) and b.get("type") == "tool_result"
+                    and isinstance(b.get("content"), list)):
+                inner, markers = [], []
+                for x in b["content"]:
+                    if _is_media(x):
+                        removed += 1
+                        if "cache_control" in x:
+                            markers.append(x["cache_control"])
+                        continue
+                    inner.append(x)
+                if not inner or _placeholder_only(inner):
+                    if inner and "cache_control" in inner[0]:
+                        markers.insert(0, inner[0]["cache_control"])
+                    inner = [_media_placeholder(markers)]
+                    markers = markers[1:]
+                inner.extend(_media_placeholder([cc]) for cc in markers)
+                if inner != b["content"]:
+                    b["content"] = inner
+            kept.append(b)
+        if not kept:
+            kept = [{"type": "text", "text": MEDIA_PLACEHOLDER}]
+        if kept != content:
+            m["content"] = kept
+    return removed
+
+
+def _media_free_bytes(msg: dict) -> bytes:
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        msg = dict(msg, content=[b for b in content if not _is_media(b)])
+    return _msg_bytes(msg)
+
+
+def _floor_digest(msg: dict) -> bytes:
+    """One message as a floor fingerprint sees it: whoever removed its media."""
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        blocks = []
+        for b in content:
+            if _is_media(b):
+                continue
+            if (isinstance(b, dict) and b.get("type") == "tool_result"
+                    and isinstance(b.get("content"), list)):
+                inner = [x for x in b["content"] if not _is_media(x)]
+                b = dict(b, content=[] if not inner or _placeholder_only(inner) else inner)
+            blocks.append(b)
+        msg = dict(msg, content=blocks)
+    return hashlib.sha256(_msg_bytes(msg)).digest()
+
+
+class _FloorFingerprints:
+    """Fingerprint of msgs[:n] for any n, each message digested once.
+
+    A stored floor is reused only where this matches: the history up to the
+    floor is then the one it was learned on (V1 findings, 2026-10-25: an early
+    fork that grew differently reused the parent's later floor and lost all
+    100 images; a check of the one message before the floor could match by
+    coincidence).
+    """
+
+    def __init__(self, msgs: list):
+        self.msgs, self.digests = msgs, []
+
+    def __call__(self, n: int) -> str:
+        while len(self.digests) < n:
+            self.digests.append(_floor_digest(self.msgs[len(self.digests)]))
+        return hashlib.sha256(b"".join(self.digests[:n])).hexdigest()[:16]
+
+
+def pin_media_floor(body: dict, store: "EffortPinStore | None" = None,
+                    now: float | None = None) -> dict:
+    """Evict old images in large, pinned steps (see above). Mutates body.
+
+    Returns {"media", "front", "floor", "removed", "recorded"}. Must run after
+    normalize_request (it relies on emptied tool results already carrying the
+    reminder placeholder) and before the other pins.
+    """
+    result = {"media": 0, "front": None, "floor": None, "removed": 0, "recorded": False}
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or not msgs or not body.get("tools"):
+        return result
+    pos = _media_message_indices(msgs)
+    result["media"] = len(pos)
+    if len(pos) < MEDIA_CAP:
+        return result
+    front = pos[0]
+    store = store or _get_effort_pins()
+    now = time.time() if now is None else now
+    key = hashlib.sha256(str(body.get("model", "")).encode() + b"\0"
+                         + _media_free_bytes(msgs[0]) + b"\0").hexdigest()
+    last = len(msgs) - 1
+    fingerprint = _FloorFingerprints(msgs)
+    with store.lock:
+        entry = store.media.get(key)
+        floors = entry[0] if entry else []
+        floor = None
+        # the floor learned at the latest front not after this one, on this
+        # history: before the newest message, cutting at most one batch of
+        # this request's media, with the history before it unchanged
+        for f in reversed(floors):  # sorted by front, then floor
+            if len(f) < 3 or f[0] > front or f[1] > last:
+                continue
+            if bisect.bisect_left(pos, f[1]) > MEDIA_FLOOR_STEP:
+                continue
+            if fingerprint(f[1]) == f[2]:
+                floor = f[1]
+                break
+        dirty = entry is None or now - entry[1] >= TTL_PIN_SAVE_EVERY
+        if floor is None or floor <= front:
+            # first time at the cap, or the CLI's front reached the floor. The
+            # floor is the message holding the (STEP+1)-th media: whole
+            # messages before it hold at most STEP media. When that is the
+            # front message itself (it alone holds more than STEP media),
+            # cutting it would drop more than a batch, possibly every image
+            # (V1 finding, 2026-10-25): send as the CLI built it.
+            floor = pos[MEDIA_FLOOR_STEP]
+            if floor <= front:
+                return result
+            fp = fingerprint(floor)
+            floors = sorted([f for f in floors if len(f) >= 3 and f != [front, floor, fp]]
+                            + [[front, floor, fp]])
+            floors = floors[-MEDIA_FLOOR_MAX_ENTRIES:]
+            result["recorded"] = dirty = True
+        store.media[key] = [floors, now]
+        if dirty:
+            try:
+                store._save()
+            except Exception as e:
+                log(f"media floor save failed: {e}")
+    result["front"], result["floor"] = front, floor
+    result["removed"] = _strip_media_before(msgs, floor)
+    if result["removed"]:
+        stats["media_floor_applied"] += 1
     return result
 
 
@@ -2471,6 +2709,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # norm.* field in the request index and a prefix_repro scenario.
             # Live check: scripts/cache_regression.py (docs/cache-proxy-safety.md).
             data, info = normalize_request(data)
+            if upstream == ANTHROPIC_UPSTREAM:
+                try:
+                    media_floor = pin_media_floor(data)
+                    if media_floor["media"]:
+                        info["media_floor"] = media_floor
+                except Exception as e:
+                    log(f"media floor error, sending as-is: {e}")
             if is_local:
                 try:
                     info["local_compact"] = share_local_compaction_prefix(
@@ -2620,7 +2865,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                      ("action", "billing", "strings", "reminders", "git_status",
                       "tools", "metadata", "effort_stripped", "schema_sanitized",
                       "dynamic_boundary", "ws_trimmed", "volatile_pin", "ttl_pin", "cache_key",
-                      "local_compact")
+                      "local_compact", "media_floor")
                      if isinstance(info, dict) and k in info},
             # which proxy code produced these bytes (load-time hash, short)
             "proxy_source": _LOADED_SOURCE_SHA256[:12],

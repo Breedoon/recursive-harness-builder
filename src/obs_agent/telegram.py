@@ -36,8 +36,9 @@ except Exception:  # pragma: no cover - optional import error surfaced on cron c
 
 from telegram import Bot, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, Conflict, RetryAfter, TelegramError
+from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest
 
 from obs_agent.context_stats import (
     build_context_snapshot,
@@ -51,10 +52,12 @@ from obs_agent.config import (
 from obs_agent import event_tap as _event_tap
 from obs_agent.events import StatusEvent
 from obs_agent.hooks import HookState
-from obs_agent.context_jsonl import find_session_jsonl
+from obs_agent.context_jsonl import find_session_jsonl, session_jsonl_has_conversation
 from obs_agent.jsonl_health import (
     JsonlSessionHealth,
+    futile_refusal_streak,
     is_stale_session_head,
+    record_refusal_streak,
     resolve_safe_jsonl_target,
 )
 from obs_agent.jsonl_fork import fork_session_jsonl, resolve_session_source
@@ -115,6 +118,13 @@ _MEDIA_GROUP_GAP_SECONDS = 0.75
 
 # Background queue polling interval
 _BACKGROUND_POLL_SECONDS = 3.0
+# obs-54: the inbox wake poller reuses a parsed inbox while its file is
+# unchanged, but only once the file is older than this (coarse fs clocks).
+_INBOX_CACHE_SETTLE_SECONDS = 2.0
+# obs-54: long synchronous sweeps hand the event loop back this often.
+_LOOP_YIELD_EVERY = 256
+# obs-54: an unchanged team-config member entry is rewritten at most this often.
+_TEAM_PROJECTION_REFRESH_SECONDS = 30.0
 
 # One-shot reminder for the root/main session age.
 _MAIN_SESSION_WARNING_SECONDS = 50 * 60.0
@@ -170,7 +180,9 @@ _PRIORITY_SYSTEM = 0
 _PRIORITY_ASSISTANT = 10
 _PRIORITY_OBSERVABILITY = 30
 _TOPIC_CREATE_MAX_ATTEMPTS = 3
-_TASK_LAUNCH_SEND_MAX_ATTEMPTS = 3
+# obs-54: launch/resume notices retry through 2+4+8+16+30 s of backoff before
+# the launch goes on without them (_send_task_launch_notice); was 3 attempts.
+_TASK_LAUNCH_SEND_MAX_ATTEMPTS = 6
 _RANDOM_TOPIC_WORDS = (
     "amber",
     "atlas",
@@ -311,6 +323,13 @@ class TelegramSessionState:
     # route whose session id is not known yet, so a resume after a crash in
     # the first seconds of a new session does not lose the original request.
     inflight_user_text: str | None = None
+    # True while the turn in flight started without a session id, i.e. it is
+    # the first turn of a new session (vault-1i53). The session id is known
+    # from the CLI's init message soon after, but until the CLI writes the
+    # turn's first rows the session cannot be resumed, so the crash snapshot
+    # keeps the turn's input for this whole turn and the resume decides from
+    # the transcript.
+    inflight_first_turn: bool = False
 
     @property
     def session_id(self) -> str | None:
@@ -331,6 +350,46 @@ class _TopicDeletedError(Exception):
 
 class _TelegramPollingConflictError(RuntimeError):
     pass
+
+
+# obs-52: how many times in a row a route may be recovered from a content
+# refusal by a session that answered nothing of its own (a futile retry of the
+# same context) before OBS stops and tells the route. Two is the upper end of
+# "not ... more than once or twice" (bead obs-52): on 2026-10-25 a
+# cybersecurity-flagged route got going again on a retry, the proc-work trunk
+# never did.
+_CONTENT_REFUSAL_FUTILE_LIMIT = 2
+_CONTENT_REFUSAL_LABELS = {
+    "usage_policy": "it says the request appears to violate its Usage Policy",
+    "cybersecurity_flag": "it flagged the content as a possible cybersecurity risk",
+}
+
+
+class ContentRefusalLoopError(RuntimeError):
+    """obs-52: the API keeps refusing this context; recovering again would re-send it.
+
+    The text is stable for one session and kind, so the run-start failure
+    notice (deduplicated per session and error) is posted once, not per wake.
+    """
+
+    def __init__(self, *, session_id: str, kind: str, futile: int) -> None:
+        self.session_id = session_id
+        self.kind = kind
+        self.futile = futile
+        super().__init__(
+            f"content refusal ({kind}) of session {session_id}; {futile} attempts in a row were "
+            "refused before answering anything, so the same context is not re-sent"
+        )
+
+    def notice(self) -> str:
+        return (
+            "The model provider refused this conversation again "
+            f"({_CONTENT_REFUSAL_LABELS.get(self.kind, self.kind)}). {self.futile} attempts in a "
+            "row were refused before answering anything, so OBS stopped re-sending the same "
+            "context. Nothing was sent to the model for this message; queued agent messages "
+            "stay queued. To continue, reply to an earlier message to fork from before the "
+            "refused part, or send /clear to start a fresh session."
+        )
 
 
 @dataclass
@@ -538,7 +597,7 @@ class FragmentBuffer:
 
     def __init__(
         self,
-        on_complete,  # async callable(full_text, update, context)
+        on_complete,  # async callable(full_text, update, context, *, last_message_id)
         gap_seconds: float = _FRAGMENT_MAX_GAP_SECONDS,
     ) -> None:
         self._on_complete = on_complete
@@ -617,7 +676,10 @@ class FragmentBuffer:
         full_text = "\n\n".join(pending.segments)
         if pending.update is not None and pending.context is not None:
             try:
-                await self._on_complete(full_text, pending.update, pending.context)
+                await self._on_complete(
+                    full_text, pending.update, pending.context,
+                    last_message_id=pending.last_message_id,
+                )
             except Exception:
                 logger.exception("Error in fragment flush callback")
 
@@ -724,7 +786,7 @@ class TelegramBot:
                 "OBS_TELEGRAM_TEMP_ROOT to avoid startup cleanup deleting persistence data."
             )
         self._fragment_buffer = FragmentBuffer(
-            on_complete=self._process_message, gap_seconds=fragment_gap
+            on_complete=self._process_admitted_message, gap_seconds=fragment_gap
         )
         self._media_group_buffer = MediaGroupBuffer(
             on_complete=self._process_media_group,
@@ -780,6 +842,12 @@ class TelegramBot:
         # unread message every poll cycle within this daemon process. Pre-start
         # inbox messages are ignored after daemon restart.
         self._notified_inbox_keys: set[tuple[str, str, str]] = set()
+        # inbox path -> (file identity, wake floor, latest unread); see
+        # _cached_latest_unread_team_inbox_message (obs-54).
+        self._inbox_latest_cache: dict[Path, tuple[tuple[int, ...], float, Any]] = {}
+        # (team, agent) -> (member data fingerprint, monotonic write time, config
+        # size after the write); see _upsert_team_projection_config (obs-54).
+        self._team_projection_written: dict[tuple[str, str], tuple[str, float, int]] = {}
         self._topic_schedules_by_id: dict[str, _TopicScheduleRecord] = {}
         self._pending_schedule_owners: dict[str, tuple[_TopicScheduleRecord, Any]] = {}
         self._pending_schedule_owner_retirements: set[str] = set()
@@ -841,6 +909,7 @@ class TelegramBot:
         self._system_message_ids: set[tuple[int, int]] = set()
         self._system_message_routes: dict[tuple[int, int], TelegramRoute] = {}
         self._last_inbound_message_id_by_route: dict[TelegramRoute, int] = {}
+        self._pending_inbound_message_ids_by_route: dict[TelegramRoute, set[int]] = {}
         self._topic_metadata_by_route: dict[TelegramRoute, _TopicMetadata] = {}
         self._state_store = TelegramStateStore(config.telegram_state_db_path)
         self._state_store.initialize()
@@ -2174,10 +2243,13 @@ class TelegramBot:
                 continue
             session_id = state.session_id
             inflight_prompt: str | None = None
-            if not session_id:
-                # No transcript to resume yet (the SDK reports the session id
-                # with its first message). Keep the turn's input so the resume
-                # can re-send it instead of a bare "continue" into a new session.
+            if not session_id or state.inflight_first_turn:
+                # No transcript to resume yet, or maybe none: a new session's id
+                # is known from the CLI's init message (vault-1i53), but until the
+                # CLI writes the turn's first rows `--resume` fails. Keep the
+                # turn's input so the resume can re-send it into a new session
+                # instead of a bare "continue"; it resumes the transcript when
+                # there is one.
                 inflight_prompt = state.inflight_user_text
                 if not inflight_prompt and record is not None and (record.prompt or record.prompt_file_content):
                     inflight_prompt = self._compose_prompt_file_context(
@@ -2452,6 +2524,17 @@ class TelegramBot:
             return None
         if entry.session_id and state.session_id != entry.session_id:
             await self._activate_route_session(state, entry.session_id)
+        if entry.inflight_prompt and state.session_id and not self._session_resumable(state.session_id):
+            # vault-1i53: the first turn was cut off after the CLI reported its
+            # session id but before it wrote the turn's first rows, so there is
+            # no transcript to --resume. A fresh session gets the original request.
+            logger.warning(
+                "[maintenance_restart] route=%s session_id=%s has no transcript yet; "
+                "re-sending the original request in a fresh session",
+                route,
+                state.session_id,
+            )
+            await self._activate_route_session(state, None)
         bot = self._bot_for_state(state)
         if bot is None:
             logger.warning("[maintenance_restart] skip route=%s reason=no_bot", route)
@@ -2550,6 +2633,17 @@ class TelegramBot:
         task.add_done_callback(self._on_detached_wake_done)
         self._track_crash_resume(route, entry, kind=kind, run=task)
         return task
+
+    def _session_resumable(self, session_id: str) -> bool:
+        """True when the session's JSONL has a conversation row the CLI can resume."""
+        try:
+            return (
+                session_jsonl_has_conversation(session_id=session_id, cwd=self._config.vault_path)
+                is True
+            )
+        except Exception:
+            logger.warning("Unable to inspect JSONL before resume session_id=%s", session_id, exc_info=True)
+            return True
 
     def _track_crash_resume(
         self,
@@ -2935,17 +3029,32 @@ class TelegramBot:
             icon_custom_emoji_id=icon_custom_emoji_id,
         )
 
+    def _active_fork_task_ids(self) -> set[str]:
+        """Every task id some route currently lists as an active child, in one pass."""
+        active: set[str] = set()
+        for state in self._states_by_route.values():
+            if state.active_fork_task_ids:
+                active.update(state.active_fork_task_ids)
+        return active
+
     def _is_fork_task_running(
         self,
         record: _ForkTaskRecord,
         *,
         completing_task_id: str | None = None,
+        active_task_ids: set[str] | None = None,
     ) -> bool:
+        """``active_task_ids``: a ``_active_fork_task_ids()`` result taken with no
+        await since, for callers that test many records (obs-54: testing each of
+        ~11k records against ~7k routes blocked the event loop 2-7 s per idle
+        sweep)."""
         if record.task_id == completing_task_id:
             return False
         task = self._fork_task_tasks.get(record.task_id)
         if task is not None and not task.done():
             return True
+        if active_task_ids is not None:
+            return record.task_id in active_task_ids
         return any(record.task_id in state.active_fork_task_ids for state in self._states_by_route.values())
 
     def _idle_claude_process_candidates(
@@ -2959,6 +3068,7 @@ class TelegramBot:
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
 
         candidates: list[_IdleClaudeProcessCandidate] = []
+        active_task_ids = self._active_fork_task_ids()
         for record in self._fork_tasks_by_id.values():
             if not record.idle_ready:
                 skip("not_idle_ready")
@@ -2966,7 +3076,9 @@ class TelegramBot:
             if not (record.team_name or "").strip() or not (record.agent_name or "").strip():
                 skip("missing_team_or_agent")
                 continue
-            if self._is_fork_task_running(record, completing_task_id=completing_task_id):
+            if self._is_fork_task_running(
+                record, completing_task_id=completing_task_id, active_task_ids=active_task_ids,
+            ):
                 skip("running")
                 continue
             child_state = self._states_by_route.get(record.child_route)
@@ -3153,6 +3265,31 @@ class TelegramBot:
             self._route_by_session_id[session_id] = state.route
             self._upsert_route_inbox_target(state)
             self._persist_state_for_route(state.route)
+            self._record_task_session(state, session_id)
+
+    def _record_task_session(self, state: TelegramSessionState, session_id: str) -> None:
+        """Put the route's current session id on its AgentTask handle, durably (vault-1i53).
+
+        Runs on every event of a run, so a fresh child's handle names its session
+        from the CLI's init message on, not from its first wake or resume:
+        AgentTaskOutput, AgentTaskStop, the rounds watchdog and crash recovery
+        can find a child that is still in, or died in, its first turn.
+        """
+        record = self._find_task_by_child_route(state.route)
+        if record is None or record.child_session_id == session_id:
+            return
+        previous = record.child_session_id
+        record.child_session_id = session_id
+        self._persist_task_handle_record(record)
+        self._persist_team_worker_record(record)
+        logger.info(
+            "[agent_task] session recorded task_id=%s agent=%s session_id=%s previous=%s route=%s",
+            record.task_id,
+            record.agent_name,
+            session_id,
+            previous or None,
+            state.route,
+        )
 
     def _unbind_route_sessions(self, route: TelegramRoute) -> None:
         stale = [session_id for session_id, mapped_route in self._route_by_session_id.items() if mapped_route == route]
@@ -3350,12 +3487,13 @@ class TelegramBot:
         def _status(*, team_name: str | None = None, **_: Any) -> dict[tuple[str, str], dict[str, Any]]:
             requested_team = (team_name or "").strip()
             records: dict[tuple[str, str], dict[str, Any]] = {}
+            active_task_ids = self._active_fork_task_ids()
             for record in self._fork_tasks_by_id.values():
                 record_team = (record.team_name or "").strip()
                 record_agent = (record.agent_name or "").strip()
                 if not record_team or not record_agent or (requested_team and record_team != requested_team):
                     continue
-                running = self._is_fork_task_running(record)
+                running = self._is_fork_task_running(record, active_task_ids=active_task_ids)
                 child_state = self._states_by_route.get(record.child_route)
                 if child_state is not None:
                     running = running or child_state.busy or child_state.hook_state.execution_active
@@ -5096,6 +5234,27 @@ class TelegramBot:
 
         team_dir = Path.home() / ".claude" / "teams" / normalized_team
         config_path = team_dir / "config.json"
+        # obs-54: this ran on every stream event of every run (_bind_state_session),
+        # re-reading and rewriting team configs of up to 1.5 MB on the event loop.
+        # Skip it while the same member data was written within the refresh
+        # interval; only the joinedAt/updated_at stamps would differ. OBS's other
+        # upserts read-modify-write and keep every member, so the config only
+        # grows; a smaller file than this process last wrote means a member was
+        # removed outside OBS, and the entry is written again at once.
+        memo_key = (normalized_team, normalized_agent)
+        fingerprint = self._team_projection_fingerprint(child_session_id, obs_metadata)
+        written = self._team_projection_written.get(memo_key)
+        if (
+            written is not None
+            and written[0] == fingerprint
+            and time.monotonic() - written[1] < _TEAM_PROJECTION_REFRESH_SECONDS
+            and (team_dir / "inboxes" / f"{normalized_agent}.json").exists()
+        ):
+            try:
+                if config_path.stat().st_size >= written[2]:
+                    return
+            except OSError:
+                pass
         team_dir.mkdir(parents=True, exist_ok=True)
 
         payload: dict[str, Any] = {}
@@ -5165,13 +5324,24 @@ class TelegramBot:
         )
 
         payload["members"] = members
-        config_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+        serialized = json.dumps(payload, indent=2, ensure_ascii=True)
+        config_path.write_text(serialized, encoding="utf-8")
 
         inbox_dir = team_dir / "inboxes"
         inbox_dir.mkdir(parents=True, exist_ok=True)
         inbox_path = inbox_dir / f"{normalized_agent}.json"
         if not inbox_path.exists():
             inbox_path.write_text("[]", encoding="utf-8")
+        # ensure_ascii output: characters are bytes.
+        self._team_projection_written[memo_key] = (fingerprint, time.monotonic(), len(serialized))
+
+    @staticmethod
+    def _team_projection_fingerprint(
+        child_session_id: str | None,
+        obs_metadata: dict[str, Any] | None,
+    ) -> str:
+        stable = {key: value for key, value in (obs_metadata or {}).items() if key != "updated_at"}
+        return json.dumps([child_session_id, stable], sort_keys=True, default=str)
 
     def _child_session_path(self, session_id: str) -> str | None:
         path = find_session_jsonl(
@@ -5286,6 +5456,24 @@ class TelegramBot:
                 self._set_session_head(session_id=session_id, jsonl_uuid=target.target_uuid)
         if target is None or not target.health.needs_recovery or not target.target_uuid:
             return None
+        # obs-52: a content refusal is driven by what the context holds, so a
+        # recovery re-sends it and is refused again (2026-10-25: nine recoveries
+        # of the proc-work trunk in 18 minutes, one per wake, none answered).
+        # A refused session that answered nothing of its own was a futile retry
+        # of that context; after _CONTENT_REFUSAL_FUTILE_LIMIT of them in a row
+        # stop and tell the route. The count so far is recorded for each
+        # recovery fork made here, so restarts keep it and later work in the
+        # source session cannot change it; every other session (/clear, a
+        # reply forking from an earlier message) starts its own count.
+        # Nothing is reworded; any answer resets it.
+        refusal, futile = futile_refusal_streak(target.health, target.target_uuid)
+        if refusal is not None and futile >= _CONTENT_REFUSAL_FUTILE_LIMIT:
+            logger.warning(
+                "[refusal_loop] route=%s source=%s session_id=%s kind=%s futile=%d "
+                "recovery_uuid=%s: not recovering into the same context again",
+                state.route, source, session_id, refusal, futile, target.target_uuid,
+            )
+            raise ContentRefusalLoopError(session_id=session_id, kind=refusal, futile=futile)
 
         old_model_override = state.session_manager.model_override
         old_effort_override = state.session_manager.effort_override
@@ -5340,6 +5528,13 @@ class TelegramBot:
             target.health.first_unsafe_tail_uuid,
             target.health.first_poison_uuid,
         )
+        if refusal is not None:
+            try:
+                record_refusal_streak(recovery_session_id, futile_before=futile, kind=refusal,
+                                      source_session_id=session_id)
+            except OSError as exc:
+                logger.warning("[refusal_loop] could not record the streak for session_id=%s: %s",
+                               recovery_session_id, exc)
         _event_tap.emit_route("recovery", self, state.route, state=state, source=source, outcome="forked", old_session_id=session_id, session_id=recovery_session_id, reason=target.health.unsafe_tail_reason)
 
         self._set_session_head(session_id=session_id, jsonl_uuid=target.target_uuid)
@@ -6554,7 +6749,15 @@ class TelegramBot:
         if parent is None:
             return {"ok": False, "error": "parent agent has no current route binding"}
         task_id = str(args["expected_task_id"])
-        generation = int(args["expected_launch_parent_message_id"])
+        raw_generation = args["expected_launch_parent_message_id"]
+        # obs-54: runs whose parent notice never reached Telegram get a negative
+        # synthetic generation (_run_generation). Records written before that, or
+        # by other paths, may still hold None; obs-agentctl and the rounds watchdog
+        # spell it "None". It matches only a record whose generation is None.
+        generation = (
+            None if raw_generation is None or str(raw_generation).strip() in ("None", "null")
+            else int(raw_generation)
+        )
         key = hashlib.sha256(json.dumps([args["parent_team"], args["parent_agent"], task_id, generation]).encode()).hexdigest()
         locks = self.__dict__.setdefault("_control_stop_locks", {})
         async with locks.setdefault(key, asyncio.Lock()):
@@ -6785,10 +6988,14 @@ class TelegramBot:
                 return {"ok": False, "error": "hooks must map event names to 'file_path::function_name'"}
             from obs_agent.tools import _resolve_hook_spec_path
 
-            hooks = {
-                str(event): _resolve_hook_spec_path(spec, self._config.vault_path)
-                for event, spec in hooks.items()
-            }
+            try:
+                # obs-54: validation runs Git subprocesses; keep them off the event loop.
+                hooks = {
+                    str(event): await asyncio.to_thread(_resolve_hook_spec_path, spec, self._config.vault_path)
+                    for event, spec in hooks.items()
+                }
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
         if env is not None and not isinstance(env, dict):
             return {"ok": False, "error": "env must be a JSON object"}
         resolved_model: str | None = None
@@ -7201,6 +7408,47 @@ class TelegramBot:
         self._remember_system_message_ids(route=route, sent_messages=sent_messages)
         return sent_messages
 
+    async def _send_task_launch_notice(
+        self,
+        *,
+        route: TelegramRoute,
+        bot,
+        html_text: str,
+        underline: bool = True,
+        purpose: str,
+    ) -> list:
+        """A launch or resume notice; the launch goes on without it if Telegram keeps failing.
+
+        obs-54: on 2026-10-25 AgentTask launches aborted after the child topic
+        was created, because the child's first service message timed out three
+        times while the event loop stalled; that left empty topics and NoTask
+        handles. The notice is retried with the transport's backoff
+        (2, 4, 8, 16, 30 s), and a timeout, network error or flood wait after
+        the last attempt returns no messages instead of failing the launch.
+        Other errors (deleted topic, bad request) still raise.
+        """
+        try:
+            return await self._send_system_html_message(
+                route=route,
+                bot=bot,
+                html_text=html_text,
+                disable_notification=True,
+                underline=underline,
+                max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+            )
+        except (TimedOut, NetworkError, RetryAfter) as exc:
+            if isinstance(exc, BadRequest):
+                raise
+            logger.warning(
+                "[launch_notice] %s not sent route=%s after %d attempts (%s: %s); continuing without it",
+                purpose,
+                route,
+                _TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+                type(exc).__name__,
+                exc,
+            )
+            return []
+
     def _active_schedules_for_route(self, route: TelegramRoute) -> list[_TopicScheduleRecord]:
         schedule_ids = self._schedule_ids_by_route.get(route, set())
         records = [
@@ -7459,6 +7707,7 @@ class TelegramBot:
             len(state.pending_messages),
         )
         self._last_inbound_message_id_by_route.pop(state.route, None)
+        self._pending_inbound_message_ids_by_route.pop(state.route, None)
         self._unbind_route_sessions(state.route)
         await state.session_manager.async_reset()
         state.pending_messages.clear()
@@ -7532,6 +7781,27 @@ class TelegramBot:
         if isinstance(candidate, int):
             return candidate
         return None
+
+    def _run_generation(self, parent_message_id: int | None) -> int:
+        """The run generation of a launch, resume or wake: its parent message id.
+
+        obs-54: a run whose parent notice never reached Telegram still needs a
+        distinct, durable generation, or a stale control-stop timer for one run
+        could stop the next (`_control_stop_child` matches by equality). It gets
+        a negative, strictly decreasing id from the clock instead, which no
+        Telegram message has; `_reply_anchor` keeps it out of reply targets.
+        """
+        if parent_message_id is not None:
+            return parent_message_id
+        last = self.__dict__.get("_last_synthetic_generation", 0)
+        generation = min(-(time.time_ns() // 1000), last - 1)
+        self._last_synthetic_generation = generation
+        return generation
+
+    @staticmethod
+    def _reply_anchor(message_id: int | None) -> int | None:
+        """A message id to reply to, or None for a synthetic run generation."""
+        return message_id if isinstance(message_id, int) and message_id > 0 else None
 
     def _record_or_defer_message_bindings(
         self,
@@ -7608,6 +7878,7 @@ class TelegramBot:
             thread_id=route.thread_id,
         )
         self._last_inbound_message_id_by_route.pop(route, None)
+        self._pending_inbound_message_ids_by_route.pop(route, None)
         self._persist_state_for_route(route)
 
     async def _await_persisted_session_uuid(
@@ -7989,8 +8260,20 @@ class TelegramBot:
             logger.warning("Unauthorized Telegram user: %d", user_id)
             return
 
-        await self._ensure_background_poller(context.bot)
         message = update.effective_message
+        route = self._route_for_message(message)
+        last_seen = self._last_inbound_message_id_by_route.get(route, 0)
+        pending_ids = self._pending_inbound_message_ids_by_route.setdefault(route, set())
+        if message.message_id <= last_seen or message.message_id in pending_ids:
+            logger.info(
+                "Skipping duplicate/stale inbound at receipt route=%s message_id=%s last_seen=%s",
+                route, message.message_id, last_seen,
+            )
+            return
+        # Admission must precede every await: normalization and buffer flushes
+        # finish out of order, but cannot revoke an already received input.
+        pending_ids.add(message.message_id)
+        await self._ensure_background_poller(context.bot)
         # Cache the group chat title for General topic naming
         chat = getattr(message, "chat", None)
         if chat is not None:
@@ -8051,20 +8334,26 @@ class TelegramBot:
             if isinstance(status_id, int):
                 receipt_message_ids.append(status_id)
 
-        if message.voice is not None:
-            normalized = await self._normalizer.normalize_update(
-                update,
-                transcription_progress=report_transcription_progress,
-            )
-        else:
-            normalized = await self._normalizer.normalize_update(update)
+        try:
+            if message.voice is not None:
+                normalized = await self._normalizer.normalize_update(
+                    update,
+                    transcription_progress=report_transcription_progress,
+                )
+            else:
+                normalized = await self._normalizer.normalize_update(update)
+        except BaseException:
+            pending_ids.discard(message.message_id)
+            raise
         if not normalized.agent_text.strip():
+            pending_ids.discard(message.message_id)
             logger.info("Skipping empty normalized Telegram message id=%s", message.message_id)
             return
         await self._process_message(
             normalized.agent_text,
             update,
             context,
+            inbound_admitted=True,
             pre_sent_status_message_ids=receipt_message_ids,
             user_warnings=normalized.user_warnings,
         )
@@ -9838,7 +10127,10 @@ class TelegramBot:
             )
         except Exception as exc:
             # Dead-topic fix (2026-10-12): never drop the turn silently. Tell the
-            # topic once per (session, error); queued work stays owned by the route.
+            # topic once per (session, error); queued work stays owned by the route,
+            # including messages a caller drained into extra_pending (obs-52 V1:
+            # an idle inbox wake lost them when this preflight raised).
+            state.pending_messages = pending_messages
             error = f"{type(exc).__name__}: {exc}"
             key = (state.session_id, error)
             if self._recovery_failure_notified.get(state.route) != key:
@@ -9848,6 +10140,7 @@ class TelegramBot:
                         route=state.route,
                         bot=bot,
                         text=(
+                            exc.notice() if isinstance(exc, ContentRefusalLoopError) else
                             f"Session recovery failed for {state.session_id}, so this turn could not run "
                             f"({error}). Send /clear to start a fresh session in this topic."
                         ),
@@ -9925,6 +10218,7 @@ class TelegramBot:
         _event_tap.emit_route("turn_start", self, state.route, state=state, trigger_message=trigger_message, schedule_id=triggered_schedule_id, text=user_text)
 
         state.inflight_user_text = user_text
+        state.inflight_first_turn = not state.session_id
         try:
             if state.pending_obs_bootstrap is None and not self._session_heads.get(state.session_id or ""):
                 had_lineage = state.agent_lineage is not None
@@ -10308,6 +10602,7 @@ class TelegramBot:
                 state.hook_state.post_stop_messages = []
             state.busy = False
             state.inflight_user_text = None
+            state.inflight_first_turn = False
             state.hook_state.execution_active = False
             state.hook_state.interrupt_requested = False
             try:
@@ -10458,6 +10753,15 @@ class TelegramBot:
             f'user_id="{int(user_id)}"/>\n{user_text}'
         )
 
+    async def _process_admitted_message(
+        self, user_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        *, last_message_id: int,
+    ) -> None:
+        await self._process_message(
+            user_text, update, context,
+            inbound_admitted=True, last_message_id=last_message_id,
+        )
+
     async def _process_message(
         self,
         user_text: str,
@@ -10466,6 +10770,8 @@ class TelegramBot:
         *,
         pre_sent_status_message_ids: list[int] | None = None,
         user_warnings: list[str] | None = None,
+        inbound_admitted: bool = False,
+        last_message_id: int | None = None,
     ) -> None:
         """Process a complete (possibly reassembled) user message."""
         if update.effective_message is None or update.effective_user is None:
@@ -10474,7 +10780,7 @@ class TelegramBot:
         route = self._route_for_message(update.effective_message)
         message_id = update.effective_message.message_id
         last_seen = self._last_inbound_message_id_by_route.get(route)
-        if isinstance(last_seen, int) and message_id <= last_seen:
+        if not inbound_admitted and isinstance(last_seen, int) and message_id <= last_seen:
             logger.info(
                 "Skipping duplicate/out-of-order inbound route=%s message_id=%s last_seen=%s",
                 route,
@@ -10482,7 +10788,15 @@ class TelegramBot:
                 last_seen,
             )
             return
-        self._last_inbound_message_id_by_route[route] = message_id
+        self._last_inbound_message_id_by_route[route] = max(
+            last_seen or 0, message_id, last_message_id or 0,
+        )
+        pending_ids = self._pending_inbound_message_ids_by_route.get(route)
+        if pending_ids is not None:
+            pending_ids.difference_update({
+                mid for mid in pending_ids
+                if mid <= self._last_inbound_message_id_by_route[route]
+            })
         state = self._get_state(route)
         if state is None:
             return
@@ -10602,6 +10916,8 @@ class TelegramBot:
             normalized.agent_text,
             updates[0],
             context,
+            inbound_admitted=True,
+            last_message_id=max(item.effective_message.message_id for item in updates),
             pre_sent_status_message_ids=receipt_message_ids,
             user_warnings=normalized.user_warnings,
         )
@@ -11372,13 +11688,14 @@ class TelegramBot:
             else None
         )
         styled_service_html = self._underline_first_nonempty_line_html(child_service_html)
-        service_messages = await self._send_system_html_message(
+        # obs-54: the topic exists from here on; a failed notice must not abort
+        # the launch and leave the topic empty with no task behind it.
+        service_messages = await self._send_task_launch_notice(
             route=child_route,
             bot=bot,
             html_text=styled_service_html,
-            disable_notification=True,
             underline=False,
-            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+            purpose="child service message",
         )
         service_message_id = self._sent_message_id(service_messages[0]) if service_messages else None
         if service_message_id is not None:
@@ -11402,6 +11719,9 @@ class TelegramBot:
                 bot=bot,
                 text=session_marker_text,
                 disable_notification=True,
+                # obs-54: best-effort like the notices; unbounded retries held
+                # the launch here for as long as Telegram stayed unreachable.
+                max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
             )
             session_marker_id = self._sent_message_id(session_marker)
             if session_marker_id is not None:
@@ -11605,7 +11925,7 @@ class TelegramBot:
                 bot=parent_state.last_bot,
                 html_text=html_text,
                 disable_notification=True,
-                reply_to_message_id=record.launch_parent_message_id,
+                reply_to_message_id=self._reply_anchor(record.launch_parent_message_id),
                 priority=_PRIORITY_SYSTEM,
             )
             self._remember_system_message_ids(route=record.parent_route, sent_messages=sent_messages)
@@ -11871,6 +12191,50 @@ class TelegramBot:
                 return str(item.get("from_team") or "").strip() or None
         return None
 
+    def _cached_latest_unread_team_inbox_message(
+        self,
+        *,
+        team_name: str,
+        agent_name: str,
+    ) -> tuple[str | None, str | None, str | None] | None:
+        """``_latest_unread_team_inbox_message``, reused while the inbox file is unchanged.
+
+        obs-54: the wake poller asks for every team worker and route inbox
+        (~19k on 2026-10-25) every 3 s, and reading and parsing each file
+        blocked the event loop. The answer is a function of the file bytes and
+        the wake floor, so it is reused while the file's identity (device,
+        inode, size, mtime, ctime) is unchanged. Any write, and any utime that
+        restores an old mtime, sets ctime to the current time, which userspace
+        cannot set back. The answer is stored only for a file whose last
+        change (the later of mtime and ctime) is more than
+        ``_INBOX_CACHE_SETTLE_SECONDS`` old when it is read, so a later write
+        gets a later timestamp even on a coarse filesystem clock.
+        """
+        inbox_path = self._team_inbox_path(team_name, agent_name)
+        try:
+            st = inbox_path.stat()
+        except OSError:
+            self._inbox_latest_cache.pop(inbox_path, None)
+            return None
+        identity = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        floor = self._inbox_wake_floor
+        cached = self._inbox_latest_cache.get(inbox_path)
+        if cached is not None and cached[0] == identity and cached[1] == floor:
+            return cached[2]
+        settled = time.time() - max(st.st_mtime, st.st_ctime) > _INBOX_CACHE_SETTLE_SECONDS
+        result = self._latest_unread_team_inbox_message(team_name=team_name, agent_name=agent_name)
+        try:
+            after = inbox_path.stat()
+        except OSError:
+            after = None
+        if settled and after is not None and (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+        ) == identity:
+            self._inbox_latest_cache[inbox_path] = (identity, floor, result)
+        else:
+            self._inbox_latest_cache.pop(inbox_path, None)
+        return result
+
     def _latest_unread_team_inbox_message(
         self,
         *,
@@ -11918,7 +12282,10 @@ class TelegramBot:
     async def _poll_team_worker_inbox_wakes(self) -> None:
         handled_keys: set[tuple[str, str]] = set()
         task_ids = list(dict.fromkeys(self._team_worker_records.values()))
-        for task_id in task_ids:
+        for index, task_id in enumerate(task_ids):
+            if index and index % _LOOP_YIELD_EVERY == 0:
+                # obs-54: ~19k inboxes per sweep; let other topics run between batches.
+                await asyncio.sleep(0)
             record = self._fork_tasks_by_id.get(task_id)
             if record is None:
                 self._remove_team_worker_mappings_for_task(task_id)
@@ -11931,7 +12298,7 @@ class TelegramBot:
             if not team_name or not agent_name:
                 continue
             handled_keys.add((team_name, agent_name))
-            latest = self._latest_unread_team_inbox_message(
+            latest = self._cached_latest_unread_team_inbox_message(
                 team_name=team_name,
                 agent_name=agent_name,
             )
@@ -11956,14 +12323,16 @@ class TelegramBot:
                     "content": content,
                 },
             )
-        for key, route in list(self._route_inbox_targets.items()):
+        for index, (key, route) in enumerate(list(self._route_inbox_targets.items())):
+            if index and index % _LOOP_YIELD_EVERY == 0:
+                await asyncio.sleep(0)
             if key in handled_keys:
                 continue
             state = self._get_state(route, create=False)
             if state is None:
                 self._remove_route_inbox_target(route)
                 continue
-            latest = self._latest_unread_team_inbox_message(
+            latest = self._cached_latest_unread_team_inbox_message(
                 team_name=key[0],
                 agent_name=key[1],
             )
@@ -12082,7 +12451,7 @@ class TelegramBot:
         record.launch_tool_name = "AgentTask"
         if not owed_callback:
             # An owed callback replies to the parent's original launch message.
-            record.launch_parent_message_id = wake_message_id
+            record.launch_parent_message_id = self._run_generation(wake_message_id)
         record.launch_child_message_id = wake_message_id
         record.idle_ready = False
         record.wake_requested = False
@@ -12573,13 +12942,12 @@ class TelegramBot:
             team_name=record.team_name,
             agent_name=record.agent_name,
         )
-        resume_service_messages = await self._send_system_html_message(
+        resume_service_messages = await self._send_task_launch_notice(
             route=record.child_route,
             bot=state.last_bot,
             html_text=self._underline_first_nonempty_line_html(resume_service_html),
-            disable_notification=True,
             underline=False,
-            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+            purpose="resume service message",
         )
         record.launch_child_message_id = (
             self._sent_message_id(resume_service_messages[0]) if resume_service_messages else None
@@ -12609,16 +12977,18 @@ class TelegramBot:
                 f'<a href="{html.escape(child_link)}">'
                 f"{html.escape(self._current_topic_title(record.child_route))}</a>"
             )
-        parent_messages = await self._send_system_html_message(
+        parent_messages = await self._send_task_launch_notice(
             route=route,
             bot=state.last_bot,
             html_text=parent_html,
-            disable_notification=True,
-            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+            purpose="parent resume notice",
         )
-        record.launch_parent_message_id = (
+        record.launch_parent_message_id = self._run_generation(
             self._sent_message_id(parent_messages[0]) if parent_messages else None
         )
+        # obs-54 V1: make the new generation durable before the run starts, so a
+        # restart in between restores the generation a control stop will pin.
+        self._persist_task_handle_record(record)
         await self._schedule_fork_task(task_id=task_id, parent_state=state)
         return {
             "content": [
@@ -12956,12 +13326,11 @@ class TelegramBot:
                 f'<a href="{html.escape(child_link)}">'
                 f"{html.escape(topic_name)}</a>"
             )
-        confirmation_messages = await self._send_system_html_message(
+        confirmation_messages = await self._send_task_launch_notice(
             route=route,
             bot=state.last_bot,
             html_text=confirmation,
-            disable_notification=True,
-            max_attempts=_TASK_LAUNCH_SEND_MAX_ATTEMPTS,
+            purpose="parent launch confirmation",
         )
         confirmation_id = (
             self._sent_message_id(confirmation_messages[0]) if confirmation_messages else None
@@ -12989,7 +13358,7 @@ class TelegramBot:
             description=description,
             timeout_ms=timeout_ms,
             max_turns=max_turns,
-            launch_parent_message_id=confirmation_id,
+            launch_parent_message_id=self._run_generation(confirmation_id),
             launch_child_message_id=child_service_message_id,
             is_fork=is_fork,
             launch_tool_name=launch_tool_name,
@@ -13133,6 +13502,10 @@ class TelegramBot:
                 if parent_state is not None:
                     parent_state.active_fork_task_ids.discard(task_id)
             record.completed_at = time.time()
+            # vault-1i53: the run's own session, even if it changed after the last event.
+            finished_session_id = (child_state.session_id or "").strip() if child_state is not None else ""
+            if finished_session_id:
+                record.child_session_id = finished_session_id
             result_data = child_state.hook_state.last_result_data if child_state is not None else None
             usage = result_data.get("usage") if isinstance(result_data, dict) else None
             if isinstance(usage, dict):
@@ -13240,7 +13613,7 @@ class TelegramBot:
                     bot=parent_state.last_bot,
                     html_text=parent_marker,
                     disable_notification=True,
-                    reply_to_message_id=record.launch_parent_message_id,
+                    reply_to_message_id=self._reply_anchor(record.launch_parent_message_id),
                 )
                 record.parent_callback_message_id = (
                     self._sent_message_id(marker_messages[0]) if marker_messages else None
@@ -13727,6 +14100,44 @@ class TelegramBot:
         )
 
 
+_TELEGRAM_POLL_RETRY_DELAYS = (2.0, 4.0, 8.0, 16.0, 30.0)
+
+
+class _TelegramPollingRetryExhaustedError(TelegramError):
+    pass
+
+
+class _TelegramPollingRequest(HTTPXRequest):
+    def __init__(self) -> None:
+        super().__init__(connection_pool_size=1)
+        self.exhausted_error: TelegramError | None = None
+
+    async def post(self, *args: Any, **kwargs: Any) -> Any:
+        if self.exhausted_error is not None:
+            raise _TelegramPollingRetryExhaustedError("Telegram polling retry budget exhausted")
+        for attempt in range(len(_TELEGRAM_POLL_RETRY_DELAYS) + 1):
+            try:
+                result = await super().post(*args, **kwargs)
+            except BadRequest:
+                raise
+            except (Conflict, NetworkError) as exc:
+                if attempt == len(_TELEGRAM_POLL_RETRY_DELAYS):
+                    self.exhausted_error = exc
+                    raise _TelegramPollingRetryExhaustedError(
+                        "Telegram polling retry budget exhausted"
+                    ) from exc
+                delay = _TELEGRAM_POLL_RETRY_DELAYS[attempt]
+                logger.warning(
+                    "[polling_retry] error=%s retry=%s/%s backoff=%.1fs",
+                    type(exc).__name__, attempt + 1, len(_TELEGRAM_POLL_RETRY_DELAYS), delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                if attempt:
+                    logger.info("[polling_retry] recovered after %s retries", attempt)
+                return result
+
+
 def create_telegram_app(config: OBSConfig) -> Application:
     """Create and configure a python-telegram-bot Application."""
     primary_token = config.telegram_primary_bot_token
@@ -13739,13 +14150,16 @@ def create_telegram_app(config: OBSConfig) -> Application:
         )
 
     bot = TelegramBot(config)
+    polling_request = _TelegramPollingRequest()
     app = (
         Application.builder()
         .token(primary_token)
+        .get_updates_request(polling_request)
         .concurrent_updates(True)
         .build()
     )
     app.bot_data["obs_telegram_bot"] = bot
+    app.bot_data["obs_polling_request"] = polling_request
     app.add_handler(MessageHandler(filters.COMMAND, bot.log_command_update), group=-1)
     app.add_handler(
         MessageHandler(
@@ -13931,6 +14345,11 @@ async def _run_telegram_bot_once(config: OBSConfig, *, first_start: bool = True)
         while True:
             await asyncio.sleep(_TELEGRAM_RUNTIME_HEALTH_POLL_SECONDS)
             updater_running = app.updater.running if app.updater is not None else False
+            polling_request = app.bot_data.get("obs_polling_request")
+            if isinstance(polling_request, _TelegramPollingRequest) and polling_request.exhausted_error is not None:
+                raise _TelegramPollingRetryExhaustedError(
+                    "Telegram polling retry budget exhausted"
+                ) from polling_request.exhausted_error
             if not polling_error.empty():
                 raise _TelegramPollingConflictError(
                     "Telegram polling conflict: another getUpdates consumer is active"
@@ -14038,7 +14457,7 @@ def _install_maintenance_signal_handler(tg_bot: "TelegramBot") -> None:
 
 def _is_fatal_telegram_runtime_error(exc: Exception) -> bool:
     """Errors that should fail fast rather than trigger restart loops."""
-    return isinstance(exc, (ValueError, _TelegramPollingConflictError))
+    return isinstance(exc, (ValueError, _TelegramPollingConflictError, _TelegramPollingRetryExhaustedError))
 
 
 async def run_telegram_bot(config: OBSConfig) -> None:

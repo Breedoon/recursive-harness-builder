@@ -30,6 +30,11 @@ from obs_agent.hooks import (
     _make_stop_check,
     create_hook_matchers,
     load_hook_function,
+    validate_hook_spec,
+    HookValidationError,
+    _TRUSTED_HOOK_DIRS,
+    _TRUSTED_HOOK_FILES,
+    _TRUSTED_HOOK_FUNCTIONS,
     _make_user_hook_check,
 )
 from obs_agent.queueing import QueuedMessage
@@ -456,16 +461,16 @@ class TestPreCompactHandoffPolicy:
         assert "VERBOSELY" in text and "Source-cite" in text and "related-reports" in text
 
     @pytest.mark.asyncio
-    async def test_create_hook_matchers_registers_pre_compact_with_user_hook(self, config, tmp_path):
-        hook_file = tmp_path / "pc.py"
-        hook_file.write_text(
-            "def pc(hook_input, tool_use_id, context):\n"
+    async def test_create_hook_matchers_registers_pre_compact_with_user_hook(self, config, commit_hook):
+        hook_file = commit_hook(
+            config.vault_path, _TRUSTED_HOOK_DIRS[0] + "/new_chat_guard.py",
+            "def check(hook_input, tool_use_id, context):\n"
             "    return {'hookSpecificOutput': {'hookEventName': 'PreCompact', 'additionalContext': 'VAULT PROMPT'}}\n"
         )
         state = HookState()
         state.sdk_env_overrides = {"OBS_COMPACT_POLICY": "handoff"}
         state.client_interrupter = AsyncMock()
-        matchers = create_hook_matchers(config, state, user_hooks={"PreCompact": f"{hook_file}::pc"})
+        matchers = create_hook_matchers(config, state, user_hooks={"PreCompact": f"{hook_file}::check"})
         assert "PreCompact" in matchers
         callback = matchers["PreCompact"][0].hooks[0]
         await callback(_pre_compact_input(), None, {})
@@ -504,14 +509,14 @@ class TestStopDecisionPassThrough:
         assert "decision" not in result
 
     @pytest.mark.asyncio
-    async def test_stop_block_through_create_hook_matchers(self, config, tmp_path):
-        hook_file = tmp_path / "st.py"
-        hook_file.write_text(
-            "def st(hook_input, tool_use_id, context):\n"
+    async def test_stop_block_through_create_hook_matchers(self, config, commit_hook):
+        hook_file = commit_hook(
+            config.vault_path, _TRUSTED_HOOK_DIRS[0] + "/new_chat_guard.py",
+            "def check(hook_input, tool_use_id, context):\n"
             "    return {'decision': 'block', 'reason': 'not yet'}\n"
         )
         state = HookState()
-        matchers = create_hook_matchers(config, state, user_hooks={"Stop": f"{hook_file}::st"})
+        matchers = create_hook_matchers(config, state, user_hooks={"Stop": f"{hook_file}::check"})
         result = await matchers["Stop"][0].hooks[0]({"hook_event_name": "Stop", "session_id": "s"}, None, {})
         assert result["decision"] == "block" and result["reason"] == "not yet"
 
@@ -1001,19 +1006,18 @@ class TestCreateHookMatchers:
         assert event.summary == "notification: TaskCompleted"
 
     @pytest.mark.asyncio
-    async def test_user_hook_loads_from_vault_relative_agenttask_spec(self, config):
-        hook_file = config.vault_path / "Projects" / "Hooks" / "relative_hook.py"
-        hook_file.parent.mkdir(parents=True)
-        hook_file.write_text(
+    async def test_user_hook_loads_from_vault_relative_agenttask_spec(self, config, commit_hook):
+        relative = _TRUSTED_HOOK_DIRS[0] + "/new_chat_guard.py"
+        commit_hook(
+            config.vault_path, relative,
             "def check(hook_input, tool_use_id, context):\n"
             "    return {'hookSpecificOutput': {'additionalContext': 'relative hook ran'}}\n",
-            encoding="utf-8",
         )
         state = HookState()
         matchers = create_hook_matchers(
             config,
             state,
-            user_hooks={"PreToolUse": "Projects/Hooks/relative_hook.py::check"},
+            user_hooks={"PreToolUse": relative + "::check"},
         )
         pipeline = matchers["PreToolUse"][0].hooks[0]
 
@@ -1028,85 +1032,149 @@ class TestCreateHookMatchers:
 
 
 class TestLoadHookFunction:
-    """Tests for load_hook_function — dynamic Python function loading."""
+    @pytest.mark.parametrize("relative,function", [(path, name) for path, names in _TRUSTED_HOOK_FUNCTIONS.items()
+                                                 for name in sorted(names)])
+    def test_all_inventoried_guards_load(self, tmp_path, commit_hook, relative, function):
+        hook = commit_hook(tmp_path, relative, f"def {function}(a, b, c):\n    return {{'decision': 'allow'}}\n")
+        assert load_hook_function(str(hook), function, vault_path=tmp_path)({}, None, {}) == {"decision": "allow"}
 
-    def test_loads_valid_function(self, tmp_path):
-        """Loads a simple function from a temp .py file."""
-        hook_file = tmp_path / "my_hook.py"
-        hook_file.write_text(
-            "def my_check(hook_input, tool_use_id, context):\n"
-            "    return {'decision': 'allow'}\n"
-        )
-        func = load_hook_function(str(hook_file), "my_check")
-        assert callable(func)
-        assert func.__name__ == "my_check"
-        # Verify it actually works
-        result = func({}, None, {})
-        assert result == {"decision": "allow"}
+    @pytest.mark.parametrize("relative", [
+        "uploads/telegram.py", "tmp/upload.py", "obs-artifacts/hooks/guard.py",
+        "Projects/Untrusted/hooks/guard.py", "Projects/Personal Projects/Agentic/uploads/hooks/guard.py",
+    ])
+    def test_untrusted_paths_never_import(self, tmp_path, caplog, relative):
+        hook = tmp_path / relative
+        hook.parent.mkdir(parents=True)
+        marker = tmp_path / "imported"
+        hook.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\ndef check(a,b,c): pass\n")
+        with pytest.raises(HookValidationError, match="not in a trusted"):
+            load_hook_function(str(hook), "check", vault_path=tmp_path)
+        assert not marker.exists()
+        assert "Rejected user hook" in caplog.text
 
-    def test_file_not_found(self, tmp_path):
-        """Raises FileNotFoundError for nonexistent file."""
-        with pytest.raises(FileNotFoundError, match="Hook file not found"):
-            load_hook_function(str(tmp_path / "nonexistent.py"), "fn")
+    def test_outside_vault_never_imports(self, tmp_path):
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        marker = tmp_path / "imported"
+        hook = tmp_path / "uploaded.py"
+        hook.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+        with pytest.raises(HookValidationError, match="outside the configured vault"):
+            load_hook_function(str(hook), "check", vault_path=vault)
+        assert not marker.exists()
 
-    def test_function_not_found_lists_available(self, tmp_path):
-        """Raises AttributeError listing available functions when target not found."""
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text(
-            "def alpha():\n    pass\n"
-            "def beta():\n    pass\n"
-        )
-        with pytest.raises(AttributeError, match="Available:.*alpha.*beta"):
-            load_hook_function(str(hook_file), "nonexistent")
+    @pytest.mark.parametrize("escape", ["file", "directory", "traversal"])
+    def test_symlink_and_traversal_escape_never_import(self, tmp_path, escape):
+        vault = tmp_path / "vault"
+        trusted = vault / _TRUSTED_HOOK_DIRS[0]
+        trusted.mkdir(parents=True)
+        marker = tmp_path / "imported"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        hook = outside / "upload.py"
+        hook.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+        if escape == "file":
+            candidate = trusted / "guard.py"
+            candidate.symlink_to(hook)
+        elif escape == "directory":
+            (trusted / "linked").symlink_to(outside, target_is_directory=True)
+            candidate = trusted / "linked/upload.py"
+        else:
+            candidate = trusted / ("../" * len(Path(_TRUSTED_HOOK_DIRS[0]).parts)) / "../outside/upload.py"
+        with pytest.raises(HookValidationError, match="outside the configured vault"):
+            load_hook_function(str(candidate), "check", vault_path=vault)
+        assert not marker.exists()
 
-    def test_non_py_file_rejected(self, tmp_path):
-        """Raises ValueError for non-.py files."""
-        txt_file = tmp_path / "hook.txt"
-        txt_file.write_text("def fn(): pass")
-        with pytest.raises(ValueError, match="must be a .py file"):
-            load_hook_function(str(txt_file), "fn")
+    @pytest.mark.parametrize("state", ["untracked", "staged", "modified", "staged_modified"])
+    def test_unreviewed_source_never_imports(self, tmp_path, commit_hook, state):
+        import subprocess
+        relative = _TRUSTED_HOOK_DIRS[0] + "/new_chat_guard.py"
+        hook = commit_hook(tmp_path, relative, "def check(a,b,c): pass\n")
+        marker = tmp_path / "imported"
+        if state in {"untracked", "staged"}:
+            hook = hook.parent / "router_guard.py"
+        hook.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\ndef check(a,b,c): pass\n")
+        if state in {"staged", "staged_modified"}:
+            subprocess.run(["git", "-C", str(tmp_path), "add", str(hook)], check=True)
+        with pytest.raises(HookValidationError, match="tracked in Git HEAD|uncommitted modifications"):
+            load_hook_function(str(hook), "check", vault_path=tmp_path)
+        assert not marker.exists()
 
-    def test_syntax_error_in_file(self, tmp_path):
-        """Raises SyntaxError for files with syntax errors."""
-        bad_file = tmp_path / "bad.py"
-        bad_file.write_text("def broken(\n")
-        with pytest.raises(SyntaxError, match="Syntax error"):
-            load_hook_function(str(bad_file), "broken")
+    def test_unchecked_bytecode_is_not_executed(self, tmp_path, commit_hook):
+        import py_compile
+        hook = commit_hook(tmp_path, _TRUSTED_HOOK_DIRS[0] + "/new_chat_guard.py", "def check(a,b,c): return 1\n")
+        marker = tmp_path / "imported"
+        bad = tmp_path / "bad.py"
+        bad.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+        py_compile.compile(str(bad), cfile=__import__('importlib').util.cache_from_source(str(hook)),
+                           invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+        assert load_hook_function(str(hook), "check", vault_path=tmp_path)({}, None, {}) == 1
+        assert not marker.exists()
 
-    def test_not_callable_rejected(self, tmp_path):
-        """Raises TypeError if the name resolves to a non-callable."""
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("NOT_A_FUNC = 42\n")
-        with pytest.raises(TypeError, match="is not callable"):
-            load_hook_function(str(hook_file), "NOT_A_FUNC")
+    @pytest.mark.parametrize("source,name,error,match", [
+        ("def alpha(): pass\ndef beta(): pass\n", "check", AttributeError, "Available:.*alpha.*beta"),
+        ("def broken(\n", "check", SyntaxError, "Syntax error"),
+        ("check = 42\n", "check", TypeError, "not callable"),
+        ("import nonexistent_module_xyz_12345\n", "check", ImportError, "Error loading hook file"),
+    ])
+    def test_loading_errors_are_clear(self, tmp_path, commit_hook, source, name, error, match):
+        hook = commit_hook(tmp_path, _TRUSTED_HOOK_DIRS[0] + "/new_chat_guard.py", source)
+        with pytest.raises(error, match=match):
+            load_hook_function(str(hook), name, vault_path=tmp_path)
 
-    def test_lenient_signature_one_param_loads(self, tmp_path):
-        """Loads function with only 1 parameter (warns but doesn't fail)."""
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("def one_param(x):\n    return None\n")
-        func = load_hook_function(str(hook_file), "one_param")
-        assert callable(func)
+    def test_missing_file_fails_closed(self, tmp_path):
+        with pytest.raises(HookValidationError, match="verification failed"):
+            load_hook_function(str(tmp_path / "missing.py"), "check", vault_path=tmp_path)
 
-    def test_kwargs_function_accepted(self, tmp_path):
-        """Function with **kwargs doesn't trigger signature warning."""
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("def flex(**kwargs):\n    return None\n")
-        func = load_hook_function(str(hook_file), "flex")
-        assert callable(func)
+    def test_non_python_file_rejected(self, tmp_path):
+        hook = tmp_path / _TRUSTED_HOOK_DIRS[0] / "guard.txt"
+        hook.parent.mkdir(parents=True)
+        hook.write_text("def check(a,b,c): pass\n")
+        with pytest.raises(HookValidationError, match="must be a .py file"):
+            load_hook_function(str(hook), "check", vault_path=tmp_path)
 
-    def test_import_error_in_file(self, tmp_path):
-        """Raises ImportError for files that fail during import."""
-        bad_file = tmp_path / "bad_import.py"
-        bad_file.write_text("import nonexistent_module_xyz_12345\n")
-        with pytest.raises(ImportError, match="Error loading hook file"):
-            load_hook_function(str(bad_file), "fn")
+    def test_matchers_fail_closed_before_importing_any_hook(self, config, commit_hook):
+        marker = config.vault_path / "imported"
+        hook = commit_hook(config.vault_path, _TRUSTED_HOOK_DIRS[0] + "/new_chat_guard.py",
+                           f"from pathlib import Path\nPath({str(marker)!r}).touch()\ndef check(a,b,c): pass\n")
+        with pytest.raises(HookValidationError):
+            create_hook_matchers(config, HookState(), user_hooks={
+                "PreToolUse": f"{hook}::check", "Stop": "/tmp/untrusted.py::check",
+            })
+        assert not marker.exists()
 
-    def test_path_resolution_works(self, tmp_path):
-        """Path resolution (expanduser, resolve) works for valid paths."""
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("def fn(a, b, c):\n    return None\n")
-        func = load_hook_function(str(hook_file), "fn")
-        assert callable(func)
+    def test_missing_function_does_not_silently_drop_guard(self, config, commit_hook):
+        hook = commit_hook(config.vault_path, _TRUSTED_HOOK_DIRS[0] + "/new_chat_guard.py", "def check(a,b,c): pass\n")
+        with pytest.raises(HookValidationError):
+            create_hook_matchers(config, HookState(), user_hooks={"PreToolUse": f"{hook}::missing"})
+
+    @pytest.mark.parametrize("relative,function", [
+        (_TRUSTED_HOOK_DIRS[0] + "/test_router_guard_depth.py", "test_helper"),
+        (_TRUSTED_HOOK_DIRS[0] + "/credit_state_handoff.py", "_git"),
+        (_TRUSTED_HOOK_DIRS[0] + "/new_chat_guard.py", "helper"),
+        ("Projects/Personal Projects/Agentic/Agent Operations/scripts/ops/rounds.py", "run_action"),
+    ])
+    def test_tracked_non_hook_gadgets_rejected_before_import(self, tmp_path, commit_hook, relative, function):
+        marker = tmp_path / "imported"
+        hook = commit_hook(tmp_path, relative,
+                           f"from pathlib import Path\nPath({str(marker)!r}).touch()\ndef {function}(a,b,c): pass\n")
+        with pytest.raises(HookValidationError, match="not a trusted hook capability"):
+            load_hook_function(str(hook), function, vault_path=tmp_path)
+        assert not marker.exists()
+
+    def test_git_failure_never_imports(self, tmp_path, commit_hook, monkeypatch):
+        import subprocess
+        marker = tmp_path / "imported"
+        hook = commit_hook(tmp_path, _TRUSTED_HOOK_DIRS[0] + "/new_chat_guard.py",
+                           f"from pathlib import Path\nPath({str(marker)!r}).touch()\ndef check(a,b,c): pass\n")
+        monkeypatch.setattr("obs_agent.hooks.subprocess.run", MagicMock(side_effect=subprocess.TimeoutExpired("git", 5)))
+        with pytest.raises(HookValidationError, match="verification failed"):
+            load_hook_function(str(hook), "check", vault_path=tmp_path)
+        assert not marker.exists()
+
+    @pytest.mark.parametrize("spec", ["bad", "::check", "guard.py::", "guard.py::not-a-name", 123])
+    def test_malformed_specs_rejected(self, tmp_path, spec):
+        with pytest.raises(HookValidationError):
+            validate_hook_spec(spec, tmp_path)
 
 
 class TestMakeUserHookCheck:

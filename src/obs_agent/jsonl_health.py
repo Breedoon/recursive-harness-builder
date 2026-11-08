@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import json
 import hashlib
+import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -255,22 +256,42 @@ def _collect_chain_unsafe(
     by_uuid: dict[str, _ParsedEntry],
     poison_uuids: set[str],
 ) -> frozenset[str]:
+    """Rows whose own ancestor chain holds a poison row or a parent cycle.
+
+    obs-54: the previous version walked every row's chain to the root
+    separately, O(rows x depth), which is quadratic on a linear session: 1-2 s
+    per call on 4k-row sessions, run on the event loop several times per turn
+    (1,276 of 3,323 loop stalls on 2026-10-25). Each walk now stops at the
+    first row whose verdict is already known and gives every row on its path
+    that verdict, so each row is walked once. The result is the same set
+    (checked against the old walk on real session files).
+    """
     unsafe: set[str] = set(poison_uuids)
+    safe: set[str] = set()
     for uuid_value in by_uuid:
-        seen: set[str] = set()
+        if uuid_value in unsafe or uuid_value in safe:
+            continue
+        path: list[str] = []
+        on_path: set[str] = set()
         cursor: str | None = uuid_value
+        is_unsafe = False
         while cursor:
             if cursor in unsafe:
-                unsafe.add(uuid_value)
+                is_unsafe = True
                 break
-            if cursor in seen:
-                unsafe.add(uuid_value)
+            if cursor in safe:
                 break
-            seen.add(cursor)
+            if cursor in on_path:
+                # A parent cycle: every row on the path leads into it.
+                is_unsafe = True
+                break
             entry = by_uuid.get(cursor)
             if entry is None:
                 break
+            path.append(cursor)
+            on_path.add(cursor)
             cursor = entry.parent_uuid
+        (unsafe if is_unsafe else safe).update(path)
     return frozenset(unsafe)
 
 
@@ -524,6 +545,121 @@ def is_stale_session_head(health: JsonlSessionHealth, head: str | None) -> bool:
         return False
     line = health.uuid_line_numbers[head]
     return any(health.uuid_line_numbers[uuid] > line for uuid in health.recovered_poison_uuids)
+
+
+# Content refusals (obs-52): the API declined the request because of what the
+# conversation holds, so a recovery that re-sends the same context is refused
+# again (2026-10-25: proc-work trunk, 9 recoveries in 18 minutes, each one
+# refused within seconds). The texts are the CLI's and the API's own words.
+CONTENT_REFUSAL_MARKERS = (
+    ("usage_policy", "violate our Usage Policy"),
+    ("cybersecurity_flag", "flagged for possible cybersecurity risk"),
+)
+
+
+def content_refusal_after(health: JsonlSessionHealth, uuid: str | None) -> str | None:
+    """The content-refusal kind among the rows after ``uuid`` (a recovery target).
+
+    A row counts when the API ended the turn with ``stop_reason: "refusal"``
+    or the CLI wrote an API-error row with one of the refusal texts. Returns
+    None when there is none (an ordinary interrupted or failed turn).
+    """
+    after = health.uuid_line_numbers.get(uuid) if uuid else None
+    if after is None:
+        return None
+    try:
+        with health.path.open("r", encoding="utf-8") as handle:
+            for line_no, raw in enumerate(handle, 1):
+                if line_no <= after or ('"refusal"' not in raw and "isApiErrorMessage" not in raw):
+                    continue
+                entry = _parse_entry(line_no, raw)
+                if entry is None or entry.type != "assistant":
+                    continue
+                if entry.obj.get("message", {}).get("stop_reason") == "refusal":
+                    return "usage_policy"
+                if entry.is_error:
+                    for kind, marker in CONTENT_REFUSAL_MARKERS:
+                        if marker in entry.text:
+                            return kind
+    except OSError:
+        return None
+    return None
+
+
+_ANSWER_STOP_REASONS = frozenset({"end_turn", "tool_use", "max_tokens", "stop_sequence"})
+
+
+def session_has_own_answer(health: JsonlSessionHealth) -> bool:
+    """Whether the session's own CLI wrote at least one complete real answer.
+
+    Rows a fork or recovery copied in keep their original ``sessionId``, so a
+    recovery fork that was refused before answering anything has none: it was
+    a futile retry of the context it was copied from (obs-52).
+    """
+    sid = health.session_id
+    try:
+        with health.path.open("r", encoding="utf-8") as handle:
+            for line_no, raw in enumerate(handle, 1):
+                if sid not in raw or '"assistant"' not in raw:
+                    continue
+                entry = _parse_entry(line_no, raw)
+                if (entry is not None and entry.obj.get("sessionId") == sid
+                        and _is_real_assistant(entry)
+                        and entry.obj.get("message", {}).get("stop_reason") in _ANSWER_STOP_REASONS):
+                    return True
+    except OSError:
+        return True  # unknown: do not count it as a futile retry
+    return False
+
+
+def _refusal_streak_path(session_id: str) -> Path:
+    root = Path(os.environ.get("OBS_SESSION_REPLAY_PROVENANCE_DIR", "/workspace/runtime/state/session-replay"))
+    return root / "refusal-streaks" / f"{session_id}.json"
+
+
+def recorded_refusal_streak(session_id: str) -> int:
+    """Futile refused attempts before this session, as recorded when a
+    content-refusal recovery created it (0 when it was not created that way)."""
+    try:
+        record = json.loads(_refusal_streak_path(session_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    futile = record.get("futile_before") if isinstance(record, dict) else None
+    return futile if type(futile) is int and futile > 0 else 0
+
+
+def record_refusal_streak(session_id: str, *, futile_before: int, kind: str, source_session_id: str) -> None:
+    """Record, for a recovery fork made because of a content refusal, how many
+    futile refused attempts came before it. Written once, next to the fork
+    receipts; later work in the source session cannot change it."""
+    path = _refusal_streak_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({
+        "session_id": session_id, "source_session_id": source_session_id,
+        "kind": kind, "futile_before": futile_before,
+    }) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def futile_refusal_streak(health: JsonlSessionHealth, uuid: str | None) -> tuple[str | None, int]:
+    """(kind, n) for a session whose tail after ``uuid`` is a content refusal (obs-52).
+
+    ``n`` counts the futile attempts in a row that ended here: this session,
+    when it was refused before answering anything of its own, plus the ones
+    recorded for it when a content-refusal recovery created it. The record is
+    written once, at that recovery, so the count survives an OBS restart and
+    nothing that happens later in the source session changes it. Any other
+    session (a fresh one after /clear, a reply that forks from an earlier
+    message, an AgentTask fork) has no record and starts its own count.
+    (None, 0) when the tail is not a content refusal.
+    """
+    kind = content_refusal_after(health, uuid)
+    if kind is None:
+        return None, 0
+    if session_has_own_answer(health):
+        return kind, 0
+    return kind, 1 + recorded_refusal_streak(health.session_id)
 
 
 # CACHE-PREFIX WARNING (M5): safe recovery means a complete API message,

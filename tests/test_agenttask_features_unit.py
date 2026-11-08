@@ -58,7 +58,7 @@ class TestModelResolution:
         ("astra", "gpt-6-astra"),
         ("sol", "gpt-6.1-sol"),
         ("gpt-sol", "gpt-6.1-sol"),
-        ("terra", "gpt-5.6-terra"),
+        ("terra", "gpt-6.1-terra"),
         ("luna", "gpt-6-luna"),
     ])
     def test_named_gpt_aliases(self, alias, model):
@@ -85,6 +85,9 @@ class TestModelResolution:
         ("glm-5.3-flash", "local-sparks-glm-5.3-flash-uncensored"),
         ("glm-5.3-flash-uncensored", "local-sparks-glm-5.3-flash-uncensored"),
         ("local-sparks-glm-5.3-flash-uncensored", "local-sparks-glm-5.3-flash-uncensored"),
+        ("ds", "local-sparks-deepseek-v4.1-flash-1017"),
+        ("deepseek", "local-sparks-deepseek-v4.1-flash-1017"),
+        ("local-sparks-deepseek-v4.1-flash-1017", "local-sparks-deepseek-v4.1-flash-1017"),
         # Hosted Z.AI GLM served through CLIProxyAPI is a different backend.
         ("glm-5.3", "glm-5.3"),
         # Unknown names pass through unchanged (the provider rejects them).
@@ -94,7 +97,8 @@ class TestModelResolution:
         assert resolve_model(alias) == model
 
     @pytest.mark.parametrize(("alias", "suffix"), [
-        ("qwen", "[1m]"), ("qwen-fn", "[262k]"), ("glm", "[200k]"), ("qwen-27b", "[262k]"),
+        ("qwen", "[1m]"), ("qwen-fn", "[262k]"), ("glm", "[200k]"), ("deepseek", "[1m]"),
+        ("qwen-27b", "[262k]"),
     ])
     def test_alias_keeps_context_suffix(self, alias, suffix):
         assert resolve_model(alias + suffix) == resolve_model(alias) + suffix
@@ -132,7 +136,7 @@ class TestModelResolution:
         assert result == "gpt-5.4-mini[200k]"
 
     def test_resolution_does_not_add_default_context_suffix(self):
-        assert resolve_model("gpt") == "gpt-6.1-sol"
+        assert resolve_model("gpt") == "gpt-6.1-terra"
         assert resolve_model("claude") == "claude-opus-5-5"
 
 
@@ -142,7 +146,7 @@ class TestModelContextBoundary:
         assert split_context_suffix("gpt-5.4-mini[200k]") == ("gpt-5.4-mini", 200_000)
 
     def test_claude_code_boundary_adds_resolved_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt") == "gpt-6.1-sol[900k]"
+        assert normalize_model_for_claude_code("gpt") == "gpt-6.1-terra[872k]"
         assert normalize_model_for_claude_code("claude") == "claude-opus-5-5[1m]"
         assert normalize_model_for_claude_code("haiku") == "claude-haiku-5-5[1m]"
         assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
@@ -154,8 +158,14 @@ class TestModelContextBoundary:
     def test_current_gpt_models_default_to_900k(self, model):
         assert normalize_model_for_claude_code(model) == f"{model}[900k]"
 
+    def test_terra_uses_paid_codex_route_context_budget(self):
+        resolved = resolve_model_context("terra")
+        assert resolved.model == "gpt-6.1-terra"
+        assert resolved.context_tokens == 872_000
+        assert normalize_model_for_claude_code("terra") == "gpt-6.1-terra[872k]"
+
     def test_claude_code_boundary_preserves_explicit_context_suffix(self):
-        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-6.1-sol[200k]"
+        assert normalize_model_for_claude_code("gpt[200k]") == "gpt-6.1-terra[200k]"
         assert normalize_model_for_claude_code("gpt-5.4-mini[128k]") == "gpt-5.4-mini[128k]"
 
     def test_local_provider_boundary_preserves_canonical_model_id(self):
@@ -185,8 +195,8 @@ class TestModelContextBoundary:
         ) == 262_000
         assert compaction_threshold(resolved.context_tokens) == 229_000
 
-    def test_default_context_estimate_matches_default_sol_budget(self):
-        assert OBSConfig().context_window_estimate_tokens == 900_000
+    def test_default_context_estimate_matches_default_terra_budget(self):
+        assert OBSConfig().context_window_estimate_tokens == 872_000
 
     def test_auto_compact_window_tracks_context_by_default(self):
         assert auto_compact_window_for_context(1_000_000) == 1_000_000
@@ -316,110 +326,40 @@ class TestIsClaudeModel:
 # ---------------------------------------------------------------------------
 
 class TestHookSpecParsing:
-    """Test hook spec parsing via actual load_hook_function."""
+    """Hook specs select reviewed code, not arbitrary uploaded Python."""
 
-    def test_valid_spec_loads_function(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_file = tmp_path / "guard.py"
-        hook_file.write_text(
-            "def check_access(hook_input, tool_use_id, context):\n"
-            "    return None\n"
-        )
-        fn = load_hook_function(str(hook_file), "check_access")
+    @pytest.mark.parametrize("filename", ["new_chat_guard.py", "router_guard.py"])
+    def test_valid_spec_loads_function(self, tmp_path, commit_hook, filename):
+        from obs_agent.hooks import load_hook_function, _TRUSTED_HOOK_DIRS
+        hook_file = commit_hook(tmp_path, _TRUSTED_HOOK_DIRS[0] + "/" + filename,
+                                "def check(hook_input, tool_use_id, context): return None\n")
+        fn = load_hook_function(str(hook_file), "check", vault_path=tmp_path)
         assert callable(fn)
-        assert fn.__name__ == "check_access"
+        assert fn.__name__ == "check"
 
-    def test_missing_double_colon_in_spec_format(self):
-        """Verify the spec format validation catches single colon."""
-        spec = "/tmp/guard.py:check_access"
-        assert "::" not in spec  # Format check before load
+    def test_missing_double_colon_in_spec_format(self, tmp_path):
+        from obs_agent.hooks import validate_hook_spec, HookValidationError
+        with pytest.raises(HookValidationError, match="file_path::function_name"):
+            validate_hook_spec("/tmp/guard.py:check_access", tmp_path)
 
-    def test_path_with_spaces(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_dir = tmp_path / "my hooks"
-        hook_dir.mkdir()
-        hook_file = hook_dir / "guard file.py"
-        hook_file.write_text("def func(h, t, c): return None\n")
-        fn = load_hook_function(str(hook_file), "func")
-        assert callable(fn)
-
-    def test_function_not_found_lists_available(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("def real_func(h, t, c): return None\n")
-        with pytest.raises(AttributeError, match="Available:.*real_func"):
-            load_hook_function(str(hook_file), "nonexistent")
-
-    def test_syntax_error_in_file(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_file = tmp_path / "bad.py"
-        hook_file.write_text("def func(:\n    invalid\n")
-        with pytest.raises(SyntaxError):
-            load_hook_function(str(hook_file), "func")
-
-    def test_non_py_file_rejected(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_file = tmp_path / "hook.txt"
-        hook_file.write_text("not python")
-        with pytest.raises(ValueError, match=".py"):
-            load_hook_function(str(hook_file), "func")
-
-    def test_not_callable_rejected(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("my_var = 42\n")
-        with pytest.raises(TypeError, match="not callable"):
-            load_hook_function(str(hook_file), "my_var")
-
-
-# ---------------------------------------------------------------------------
-# Hook function loading (integration with importlib)
-# ---------------------------------------------------------------------------
 
 class TestHookFunctionLoading:
-    def test_load_valid_hook(self, tmp_path):
-        hook_file = tmp_path / "good_hook.py"
-        hook_file.write_text(
-            "def my_hook(hook_input, tool_use_id, context):\n"
-            "    return None\n"
-        )
-        from obs_agent.hooks import load_hook_function
-        fn = load_hook_function(str(hook_file), "my_hook")
-        assert callable(fn)
-        assert fn.__name__ == "my_hook"
+    @pytest.mark.parametrize("filename,source,name,error,match", [
+        ("new_chat_guard.py", "def real_func(h,t,c): return None\n", "check", AttributeError, "Available:.*real_func"),
+        ("new_chat_guard.py", "def func(:\n    invalid\n", "check", SyntaxError, "Syntax error"),
+        ("hook.txt", "not python", "check", ValueError, ".py"),
+        ("new_chat_guard.py", "check = 42\n", "check", TypeError, "not callable"),
+    ])
+    def test_loading_errors(self, tmp_path, commit_hook, filename, source, name, error, match):
+        from obs_agent.hooks import load_hook_function, _TRUSTED_HOOK_DIRS
+        hook_file = commit_hook(tmp_path, _TRUSTED_HOOK_DIRS[0] + "/" + filename, source)
+        with pytest.raises(error, match=match):
+            load_hook_function(str(hook_file), name, vault_path=tmp_path)
 
     def test_load_nonexistent_file(self, tmp_path):
-        from obs_agent.hooks import load_hook_function
-        with pytest.raises(FileNotFoundError):
-            load_hook_function(str(tmp_path / "nonexistent.py"), "func")
-
-    def test_load_nonexistent_function(self, tmp_path):
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("def other_func(): pass\n")
-        from obs_agent.hooks import load_hook_function
-        with pytest.raises(AttributeError, match="Available:"):
-            load_hook_function(str(hook_file), "nonexistent")
-
-    def test_load_syntax_error(self, tmp_path):
-        hook_file = tmp_path / "bad.py"
-        hook_file.write_text("def func(:\n    this is not valid\n")
-        from obs_agent.hooks import load_hook_function
-        with pytest.raises(SyntaxError):
-            load_hook_function(str(hook_file), "func")
-
-    def test_load_non_py_file(self, tmp_path):
-        hook_file = tmp_path / "hook.txt"
-        hook_file.write_text("not python")
-        from obs_agent.hooks import load_hook_function
-        with pytest.raises(ValueError, match=".py"):
-            load_hook_function(str(hook_file), "func")
-
-    def test_load_not_callable(self, tmp_path):
-        hook_file = tmp_path / "hook.py"
-        hook_file.write_text("my_var = 42\n")
-        from obs_agent.hooks import load_hook_function
-        with pytest.raises(TypeError, match="not callable"):
-            load_hook_function(str(hook_file), "my_var")
+        from obs_agent.hooks import load_hook_function, HookValidationError
+        with pytest.raises(HookValidationError):
+            load_hook_function(str(tmp_path / "nonexistent.py"), "func", vault_path=tmp_path)
 
 
 # ---------------------------------------------------------------------------

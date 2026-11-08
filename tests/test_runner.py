@@ -151,6 +151,50 @@ class TestRunnerBasicResponse:
         assert session_mgr.session_id == "sess-42"
 
     @patch("obs_agent.session.SessionManager.get_client")
+    async def test_captures_session_id_from_init_before_the_turn_ends(self, mock_get_client, config):
+        """vault-1i53: the CLI's system/init names the session long before the result."""
+        from claude_agent_sdk import SystemMessage
+
+        init = SystemMessage(subtype="init", data={"type": "system", "subtype": "init", "session_id": "sess-init"})
+        reply = MagicMock(content=[TextBlock(text="working")], session_id=None)
+        mock_get_client.return_value = _make_mock_client(
+            [init, reply, _make_result_message(session_id="sess-init")]
+        )
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        seen: list[tuple[str, str | None]] = []
+        async for event in runner.run("test"):
+            seen.append((type(event).__name__, session_mgr.session_id))
+
+        # The first event (init's TurnEnd) and the reply text, both before the
+        # ResultMessage, already see the session id.
+        assert seen[0] == ("TurnEndEvent", "sess-init")
+        first_text = next(sid for name, sid in seen if name == "TextEvent")
+        assert first_text == "sess-init"
+        assert session_mgr.session_id == "sess-init"
+
+    @patch("obs_agent.session.SessionManager.get_client")
+    async def test_non_init_system_message_does_not_set_session_id(self, mock_get_client, config):
+        from claude_agent_sdk import SystemMessage
+
+        other = SystemMessage(subtype="task_started", data={"session_id": "sess-other", "task_id": "t1"})
+        reply = MagicMock(content=[TextBlock(text="ok")], session_id=None)
+        mock_get_client.return_value = _make_mock_client([other, reply])
+
+        hook_state = HookState()
+        from obs_agent.session import SessionManager
+        session_mgr = SessionManager(config=config, hook_state=hook_state)
+
+        runner = ConversationRunner(session_mgr, hook_state, config)
+        await _collect_events(runner, "test")
+
+        assert session_mgr.session_id is None
+
+    @patch("obs_agent.session.SessionManager.get_client")
     async def test_initial_query_persists_entry_file_context_once(
         self, mock_get_client, config
     ):

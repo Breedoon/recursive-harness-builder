@@ -157,12 +157,16 @@ if (( health_parse_rc != 0 )); then
   fail_retryably 'GPU transcription service contract is invalid; retry later'
 fi
 
-if ! /usr/bin/python3 - "$AUDIO_FILE" "$TITLE" "$DEST_DIR" "$CORRELATION_ID" "$REQUEST_TIMEOUT_SECONDS" "$REQUEST_PATH" <<'PY'
+if ! /usr/bin/python3 - "$AUDIO_FILE" "$TITLE" "$DEST_DIR" "$CORRELATION_ID" "$REQUEST_TIMEOUT_SECONDS" "$REQUEST_PATH" "${OBS_TRANSCRIPTION_WINDOWED:-0}" "${OBS_TRANSCRIPTION_HYBRID_WATCH:-0}" "${OBS_TRANSCRIPTION_REQUEST_ADAPTER:-}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-audio, title, dest, correlation_id, timeout, output = sys.argv[1:]
+audio, title, dest, correlation_id, timeout, output, windowed, watch_hybrid, source_adapter = sys.argv[1:]
+if (windowed not in {'0', '1'} or watch_hybrid not in {'0', '1'}
+        or source_adapter not in {'', 'just-press-record', 'voice-memos'}
+        or (watch_hybrid == '1' and (windowed != '1' or source_adapter != 'just-press-record'))):
+    raise SystemExit(1)
 Path(output).write_text(
     json.dumps(
         {
@@ -171,6 +175,9 @@ Path(output).write_text(
             "dest_dir": dest,
             "correlation_id": correlation_id,
             "timeout_seconds": int(timeout),
+            "windowed": windowed == "1",
+            "watch_hybrid": watch_hybrid == "1",
+            "source_adapter": source_adapter,
         },
         separators=(",", ":"),
     )

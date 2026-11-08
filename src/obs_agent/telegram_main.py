@@ -7,6 +7,8 @@ Usage:
 import asyncio
 import logging
 import os
+import threading
+from collections.abc import Awaitable
 from pathlib import Path
 
 from obs_agent.config import OBSConfig
@@ -16,6 +18,46 @@ from obs_agent.runtime_env import (
     bootstrap_runtime_env,
 )
 from obs_agent.telegram import run_telegram_bot
+
+# asyncio.run() cancels every task when the Telegram runtime ends and waits for
+# all of them. One that never finishes (a send retrying the closed HTTPX
+# transport after a fatal getUpdates Conflict) kept the daemon silent but
+# RUNNING for hours, so Supervisor never restarted it (obs-22.61). Past the
+# grace period the process hard-exits instead; os._exit skips the SIGTERM kill
+# switch, so the crash snapshot survives and the wrapper's restart resumes it.
+_DEFAULT_TEARDOWN_GRACE_SECONDS = 60.0
+_TEARDOWN_EXIT_CODE = 70
+
+
+def _teardown_grace_seconds() -> float:
+    raw = (os.environ.get("OBS_TELEGRAM_TEARDOWN_GRACE_SECONDS") or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_TEARDOWN_GRACE_SECONDS
+    return value if value > 0 else _DEFAULT_TEARDOWN_GRACE_SECONDS
+
+
+def _arm_teardown_deadline(grace_seconds: float) -> None:
+    def _expire() -> None:
+        os.write(
+            2,
+            f"[teardown_deadline] runtime teardown still running after {grace_seconds:g}s; "
+            f"hard exit {_TEARDOWN_EXIT_CODE} so Supervisor restarts OBS (obs-22.61)\n".encode(),
+        )
+        os._exit(_TEARDOWN_EXIT_CODE)
+
+    timer = threading.Timer(grace_seconds, _expire)
+    timer.daemon = True
+    timer.start()
+
+
+async def _run_with_bounded_teardown(runtime: Awaitable[None], grace_seconds: float) -> None:
+    try:
+        await runtime
+    finally:
+        _arm_teardown_deadline(grace_seconds)
+
 
 class _DropGetUpdatesFilter(logging.Filter):
     """Suppress high-volume polling lines while keeping other runtime logs."""
@@ -111,7 +153,7 @@ def main() -> None:
     except Exception:
         logging.getLogger("obs_agent.cache_gate").warning("could not record running code", exc_info=True)
 
-    asyncio.run(run_telegram_bot(config))
+    asyncio.run(_run_with_bounded_teardown(run_telegram_bot(config), _teardown_grace_seconds()))
 
 
 if __name__ == "__main__":

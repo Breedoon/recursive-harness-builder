@@ -169,6 +169,43 @@ def find_session_jsonl(
     ).get(session_id)
 
 
+_CONVERSATION_ROW_TYPES = frozenset({"user", "assistant"})
+
+
+def session_jsonl_has_conversation(
+    *,
+    session_id: str,
+    cwd: Path,
+    projects_root: Path | None = None,
+) -> bool | None:
+    """Whether the CLI can resume this session yet: True, False, or None (no file).
+
+    OBS learns a session id from the CLI's ``system/init`` message, before the
+    first API call (vault-1i53). The CLI writes a turn's user row together with
+    its first assistant content block, so until then the session's JSONL holds
+    only ``queue-operation`` rows and ``--resume`` fails with "No conversation
+    found" (CLI 2.1.59). False means the file exists and has no user/assistant
+    row; the scan stops at the first such row, which is near the top.
+    """
+    path = find_session_jsonl(session_id=session_id, cwd=cwd, projects_root=projects_root)
+    if path is None:
+        return None
+    try:
+        with path.open("rb") as handle:
+            for raw in handle:
+                if b'"type"' not in raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(entry, dict) and entry.get("type") in _CONVERSATION_ROW_TYPES:
+                    return True
+    except OSError:
+        return None
+    return False
+
+
 def load_jsonl_usage_snapshot(
     *,
     session_id: str | None,

@@ -34,6 +34,16 @@ def test_glm_explicit_context_and_qwen_default_unchanged():
     assert config_module.resolve_model_context("qwen").context_tokens == 262_000
 
 
+@pytest.mark.parametrize("model", ["ds", "deepseek", config_module.SPARK_DEEPSEEK_MODEL])
+def test_deepseek_aliases_use_native_context(model):
+    resolved = config_module.resolve_model_context(model)
+    assert resolved.model == config_module.SPARK_DEEPSEEK_MODEL
+    assert resolved.context_tokens == 1_048_576
+    assert not resolved.explicit_context
+    assert resolved.model_with_context == config_module.SPARK_DEEPSEEK_MODEL
+    assert resolved.model_for_claude_code == config_module.SPARK_DEEPSEEK_MODEL
+
+
 # --- Vault Path Resolution ---
 
 
@@ -164,7 +174,16 @@ class TestSessionSettings:
     def test_default_model(self):
         """Default config stores model identity without context suffix."""
         cfg = OBSConfig()
-        assert cfg.model == "gpt-6.1-sol"
+        assert cfg.default_model == "terra"
+        assert cfg.model == "gpt-6.1-terra"
+
+    def test_from_env_uses_terra_when_no_model_override_is_set(self, monkeypatch):
+        monkeypatch.delenv("OBS_DEFAULT_MODEL", raising=False)
+        monkeypatch.delenv("OBS_AGENT_MODEL", raising=False)
+        monkeypatch.delenv("OBS_MODEL", raising=False)
+        cfg = OBSConfig.from_env()
+        assert cfg.default_model == "terra"
+        assert cfg.model == "gpt-6.1-terra"
 
     def test_model_from_env_resolves_shorthand_without_context_suffix(self, monkeypatch):
         """OBS_AGENT_MODEL overrides the default session model identity."""
@@ -175,7 +194,7 @@ class TestSessionSettings:
     def test_model_from_env_preserves_explicit_context_suffix(self, monkeypatch):
         monkeypatch.setenv("OBS_AGENT_MODEL", "gpt[200k]")
         cfg = OBSConfig.from_env()
-        assert cfg.model == "gpt-6.1-sol[200k]"
+        assert cfg.model == "gpt-6.1-terra[200k]"
 
     @pytest.mark.parametrize("alias", ["claude", "opus", "claude-opus"])
     def test_current_opus_alias_preserves_effort_and_context(self, alias):

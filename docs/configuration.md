@@ -49,7 +49,7 @@ For the first public setup path, aim for a single bot and one human operator:
 
 ```bash
 OBS_VAULT_PATH=/absolute/path/to/repo/examples/recursive-workflow
-OBS_DEFAULT_MODEL=sol
+OBS_DEFAULT_MODEL=terra
 OBS_TELEGRAM_BOT_TOKEN=1234567890:replace-with-bot-token
 OBS_TELEGRAM_ALLOWED_USERS=123456789
 ```
@@ -112,10 +112,11 @@ Supported shorthands in current code include:
 
 - `claude` and `opus` → `claude-opus-5-5`
 - `sonnet` → `claude-sonnet-5-5` (1M context, 128K output); `fable` → `claude-fable-5-1`; `haiku` → `claude-haiku-5-5`
-- `astra` → `gpt-6-astra`; `sol`/`gpt`/`gpt-pro`/`gpt-sol`/`openai`/`chatgpt` → `gpt-6.1-sol` (released 2026-09-29; `gpt-6-sol` and `gpt-5.6-sol` still work by full name); `terra` → `gpt-5.6-terra`; `luna` → `gpt-6-luna`
+- `gpt`/`terra`/`openai`/`chatgpt` → `gpt-6.1-terra` (ordinary-work default); `sol`/`gpt-sol`/`gpt-pro` → `gpt-6.1-sol`; `astra` → `gpt-6-astra`; `luna` → `gpt-6-luna`. Older model IDs, including `gpt-5.6-terra`, remain available by full name.
 - `gpt-mini`
 - Local Qwen: `qwen`/`qwen-fn`/`qwen-flash-next`/`qwen3.8-flash-next` → the DGX Sparks Qwen3.8 Flash Next (`local-sparks-qwen3.8-flash-next-abliterated`); `qwen-27b`/`qwen3.8-27b`/`local-qwen` → the 3090 Qwen (`local-qwen3.8-27b`). Plain `qwen` is a single switch, `DEFAULT_QWEN_MODEL` in `config.py`.
 - Local GLM: `glm`/`glm-flash`/`glm-5.3-flash`/`glm-5.3-flash-uncensored` → the Sparks GLM (`local-sparks-glm-5.3-flash-uncensored`). The hosted `glm-5.3` (Z.AI through CLIProxyAPI) is a different model and keeps its own name.
+- Local DeepSeek: `ds`/`deepseek` → the served Sparks DeepSeek (`local-sparks-deepseek-v4.1-flash-1017`) with its native 1,048,576-token window.
 - `gemini`, `gemini-pro`, `gemini-flash`
 
 Claude models route directly to Anthropic through Claude Code. Non-Claude models route through the local cache proxy and then CLIProxyAPI.
@@ -124,7 +125,7 @@ Claude models route directly to Anthropic through Claude Code. Non-Claude models
 
 The Sparks host one model at a time, behind their own cache proxy (default `http://127.0.0.1:28931`). The backend follows the model *name*: `obs_agent.spark` fills `ANTHROPIC_BASE_URL`, the credential (read from `/workspace/runtime/secrets/spark-api-key` at session build; never stored) and the small-model variables for any session whose model resolves to `local-sparks-*`, so children, forks and restores reach the Sparks without an `env`. An explicit per-session `env` still wins. Overrides: `OBS_SPARK_LLM_BASE_URL`, `OBS_SPARK_LLM_KEY_FILE`.
 
-- Default window is 262,000 tokens (the default profile serves 262,144). `[1m]` is valid only while the `qwen-1m` profile serves (≈1,048,576 tokens); OBS then raises the compaction ceiling to the requested window.
+- Spark Qwen defaults to 262,000 tokens (the default profile serves 262,144); its `[1m]` suffix is valid only while the `qwen-1m` profile serves. Spark GLM and DeepSeek use their native 1,048,576-token windows by default. OBS passes local model IDs unsuffixed and carries the context budget separately.
 - When an AgentTask child is created with a Spark model, OBS asks `GET /v1/models` and fails with an actionable message if a different model is being served or the window is larger than the serving profile. Unreachable endpoint = no check (the ordinary connection error surfaces). `OBS_SPARK_PREFLIGHT=0` disables the check.
 - Switching models is a host operation, not an OBS setting: `spark-model switch qwen|qwen-1m|glm` (see the vault DGX Sparks Runbook).
 
@@ -433,24 +434,28 @@ OBS_DAEMON_PORT=7832
 OBS_MAX_QUEUE_CONTINUATIONS=3
 OBS_BG_FORK_TIMEOUT=600
 OBS_MAX_BUFFER_SIZE=10485760
-OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS=900000
+OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS=872000
 OBS_AUTO_COMPACT_WINDOW_TOKENS=0
 OBS_FORK_CACHE_WARMUP_DELAY_SECONDS=1.0
 ```
 
 `OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS` is telemetry for context reporting and
-model suffix resolution. The fallback OBS context follows the default Sol model
-at 900k. Current GPT models use a 900k default, while Qwen uses 262k. At the
-Claude Code boundary, a model without an explicit suffix is sent with the
-resolved model-specific context suffix, for example `sol` becomes
-`gpt-6.1-sol[900k]`, `astra` becomes `gpt-6-astra[900k]`, and `claude` becomes
-`claude-opus-5-5[1m]`. Local Qwen keeps its canonical unsuffixed provider model ID
-while receiving the 262k context limit through the SDK environment.
+model suffix resolution. The fallback OBS context follows the default Terra
+route at 872k. OpenAI documents a 1.05M total window and 922k maximum input for
+GPT-6.1 Terra; the paid Codex catalog used by CLIProxyAPI advertises an 872k
+maximum context budget, so OBS uses that route ceiling. Other current GPT models
+retain their 900k defaults, while Qwen uses 262k. At the Claude Code boundary, a
+model without an explicit suffix is sent with the resolved model-specific
+context suffix, for example `terra` becomes `gpt-6.1-terra[872k]`, `sol` becomes
+`gpt-6.1-sol[900k]`, and `claude` becomes `claude-opus-5-5[1m]`. Local Qwen keeps
+its canonical unsuffixed provider model ID while receiving the 262k context limit
+through the SDK environment.
 `OBS_AUTO_COMPACT_WINDOW_TOKENS` optionally caps the Claude Code auto-compact
 trigger window. Leave it at `0` to use OBS's model-aware default: the resolved
 context window is passed through so Claude Code's built-in compaction curve is
-used consistently. A 900k window targets compaction around 867k, Qwen's 262k
-window around 229k, and a 200k window around 167k.
+used consistently. With the current 32k CLI output cap, Terra's 872k route
+targets compaction around 827k, a 900k GPT route around 855k, Qwen's 262k
+window around 217k, and a 200k window around 155k.
 `OBS_FORK_CACHE_WARMUP_DELAY_SECONDS` gives parent prompt-cache writes a short
 propagation window before a fork sends its first request.
 

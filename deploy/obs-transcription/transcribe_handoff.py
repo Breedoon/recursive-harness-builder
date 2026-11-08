@@ -38,6 +38,7 @@ MODEL_SNAPSHOT = Path(
     "models--mobiuslabsgmbh--faster-whisper-large-v3-turbo/"
     "snapshots/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
 )
+WATCH_HYBRID_HELPER_SHA256 = '9797db98e320021cc28cefec1ebbd52c7b5e234301efa16a8ba77f6d0854a050'
 JOBS_DIR = BASE / "jobs"
 JOB_PREFIX = "obs-transcribe-"
 SAFE_TITLE_RE = re.compile(r"^[A-Za-z0-9._ -]+$")
@@ -104,7 +105,7 @@ def reconcile_stale_demands() -> dict[str, Any]:
     return {"gate": gate, "recovered": recovered, "blocked": blocked}
 
 
-def _validate_transcript(path: Path, correlation_id: str) -> None:
+def _validate_transcript(path: Path, correlation_id: str, *, watch_hybrid: bool = False) -> None:
     if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
         raise RuntimeError("GPU child produced no complete transcript")
     statuses = {'transcription_status: "ok"', 'transcription_status: "degraded"'}
@@ -116,16 +117,35 @@ def _validate_transcript(path: Path, correlation_id: str) -> None:
         "# Transcript",
     }
     found: set[str] = set()
+    settings = None
+    frontmatter_delimiters = 0
     with path.open("r", encoding="utf-8", errors="strict") as handle:
         for line in handle:
             value = line.rstrip("\r\n")
+            if value == '---':
+                frontmatter_delimiters += 1
             if value in expected:
                 found.add(value)
             elif value in statuses:
                 found.add("transcription_status")
+            elif frontmatter_delimiters == 1 and value.startswith('whisper_settings: '):
+                if settings is not None:
+                    raise RuntimeError('GPU child settings metadata is duplicated')
+                try:
+                    settings = json.loads(value.split(': ', 1)[1])
+                    if not isinstance(settings, dict):
+                        raise RuntimeError('GPU child settings metadata is invalid')
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError('GPU child settings metadata is invalid') from exc
     missing = (expected | {"transcription_status"}) - found
     if missing:
         raise RuntimeError(f"GPU child transcript is incomplete: {sorted(missing)}")
+    if settings is not None and not isinstance(settings, dict):
+        raise RuntimeError('GPU child settings metadata is invalid')
+    if watch_hybrid and (settings is None or settings.get('watch_loudness_hybrid') is not True):
+        raise RuntimeError('GPU child did not apply requested Watch hybrid')
+    if not watch_hybrid and settings is not None and settings.get('watch_loudness_hybrid') is True:
+        raise RuntimeError('GPU child unexpectedly applied Watch hybrid')
 
 
 def _publish_no_replace(source: Path, output: Path) -> None:
@@ -149,6 +169,13 @@ def transcribe(audio_arg: str, title_arg: str, dest_arg: str) -> dict[str, Any]:
     dest = dest_source.resolve()
     title = title_arg
     correlation_id = os.environ.get("OBS_TRANSCRIPTION_CORRELATION_ID", "")
+    windowed = os.environ.get('OBS_TRANSCRIPTION_WINDOWED', '0')
+    watch_hybrid = os.environ.get('OBS_TRANSCRIPTION_HYBRID_WATCH', '0')
+    source_adapter = os.environ.get('OBS_TRANSCRIPTION_REQUEST_ADAPTER', '')
+    if (windowed not in {'0', '1'} or watch_hybrid not in {'0', '1'}
+            or source_adapter not in {'', 'just-press-record', 'voice-memos'}
+            or (watch_hybrid == '1' and (windowed != '1' or source_adapter != 'just-press-record'))):
+        raise ValueError('invalid Watch hybrid provenance')
 
     if not SAFE_CORRELATION_RE.fullmatch(correlation_id):
         raise ValueError("invalid transcription correlation ID")
@@ -166,6 +193,9 @@ def transcribe(audio_arg: str, title_arg: str, dest_arg: str) -> dict[str, Any]:
         raise ValueError(f"invalid destination path: {dest}")
     if not PYTHON.is_file() or not HELPER.is_file() or not MODEL_SNAPSHOT.is_dir():
         raise RuntimeError("GPU transcription runtime is incomplete")
+    helper_sha256 = _sha256(HELPER)
+    if watch_hybrid == '1' and helper_sha256 != WATCH_HYBRID_HELPER_SHA256:
+        raise RuntimeError('Watch hybrid helper does not match reviewed digest')
 
     output = dest / f"{title}.md"
     if output.exists() or output.is_symlink():
@@ -194,6 +224,9 @@ def transcribe(audio_arg: str, title_arg: str, dest_arg: str) -> dict[str, Any]:
             extra_request={
                 "audio_sha256": audio_sha256,
                 "correlation_id": correlation_id,
+                'source_adapter': source_adapter,
+                'watch_hybrid': watch_hybrid == '1',
+                'helper_sha256': helper_sha256,
                 "output_path": str(output),
                 "request_temp": str(request_temp),
                 "model_snapshot": str(MODEL_SNAPSHOT),
@@ -203,6 +236,8 @@ def transcribe(audio_arg: str, title_arg: str, dest_arg: str) -> dict[str, Any]:
             child_env={
                 "OBS_TRANSCRIPTION_LOCK_ALREADY_HELD": "1",
                 "OBS_TRANSCRIPTION_CORRELATION_ID": correlation_id,
+                "OBS_TRANSCRIPTION_WINDOWED": windowed,
+                'OBS_TRANSCRIPTION_HYBRID_WATCH': watch_hybrid,
                 "OBS_TRANSCRIPTION_MODEL": str(MODEL_SNAPSHOT),
                 "OBS_TRANSCRIPTION_MODEL_DIR": str(BASE / "models"),
                 "OBS_TRANSCRIPTION_DEVICE": "cuda",
@@ -228,12 +263,19 @@ def transcribe(audio_arg: str, title_arg: str, dest_arg: str) -> dict[str, Any]:
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
         )
-        _validate_transcript(temp_output, correlation_id)
+        if _sha256(audio) != audio_sha256:
+            raise RuntimeError('audio changed during transcription')
+        if _sha256(HELPER) != helper_sha256:
+            raise RuntimeError('transcription helper changed during lease')
+        _validate_transcript(temp_output, correlation_id, watch_hybrid=watch_hybrid == '1')
         _publish_no_replace(temp_output, output)
         return {
             **result,
             "audio_sha256": audio_sha256,
             "correlation_id": correlation_id,
+            'source_adapter': source_adapter,
+            'watch_hybrid': watch_hybrid == '1',
+            'helper_sha256': helper_sha256,
             "output_path": str(output),
             "model_snapshot": str(MODEL_SNAPSHOT),
             "device": "cuda",

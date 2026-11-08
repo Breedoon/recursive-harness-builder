@@ -10,6 +10,27 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 
+@pytest.fixture
+def commit_hook():
+    """Create reviewed hook code in an isolated Git-backed test vault."""
+    def commit(root: Path, relative: str, source: str) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+        def git(*args):
+            subprocess.run(
+                ["git", "-c", "user.name=OBS tests", "-c", "user.email=tests@example.invalid",
+                 "-C", str(root), *args], check=True, capture_output=True,
+            )
+        if not (root / ".git").exists():
+            git("init", "-q")
+        git("add", "--", relative)
+        git("commit", "-qm", "Reviewed test hook")
+        return path
+    return commit
+
+
 # ---------------------------------------------------------------------------
 # Unit tests may only signal processes they started (obs-3, 2026-10-16).
 #

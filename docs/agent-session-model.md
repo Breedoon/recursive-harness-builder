@@ -62,7 +62,7 @@ per session without mutating that shared configuration.
 | `lineage` / `agent_lineage` | Ordered human labels from root to current agent, not a sequence of SDK session UUIDs. |
 | `parent_agent_name`, `parent_display_name` | Parent's logical identity. These are different from the parent conversation ID. |
 | `origin`, `is_fork` | Bootstrap provenance and whether the session was forked rather than started fresh. |
-| `session_id` | Current Claude SDK conversation ID, owned by `SessionManager`; mirrored into hook/runtime/result data. Usually becomes known at SDK init. |
+| `session_id` | Current Claude SDK conversation ID, owned by `SessionManager`; mirrored into hook/runtime/result data. Becomes known from the CLI's `system/init` message, under a second into the first turn, and is persisted at once on the route and the AgentTask handle (vault-1i53; until 2026-10-22 only at the first turn's end). |
 | `agent_id` | **Still exists** as an optional bootstrap attribute. Agent-launched children commonly put the internal task UUID here. Not every route/manual fork has one. |
 | `task_id` | Internal launch/task handle in `_ForkTaskRecord`. Do not replace `(team_name, agent_name)` addressing with it. A normal root session need not have a task record. |
 | Native team `agentId` | Team-file compatibility identifier (often `agent@team`, including the synthetic team lead). It is not automatically the bootstrap `agent_id` or the SDK session ID. |

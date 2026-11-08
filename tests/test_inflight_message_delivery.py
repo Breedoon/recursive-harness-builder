@@ -38,7 +38,8 @@ def _callbacks(tmp_path, state, monkeypatch, user_hook=None, event="PostToolUse"
     config = SimpleNamespace(vault_path=tmp_path, is_immutable=lambda path: False)
     user_hooks = None
     if user_hook is not None:
-        monkeypatch.setattr(hooks, "load_hook_function", lambda *args: user_hook)
+        monkeypatch.setattr(hooks, "validate_hook_spec", lambda spec, vault: spec)
+        monkeypatch.setattr(hooks, "load_hook_function", lambda *args, **kwargs: user_hook)
         user_hooks = {event: "delivery_test.py::check"}
     matchers = hooks.create_hook_matchers(config, state, user_hooks=user_hooks)
     return {name: matchers[name][0].hooks[0] for name in matchers}
