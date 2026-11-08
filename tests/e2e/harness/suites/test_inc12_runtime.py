@@ -164,13 +164,13 @@ async def _scenario(lane, p, proof):
     def find(rows, argv0):
         return [r for r in rows if r["args"] and r["args"][0] == argv0]
 
+    await lane.exec("sh", "-c", "sleep 2", timeout=10)  # the background spawns need a moment to exec
     rows = await lane.procs()
     canary_rows = find(rows, p.canary)
     orphans = {"canary": [r["pid"] for r in canary_rows if r["ppid"] <= 1 or r["ppid"] not in {x["pid"] for x in rows}],
                "canary_live": [r["pid"] for r in canary_rows if r["ppid"] > 1 and r["ppid"] in {x["pid"] for x in rows}],
                "bundled": [r["pid"] for r in find(rows, bundled) if r["ppid"] <= 1], "never_named": [r["pid"] for r in find(rows, never_named)]}
     proof["D_before"] = orphans
-    proof["D_debug"] = [{k: r[k] for k in ("pid", "ppid", "pgid", "args")} for r in rows if "sleep" in " ".join(r["args"]) or "exec -a" in " ".join(r["args"])]
     assert orphans["canary"] and orphans["canary_live"] and orphans["bundled"] and orphans["never_named"], (orphans, canary_rows)
     p.new_window()
     await lane.restart_obs("plain")
