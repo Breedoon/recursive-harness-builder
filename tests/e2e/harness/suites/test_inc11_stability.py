@@ -403,11 +403,14 @@ async def test_s5_three_compactions_then_recall(lane):
     first = await lane.turn(topic, f"Remember this codeword for later: {code}. Reply with exactly: NOTED-{nonce}")
     assert f"NOTED-{nonce}" in first.text, first.messages
     session_id = first.end["session_id"]
-    fixture = "/workspace/runtime/git/obs-vault-active/CLAUDE.md"
+    import random
+    rng = random.Random(nonce)
+    words = [f"w{rng.randrange(10**6)}" for _ in range(1500)]
     turns = []
-    for i in range(10):
-        offset = 1 + 90 * i
-        result = await lane.turn(topic, f"Call the Read tool once on {fixture} with offset {offset} and limit 90. "
+    for i in range(12):
+        big = lane.lane_dir / "state" / f"inc11-big-{nonce}-{i}.txt"
+        big.write_text("\n".join(" ".join(rng.choice(words) for _ in range(12)) for _ in range(300)), encoding="utf-8")
+        result = await lane.turn(topic, f"Call the Read tool once on /workspace/runtime/state/{big.name}. "
                                  f"Do not summarize it. Reply with exactly: READ-{i}-{nonce}", timeout=240)
         session_id = result.end.get("session_id") or session_id
         compactions = _compaction_rows(_jsonl_rows(lane, session_id))
