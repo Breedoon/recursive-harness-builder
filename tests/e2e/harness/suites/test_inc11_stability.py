@@ -356,7 +356,7 @@ def _wire_fields(lane, rows):
     import gzip
     out = []
     for row in rows:
-        if row.get("_source") != "proxy" or row.get("path") != "/v1/messages":
+        if row.get("_source") != "proxy" or not str(row.get("path", "")).startswith("/v1/messages"):
             continue
         hits = glob.glob(str(lane.lane_dir / "logs" / "cache-proxy" / "requests" / "*" / f"{row['req_id']}.wire.json.gz"))
         body = json.load(gzip.open(hits[0])) if hits else {}
