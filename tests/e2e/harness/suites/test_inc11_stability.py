@@ -98,7 +98,7 @@ def _proof(lane, name, data):
 
 
 async def _wait_tool_use(lane, session_id, after, tool, needle=""):
-    cursor = after
+    cursor = float(after["ts"])
     async with asyncio.timeout(120):
         while True:
             row = await lane.wait("jsonl_append", match={"session_id": session_id, "type": "assistant"}, after=cursor)
