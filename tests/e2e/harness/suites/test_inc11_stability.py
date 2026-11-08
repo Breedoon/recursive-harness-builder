@@ -373,3 +373,45 @@ async def test_s6_effort_high_and_low_on_opus(lane):
     for level in ("high", "low"):
         main = [r for r in proof[level]["requests"] if r["has_tools"]]
         assert main and all(r["http_status"] == 200 for r in main), proof[level]
+
+
+# -- scenario 5: three automatic compactions on Haiku (run with --profile inc11-compact) ------------
+
+def _compaction_rows(rows):
+    return [r for r in rows if r.get("type") == "system" and (r.get("subtype") == "compact_boundary" or "compact" in str(r.get("subtype", "")))
+            or r.get("isCompactSummary")]
+
+
+async def test_s5_three_compactions_then_recall(lane):
+    nonce = _nonce()
+    code = "CW" + nonce
+    topic = await lane.new_topic(f"inc11 compact {nonce}")
+    first = await lane.turn(topic, f"Remember this codeword for later: {code}. Reply with exactly: NOTED-{nonce}")
+    assert f"NOTED-{nonce}" in first.text, first.messages
+    session_id = first.end["session_id"]
+    fixture = "/workspace/runtime/git/obs-vault-active/CLAUDE.md"
+    turns = []
+    for i in range(10):
+        offset = 1 + 90 * i
+        result = await lane.turn(topic, f"Call the Read tool once on {fixture} with offset {offset} and limit 90. "
+                                 f"Do not summarize it. Reply with exactly: READ-{i}-{nonce}", timeout=240)
+        session_id = result.end.get("session_id") or session_id
+        compactions = _compaction_rows(_jsonl_rows(lane, session_id))
+        turns.append({"i": i, "failed": result.end.get("failed"), "subtype": result.end.get("subtype"), "session": session_id,
+                      "replied": f"READ-{i}-{nonce}" in result.text, "compact_rows": len(compactions)})
+        assert not result.end.get("failed"), (i, result.end)
+        if len(compactions) >= 3:
+            break
+    recall = await lane.turn(topic, "What was the codeword I asked you to remember at the start? Reply with only the codeword.", timeout=240)
+    log = (lane.lane_dir / "logs" / "telegram-prod.log").read_text(encoding="utf-8", errors="replace").splitlines()
+    summary_requests = [r for r in lane.reqlog(agent=topic) if r.get("_source") == "proxy" and r.get("path") == "/v1/messages"]
+    rows = _jsonl_rows(lane, session_id)
+    _proof(lane, "s5_compaction", {
+        "turns": turns, "compaction_rows": [{"subtype": r.get("subtype"), "type": r.get("type"), "keys": sorted(r)[:12]} for r in _compaction_rows(rows)][:6],
+        "recall_has_code": code in recall.text, "recall_end": {k: recall.end.get(k) for k in ("failed", "subtype", "turns", "session_id")},
+        "first_session": first.end["session_id"], "final_session": recall.end.get("session_id"),
+        "log_compact_lines": [line[:200] for line in log if "ompact" in line][:12],
+        "n_proxy_messages_requests": len(summary_requests)})
+    assert code in recall.text, recall.messages
+    assert not recall.end.get("failed"), recall.end
+    assert len(_compaction_rows(rows)) >= 3, turns
