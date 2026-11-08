@@ -246,6 +246,21 @@ def _isolate_session_replay_state(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_cli_runtime_state(tmp_path_factory, monkeypatch):
+    """Keep the obs-cli canary file and runtime records off production state.
+
+    ``cli_runtime`` reads ``obs-cli-canary.json`` and reads/writes
+    ``obs-cli-runtime.sqlite3`` beside the Telegram state DB, which is the live
+    ``/workspace/runtime/state`` in an agent shell (obs-22 inc12). Tests of the
+    feature (tests/test_cli_runtime.py) unset these and use the config's own paths.
+    """
+    root = tmp_path_factory.mktemp("cli-runtime")
+    monkeypatch.setenv("OBS_CLI_CANARY_PATH", str(root / "obs-cli-canary.json"))
+    monkeypatch.setenv("OBS_CLI_RUNTIME_DB_PATH", str(root / "obs-cli-runtime.sqlite3"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_session_effort(monkeypatch):
     """Tests run from agent shells, which export the agent's own CLI effort.
 
