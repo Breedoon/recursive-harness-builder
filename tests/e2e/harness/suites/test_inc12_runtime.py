@@ -149,8 +149,16 @@ async def _scenario(lane, p, proof):
     before = await p.clis()
     assert [r["args"][0] for r in before] == [p.canary], before
     orphan_pids = [r["pid"] for r in before]
+    # A CLI that exits on its own when the daemon dies is no orphan: freeze it first, as the spinning
+    # orphans of 2026-09-25 were (it cannot read EOF or handle SIGTERM; the reaper's SIGKILL ends it).
+    for pid in orphan_pids:
+        await lane._ctl.call("POST", "/signal", {"pid": pid, "sig": "STOP"})
     p.new_window()
     await lane.restart_obs("kill")
+    proof["D_alive_after_restart_ready"] = sorted({r["pid"] for r in await p.clis()} & set(orphan_pids))
+    for pid in orphan_pids:  # the reaper's SIGKILL follows its SIGTERM after a short grace
+        gone = await lane.exec("sh", "-c", f"n=0; while kill -0 {pid} 2>/dev/null && [ $n -lt 120 ]; do sleep 0.5; n=$((n+1)); done; kill -0 {pid} 2>/dev/null && echo ALIVE || echo GONE", timeout=90)
+        proof.setdefault("D_wait", {})[str(pid)] = gone["stdout"].strip()
     after = {r["pid"] for r in await p.clis()}
     log = p.log_text()
     proof["D"] = {"orphan_pids": orphan_pids, "still_alive": sorted(set(orphan_pids) & after),
