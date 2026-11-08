@@ -375,12 +375,12 @@ async def test_s6_effort_high_and_low_on_opus(lane):
     proof = {}
     for level in ("high", "low"):
         mark = lane.events.mark()
-        cmd_ts = float(lane.find()[-1]["ts"]) if lane.find() else 0.0
+        cmd_ts = time.time()
         await lane.command(topic, f"/effort {level}")
         await lane.wait("telegram_send", agent=topic, match=lambda e, l=level: l in (e.get("text_head") or "").lower(), after=mark)
         turn = await lane.turn(topic, f"Reply with exactly: EFF-{level.upper()}-{nonce}")
         assert f"EFF-{level.upper()}-{nonce}" in turn.text, turn.messages
-        rows = lane.reqlog(agent=topic, since=cmd_ts)
+        rows = lane.reqlog(agent=turn.end["agent_name"], since=cmd_ts)
         proof[level] = {"end": {k: turn.end.get(k) for k in ("failed", "subtype", "turns", "cli_runtime", "cost_usd")},
                         "requests": _wire_fields(lane, rows)}
     _proof(lane, "s6_effort", proof)
