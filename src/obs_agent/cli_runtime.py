@@ -212,6 +212,7 @@ def _connect(db_path: Path, *, create: bool) -> sqlite3.Connection | None:
     conn = sqlite3.connect(str(db_path), timeout=5.0)
     conn.execute("PRAGMA busy_timeout=5000")
     if create:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS session_runtime (
@@ -243,8 +244,8 @@ def get_record(db_path: Path, session_id: str | None) -> RuntimeRecord | None:
             ).fetchone()
         finally:
             conn.close()
-    except sqlite3.Error:
-        logger.debug("obs-cli runtime record lookup failed", exc_info=True)
+    except sqlite3.Error as exc:
+        _warn_once(db_path, f"db:{exc.__class__.__name__}", f"obs-cli runtime records unreadable ({exc}); treating as empty")
         return None
     return RuntimeRecord(row[0], row[1]) if row else None
 
@@ -270,8 +271,8 @@ def put_record(db_path: Path, session_id: str, runtime: str, cli_path: str | Non
             conn.commit()
         finally:
             conn.close()
-    except (sqlite3.Error, OSError):
-        logger.warning("could not record CLI runtime for session %s", session_id, exc_info=True)
+    except (sqlite3.Error, OSError) as exc:
+        _warn_once(db_path, f"db:{exc.__class__.__name__}", f"could not record CLI runtime ({exc}); resumed canary sessions will use the bundled CLI")
 
 
 def inherit_record(source_session_id: str | None, new_session_id: str | None, *, state_db_path: Path | str | None = None) -> None:
@@ -315,8 +316,8 @@ def known_cli_paths(state_db_path: Path | str | None = None) -> frozenset[str]:
                 paths.update(row[0] for row in conn.execute("SELECT path FROM cli_path_seen"))
             finally:
                 conn.close()
-    except sqlite3.Error:
-        logger.debug("obs-cli path lookup failed", exc_info=True)
+    except sqlite3.Error as exc:
+        _warn_once(runtime_db_path(state_db_path), f"db:{exc.__class__.__name__}", f"obs-cli runtime records unreadable ({exc}); treating as empty")
     return frozenset(paths)
 
 

@@ -370,3 +370,18 @@ def test_kill_and_capture_accept_canary_clients_and_still_refuse_others(tmp_path
         maint.kill_process_tree(603, proc_root=proc, kill=lambda p, s: None)
     with pytest.raises(ValueError):
         maint.capture_process_tree(603, proc_root=proc)
+
+
+def test_corrupt_or_missing_runtime_db_is_empty_and_warns_once(config, tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="obs_agent.cli_runtime")
+    binary, _ = _selected(config, tmp_path)
+    monkeypatch.setattr(SessionManager, "_session_is_unborn", lambda self: False)
+    _db(config).write_bytes(b"this is not a sqlite database" * 20)
+    manager = _manager(config)
+    _resumable(manager, "s-x")
+    for _ in range(3):  # resumed but unrecorded => bundled; never fails the spawn
+        assert manager.create_options().cli_path is None
+    assert cli_runtime.known_cli_paths(config.telegram_state_db_path) >= {str(binary)}
+    assert len([r for r in caplog.records if r.name == "obs_agent.cli_runtime"]) == 1
+    _db(config).unlink()  # losing the file only sends resumed canary sessions back to bundled
+    assert manager.create_options().cli_path is None
