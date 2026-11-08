@@ -143,6 +143,20 @@ async def _bash_child(lane, topic, parent, nonce, seconds):
     return child, child_end, sent, start, session_id
 
 
+async def _running_child(lane, topic, parent, nonce, seconds):
+    """A fresh executor-guarded child whose FIRST turn is a foreground Bash sleep, so its task stays running."""
+    marker = lane.lane_dir / "state" / f"inc11-run-{nonce}"
+    child = await _launch(lane, topic, parent, {"display_name": f"inc11 running {nonce}", "fork": False, "effort": "low",
+                          "hooks": json.dumps(GUARD),
+                          "prompt": f"Call Bash exactly once in the foreground with command `touch /workspace/runtime/state/{marker.name}; "
+                                    f"sleep {seconds}; echo SLEPT-{nonce}`. After it returns reply exactly DONE-{nonce}, no other tools."}, nonce)
+
+    async def started():
+        return marker.exists()
+    await _until_changed(lane, started)
+    return child
+
+
 async def _bot_text_since(lane, topic, sent):
     messages = await lane.telegram.messages(topic, since=sent, from_bot=True)
     return [m.get("text") or "" for m in messages]
@@ -209,12 +223,12 @@ async def test_s2_inbox_read_and_send_between_agents(lane):
 
 async def test_s2_agenttaskoutput_on_running_child(lane):
     nonce, topic, parent = await _root(lane, "output")
-    child, child_end, sent, start, session_id = await _bash_child(lane, topic, parent, nonce, 25)
+    child = await _running_child(lane, topic, parent, nonce, 40)
     args = {"agent_name": child["agent_name"], "task_id": "", "team_name": parent.end["team"], "block": "false", "timeout": "1000"}
     ask = await lane.send(topic, "Call mcp__obs-agent__AgentTaskOutput exactly once with these exact arguments: "
                           + json.dumps(args) + f". Then reply exactly: OUT-{nonce}. Use no other tool.")
     await _until_changed(lane, lambda: _messages(lane, topic, ask, f"OUT-{nonce}"))
-    end = await lane.wait("turn_end", agent=child["agent_name"], after=start)
+    end = await lane.wait("turn_end", agent=child["agent_name"], after=child)
     results = _tool_results(_jsonl_rows(lane, parent.end["session_id"]))
     _proof(lane, "s2_agenttaskoutput", {"parent_results": results[-3:], "child_end": end})
     assert any((r["tool"] or "").endswith("AgentTaskOutput") for r in results), results
@@ -257,7 +271,7 @@ async def test_s3_stop_during_bash(lane):
 
 async def test_s3_stop_during_mcp_tool(lane):
     nonce, topic, parent = await _root(lane, "stopmcp")
-    child, child_end, sent_c, start_c, child_session = await _bash_child(lane, topic, parent, nonce, 80)
+    child = await _running_child(lane, topic, parent, nonce, 80)
     args = {"agent_name": child["agent_name"], "task_id": "", "team_name": parent.end["team"], "block": "true", "timeout": "120000"}
     ask = await lane.send(topic, "Call mcp__obs-agent__AgentTaskOutput exactly once with these exact arguments: "
                           + json.dumps(args) + f". Then reply exactly: OUT-{nonce}. Use no other tool.")
