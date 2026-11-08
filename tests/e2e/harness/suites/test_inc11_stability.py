@@ -392,8 +392,8 @@ async def test_s6_effort_high_and_low_on_opus(lane):
 # -- scenario 5: three automatic compactions on Haiku (run with --profile inc11-compact) ------------
 
 def _compaction_rows(rows):
-    return [r for r in rows if r.get("type") == "system" and (r.get("subtype") == "compact_boundary" or "compact" in str(r.get("subtype", "")))
-            or r.get("isCompactSummary")]
+    """One row per automatic compaction: the transcript's compact_boundary system row."""
+    return [r for r in rows if r.get("type") == "system" and r.get("subtype") == "compact_boundary"]
 
 
 async def test_s5_three_compactions_then_recall(lane):
