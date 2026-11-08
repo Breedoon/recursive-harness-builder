@@ -372,6 +372,16 @@ def put_record(db_path: Path, session_id: str, runtime: str, cli_path: str | Non
         assert conn is not None
         try:
             now = time.time()
+            # One write transaction with the hash worker's: a provisional id is replaced by the
+            # persisted hash when it exists already, and the worker's UPDATE covers the other order.
+            conn.execute("BEGIN IMMEDIATE")
+            if cli_path and runtime == provisional_runtime_id(cli_path):
+                key = _binary_key(cli_path)
+                row = conn.execute(
+                    "SELECT runtime FROM binary_hash WHERE path=? AND mtime_ns=? AND size=?", key
+                ).fetchone() if key else None
+                if row:
+                    runtime = row[0]
             conn.execute(
                 "INSERT INTO session_runtime(session_id, runtime, cli_path, updated_at) VALUES (?,?,?,?) "
                 "ON CONFLICT(session_id) DO UPDATE SET runtime=excluded.runtime, "

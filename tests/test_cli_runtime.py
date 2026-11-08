@@ -527,3 +527,10 @@ def test_reaper_and_fork_inheritance_use_the_configured_state_dir(config, tmp_pa
     cli_runtime.put_record(_db(config), "s-old", "obs-cli:y", str(other))
     assert maint._canary_cli_paths() == {str(binary), str(other)}
     assert cli_runtime.known_cli_paths() == {str(binary), str(other)}
+
+
+def test_a_provisional_record_written_after_the_hash_exists_gets_the_real_id(config, tmp_path):
+    binary = _binary(tmp_path)
+    final = cli_runtime.runtime_id_for_path(str(binary), db_path=_db(config), wait=True)
+    cli_runtime.put_record(_db(config), "late", cli_runtime.provisional_runtime_id(str(binary)), str(binary))
+    assert cli_runtime.get_record(_db(config), "late").runtime == final
