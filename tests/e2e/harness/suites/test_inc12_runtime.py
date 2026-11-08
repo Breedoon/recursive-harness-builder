@@ -154,7 +154,7 @@ async def _scenario(lane, p, proof):
         if orphan:  # the group leader exits at once, leaving a parentless child in a leaderless group
             await lane.exec("setsid", "bash", "-c", f"(exec -a {argv0} sleep 900) </dev/null >/dev/null 2>&1 & exit 0", timeout=20)
         else:  # the leader stays as the live parent: another OBS instance's CLI
-            await lane.exec("sh", "-c", f"setsid bash -c '(exec -a {argv0} sleep 900) & wait' </dev/null >/dev/null 2>&1 &", timeout=20)
+            await lane._ctl.call("POST", "/exec", {"argv": ["setsid", "bash", "-c", f"(exec -a {argv0} sleep 900) & wait"], "background": True})
 
     await spawn(p.canary, orphan=True)       # reaped: canary path, parent and leader gone
     await spawn(bundled, orphan=True)        # reaped: the existing rule
@@ -168,7 +168,7 @@ async def _scenario(lane, p, proof):
     canary_rows = find(rows, p.canary)
     orphans = {"canary": [r["pid"] for r in canary_rows if r["ppid"] <= 1 or r["ppid"] not in {x["pid"] for x in rows}],
                "canary_live": [r["pid"] for r in canary_rows if r["ppid"] > 1 and r["ppid"] in {x["pid"] for x in rows}],
-               "bundled": [r["pid"] for r in find(rows, bundled)], "never_named": [r["pid"] for r in find(rows, never_named)]}
+               "bundled": [r["pid"] for r in find(rows, bundled) if r["ppid"] <= 1], "never_named": [r["pid"] for r in find(rows, never_named)]}
     proof["D_before"] = orphans
     assert orphans["canary"] and orphans["canary_live"] and orphans["bundled"] and orphans["never_named"], (orphans, canary_rows)
     p.new_window()
