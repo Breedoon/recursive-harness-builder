@@ -319,3 +319,44 @@ async def test_s4_maintenance_restart_while_idle(lane):
 
 async def test_s4_kill_while_idle(lane):
     await _idle_restart(lane, "kill", "idlekill")
+
+
+# -- scenario 6: thinking and effort on a real model (run with --profile inc11-opus) ---------------
+
+def _wire_fields(lane, rows):
+    """The projected request fields the proxy forwarded for main-path rows (no system text, no messages)."""
+    import glob
+    import gzip
+    out = []
+    for row in rows:
+        if row.get("_source") != "proxy" or row.get("path") != "/v1/messages":
+            continue
+        hits = glob.glob(str(lane.lane_dir / "logs" / "cache-proxy" / "requests" / "*" / f"{row['req_id']}.wire.json.gz"))
+        body = json.load(gzip.open(hits[0])) if hits else {}
+        out.append({"model": row.get("model"), "http_status": row.get("http_status"), "stream": row.get("stream"),
+                    "has_tools": bool(body.get("tools")), "max_tokens": body.get("max_tokens"),
+                    "thinking": body.get("thinking"), "output_config": body.get("output_config"),
+                    "temperature": body.get("temperature"), "context_management": body.get("context_management"),
+                    "upstream_beta": row.get("upstream_beta"), "effort_pin": row.get("effort_pin"),
+                    "usage_keys": sorted((row.get("usage") or {}).keys()) if isinstance(row.get("usage"), dict) else None})
+    return out
+
+
+async def test_s6_effort_high_and_low_on_opus(lane):
+    nonce = _nonce()
+    topic = await lane.new_topic(f"inc11 effort {nonce}")
+    proof = {}
+    for level in ("high", "low"):
+        mark = lane.events.mark()
+        cmd_ts = float(lane.find()[-1]["ts"]) if lane.find() else 0.0
+        await lane.command(topic, f"/effort {level}")
+        await lane.wait("telegram_send", agent=topic, match=lambda e, l=level: l in (e.get("text_head") or "").lower(), after=mark)
+        turn = await lane.turn(topic, f"Reply with exactly: EFF-{level.upper()}-{nonce}")
+        assert f"EFF-{level.upper()}-{nonce}" in turn.text, turn.messages
+        rows = lane.reqlog(agent=topic, since=cmd_ts)
+        proof[level] = {"end": {k: turn.end.get(k) for k in ("failed", "subtype", "turns", "cli_runtime", "cost_usd")},
+                        "requests": _wire_fields(lane, rows)}
+    _proof(lane, "s6_effort", proof)
+    for level in ("high", "low"):
+        main = [r for r in proof[level]["requests"] if r["has_tools"]]
+        assert main and all(r["http_status"] == 200 for r in main), proof[level]
