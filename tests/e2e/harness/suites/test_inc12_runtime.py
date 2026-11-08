@@ -142,26 +142,45 @@ async def _scenario(lane, p, proof):
     assert p.runtime_lines()[-1][0].startswith("bundled-")
     assert all(BUNDLED_MARK in a for a in proof["C_fresh"]["argv0"]) and proof["C_fresh"]["argv0"]
 
-    # D. Orphan: back on obs-cli, kill the lane's OBS; its obs-cli child is reaped by the restarted OBS.
-    p.write([agent])
-    await lane.command(topic, "/clear")
-    sixth = await lane.turn(topic, f"Reply with exactly: F-{code}")
-    before = await p.clis()
-    assert [r["args"][0] for r in before] == [p.canary], before
-    orphan_pids = [r["pid"] for r in before]
-    # A CLI that exits on its own when the daemon dies is no orphan: freeze it first, as the spinning
-    # orphans of 2026-09-25 were (it cannot read EOF or handle SIGTERM; the reaper's SIGKILL ends it).
-    for pid in orphan_pids:
-        await lane._ctl.call("POST", "/signal", {"pid": pid, "sig": "STOP"})
+    # D. Orphan reaper. A real obs-cli dies with its daemon here (supervisord signals the group), so
+    # orphans are reproduced the way production meets them: processes whose argv[0] is a CLI path, whose
+    # parent is gone and whose process-group leader is gone. The canary file is removed first (full
+    # rollback), so a restarted OBS can only learn the canary path from its persisted record.
+    p.file.unlink()
+    bundled = f"/workspace/obs/.venv/lib/python3.12/site-packages/{BUNDLED_MARK}"
+    never_named = "/workspace/runtime/e2e/obs-cli-never-named-by-any-canary"
+
+    async def spawn(argv0, *, orphan):
+        if orphan:  # the group leader exits at once, leaving a parentless child in a leaderless group
+            await lane.exec("setsid", "bash", "-c", f"(exec -a {argv0} sleep 900) </dev/null >/dev/null 2>&1 & exit 0", timeout=20)
+        else:  # the leader stays as the live parent: another OBS instance's CLI
+            await lane.exec("sh", "-c", f"setsid bash -c '(exec -a {argv0} sleep 900) & wait' </dev/null >/dev/null 2>&1 &", timeout=20)
+
+    await spawn(p.canary, orphan=True)       # reaped: canary path, parent and leader gone
+    await spawn(bundled, orphan=True)        # reaped: the existing rule
+    await spawn(never_named, orphan=True)    # kept: not an agent CLI path
+    await spawn(p.canary, orphan=False)      # kept: a live CLI of another OBS keeps its parent and leader
+
+    def find(rows, argv0):
+        return [r for r in rows if r["args"] and r["args"][0] == argv0]
+
+    rows = await lane.procs()
+    canary_rows = find(rows, p.canary)
+    orphans = {"canary": [r["pid"] for r in canary_rows if r["ppid"] <= 1 or r["ppid"] not in {x["pid"] for x in rows}],
+               "canary_live": [r["pid"] for r in canary_rows if r["ppid"] > 1 and r["ppid"] in {x["pid"] for x in rows}],
+               "bundled": [r["pid"] for r in find(rows, bundled)], "never_named": [r["pid"] for r in find(rows, never_named)]}
+    proof["D_before"] = orphans
+    assert orphans["canary"] and orphans["canary_live"] and orphans["bundled"] and orphans["never_named"], (orphans, canary_rows)
     p.new_window()
-    await lane.restart_obs("kill")
-    proof["D_alive_after_restart_ready"] = sorted({r["pid"] for r in await p.clis()} & set(orphan_pids))
-    for pid in orphan_pids:  # the reaper's SIGKILL follows its SIGTERM after a short grace
+    await lane.restart_obs("plain")
+    for pid in orphans["canary"] + orphans["bundled"]:  # the reaper's SIGKILL follows its SIGTERM after a short grace
         gone = await lane.exec("sh", "-c", f"n=0; while kill -0 {pid} 2>/dev/null && [ $n -lt 120 ]; do sleep 0.5; n=$((n+1)); done; kill -0 {pid} 2>/dev/null && echo ALIVE || echo GONE", timeout=90)
         proof.setdefault("D_wait", {})[str(pid)] = gone["stdout"].strip()
-    after = {r["pid"] for r in await p.clis()}
-    log = p.log_text()
-    proof["D"] = {"orphan_pids": orphan_pids, "still_alive": sorted(set(orphan_pids) & after),
-                  "reaper_lines": [line.split("] ", 1)[-1][:160] for line in log.splitlines() if "orphan_reaper" in line]}
-    assert not set(orphan_pids) & after, proof["D"]
-    assert any(str(pid) in " ".join(proof["D"]["reaper_lines"]) for pid in orphan_pids), proof["D"]
+    rows = await lane.procs()
+    alive = {pid for pid in orphans["canary_live"] + orphans["never_named"] if any(r["pid"] == pid for r in rows)}
+    proof["D_after"] = {"live_controls_alive": sorted(alive), "reaper_lines": [l.split("] ", 1)[-1][:200] for l in p.log_text().splitlines() if "orphan_reaper" in l]}
+    for pid in orphans["canary_live"] + orphans["never_named"]:
+        await lane.exec("sh", "-c", f"kill -9 {pid} 2>/dev/null; true", timeout=10)
+    assert all(v == "GONE" for v in proof["D_wait"].values()), proof["D_wait"]
+    assert alive == set(orphans["canary_live"] + orphans["never_named"]), proof["D_after"]
+    assert all(str(pid) in " ".join(proof["D_after"]["reaper_lines"]) for pid in orphans["canary"] + orphans["bundled"]), proof["D_after"]
