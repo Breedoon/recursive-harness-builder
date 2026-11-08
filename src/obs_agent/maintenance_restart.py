@@ -72,6 +72,8 @@ DEFAULT_CRASH_SNAPSHOT_SECONDS = 15.0
 DEFAULT_CRASH_MAX_CONSECUTIVE = 2
 DEFAULT_ORPHAN_REAP_GRACE_SECONDS = 5.0
 AGENT_CLI_MARKER = "claude_agent_sdk/_bundled/claude"
+# Canary obs-cli binaries (obs-22) are agent CLIs too, by exact argv[0]; the
+# paths come from obs_agent.cli_runtime (see _canary_cli_paths).
 MARKER_VERSION = 1
 # 15 min (was 5): a power cut plus host boot plus Wi-Fi return took ~5 min on
 # 2026-10-21; Daniel asked for 15 min headroom. Also the kill-switch horizon.
@@ -603,13 +605,27 @@ def refresh_process_tree(owned: dict[int, int], *, proc_root: Path = Path("/proc
     return found
 
 
+def _canary_cli_paths() -> frozenset[str]:
+    try:
+        from obs_agent.cli_runtime import known_cli_paths
+
+        return known_cli_paths()
+    except Exception:
+        return frozenset()
+
+
+def _is_agent_cli_argv(argv: list[str], canary_paths: frozenset[str]) -> bool:
+    """argv[0] is the SDK's bundled CLI or a canary obs-cli binary (exact path)."""
+    return bool(argv) and (AGENT_CLI_MARKER in argv[0] or argv[0] in canary_paths)
+
+
 def capture_process_tree(root_pid: int, *, proc_root: Path = Path("/proc")) -> dict[int, int]:
     """Capture kill authority only from a plain-int, live SDK CLI root."""
     if type(root_pid) is not int or root_pid <= 1 or root_pid == os.getpid():
         raise ValueError(f"capture_process_tree refused root pid {root_pid!r}")
     identity = _process_identity(root_pid, proc_root)
     argv = _proc_argv(root_pid, proc_root)
-    if identity is None or not argv or AGENT_CLI_MARKER not in argv[0]:
+    if identity is None or not _is_agent_cli_argv(argv, _canary_cli_paths()):
         raise ValueError(f"capture_process_tree refused pid {root_pid}: not a live agent CLI")
     return refresh_process_tree({root_pid: identity[1]}, proc_root=proc_root)
 
@@ -642,7 +658,7 @@ def kill_process_tree(root_pid: int, *, proc_root: Path = Path("/proc"), kill=os
     if type(root_pid) is not int or root_pid <= 1 or root_pid == os.getpid():
         raise ValueError(f"kill_process_tree refused root pid {root_pid!r}")
     argv = _proc_argv(root_pid, proc_root)
-    if not argv or AGENT_CLI_MARKER not in argv[0]:
+    if not _is_agent_cli_argv(argv, _canary_cli_paths()):
         raise ValueError(f"kill_process_tree refused pid {root_pid}: not an agent CLI ({argv[:1]})")
     tree = [root_pid, *descendant_pids(root_pid, proc_root=proc_root)]
     for pid in tree:
@@ -653,7 +669,12 @@ def kill_process_tree(root_pid: int, *, proc_root: Path = Path("/proc"), kill=os
     return tree
 
 
-def find_orphaned_agent_clis(*, own_pgid: int, proc_root: Path = Path("/proc")) -> list[int]:
+def find_orphaned_agent_clis(
+    *,
+    own_pgid: int,
+    proc_root: Path = Path("/proc"),
+    canary_paths: frozenset[str] | None = None,
+) -> list[int]:
     """Claude CLIs left behind by a previous daemon.
 
     A process qualifies only when all hold: its argv[0] is the Agent SDK's
@@ -661,8 +682,11 @@ def find_orphaned_agent_clis(*, own_pgid: int, proc_root: Path = Path("/proc")) 
     it is not in this daemon's process group; and its process-group leader no
     longer exists (the old supervisord wrapper exited). Live CLIs of any other
     running OBS instance keep a live parent and group leader, so they never
-    match.
+    match. A canary obs-cli binary (obs_agent.cli_runtime) counts as an agent
+    CLI by exact argv[0] path, so a restarted OBS reaps its orphans too.
     """
+    if canary_paths is None:
+        canary_paths = _canary_cli_paths()
     found: list[int] = []
     try:
         entries = list(proc_root.iterdir())
@@ -673,7 +697,7 @@ def find_orphaned_agent_clis(*, own_pgid: int, proc_root: Path = Path("/proc")) 
             continue
         pid = int(entry.name)
         argv = _proc_argv(pid, proc_root)
-        if not argv or AGENT_CLI_MARKER not in argv[0]:
+        if not _is_agent_cli_argv(argv, canary_paths):
             continue
         fields = _proc_stat_fields(pid, proc_root)
         if fields is None:
@@ -701,7 +725,8 @@ def reap_orphaned_agent_clis(
     CPU and never processed stdin EOF (vault-u3b.66, .76). Returns the PIDs
     that were signalled.
     """
-    pids = find_orphaned_agent_clis(own_pgid=own_pgid, proc_root=proc_root)
+    canary_paths = _canary_cli_paths()
+    pids = find_orphaned_agent_clis(own_pgid=own_pgid, proc_root=proc_root, canary_paths=canary_paths)
     for pid in pids:
         try:
             kill(pid, signal.SIGTERM)
@@ -710,7 +735,7 @@ def reap_orphaned_agent_clis(
     if not pids:
         return []
     sleep(grace_seconds)
-    survivors = set(find_orphaned_agent_clis(own_pgid=own_pgid, proc_root=proc_root))
+    survivors = set(find_orphaned_agent_clis(own_pgid=own_pgid, proc_root=proc_root, canary_paths=canary_paths))
     for pid in pids:
         if pid in survivors:
             try:
