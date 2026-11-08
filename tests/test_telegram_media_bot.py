@@ -12,10 +12,10 @@ def test_allowlist_is_exact_and_excludes_third_identity():
 
 
 def test_model_registry_only_advertises_qualified_nondeprecated_paths():
-    assert SELECTABLE_MODELS == ("qwen-image-2.1", "h3", "h3-beta1", "ltx")
+    assert SELECTABLE_MODELS == ("qwen-image-2.1", "h3")
     assert MODEL_REGISTRY["h3"]["label"] == "H3 Eros Max beta6 (checkpoint)"
     assert MODEL_REGISTRY["wan"]["deprecated"] is True
-    assert MODEL_REGISTRY["ltx"]["qualified"] is True
+    assert MODEL_REGISTRY["ltx"]["deprecated"] is True and MODEL_REGISTRY["h3-beta1"]["deprecated"] is True
 
 
 def test_settings_keyboard_rebuilds_model_label_after_cycle(tmp_path):
@@ -25,10 +25,8 @@ def test_settings_keyboard_rebuilds_model_label_after_cycle(tmp_path):
     assert h3_keyboard.inline_keyboard[2][0].text == "Model: H3 Eros Max beta6 (checkpoint)"
     assert qwen_keyboard.inline_keyboard[2][0].text == "Model: Qwen Image 2.1"
     assert h3_keyboard.inline_keyboard[2][0].callback_data == qwen_keyboard.inline_keyboard[2][0].callback_data
-    ltx_settings = Settings(model="ltx", media_kind="video")
-    ltx_keyboard = bot._settings_keyboard(5129431382, ltx_settings)
-    assert ltx_keyboard.inline_keyboard[2][0].text == "Model: LTX 2.5 (qualified)"
-    assert "strength=default" in bot._settings_text(ltx_settings)
+    h3_settings = Settings(model="h3", media_kind="video")
+    assert "strength=default" in bot._settings_text(h3_settings)
     image_keyboard = bot._settings_keyboard(5129431382, Settings(model="qwen-image-2.1", media_kind="image", strength=0.5))
     assert image_keyboard.inline_keyboard[6][0].text == "Strength: 0.5"
 
@@ -44,11 +42,11 @@ def test_adaptive_presets_preserve_portrait_aspect_and_align_model():
 
 
 def test_manual_dimension_precedence_and_auto_reset():
-    settings = Settings(model="ltx", media_kind="video", mode="t2v", longest=700, auto_size=True, width=None, height=None)
+    settings = Settings(model="h3", media_kind="video", mode="t2v", longest=700, auto_size=True, width=None, height=None)
     manual = MediaBot._apply_setting(settings, "width", "640")
     manual = MediaBot._apply_setting(manual, "height", "480")
     assert manual.auto_size is False
-    assert _resolve_dimensions(manual, (9, 16)) == (704, 512)
+    assert _resolve_dimensions(manual, (9, 16)) == (640, 480)
     reset = MediaBot._apply_setting(manual, "auto", "auto")
     assert reset.auto_size is True and reset.width is None and reset.height is None
     assert _resolve_dimensions(reset, (9, 16))[1] > _resolve_dimensions(manual, (9, 16))[1]
@@ -58,7 +56,7 @@ def test_supported_four_step_control_is_model_specific():
     h3 = MediaBot._apply_setting(Settings(model="h3", media_kind="video", mode="t2v"), "steps", "4")
     assert h3.steps == 4
     try:
-        MediaBot._apply_setting(Settings(model="ltx", media_kind="video", mode="t2v"), "variant", "turbo")
+        MediaBot._apply_setting(Settings(model="qwen-image-2.1", media_kind="image", mode="t2i"), "variant", "turbo")
     except ValueError:
         pass
     else:
@@ -283,8 +281,13 @@ def test_metadata_and_events_survive_restart_without_content(tmp_path, caplog):
 def test_checkpoints_default_to_correct_sampling_without_loras(tmp_path):
     selected = MediaBot._apply_setting(Settings(lora="hmnsfw"), "model", "h3")
     assert (selected.variant, selected.steps, selected.lora) == ("beta6", 8, None)
-    previous = MediaBot._apply_setting(selected, "model", "h3-beta1")
-    assert (previous.variant, previous.steps, previous.lora) == ("beta1", 4, None)
+    for retired in ("h3-beta1", "ltx", "wan"):
+        try:
+            MediaBot._apply_setting(selected, "model", retired)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("retired model accepted")
     store = StateStore(tmp_path / "state.sqlite3")
     store.put_settings(5129431382, Settings(model="h3", media_kind="video", mode="t2v", variant="turbo", steps=4, lora="hmnsfw"))
     migrated = store.get_settings(5129431382)

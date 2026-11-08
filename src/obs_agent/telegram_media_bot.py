@@ -44,10 +44,10 @@ MODEL_REGISTRY = {
         "deprecated": False,
     },
     "h3-beta1": {
-        "label": "H3 Eros Max beta1 (previous checkpoint)",
+        "label": "H3 Eros Max beta1 (retired)",
         "media_kind": "video",
         "qualified": True,
-        "deprecated": False,
+        "deprecated": True,
     },
     "wan": {
         "label": "Wan 2.2 (deprecated)",
@@ -56,10 +56,10 @@ MODEL_REGISTRY = {
         "deprecated": True,
     },
     "ltx": {
-        "label": "LTX 2.5 (qualified)",
+        "label": "LTX 2.5 (retired)",
         "media_kind": "video",
         "qualified": True,
-        "deprecated": False,
+        "deprecated": True,
     },
 }
 SELECTABLE_MODELS = tuple(name for name, spec in MODEL_REGISTRY.items() if spec["qualified"] and not spec["deprecated"])
@@ -262,10 +262,7 @@ class StateStore:
             settings = Settings(**{k: data[k] for k in asdict(Settings()) if k in data})
             if settings.model not in SELECTABLE_MODELS:
                 return Settings(media_kind="video", model="h3", mode="t2v", variant="beta6", steps=8, width=640, height=384)
-            if settings.model == "h3" and settings.variant == "beta1":
-                settings = replace(settings, model="h3-beta1")
-                self.put_settings(user_id, settings)
-            elif settings.model == "h3" and settings.variant != "beta6":
+            if settings.model == "h3" and settings.variant != "beta6":
                 settings = replace(settings, variant="beta6", steps=8 if settings.steps == 4 else settings.steps, lora=None, lora_strength=None)
                 self.put_settings(user_id, settings)
             elif settings.model == "h3-beta1" and settings.variant != "beta1":
@@ -429,7 +426,7 @@ class MediaBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
             return await self.deny(update)
-        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3|h3-beta1|ltx (H3 Eros Max beta6 or previous beta1 checkpoint or qualified LTX 2.5).")
+        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3 (H3 Eros Max beta6).")
 
     @staticmethod
     def _display_strength(settings: Settings) -> float | str:
@@ -536,7 +533,7 @@ class MediaBot:
         args = context.args
         cmd = update.effective_message.text.split()[0].split("@", 1)[0].lower()
         settings = self.state.get_settings(update.effective_user.id)
-        usage = "Usage: /set KEY VALUE (model, mode, preset, longest, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|h3|h3-beta1|ltx"
+        usage = "Usage: /set KEY VALUE (model, mode, preset, longest, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|h3"
         if cmd == "/set":
             if len(args) != 2:
                 return await update.effective_message.reply_text(usage)
