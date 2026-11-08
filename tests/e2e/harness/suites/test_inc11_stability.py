@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import uuid
 
 import pytest
@@ -124,6 +125,10 @@ async def _bash_child(lane, topic, parent, nonce, seconds):
     child_end = await lane.wait("turn_end", agent=child["agent_name"], after=child)
     assert not child_end.get("failed") and child_end.get("session_id"), child_end
     await _until_changed(lane, lambda: _messages(lane, child["topic_id"], None, f"CHILD-READY-{nonce}"))
+    # The parent is woken by the child's idle notice; let that turn end so later asks start their own turn.
+    notice = await lane.wait("telegram_send", agent=parent.end["agent_name"], after=child_end,
+                             match=lambda e: "went idle" in (e.get("text_head") or ""))
+    await lane.wait("turn_end", agent=parent.end["agent_name"], after=notice)
     marker = lane.lane_dir / "state" / f"inc11-bash-{nonce}"
     sent = await lane.send(child["topic_id"], f"Call Bash exactly once in the foreground with command "
                            f"`touch /workspace/runtime/state/{marker.name}; sleep {seconds}; echo SLEPT-{nonce}`. "
@@ -232,11 +237,14 @@ async def _assert_stop_clean(lane, topic_id, sent, start, stop_marker, session_i
 async def test_s3_stop_during_bash(lane):
     nonce, topic, parent = await _root(lane, "stopbash")
     child, child_end, sent, start, session_id = await _bash_child(lane, topic, parent, nonce, 90)
+    t_stop = time.time()
     stop = await lane.command(child["topic_id"], "/stop")
     end, cleanup = await asyncio.gather(
         lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start),
         lane.wait("stop_cleanup", agent=child["agent_name"], after=start))
-    proof = await _assert_stop_clean(lane, child["topic_id"], sent, start, {"end": end, "cleanup": cleanup}, session_id, "s3")
+    proof = await _assert_stop_clean(lane, child["topic_id"], sent, start, {"end": end, "cleanup": cleanup}, session_id, "s3",
+                                     {"stop_to_turn_end_s": round(float(end["ts"]) - t_stop, 1),
+                                      "stop_to_cleanup_s": round(float(cleanup["ts"]) - t_stop, 1)})
     after = await lane.turn(child["topic_id"], f"Reply with exactly: AFTER-{nonce}")
     proof["follow_up"] = {"same_session": after.end.get("session_id") == session_id, "end_session": after.end.get("session_id"),
                           "replied": f"AFTER-{nonce}" in after.text}
@@ -255,11 +263,14 @@ async def test_s3_stop_during_mcp_tool(lane):
                           + json.dumps(args) + f". Then reply exactly: OUT-{nonce}. Use no other tool.")
     start = await lane.wait("turn_start", match={"trigger_message_id": ask.message_id})
     await _wait_tool_use(lane, parent.end["session_id"], start, "mcp__obs-agent__AgentTaskOutput")
+    t_stop = time.time()
     await lane.command(topic, "/stop")
     end, cleanup = await asyncio.gather(
         lane.wait("turn_end", match={"trigger_message_id": ask.message_id}, after=start),
         lane.wait("stop_cleanup", agent=topic, after=start))
-    proof = await _assert_stop_clean(lane, topic.topic_id, ask, start, {"end": end, "cleanup": cleanup}, parent.end["session_id"], "s3")
+    proof = await _assert_stop_clean(lane, topic.topic_id, ask, start, {"end": end, "cleanup": cleanup}, parent.end["session_id"], "s3",
+                                     {"stop_to_turn_end_s": round(float(end["ts"]) - t_stop, 1),
+                                      "stop_to_cleanup_s": round(float(cleanup["ts"]) - t_stop, 1)})
     after = await lane.turn(topic, f"Reply with exactly: AFTER-{nonce}")
     proof["follow_up"] = {"same_session": after.end.get("session_id") == parent.end["session_id"],
                           "end_session": after.end.get("session_id"), "replied": f"AFTER-{nonce}" in after.text}
@@ -274,12 +285,14 @@ async def test_s3_agenttaskstop_child_mid_bash(lane):
     nonce, topic, parent = await _root(lane, "taskstop")
     child, child_end, sent, start, session_id = await _bash_child(lane, topic, parent, nonce, 90)
     args = {"agent_name": child["agent_name"], "task_id": "", "team_name": parent.end["team"], "shell_id": ""}
+    t_stop = time.time()
     ask = await lane.send(topic, "Call mcp__obs-agent__AgentTaskStop exactly once with these exact arguments: "
                           + json.dumps(args) + f". Then reply exactly: STOPPED-{nonce}. Use no other tool.")
     await _until_changed(lane, lambda: _messages(lane, topic, ask, f"STOPPED-{nonce}"))
     end = await lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start)
     proof = await _assert_stop_clean(lane, child["topic_id"], sent, start, {"end": end}, session_id, "s3",
-                                     {"parent_results": _tool_results(_jsonl_rows(lane, parent.end["session_id"]))[-2:]})
+                                     {"stop_to_turn_end_s": round(float(end["ts"]) - t_stop, 1),
+                                      "parent_results": _tool_results(_jsonl_rows(lane, parent.end["session_id"]))[-2:]})
     after = await lane.turn(child["topic_id"], f"Reply with exactly: AFTER-{nonce}")
     proof["follow_up"] = {"same_session": after.end.get("session_id") == session_id, "end_session": after.end.get("session_id"),
                           "replied": f"AFTER-{nonce}" in after.text}
