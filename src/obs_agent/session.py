@@ -194,6 +194,9 @@ class SessionManager:
         # recorded against the session id once the CLI reports it.
         self._pending_cli_runtime: Any = None
         self.cli_runtime: str | None = None
+        from obs_agent import cli_runtime as _cli_runtime
+
+        _cli_runtime.register_state_db_path(config.telegram_state_db_path)
 
     @property
     def compaction_handoff_active(self) -> bool:
@@ -425,7 +428,16 @@ class SessionManager:
     def _build_options(self) -> ClaudeAgentOptions:
         """Build the options, then apply the per-route CLI runtime selection."""
         options = self._build_base_options()
-        self._apply_cli_runtime(options)
+        before = options.cli_path
+        try:
+            self._apply_cli_runtime(options)
+        except Exception as exc:  # never let the canary break a session build
+            from obs_agent import cli_runtime
+
+            options.cli_path = before
+            self._pending_cli_runtime = None
+            self.cli_runtime = cli_runtime.BUNDLED_RUNTIME
+            cli_runtime.warn_fallback(exc)
         return options
 
     def _apply_cli_runtime(self, options: ClaudeAgentOptions) -> None:

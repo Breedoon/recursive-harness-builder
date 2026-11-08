@@ -25,6 +25,7 @@ def isolated(monkeypatch):
     monkeypatch.delenv("OBS_CLI_PATH", raising=False)
     cli_runtime._seen_paths.clear()
     cli_runtime._warned.clear()
+    monkeypatch.setattr(cli_runtime, "_registered_state_db", None)
     # The sessions below go through the cache proxy, as production Claude does.
     monkeypatch.setattr("obs_agent.cache_proxy_lifecycle.should_use_proxy", lambda **kw: True)
     yield
@@ -385,3 +386,75 @@ def test_corrupt_or_missing_runtime_db_is_empty_and_warns_once(config, tmp_path,
     assert len([r for r in caplog.records if r.name == "obs_agent.cli_runtime"]) == 1
     _db(config).unlink()  # losing the file only sends resumed canary sessions back to bundled
     assert manager.create_options().cli_path is None
+
+
+# --- never break a session build (12b, M2) ---------------------------------------------------
+
+
+def test_any_exception_in_selection_falls_back_to_bundled_with_one_warning(config, tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="obs_agent.cli_runtime")
+    _selected(config, tmp_path)
+
+    def boom(**kw):
+        raise RuntimeError("selection exploded")
+
+    monkeypatch.setattr(cli_runtime, "select_runtime", boom)
+    manager = _manager(config)
+    for _ in range(3):
+        assert manager.create_options().cli_path is None
+    assert manager.cli_runtime == BUNDLED
+    manager.set_session_id("s-x")  # nothing pending, nothing recorded
+    assert not _db(config).exists()
+    assert len([r for r in caplog.records if "selection failed" in r.getMessage()]) == 1
+
+
+def test_exception_after_the_choice_restores_a_lane_wide_cli_path(config, tmp_path, monkeypatch):
+    binary, _ = _selected(config, tmp_path)
+    monkeypatch.setattr(SessionManager, "_session_is_unborn", lambda self: False)
+    cli_runtime.put_record(_db(config), "s-r", "obs-cli:x", str(binary))
+    manager = _manager(config)
+    _resumable(manager, "s-r")
+    monkeypatch.setattr(cli_runtime, "put_record", lambda *a, **k: (_ for _ in ()).throw(PermissionError("denied")))
+    options = manager.create_options()
+    assert options.resume == "s-r" and options.cli_path is None
+    assert manager._pending_cli_runtime is None
+
+
+def test_untraversable_record_dir_does_not_escape_the_build(config, tmp_path, monkeypatch):
+    _selected(config, tmp_path)
+    monkeypatch.setattr(SessionManager, "_session_is_unborn", lambda self: False)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    monkeypatch.setenv(cli_runtime.RUNTIME_DB_ENV, str(locked / "obs-cli-runtime.sqlite3"))
+    locked.chmod(0)
+    try:
+        manager = _manager(config)
+        _resumable(manager, "s-l")
+        options = manager.create_options()
+        assert options.resume == "s-l" and options.cli_path is None  # unrecorded resume => bundled
+        manager.set_session_id("s-l2")
+        assert cli_runtime.known_cli_paths() is not None
+    finally:
+        locked.chmod(0o700)
+
+
+# --- one state dir for builds, forks and the reaper (12b, M3) --------------------------------
+
+
+def test_reaper_and_fork_inheritance_use_the_configured_state_dir(config, tmp_path, monkeypatch):
+    elsewhere = tmp_path / "env-elsewhere" / "telegram-state.sqlite3"
+    elsewhere.parent.mkdir()
+    monkeypatch.setenv("OBS_TELEGRAM_STATE_DB_PATH", str(elsewhere))  # a stale or different env
+    binary, runtime = _selected(config, tmp_path)
+    manager = _manager(config)  # registers config.telegram_state_db_path
+    manager.create_options()
+    manager.set_session_id("parent")
+    assert cli_runtime.get_record(_db(config), "parent") is not None
+    cli_runtime.inherit_record("parent", "child")  # no explicit path: must land in the config's dir
+    assert cli_runtime.get_record(_db(config), "child") == cli_runtime.RuntimeRecord(runtime, str(binary))
+    assert not (elsewhere.parent / cli_runtime.RUNTIME_DB_FILENAME).exists()
+    # The reaper's lookup agrees: the file and the persisted table of the configured dir.
+    other = _binary(tmp_path, "obs-cli-old")
+    cli_runtime.put_record(_db(config), "s-old", "obs-cli:y", str(other))
+    assert maint._canary_cli_paths() == {str(binary), str(other)}
+    assert cli_runtime.known_cli_paths() == {str(binary), str(other)}

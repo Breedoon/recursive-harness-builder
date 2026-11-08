@@ -65,7 +65,24 @@ _hash_cache: dict[tuple[str, int, int], str] = {}
 # --------------------------------------------------------------------------
 
 
+_registered_state_db: Path | None = None
+
+
+def register_state_db_path(state_db_path: Path | str) -> None:
+    """Remember the running process's configured Telegram state DB path.
+
+    ``SessionManager`` registers ``config.telegram_state_db_path`` so that the
+    code that has no config in hand (the orphan reaper, fork and recovery
+    inheritance) finds the same directory as the session builds do, by
+    construction rather than by both reading the same environment variable.
+    """
+    global _registered_state_db
+    _registered_state_db = Path(state_db_path)
+
+
 def _state_dir(state_db_path: Path | str | None = None) -> Path:
+    if state_db_path is None:
+        state_db_path = _registered_state_db
     if state_db_path is None:
         raw = os.environ.get(_STATE_DB_ENV, "").strip()
         if raw:
@@ -118,6 +135,15 @@ def _warn_once(path: Path, signature: str, message: str) -> None:
             return
         _warned[str(path)] = signature
     logger.warning("%s", message)
+
+
+def warn_fallback(exc: BaseException) -> None:
+    """One warning per distinct failure of the selection code (it falls back to bundled)."""
+    _warn_once(
+        Path("<session-build>"),
+        f"build:{exc.__class__.__name__}:{exc}",
+        f"obs-cli runtime selection failed ({exc.__class__.__name__}: {exc}); using bundled {BUNDLED_RUNTIME}",
+    )
 
 
 def _names(value: Any) -> frozenset[str]:
@@ -244,7 +270,7 @@ def get_record(db_path: Path, session_id: str | None) -> RuntimeRecord | None:
             ).fetchone()
         finally:
             conn.close()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError) as exc:
         _warn_once(db_path, f"db:{exc.__class__.__name__}", f"obs-cli runtime records unreadable ({exc}); treating as empty")
         return None
     return RuntimeRecord(row[0], row[1]) if row else None
@@ -316,7 +342,7 @@ def known_cli_paths(state_db_path: Path | str | None = None) -> frozenset[str]:
                 paths.update(row[0] for row in conn.execute("SELECT path FROM cli_path_seen"))
             finally:
                 conn.close()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError) as exc:
         _warn_once(runtime_db_path(state_db_path), f"db:{exc.__class__.__name__}", f"obs-cli runtime records unreadable ({exc}); treating as empty")
     return frozenset(paths)
 
