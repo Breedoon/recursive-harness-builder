@@ -39,6 +39,8 @@ Examples
   # a scratch proxy you started from the working tree on another port
   .venv/bin/python scripts/cache_regression.py --base-url http://127.0.0.1:28942 \
       --log-dir /workspace/runtime/cache-proxy-scratch/new/requests
+  # Terra instead of the default Sol on the GPT route (coverage unchanged; recorded as models.codex)
+  .venv/bin/python scripts/cache_regression.py --codex-model terra
   # one route, a few scenarios
   .venv/bin/python scripts/cache_regression.py --providers anthropic ws_resume volatile_flip
 """
@@ -105,6 +107,8 @@ def run_one(args, provider: str, name: str, out_dir: Path) -> dict:
            "--json-out", str(json_out)]
     if args.model and provider == "anthropic":
         cmd += ["--model", args.model]
+    if getattr(args, "codex_model", None) and provider == "codex":  # None = prefix_repro's own default (sol)
+        cmd += ["--model", args.codex_model]
     if getattr(args, "cli_path", None) and provider == "anthropic":  # the canary applies to the Claude route only
         cmd += ["--cli-path", args.cli_path]
     t0 = time.time()
@@ -118,7 +122,7 @@ def run_one(args, provider: str, name: str, out_dir: Path) -> dict:
     res = {"scenario": name, "provider": provider, "seconds": round(time.time() - t0), "rc": rc}
     try:
         r = json.loads(json_out.read_text())[0]
-        res.update(status=r.get("status") or ("PASS" if r.get("ok") else "FAIL"),
+        res.update(status=r.get("status") or ("PASS" if r.get("ok") else "FAIL"), model=r.get("model"),
                    sessions=r.get("sessions") or [], error=r.get("error"),
                    provider_errors=len(r.get("provider_errors") or []),
                    bad_pairs=[{"b": p.get("b"), "class": p.get("class"), "ratio": p.get("ratio")}
@@ -168,6 +172,10 @@ def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, re
         # every route that actually ran; the gate refuses a report missing either required route
         "providers": providers_run,
         "providers_all_pass": sorted(p for p, ok in route_ok.items() if ok),
+        # the model each route actually ran (what prefix_repro.py resolved and used); recorded only, the
+        # gate (cache_gate.py) does not match on it. A route with mixed models lists them all, sorted.
+        "models": {p: "+".join(sorted({r["model"] for r in results if r["provider"] == p and r.get("model")}))
+                   or None for p in providers_run},
         "scenarios": "all" if not args.scenarios else list(args.scenarios),
         "code": code,
         "proxy_source": live,
@@ -189,6 +197,10 @@ def main(argv=None) -> int:
     ap.add_argument("--log-dir", default=DEFAULT_LOG_DIR,
                     help="the request log dir OF THE PROXY UNDER TEST (scratch proxies have their own)")
     ap.add_argument("--model", default=None, help="Claude model for the anthropic route (default: harness Haiku)")
+    ap.add_argument("--codex-model", default=None,
+                    help="GPT model for the codex route, for example terra (default: prefix_repro.py's own "
+                         "default, sol); passed to every codex-route run, reruns included, and recorded as "
+                         "models.codex in the report")
     ap.add_argument("--cli-path", default=None,
                     help="run the anthropic route's scenarios on this CLI executable (an obs-cli canary "
                          "gate); the argv[0] each process had is asserted and recorded. Default: bundled.")

@@ -142,3 +142,70 @@ def test_a_canary_run_never_writes_the_admission_report(tmp_path):
     default = SimpleNamespace(scenarios=[], base_url="u", cli_path=None)
     module._write_gate_report(tmp_path, args=default, ident={}, live="x", results=results, overall="PASS")
     assert (tmp_path / "gate.json").exists()
+
+
+def _runner(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts/cache_regression.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_codex_model_reaches_every_codex_route_run_only(monkeypatch, tmp_path):
+    module = _runner("cache_regression_codex_model_test")
+    cmds = []
+
+    class Done:
+        stdout, stderr, returncode = "", "", 0
+
+    monkeypatch.setattr(module.subprocess, "run", lambda cmd, **kw: cmds.append(cmd) or Done())
+    args = SimpleNamespace(base_url="u", log_dir="l", threshold=0.95, scenario_timeout=5, model=None,
+                           cli_path=None, codex_model="terra")
+    module.run_one(args, "codex", "baseline", tmp_path)
+    module.run_one(args, "anthropic", "baseline", tmp_path)
+    assert cmds[0][cmds[0].index("--model") + 1] == "terra"
+    assert "--model" not in cmds[1]  # the Claude route keeps the harness Haiku
+    args.codex_model = None  # default unchanged: no --model, so prefix_repro.py resolves its own default
+    module.run_one(args, "codex", "baseline", tmp_path)
+    assert "--model" not in cmds[2]
+    del args.codex_model  # callers that never heard of the option (older tests) still work
+    module.run_one(args, "codex", "baseline", tmp_path)
+    assert "--model" not in cmds[3]
+
+
+def test_run_one_reads_the_model_prefix_repro_used(monkeypatch, tmp_path):
+    module = _runner("cache_regression_model_read_test")
+
+    class Done:
+        stdout, stderr, returncode = "", "", 0
+
+    def fake_run(cmd, **kw):
+        out = Path(cmd[cmd.index("--json-out") + 1])
+        out.write_text('[{"scenario": "baseline", "status": "PASS", "ok": true, "model": "gpt-6.1-terra"}]')
+        return Done()
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    args = SimpleNamespace(base_url="u", log_dir="l", threshold=0.95, scenario_timeout=5, model=None,
+                           cli_path=None, codex_model="terra")
+    assert module.run_one(args, "codex", "baseline", tmp_path)["model"] == "gpt-6.1-terra"
+
+
+def test_report_records_the_model_of_each_route_and_admission_fields_are_unchanged(tmp_path):
+    module = _runner("cache_regression_models_report_test")
+    results = [
+        {"provider": "anthropic", "scenario": "a", "status": "PASS", "model": "claude-haiku-4-5-20251001"},
+        {"provider": "codex", "scenario": "a", "status": "PASS", "model": "gpt-6.1-terra"},
+        {"provider": "codex", "scenario": "b", "status": "SKIPPED"},
+    ]
+    args = SimpleNamespace(scenarios=[], base_url="u", cli_path=None)
+    module._write_gate_report(tmp_path, args=args, ident={"code": {"head": "x"}}, live="x", results=results,
+                              overall="PASS")
+    import json
+    report = json.loads((tmp_path / "gate.json").read_text())
+    assert report["models"] == {"anthropic": "claude-haiku-4-5-20251001", "codex": "gpt-6.1-terra"}
+    assert report["providers"] == ["anthropic", "codex"] and report["scenarios"] == "all"
+    mixed = [{"provider": "codex", "scenario": "a", "status": "PASS", "model": "gpt-6.1-sol"},
+             {"provider": "codex", "scenario": "b", "status": "PASS", "model": "gpt-6.1-terra"}]
+    module._write_gate_report(tmp_path, args=args, ident={"code": {}}, live="x", results=mixed, overall="PASS")
+    assert json.loads((tmp_path / "gate.json").read_text())["models"] == {"codex": "gpt-6.1-sol+gpt-6.1-terra"}
