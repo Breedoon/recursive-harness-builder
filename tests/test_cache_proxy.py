@@ -106,6 +106,21 @@ class TestNormalizeBillingHeader:
         assert count == 1
         assert body["system"][0]["text"] == cache_proxy.FIXED_BILLING_HEADER
 
+    def test_new_model_floor_does_not_shift_other_models(self):
+        # claude-fable-5-2 needs cc_version >= 2.1.290; every other model keeps
+        # the shared constant so its cached prefix is unchanged.
+        for model in ("claude-fable-5-2", "claude-mythos-5-2"):
+            body = _make_body(system=[_billing_block()])
+            body["model"] = model
+            cache_proxy.normalize_billing_header(body)
+            assert "cc_version=2.1.290.a37;" in body["system"][0]["text"]
+        for model in ("claude-fable-5-1", "claude-opus-5-5", "claude-haiku-5-5", None):
+            body = _make_body(system=[_billing_block()])
+            if model:
+                body["model"] = model
+            cache_proxy.normalize_billing_header(body)
+            assert body["system"][0]["text"] == cache_proxy.FIXED_BILLING_HEADER
+
     def test_idempotent(self):
         body = _make_body(system=[_billing_block()])
         cache_proxy.normalize_billing_header(body)

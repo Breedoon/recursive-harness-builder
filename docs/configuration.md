@@ -111,7 +111,7 @@ Use `OBS_DEFAULT_MODEL` for normal defaults and `OBS_AGENT_MODEL` only when you 
 Supported shorthands in current code include:
 
 - `claude` and `opus` → `claude-opus-5-5`
-- `sonnet` → `claude-sonnet-5-5` (1M context, 128K output); `fable` → `claude-fable-5-1`; `haiku` → `claude-haiku-5-5`
+- `sonnet` → `claude-sonnet-5-5` (1M context, 128K output); `fable` → `claude-fable-5-2` (1M context, 128K output; `claude-fable-5-1` stays addressable by its full name); `haiku` → `claude-haiku-5-5`
 - `gpt`/`terra`/`openai`/`chatgpt` → `gpt-6.1-terra` (ordinary-work default); `sol`/`gpt-sol`/`gpt-pro` → `gpt-6.1-sol`; `astra` → `gpt-6-astra`; `luna` → `gpt-6-luna`. Older model IDs, including `gpt-5.6-terra`, remain available by full name.
 - `gpt-mini`
 - Local Qwen: `qwen`/`qwen-fn`/`qwen-flash-next`/`qwen3.8-flash-next` → the DGX Sparks Qwen3.8 Flash Next (`local-sparks-qwen3.8-flash-next-abliterated`); `qwen-27b`/`qwen3.8-27b`/`local-qwen` → the 3090 Qwen (`local-qwen3.8-27b`). Plain `qwen` is a single switch, `DEFAULT_QWEN_MODEL` in `config.py`.

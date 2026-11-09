@@ -258,6 +258,26 @@ CC_VERSION = os.environ.get("CACHE_PROXY_CC_VERSION", "2.1.280.a37")
 FIXED_BILLING_HEADER = (
     f"x-anthropic-billing-header: cc_version={CC_VERSION}; cc_entrypoint=sdk-py; cch=0;"
 )
+# Models whose floor is above CC_VERSION get their own constant, so raising a
+# floor for a new model does not shift the cached prefix (one fleet-wide
+# re-bill) of every conversation on other models. The cache is per model, so a
+# conversation never changes header unless its model changes. claude-fable-5-2:
+# floor 2.1.290 (2026-11-09, "version 2.1.290 or newer is required").
+MODEL_CC_VERSIONS = (
+    ("claude-fable-5-2", "2.1.290.a37"),
+    ("claude-mythos-5-2", "2.1.290.a37"),
+)
+
+
+def billing_header_for_model(model) -> str:
+    if isinstance(model, str):
+        for prefix, version in MODEL_CC_VERSIONS:
+            if model.startswith(prefix):
+                return (
+                    f"x-anthropic-billing-header: cc_version={version}; "
+                    "cc_entrypoint=sdk-py; cch=0;"
+                )
+    return FIXED_BILLING_HEADER
 
 # Running stats
 stats = {
@@ -362,12 +382,13 @@ def normalize_billing_header(body: dict) -> int:
     if not system or not isinstance(system, list):
         return 0
     count = 0
+    header = billing_header_for_model(body.get("model"))
     for block in system:
         if not isinstance(block, dict) or block.get("type") != "text":
             continue
         text = block.get("text", "")
         if text.startswith("x-anthropic-billing-header:"):
-            block["text"] = FIXED_BILLING_HEADER
+            block["text"] = header
             count += 1
     stats["billing_normalized"] += count
     return count
@@ -861,7 +882,7 @@ MID_EFFORT_BETA = "mid-conversation-output-config-2026-07-01"
 MID_EFFORT_MODEL_PREFIXES = tuple(
     p.strip() for p in os.environ.get(
         "CACHE_PROXY_MID_EFFORT_MODELS",
-        "claude-opus-5,claude-fable-5-1,claude-mythos-5-1",
+        "claude-opus-5,claude-fable-5-1,claude-mythos-5-1,claude-fable-5-2,claude-mythos-5-2",
     ).split(",") if p.strip()
 )
 EFFORT_PIN_FILE = os.path.join(LOG_DIR, "effort-pins.json")
