@@ -718,7 +718,8 @@ _TRUSTED_HOOK_FUNCTIONS = {
         "assembler_eval_guard", "assembler_guard", "executor_guard", "holder_guard",
         "level_context_guard", "new_chat_guard", "reporter_spawn_guard", "router_guard",
         "service_writer_guard", "session_scope_guard_v1", "session_scope_guard_v2",
-        "supervisor_guard", "verifier_guard", "watchdog_check_guard", "watchdog_check_guard_v2",
+        "supervisor_guard", "verifier_guard", "verifier_reasoning_guard", "watchdog_check_guard",
+        "watchdog_check_guard_v2",
     )},
     **{f"{_TRUSTED_HOOK_DIRS[1]}/{name}_guard.py": frozenset({"check"})
        for name in ("assembler", "router", "verifier")},
