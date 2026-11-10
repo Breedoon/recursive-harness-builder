@@ -263,6 +263,12 @@ def _vii_part_a(run_dir: Path, registry_dir: Path) -> dict:
 _WRITE_EVENTS = {"os.mkdir", "os.rename", "os.remove", "os.rmdir", "os.chmod", "os.chown", "shutil.rmtree",
                  "os.symlink", "os.link", "os.truncate", "os.utime"}
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+# Argument positions of the directory file descriptors of each event, one per path argument:
+# an fd-relative name (shutil.rmtree's internals) is joined to what /proc/self/fd/<fd> points at.
+_DIR_FD_ARGS = {"os.remove": (1,), "os.rmdir": (1,), "os.mkdir": (2,), "os.chmod": (2,), "os.chown": (3,),
+                "os.rename": (2, 3), "os.link": (2, 3), "os.symlink": (None, 2), "os.utime": (3,), "shutil.rmtree": (1,)}
+# Devices the launcher opens for writing to silence a child's stdio (subprocess.DEVNULL): not files.
+_EXEMPT_DEVICES = ("/dev/null",)
 _audit_rows: list[dict] = []
 _audit_lock = threading.Lock()
 _audit_state = {"installed": False, "flushed": 0}
@@ -279,9 +285,16 @@ def _audit_hook(event: str, args: tuple) -> None:
                 return
             row = {"event": "open-write", "paths": [os.fsdecode(os.fspath(path))]}
         elif event in _WRITE_EVENTS:
-            paths = [os.fsdecode(os.fspath(item)) for item in args[:2] if isinstance(item, (str, bytes, os.PathLike))]
-            if event in {"os.symlink", "os.link"}:
-                paths = paths[1:]  # (src, dst): only dst is written
+            fds = _DIR_FD_ARGS.get(event, ())
+            paths = []
+            for index, item in enumerate(args[:2]):
+                if not isinstance(item, (str, bytes, os.PathLike)) or (event == "os.symlink" and index == 0):
+                    continue  # symlink(src, dst): only dst is written
+                name = os.fsdecode(os.fspath(item))
+                fd = args[fds[index]] if index < len(fds) and fds[index] is not None and len(args) > fds[index] else None
+                if isinstance(fd, int) and fd >= 0 and not os.path.isabs(name):
+                    name = os.path.join(os.readlink(f"/proc/self/fd/{fd}"), name)
+                paths.append(name)
             row = {"event": event, "paths": paths}
         elif event == "subprocess.Popen":
             argv = args[1] if len(args) > 1 else []
@@ -311,7 +324,8 @@ def flush_write_audit(run_dir: Path) -> list[dict]:
     for row in rows:
         if "paths" in row:
             row["resolved"] = [os.path.realpath(os.path.join(row["cwd"], path)) for path in row["paths"]]
-            row["under_e2e"] = all(_under(path, root) for path in row["resolved"])
+            row["exempt_device"] = all(path in _EXEMPT_DEVICES for path in row["resolved"])
+            row["under_e2e"] = all(_under(path, root) or path in _EXEMPT_DEVICES for path in row["resolved"])
     _audit_local.quiet = True
     try:
         with open(run_dir / "isolation" / "launcher-writes.jsonl", "a", encoding="utf-8") as stream:
@@ -333,8 +347,8 @@ def _vii_part_d(run_dir: Path) -> dict:
     by_dir: dict[str, int] = {}
     for row in writes:
         for path in row["resolved"]:
-            key = path.split("/")[:7] if not _under(path, root) else path[len(root):].split("/")[:3]
-            by_dir["/".join(key)] = by_dir.get("/".join(key), 0) + 1
+            key = path if not _under(path, root) else "e2e/" + (path[len(root) + 1:].split("/")[0] if path != root else "(the directory itself)")
+            by_dir[key] = by_dir.get(key, 0) + 1
     children: dict[str, int] = {}
     for row in rows:
         if row["event"] == "subprocess.Popen" and row["argv"]:
@@ -342,6 +356,8 @@ def _vii_part_d(run_dir: Path) -> dict:
             children[name] = children.get(name, 0) + 1
     return {"pass": bool(writes) and not outside, "events": len(rows), "write_events": len(writes),
             "by_directory": dict(sorted(by_dir.items())), "subprocess_children_by_command": children,
+            "exempt_device_events": sum(1 for row in writes if row.get("exempt_device")),
+            "exempt_reason": "open for write of /dev/null: the launcher's subprocess.DEVNULL stdio, a device, not a file",
             "outside_e2e": [{"event": row["event"], "resolved": row["resolved"], "cwd": row["cwd"]} for row in outside][:50],
             "outside_e2e_count": len(outside),
             "note": "subprocess children (git, tar, ssh) are listed, not judged; their writes are covered by code reading and (c)"}
