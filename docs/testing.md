@@ -41,12 +41,14 @@ file keeps the essentials next to the code. If they disagree, the vault note win
 
   ```bash
   deploy/obs-e2e/obs-e2e run --code "$PWD" --lanes 5 --suite smoke --profile dev
-  deploy/obs-e2e/obs-e2e run --code "$PWD" --lanes 5 --suite isolation --profile dev --prod-send
+  deploy/obs-e2e/obs-e2e run --code "$PWD" --lanes 5 --suite isolation --profile dev --prod-send \
+    --tests tests/e2e/harness/suites/test_isolation.py
   ```
 
   Results: `/workspace/runtime/e2e/runs/<run id>/` (`summary.json`, `timing.json`,
   `manifest.json`, `isolation/summary.json`). Exit 0 is green; a skip is never
-  green. Runs are serialized on the test userbot's launch lease; a second run waits.
+  green. The isolation run names `--tests …/test_isolation.py` because the EV-C
+  increment suites also carry the `isolation` tag. Runs are serialized on the test userbot's launch lease; a second run waits.
 - The isolation suite proves a run separate from production with seven probes:
   processes (i, ii), environment (iii), production state files (iv), the shared
   refresh token (v), the production update stream (vi), and production paths (vii:
