@@ -58,8 +58,12 @@ FORBIDDEN_PROD_METHODS = {"getUpdates", "setWebhook", "deleteWebhook", "close", 
 AGENT_CLI_MARKER = "claude_agent_sdk/_bundled/claude"
 E2E_ROOT = Path("/workspace/runtime/e2e")
 # Probe (vii)(c): production directories a lane must never change, listed non-recursively.
-VII_STAT_DIRS = ("/workspace", "/workspace/runtime", "/workspace/runtime/state", "/workspace/obs", "/home/agent")
-VII_SCAN_EXTRA = ("/workspace/obs/.venv", "/workspace/runtime/bin")
+# The set matches the obs-fleetwatch mode/owner manifest (P0 owner ops-230, 2026-11-10): /workspace,
+# /workspace/runtime, runtime/{state,git,secrets,bin}, /workspace/obs and the agent home. Only names
+# starting with the probe token are reported; nothing is read inside them.
+VII_STAT_DIRS = ("/workspace", "/workspace/runtime", "/workspace/runtime/state", "/workspace/runtime/git",
+                 "/workspace/runtime/secrets", "/workspace/runtime/bin", "/workspace/obs", "/home/agent")
+VII_SCAN_EXTRA = ("/workspace/obs/.venv",)
 _BOT_TOKEN = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
 
 
