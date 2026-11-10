@@ -6159,12 +6159,24 @@ class TelegramBot:
             if not stopped_turn_active or (owned and not root_alive) or remaining <= 0:
                 break
             await asyncio.sleep(min(0.1, remaining))
-        if owned:
+        # VEHICLE ONLY (obs-22-rc2-seed, never gated or promoted): name the owned processes and,
+        # with OBS_E2E_SEED_SKIP_STOP_KILL=1, skip the kill to seed a real survivor (obs-22.122).
+        owned_diag = []
+        for _p, _s in owned.items():
+            try:
+                _argv = (Path("/proc") / str(_p) / "cmdline").read_bytes().split(b"\0")[0].decode("utf-8", "replace")
+            except OSError:
+                _argv = "<gone>"
+            owned_diag.append(f"{_p}:{_argv[-60:]}:{'live' if _maint.process_identity_matches(_p, _s) else 'dead'}")
+        logger.warning("[stop_escalation] vehicle owned=%s route=%s", owned_diag, state.route)
+        if owned and not os.environ.get("OBS_E2E_SEED_SKIP_STOP_KILL"):
             try:
                 killed = _maint.kill_process_identities(owned)
                 logger.warning("[stop_escalation] killed retained pids=%s route=%s", killed, state.route)
             except Exception:
                 logger.warning("[stop_escalation] retained tree kill failed route=%s", state.route, exc_info=True)
+        elif owned:
+            logger.warning("[stop_escalation] SEEDED: kill skipped pids=%s route=%s", list(owned), state.route)
         if not stopped_turn_active:
             _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="turn_ended", owned=len(owned), survivors=lambda: sum(1 for p, s in _maint.refresh_process_tree(dict(owned)).items() if _maint.process_identity_matches(p, s)))
             return

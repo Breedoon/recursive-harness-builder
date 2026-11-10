@@ -1,0 +1,21 @@
+# rc2-seed-no-kill (VEHICLE obs-22-rc2-seed only, never gated or promoted): the dev lane with
+# OBS_E2E_SEED_SKIP_STOP_KILL=1, which the vehicle's _escalate_stop reads to skip the stop kill,
+# so a CLI child left alive through the stop window must show up as survivors > 0 (obs-22.122,
+# the Supervisor's seeded-failure proof). Only with --code on the seed vehicle itself.
+name = "rc2-seed-no-kill"
+credential_class = "dev"
+route = "claude"
+model = "haiku"
+claude_credentials = "shared-lane-copy"
+bot_pool = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+bot_pool_exclude = ["env:OBS_TEST_TELEGRAM_BOT_TOKEN"]
+userbot_id_ref = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
+needs_cliproxy = false
+spend_cap_usd = 5.0
+
+[lane_env]
+OBS_AGENT_MODEL = "haiku"
+OBS_DEFAULT_MODEL = "haiku"
+OBS_EFFORT_LEVEL = "low"
+OBS_NEW_SESSION_EFFORT_LEVEL = "low"
+OBS_E2E_SEED_SKIP_STOP_KILL = "1"
