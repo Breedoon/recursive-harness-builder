@@ -474,7 +474,9 @@ class SessionManager:
             eligible=eligible,
             resume_session_id=options.resume,
             db_path=cli_runtime.runtime_db_path(state_db),
-            model=clean_model,
+            # The percentage draw needs the model; a session whose explicit environment hands the
+            # CLI another credential (obs-cli reads this key, OBS does not strip it) is never drawn.
+            model=None if "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" in env else clean_model,
         )
         runtime = selection.runtime
         if selection.cli_path:
