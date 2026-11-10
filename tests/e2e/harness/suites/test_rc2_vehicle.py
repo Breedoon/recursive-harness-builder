@@ -58,11 +58,15 @@ async def test_stop_reaps_live_tool_child(lane):
     await _until_changed(lane, lambda: _messages(lane, child["topic_id"], None, f"CHILD-READY-{nonce}"))
     topic = int(child["topic_id"])
     tag = f"rc2seed{nonce.lower()}"
-    command = (f"setsid bash -c 'trap \"\" TERM INT HUP; exec -a {tag} sleep 600' </dev/null >/dev/null 2>&1 & "
-               f"sleep 60; echo SLEPT")
+    # A background Bash task outlives the CLI's own interrupt of the foreground tool (the first
+    # vehicle run showed the CLI tree-kills the foreground tool's descendants itself), so only
+    # OBS's stop kill can reap it.
+    background = f"exec -a {tag} sleep 600"
     log_mark = _log_size(lane)
-    sent = await lane.send(topic, f"Call the Bash tool exactly once, in the foreground, with exactly this command: "
-                           f"`{command}`. After it returns reply exactly DONE-{nonce}. Use no other tool.")
+    sent = await lane.send(topic, "Make exactly two Bash tool calls, one after the other, and use no other tool. "
+                           f"First: the Bash tool with run_in_background set to true and exactly this command: `{background}`. "
+                           f"Second, after the first has started: the Bash tool in the foreground with exactly this command: "
+                           f"`sleep 60; echo SLEPT`. After both reply exactly DONE-{nonce}.")
     start = await lane.wait("turn_start", match={"trigger_message_id": sent.message_id})
     # Wait inside the lane (its own PID namespace) until the tagged child exists; at most ~120 s.
     waited = await lane.exec("sh", "-c", f"n=0; until ps -eo args= | grep -q '^{tag}'; do n=$((n+1)); "
