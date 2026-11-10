@@ -23,8 +23,8 @@ Before committing such a change:
    every break with `scripts/prefix_diff.py`.
 
 Sensitive sites carry a `CACHE-PREFIX WARNING` comment
-(`grep -rn "CACHE-PREFIX" src scripts deploy`). Unit tests are a quick first
-check only; they are not evidence that caching still works.
+(`grep -rn "CACHE-PREFIX" src scripts deploy`). The live cache
+regression above is the check; nothing else is evidence that caching still works.
 
 **Never put the Claude Code billing placeholder** (`cch=` followed by five
 zeros; refer to it only by the regex `cch=0{5}`) into your context, files,

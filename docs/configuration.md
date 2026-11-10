@@ -344,7 +344,7 @@ breakpoint.
 Test runs: agents' shells inherit `CACHE_PROXY_LOG_DIR` from the daemon, so a
 test proxy subprocess writes `usage.jsonl` (and, with `CACHE_PROXY_SAVE_BODIES=1`,
 legacy `bodies/`) into the production directory unless you unset it:
-`env -u CACHE_PROXY_LOG_DIR -u CACHE_PROXY_SAVE_BODIES pytest ...`. The request
+`env -u CACHE_PROXY_LOG_DIR -u CACHE_PROXY_SAVE_BODIES <command>`. The request
 log itself stays off on non-production ports unless forced.
 
 ### Which model a fork runs on

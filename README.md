@@ -32,22 +32,9 @@ The example shows the intended pattern: describe coordination behavior in markdo
 
 ## Quick start
 
-For repository development, use the canonical isolated testing protocol in
-[`docs/testing.md`](docs/testing.md). Formal tests must run through the
-host-managed `obs-live-test` service, never inside the production-serving
-`obs-test` container or by relying on `OBS_PROFILE=test` alone. The authored
-command is intentionally parked and unrun in this slice:
-
-```text
-python -m scripts.isolated_test_runner --phase host-preflight --host-observation /workspace/runtime/obs-live-test-host-observation.json --compose-file deploy/obs-live-test/compose.yaml --lane unit --scenario focused --dry-run
-```
-
-This command performs only host preflight against an independently produced
-host observation; it does not create a service. Legacy live launch through
-`--test`, `--test-instance`, `--profile test`, or the parallel live-smoke script
-fails closed before runtime side effects. The protocol candidate is
-**UNVERIFIED / UNRESOLVED** for runtime, container, credential, test, live,
-integration, release, and production-readiness claims.
+For repository development, tests are E2E-grade only: they run in isolated container lanes
+through `deploy/obs-e2e/obs-e2e run`, never on the production-serving `obs-test` host.
+The OBS unit suite is deleted (AD-15); see [`docs/testing.md`](docs/testing.md) for the protocol.
 
 The recommended setup path is to let an agent install it for you.
 
@@ -111,9 +98,8 @@ canonical persisted queries instead, as described in
 
 Before changing normalization, compare actual bundled CLI live requests and JSONL
 with actual fork **and** resume requests. Notification visibility alone does not
-establish cache safety, and unit tests (`tests/test_cache_proxy_*.py`) are only a
-quick first check: none of the real break mechanisms found in October 2026 was
-caught by them. The required check is the live runner:
+establish cache safety, and unit tests are no evidence either: none of the real
+break mechanisms found in October 2026 was caught by them. The required check is the live runner:
 
 ```text
 .venv/bin/python scripts/cache_regression.py     # both routes, all scenarios

@@ -7,11 +7,10 @@ The project is a Python harness around Claude Code / Claude Agent SDK. Workflows
 ## Current support level
 
 - macOS, Linux/WSL, and native Windows are intended support targets.
-- Formal repository testing is canonical only through the separate host-managed
-  `obs-live-test` Ubuntu service documented in [`docs/testing.md`](docs/testing.md).
-  The current `obs-test` container is production-serving despite its name.
-- The testing protocol candidate is authored but **UNVERIFIED / UNRESOLVED**;
-  this slice did not install, authenticate, start, or exercise it.
+- Repository tests are E2E-grade only and run in isolated container lanes
+  (`deploy/obs-e2e/obs-e2e run`); see [`docs/testing.md`](docs/testing.md). The
+  current `obs-test` container is production-serving despite its name, so no OBS
+  test runs in it.
 - Native Windows has not yet been validated end-to-end; if first-run setup fails there, use WSL while the compatibility issue is narrowed.
 - Claude models can run without CLIProxyAPI.
 - Non-Claude models route through CLIProxyAPI via the cache proxy and need a working local CLIProxyAPI-compatible service.
@@ -39,7 +38,8 @@ cd <repo-directory>
 uv sync
 ```
 
-For development and tests:
+For development (tests are E2E-grade only and run in isolated container lanes;
+see [`docs/testing.md`](docs/testing.md)):
 
 ```bash
 uv sync --extra dev
@@ -104,10 +104,9 @@ Runtime profile parsing remains available for pure unit/library compatibility:
 
 Every public live entry point rejects `--test`, `--test-instance`,
 `--profile test`, and `OBS_PROFILE=test` before `.env` loading, daemon/cache
-startup, Telegram polling, or client construction. Do not run formal daemon/live
-tests in the current production-serving `obs-test` container. Use the exact
-host-preflight dry run in [`docs/testing.md`](docs/testing.md); only a later
-approved host executor may create `obs-live-test` after host attestation.
+startup, Telegram polling, or client construction. Do not run daemon/live tests
+in the current production-serving `obs-test` container; run them in isolated
+container lanes as described in [`docs/testing.md`](docs/testing.md).
 
 ## Required settings for Telegram mode
 

@@ -149,8 +149,8 @@ agent types, so OBS's own restart and deploy entry points ask the tool themselve
 - Every check fails open: a missing, crashing or slow (>10 s) freeze tool, or a corrupt
   state file, lets the restart proceed and only logs the error.
 
-Tests: `tests/test_freeze_guard.py` runs the real vault tool against isolated state;
-`tests/conftest.py` keeps every test off the production freeze file.
+Tests: see [`testing.md`](testing.md) (E2E lanes only; the former unit tests of this
+guard were deleted under AD-15).
 
 ## Restart and crash paths (unchanged five-minute window)
 

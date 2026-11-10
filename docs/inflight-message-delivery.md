@@ -89,14 +89,12 @@ proofs neither qualify provider caching nor demonstrate production deployment.
 
 ## Regression coverage
 
-With development dependencies installed, relevant local library/mock and
-loopback-only protocol suites are:
-
-```sh
-.venv/bin/pytest -q tests/test_hooks.py tests/test_inflight_message_delivery.py tests/test_runner.py tests/test_daemon.py tests/test_cache_proxy_reminder_span.py
-```
-
-These cover registered hooks retaining messages despite cancellation, hook vetoes,
+The former local library/mock and loopback-only protocol suites for this feature
+(`tests/test_hooks.py`, `test_inflight_message_delivery.py`, `test_runner.py`,
+`test_daemon.py`, `test_cache_proxy_reminder_span.py`) are no longer run on a
+host; tests are E2E-grade only, in isolated container lanes (see
+[`testing.md`](testing.md)). All but the last were deleted and exist only at rc1
+`5adcd336`. They covered registered hooks retaining messages despite cancellation, hook vetoes,
 parallel tool callbacks, pause and reply metadata; initial/continuation/background
 query ownership on failure/cancellation; duplicate-content input; HTTP adapter
 handoff; and the actual bundled CLI's parent JSONL plus native fork **and** resume
