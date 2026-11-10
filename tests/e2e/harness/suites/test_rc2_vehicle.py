@@ -82,6 +82,28 @@ async def test_stop_reaps_live_tool_child(lane):
     assert cleanup.get("survivors") == 0, proof
 
 
+async def test_settings_hook_probe(lane):
+    """Diagnostic: which fixture settings PreToolUse:Bash hook denies the seeded command in a lane."""
+    command = ("setsid bash -c 'trap \"\" TERM INT HUP; exec -a rc2seedprobe sleep 600' </dev/null >/dev/null 2>&1 & "
+               "sleep 60; echo SLEPT")
+    payload = {"session_id": "00000000-0000-0000-0000-000000000000", "hook_event_name": "PreToolUse",
+               "tool_name": "Bash", "cwd": "/workspace/runtime/git/obs-vault-active",
+               "tool_input": {"command": command, "description": "probe"}}
+    (lane.lane_dir / "state" / "rc2-hook-probe.json").write_text(json.dumps(payload))
+    ops = "/workspace/runtime/git/obs-vault-active/Projects/Personal Projects/Agentic/Agent Operations/scripts/ops"
+    script = "; ".join(
+        f"python3 \"{ops}/{name}.py\" {arg} < /workspace/runtime/state/rc2-hook-probe.json > /tmp/o 2> /tmp/e; "
+        f"echo \"== {name} exit=$? out=$(head -c 300 /tmp/o) err=$(head -c 600 /tmp/e)\""
+        for name, arg in (("bash_guard", "hook"), ("freeze", "hook"), ("safe_sync", "hook"), ("shared_guard", "hook"),
+                          ("checkpoint_hook", "pre")))
+    result = await lane.exec("bash", "-c", script, timeout=60,
+                             env={"CLAUDE_CODE_AGENT_NAME": "rc2-probe", "CLAUDE_CODE_TEAM_NAME": "rc2-probe"})
+    path = lane.run_dir / "tests" / lane.name / "rc2-hook-probe.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, indent=2) + "\n")
+    assert "exit=2" not in (result.get("stdout") or ""), result
+
+
 async def test_trusted_hook_launch(lane):
     nonce = _nonce()
     topic = await lane.new_topic(f"rc2 hook {nonce}")
