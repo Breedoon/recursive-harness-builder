@@ -45,9 +45,18 @@ def _log_size(lane):
 
 async def test_stop_reaps_live_tool_child(lane):
     nonce = _nonce()
-    topic = await lane.new_topic(f"rc2 stop child {nonce}")
-    primed = await lane.turn(topic, f"Reply with exactly: READY-{nonce}")
+    root = await lane.new_topic(f"rc2 stop child {nonce}")
+    primed = await lane.turn(root, f"Reply with exactly: READY-{nonce}")
     assert f"READY-{nonce}" in primed.text and primed.end.get("session_id"), primed.end
+    # Root chats are reasoning-only (no Bash); an executor-hooked child runs the tool, as in
+    # test_obs22_agent_shapes.test_maintenance_restart_mid_tool_recovers_by_fork.
+    child = await _launch(lane, root, primed, {"display_name": f"rc2 stop child {nonce}", "fork": False,
+                          "effort": "low", "hooks": json.dumps({"PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/executor_guard.py::check"}),
+                          "prompt": f"Reply with exactly: CHILD-READY-{nonce}"}, nonce)
+    child_end = await lane.wait("turn_end", agent=child["agent_name"], after=child)
+    assert not child_end.get("failed"), child_end
+    await _until_changed(lane, lambda: _messages(lane, child["topic_id"], None, f"CHILD-READY-{nonce}"))
+    topic = int(child["topic_id"])
     tag = f"rc2seed{nonce.lower()}"
     command = (f"setsid bash -c 'trap \"\" TERM INT HUP; exec -a {tag} sleep 600' </dev/null >/dev/null 2>&1 & "
                f"sleep 60; echo SLEPT")
@@ -65,7 +74,7 @@ async def test_stop_reaps_live_tool_child(lane):
     stop = await lane.command(topic, "/stop")
     end, cleanup = await asyncio.gather(
         lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start),
-        lane.wait("stop_cleanup", agent=topic, after=start),
+        lane.wait("stop_cleanup", agent=child["agent_name"], after=start),
     )
     after = [r for r in await lane.procs() if (r.get("args") or [None])[0] == tag]
     text = _log_since(lane, log_mark)
