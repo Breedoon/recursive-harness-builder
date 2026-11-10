@@ -48,19 +48,20 @@ async def test_stop_reaps_live_tool_child(lane):
     topic = await lane.new_topic(f"rc2 stop child {nonce}")
     primed = await lane.turn(topic, f"Reply with exactly: READY-{nonce}")
     assert f"READY-{nonce}" in primed.text and primed.end.get("session_id"), primed.end
-    marker = lane.lane_dir / "state" / f"rc2-stop-child-{nonce}"
     tag = f"rc2seed{nonce.lower()}"
     command = (f"setsid bash -c 'trap \"\" TERM INT HUP; exec -a {tag} sleep 600' </dev/null >/dev/null 2>&1 & "
-               f"touch /workspace/runtime/state/{marker.name}; sleep 60; echo SLEPT")
+               f"sleep 60; echo SLEPT")
     log_mark = _log_size(lane)
     sent = await lane.send(topic, f"Call the Bash tool exactly once, in the foreground, with exactly this command: "
                            f"`{command}`. After it returns reply exactly DONE-{nonce}. Use no other tool.")
     start = await lane.wait("turn_start", match={"trigger_message_id": sent.message_id})
-
-    async def started():
-        return marker.exists()
-    await _until_changed(lane, started)
+    # Wait inside the lane (its own PID namespace) until the tagged child exists; at most ~120 s.
+    waited = await lane.exec("sh", "-c", f"n=0; until ps -eo args= | grep -q '^{tag}'; do n=$((n+1)); "
+                             f"[ $n -gt 600 ] && echo MISSING && exit 0; sleep 0.2; done; echo PRESENT", timeout=150)
     before = [r for r in await lane.procs() if (r.get("args") or [None])[0] == tag]
+    if "PRESENT" not in (waited.get("stdout") or ""):
+        text = _log_since(lane, log_mark)
+        pytest.fail(f"the seeded child never started: {waited} {[l[-300:] for l in text.splitlines() if 'flush_turn' in l]}")
     stop = await lane.command(topic, "/stop")
     end, cleanup = await asyncio.gather(
         lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start),
@@ -96,16 +97,21 @@ async def test_trusted_hook_launch(lane):
         assert not end.get("failed") and end.get("session_id"), end
         await _until_changed(lane, lambda: _messages(lane, child["topic_id"], None, f"GUARDED-{nonce}"))
 
+        # A fresh parent: the first one is busy with the child's completion notice for a while.
+        topic2 = await lane.new_topic(f"rc2 hook untrusted {nonce}")
+        parent2 = await lane.turn(topic2, f"Reply with exactly: READY2-{nonce}")
+        assert f"READY2-{nonce}" in parent2.text, parent2.messages
         mark, log_mark = lane.events.mark(), _log_size(lane)
         bad = json.dumps({"PreToolUse": UNTRUSTED})
-        refused = await lane.turn(topic, "Call the `mcp__obs-agent__AgentTask` tool exactly once with these exact arguments, "
+        refused = await lane.turn(topic2, "Call the `mcp__obs-agent__AgentTask` tool exactly once with these exact arguments, "
                                   "then reply with the tool result's text verbatim; use no other tool.\n"
                                   + json.dumps({"display_name": f"rc2 untrusted {nonce}", "fork": False, "effort": "low",
                                                 "hooks": bad, "prompt": "Reply with exactly: SHOULD-NOT-RUN"}))
         log = _log_since(lane, log_mark)
         rejected = [l.split("] ", 1)[-1][:300] for l in log.splitlines() if "Rejected user hook" in l]
         new_agents = [e for e in lane.find("turn_start", after=mark)
-                      if e.get("agent_name") not in (None, parent.end["agent_name"])]
+                      if e.get("agent_name") not in (None, parent.end["agent_name"], parent2.end["agent_name"],
+                                                     child["agent_name"])]
         proof["untrusted"] = {"reply": refused.text[:400], "rejected_log": rejected, "new_agent_starts": new_agents}
         assert any("credit_state_handoff.py" in l and "not a trusted hook capability" in l for l in rejected), proof
         assert not new_agents, proof
