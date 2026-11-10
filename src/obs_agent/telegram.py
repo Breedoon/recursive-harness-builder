@@ -6182,6 +6182,10 @@ class TelegramBot:
             return
         logger.warning("[stop_escalation] disconnecting stopped CLI pid=%s route=%s", pid, state.route)
         session_mgr = state.session_manager
+        if os.environ.get("OBS_E2E_SEED_SKIP_STOP_KILL"):  # VEHICLE ONLY: leave the stopped CLI alive
+            logger.warning("[stop_escalation] SEEDED: stopped CLI teardown skipped pid=%s route=%s", pid, state.route)
+            _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="disconnected", owned=len(owned), survivors=lambda: sum(1 for p, s in _maint.refresh_process_tree(dict(owned)).items() if _maint.process_identity_matches(p, s)))
+            return
         try:
             async with asyncio.timeout(10.0):
                 async with session_mgr._lock:

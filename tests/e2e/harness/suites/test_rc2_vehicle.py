@@ -58,15 +58,15 @@ async def test_stop_reaps_live_tool_child(lane):
     await _until_changed(lane, lambda: _messages(lane, child["topic_id"], None, f"CHILD-READY-{nonce}"))
     topic = int(child["topic_id"])
     tag = f"rc2seed{nonce.lower()}"
-    # A background Bash task outlives the CLI's own interrupt of the foreground tool (the first
-    # vehicle run showed the CLI tree-kills the foreground tool's descendants itself), so only
-    # OBS's stop kill can reap it.
-    background = f"exec -a {tag} sleep 600"
+    # The CLI tree-kills the foreground tool's descendants itself on interrupt (vehicle run
+    # 20261110T191058Z-92f85c), and run_in_background is not offered, so the owned process that the
+    # seed leaves alive is the stopped CLI itself (the obs-22.43 shape). The tagged child shows the
+    # tool tree existed at /stop.
+    command = (f"setsid bash -c 'trap \"\" TERM INT HUP; exec -a {tag} sleep 600' </dev/null >/dev/null 2>&1 & "
+               f"sleep 60; echo SLEPT")
     log_mark = _log_size(lane)
-    sent = await lane.send(topic, "Make exactly two Bash tool calls, one after the other, and use no other tool. "
-                           f"First: the Bash tool with run_in_background set to true and exactly this command: `{background}`. "
-                           f"Second, after the first has started: the Bash tool in the foreground with exactly this command: "
-                           f"`sleep 60; echo SLEPT`. After both reply exactly DONE-{nonce}.")
+    sent = await lane.send(topic, f"Call the Bash tool exactly once, in the foreground, with exactly this command: "
+                           f"`{command}`. After it returns reply exactly DONE-{nonce}. Use no other tool.")
     start = await lane.wait("turn_start", match={"trigger_message_id": sent.message_id})
     # Wait inside the lane (its own PID namespace) until the tagged child exists; at most ~120 s.
     waited = await lane.exec("sh", "-c", f"n=0; until ps -eo args= | grep -q '^{tag}'; do n=$((n+1)); "
@@ -76,23 +76,27 @@ async def test_stop_reaps_live_tool_child(lane):
         text = _log_since(lane, log_mark)
         pytest.fail(f"the seeded child never started: {waited} {[l[-300:] for l in text.splitlines() if 'flush_turn' in l]}")
     stop = await lane.command(topic, "/stop")
-    end, cleanup = await asyncio.gather(
-        lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start),
-        lane.wait("stop_cleanup", agent=child["agent_name"], after=start),
-    )
-    after = [r for r in await lane.procs() if (r.get("args") or [None])[0] == tag]
+    cleanup = await lane.wait("stop_cleanup", agent=child["agent_name"], after=start, timeout=180)
+    rows = await lane.procs()
+    after = [r for r in rows if (r.get("args") or [None])[0] == tag]
+    clis = [{"pid": r["pid"], "ppid": r["ppid"], "argv0": r["args"][0][-60:]} for r in rows
+            if r.get("args") and "--output-format" in r["args"]]
     text = _log_since(lane, log_mark)
     proof = {"run_id": lane.manifest["run_id"], "lane": lane.name, "code_dir": lane.info.get("code_dir"),
              "profile": lane.profile.name, "stop_cleanup": cleanup, "child_before": before, "child_after": after,
+             "clis_after": clis,
              "escalation_lines": [l.split("] ", 1)[-1][:300] for l in text.splitlines() if "[stop_escalation]" in l]}
     for row in after:  # leave nothing behind in the lane
         await lane.exec("sh", "-c", f"kill -9 {int(row['pid'])} 2>/dev/null; true", timeout=10)
     path = lane.run_dir / "tests" / lane.name / "rc2-stop-child.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(proof, indent=2, default=str) + "\n")
-    assert before, proof  # the seeded child existed when /stop was sent
+    assert before, proof  # the tool tree existed when /stop was sent
     assert stop.message_id > sent.message_id
     assert cleanup.get("survivors") == 0, proof
+    end = await lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start)
+    proof["stopped_turn_end"] = end
+    path.write_text(json.dumps(proof, indent=2, default=str) + "\n")
 
 
 async def test_settings_hook_probe(lane):
