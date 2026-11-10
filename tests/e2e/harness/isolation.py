@@ -1,4 +1,4 @@
-"""Isolation proof, obs-test side (design-v3 §2.1 probes (i)–(vi); G5, G11; ADR-0016, ADR-0036).
+"""Isolation proof, obs-test side (design-v3 §2.1 probes (i)–(vi) and E-TP probe (vii); G5, G11; ADR-0016, ADR-0036).
 
 Probes (i)–(iii) run inside lanes (``suites/test_isolation.py`` through lanectl).
 This module runs the parts only obs-test can see, before and after a run:
@@ -17,6 +17,18 @@ This module runs the parts only obs-test can see, before and after a run:
   close/logOut row for the prod-send token in ``runner/botapi-calls.jsonl``, in a run
   that exercised prod-send.
 
+- (vii) "a lane cannot touch production paths", obs-test halves (the lane half is
+  ``suites/test_isolation.py``, which checks each lane's own mount table and writes
+  token-named files only where the mounts allow):
+  (a) ``docker inspect`` Mounts of every container the launcher started: every
+  read-write source lies under the host path of this run's directory (the runner
+  also gets the registry and locks directories under ``/workspace/runtime/e2e/``);
+  (c) a read-only stat (mode, uid, gid; ctime reported, never judged: production
+  writes into ``state/`` constantly) of the production directories and files before
+  and after, plus a non-recursive scan of them for this run's probe token;
+  (d) an audit hook in the launcher process (``sys.addaudithook``) records every
+  write-flavoured call; every path must resolve under ``/workspace/runtime/e2e/``.
+
 Everything is written to ``<run>/isolation/``; values are fingerprints and counts.
 """
 
@@ -24,8 +36,12 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
+import re
 import signal
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -40,6 +56,16 @@ PROD_LOG = Path(os.environ.get("OBS_E2E_PROD_LOG") or "/workspace/runtime/logs/t
 CONFLICT = b"Conflict: terminated by other getUpdates request"
 FORBIDDEN_PROD_METHODS = {"getUpdates", "setWebhook", "deleteWebhook", "close", "logOut"}
 AGENT_CLI_MARKER = "claude_agent_sdk/_bundled/claude"
+E2E_ROOT = Path("/workspace/runtime/e2e")
+# Probe (vii)(c): production directories a lane must never change, listed non-recursively.
+VII_STAT_DIRS = ("/workspace", "/workspace/runtime", "/workspace/runtime/state", "/workspace/obs", "/home/agent")
+VII_SCAN_EXTRA = ("/workspace/obs/.venv", "/workspace/runtime/bin")
+_BOT_TOKEN = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+
+
+def probe_token(run_id: str) -> str:
+    """The file-name prefix lane-side probe (vii) uses; obs-test scans production directories for it."""
+    return f".obs-e2e-vii-{run_id}"
 
 
 def _stat(path: Path) -> dict:
@@ -104,6 +130,7 @@ def before_run(run_dir: Path, *, with_sentinel: bool) -> dict:
         "files": {name: _stat(path) for name, path in PROD_FILES.items()},
         "refresh_token_fp": refresh_token_fingerprint(),
         "prod_log": {"path": str(PROD_LOG), **_stat(PROD_LOG)},
+        "vii": _vii_snapshot(),
     }
     if with_sentinel:
         pid = start_host_sentinel(run_dir)
@@ -152,7 +179,175 @@ def _lane_pin_keys(run_dir: Path) -> set[str]:
     return keys
 
 
-def after_run(run_dir: Path, before: dict, *, prod_send_exercised_required: bool) -> dict:
+def _vii_stat(path: str) -> dict:
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        return {"exists": False, "errno": exc.errno}
+    return {"exists": True, "mode": oct(st.st_mode & 0o7777), "uid": st.st_uid, "gid": st.st_gid, "ctime": st.st_ctime}
+
+
+def _vii_snapshot() -> dict:
+    return {"stat": {path: _vii_stat(path) for path in (*VII_STAT_DIRS, *map(str, PROD_FILES.values()))}}
+
+
+def _vii_scan(token: str, directories: list[str]) -> dict:
+    """Non-recursive: names in each directory that start with the probe token."""
+    found: dict[str, list[str]] = {}
+    errors: dict[str, str] = {}
+    for directory in directories:
+        try:
+            with os.scandir(directory) as entries:
+                hits = sorted(entry.name for entry in entries if entry.name.startswith(token))
+        except OSError as exc:
+            errors[directory] = exc.__class__.__name__
+            continue
+        if hits:
+            found[directory] = hits
+    return {"found": found, "unreadable": errors}
+
+
+def _under(path: str, root: str) -> bool:
+    path, root = posixpath.normpath(path), posixpath.normpath(root)
+    return path == root or path.startswith(root + "/")
+
+
+def _vii_part_c(run_dir: Path, before: dict) -> dict:
+    token = probe_token(run_dir.name)
+    after = _vii_snapshot()["stat"]
+    rows, ok = {}, True
+    for path, start in before["vii"]["stat"].items():
+        end = after[path]
+        same = all(start.get(key) == end.get(key) for key in ("exists", "mode", "uid", "gid"))
+        rows[path] = {"before": start, "after": end, "mode_uid_gid_equal": same,
+                      "ctime_changed": start.get("ctime") != end.get("ctime")}
+        ok = ok and same
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    code_dir = (manifest.get("code") or {}).get("mounted_path")
+    scanned = [*VII_STAT_DIRS, *VII_SCAN_EXTRA, *([code_dir] if code_dir else [])]
+    scan = _vii_scan(token, scanned)
+    return {"pass": ok and not scan["found"] and not scan["unreadable"], "token": token, "stat": rows,
+            "ctime_note": "ctime is reported, not judged: production writes into state/ constantly",
+            "scanned_directories": scanned, "token_found": scan["found"], "unreadable": scan["unreadable"]}
+
+
+def _vii_part_a(run_dir: Path, registry_dir: Path) -> dict:
+    from . import docker
+    host_run = docker.to_host_path(run_dir)
+    host_e2e = docker.to_host_path(E2E_ROOT)
+    runner_extra = [docker.to_host_path(registry_dir), docker.to_host_path(E2E_ROOT / "locks")]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((run_dir / "isolation").glob("mounts-*.json"))]
+    containers, violations = {}, []
+    for record in records:
+        rw = [row for row in record["mounts"] if row.get("RW")]
+        for row in rw:
+            source = row.get("Source") or ""
+            allowed = row.get("Type") == "bind" and (
+                _under(source, host_run) or
+                (record["role"] == "runner" and _under(source, host_e2e) and any(_under(source, extra) for extra in runner_extra)))
+            if not allowed:
+                violations.append({"container": record["container"], "role": record["role"],
+                                   "type": row.get("Type"), "source": source, "destination": row.get("Destination")})
+        containers[record["container"]] = {
+            "role": record["role"], "mounts": len(record["mounts"]),
+            "rw_sources": [{"source": row.get("Source"), "destination": row.get("Destination"), "type": row.get("Type")} for row in rw]}
+    expected = {lane["container"] for lane in manifest.get("lanes", [])} | {f"obs-e2e-{run_dir.name}-runner"}
+    missing = sorted(expected - set(containers))
+    return {"pass": not violations and not missing, "host_run_dir": host_run, "host_e2e_root": host_e2e,
+            "runner_rw_allowed": runner_extra, "containers": containers, "violations": violations,
+            "missing_records": missing}
+
+
+# ---- (vii)(d): the launcher's own writes -------------------------------------------------------
+_WRITE_EVENTS = {"os.mkdir", "os.rename", "os.remove", "os.rmdir", "os.chmod", "os.chown", "shutil.rmtree",
+                 "os.symlink", "os.link", "os.truncate", "os.utime"}
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+_audit_rows: list[dict] = []
+_audit_lock = threading.Lock()
+_audit_state = {"installed": False, "flushed": 0}
+_audit_local = threading.local()
+
+
+def _audit_hook(event: str, args: tuple) -> None:
+    if getattr(_audit_local, "quiet", False):
+        return
+    try:
+        if event == "open":
+            path, _mode, flags = args[0], args[1], args[2]
+            if isinstance(path, int) or not isinstance(flags, int) or not flags & _WRITE_FLAGS:
+                return
+            row = {"event": "open-write", "paths": [os.fsdecode(os.fspath(path))]}
+        elif event in _WRITE_EVENTS:
+            paths = [os.fsdecode(os.fspath(item)) for item in args[:2] if isinstance(item, (str, bytes, os.PathLike))]
+            if event in {"os.symlink", "os.link"}:
+                paths = paths[1:]  # (src, dst): only dst is written
+            row = {"event": event, "paths": paths}
+        elif event == "subprocess.Popen":
+            argv = args[1] if len(args) > 1 else []
+            row = {"event": event, "argv": [_BOT_TOKEN.sub("bot<id>:<redacted>", os.fsdecode(item)) for item in argv]}
+        else:
+            return
+        row["t"], row["cwd"] = time.time(), os.getcwd()
+        with _audit_lock:
+            _audit_rows.append(row)
+    except Exception:
+        return  # an audit hook must never break the launcher
+
+
+def install_write_audit() -> None:
+    """Start recording the launcher's writes in memory; ``flush_write_audit`` saves them."""
+    if not _audit_state["installed"]:
+        sys.addaudithook(_audit_hook)
+        _audit_state["installed"] = True
+
+
+def flush_write_audit(run_dir: Path) -> list[dict]:
+    """Append rows not yet saved to isolation/launcher-writes.jsonl; return the new, resolved rows."""
+    with _audit_lock:
+        rows = _audit_rows[_audit_state["flushed"]:]
+        _audit_state["flushed"] = len(_audit_rows)
+    root = str(E2E_ROOT.resolve())
+    for row in rows:
+        if "paths" in row:
+            row["resolved"] = [os.path.realpath(os.path.join(row["cwd"], path)) for path in row["paths"]]
+            row["under_e2e"] = all(_under(path, root) for path in row["resolved"])
+    _audit_local.quiet = True
+    try:
+        with open(run_dir / "isolation" / "launcher-writes.jsonl", "a", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(json.dumps(row) + "\n")
+    finally:
+        _audit_local.quiet = False
+    return rows
+
+
+def _vii_part_d(run_dir: Path) -> dict:
+    if not _audit_state["installed"]:
+        return {"pass": False, "error": "write audit was not installed in the launcher"}
+    flush_write_audit(run_dir)
+    rows = [json.loads(line) for line in (run_dir / "isolation" / "launcher-writes.jsonl").read_text(encoding="utf-8").splitlines()]
+    writes = [row for row in rows if "paths" in row]
+    outside = [row for row in writes if not row["under_e2e"]]
+    root = str(E2E_ROOT.resolve())
+    by_dir: dict[str, int] = {}
+    for row in writes:
+        for path in row["resolved"]:
+            key = path.split("/")[:7] if not _under(path, root) else path[len(root):].split("/")[:3]
+            by_dir["/".join(key)] = by_dir.get("/".join(key), 0) + 1
+    children: dict[str, int] = {}
+    for row in rows:
+        if row["event"] == "subprocess.Popen" and row["argv"]:
+            name = posixpath.basename(row["argv"][0])
+            children[name] = children.get(name, 0) + 1
+    return {"pass": bool(writes) and not outside, "events": len(rows), "write_events": len(writes),
+            "by_directory": dict(sorted(by_dir.items())), "subprocess_children_by_command": children,
+            "outside_e2e": [{"event": row["event"], "resolved": row["resolved"], "cwd": row["cwd"]} for row in outside][:50],
+            "outside_e2e_count": len(outside),
+            "note": "subprocess children (git, tar, ssh) are listed, not judged; their writes are covered by code reading and (c)"}
+
+
+def after_run(run_dir: Path, before: dict, *, prod_send_exercised_required: bool, registry_dir: Path | None = None) -> dict:
     out_dir = run_dir / "isolation"
     lane_sessions = _lane_session_ids(run_dir)
     lane_pins = _lane_pin_keys(run_dir)
@@ -219,6 +414,10 @@ def after_run(run_dir: Path, before: dict, *, prod_send_exercised_required: bool
     if sentinel:
         results["ii_host"] = {"pid": sentinel["pid"], "alive_after": sentinel_alive(sentinel["pid"]),
                               "argv0": sentinel.get("argv0")}
+    # (vii) obs-test halves: (a) mount table, (c) production stat/scan, (d) launcher write audit
+    registry = registry_dir or Path(os.environ.get("OBS_E2E_REGISTRY_DIR") or E2E_ROOT / "registry")
+    results["vii_host"] = {"a": _vii_part_a(run_dir, registry), "c": _vii_part_c(run_dir, before),
+                           "d": _vii_part_d(run_dir)}
     (out_dir / "after.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     return results
 
@@ -240,6 +439,10 @@ def summarize(run_dir: Path, after: dict) -> dict:
         "iii": {"pass": lanes_pass("iii"), "lanes": {k: v.get("iii") for k, v in lane_side.items()}},
         "iv": after.get("iv"), "v": after.get("v"), "vi": after.get("vi"),
     }
-    summary["all_pass"] = all(bool((summary[p] or {}).get("pass")) for p in ("i", "ii", "iii", "iv", "v", "vi"))
+    host = after.get("vii_host") or {}
+    summary["vii"] = {"pass": lanes_pass("vii") and all(bool((host.get(part) or {}).get("pass")) for part in ("a", "c", "d")),
+                      "a_mounts": host.get("a"), "b_lanes": {k: v.get("vii") for k, v in lane_side.items()},
+                      "c_production_paths": host.get("c"), "d_launcher_writes": host.get("d")}
+    summary["all_pass"] = all(bool((summary[p] or {}).get("pass")) for p in ("i", "ii", "iii", "iv", "v", "vi", "vii"))
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary

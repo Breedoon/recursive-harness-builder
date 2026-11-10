@@ -147,9 +147,9 @@ def ensure_image(context_dir: Path) -> str:
     return image
 
 
-def _validate_source(source: Path) -> None:
+def _validate_source(source: Path, *, read_only: bool = True) -> None:
     resolved = source.resolve()
-    # INVARIANT(side-effects): only fixture sources may occupy production paths in a lane; a production source or any ancestor of one is refused. Breaking it lets a lane write production state through its production-path mounts.
+    # INVARIANT(side-effects): only fixture sources may occupy production paths in a lane; a production source or any ancestor of one is refused, and a source that is NOT read-only must lie under /workspace/runtime/e2e/ (never its private/ or secrets/). Breaking it lets a lane write production state through its production-path mounts.
     # Check sources (including symlink targets/ancestor mounts), not destinations.
     # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
     for forbidden in _FORBIDDEN_SOURCES:
@@ -158,11 +158,19 @@ def _validate_source(source: Path) -> None:
                 raise ValueError(f"Production source must not be mounted into E2E: {source}")
     if resolved.name == "docker.sock":
         raise ValueError(f"Docker socket must not be mounted into E2E: {source}")
+    if not read_only:
+        root = E2E_ROOT.resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError(f"A read-write E2E mount source must lie under {root}: {source}")
+        for private in ("private", "secrets"):
+            blocked = root / private
+            if resolved.is_relative_to(blocked) or blocked.is_relative_to(resolved):
+                raise ValueError(f"A read-write E2E mount must not expose {blocked}: {source}")
 
 
 def _mount_argument(mount: Mount) -> str:
     source = Path(mount.src)
-    _validate_source(source)
+    _validate_source(source, read_only=mount.ro)
     destination = Path(mount.dst)
     if not destination.is_absolute():
         raise ValueError(f"Container mount destination must be absolute: {mount.dst}")
@@ -196,7 +204,7 @@ def run_container(
     # Validate all sources before any Docker operation, even host-path discovery.
     _validate_source(Path(env_file))
     for mount in mounts:
-        _validate_source(Path(mount.src))
+        _validate_source(Path(mount.src), read_only=mount.ro)
     args = [
         "run", "--detach", "--name", name,
         "--init", "--user", "1000:1000", "--cgroup-parent", "obs-e2e.slice",
@@ -218,6 +226,18 @@ def run_container(
         args.extend(["--mount", _mount_argument(mount)])
     result = _run([*args, image, *command])
     return f"dry-run:{name}" if _dry_run() else result.stdout.strip()
+
+
+def record_mounts(name: str, role: str, out_path: Path) -> None:
+    """Save the container's actual Docker mounts (host Source, Destination, RW, Type) for probe (vii)(a).
+
+    Paths and flags only: no environment, no labels, nothing secret-bearing.
+    """
+    if _dry_run():
+        return
+    rows = [{"Type": item.get("Type"), "Source": item.get("Source"), "Destination": item.get("Destination"),
+             "RW": bool(item.get("RW"))} for item in inspect(name).get("Mounts", [])]
+    out_path.write_text(json.dumps({"container": name, "role": role, "mounts": rows}, indent=2) + "\n", encoding="utf-8")
 
 
 def ps(run_id: str | None = None) -> list[dict]:

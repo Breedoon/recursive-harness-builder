@@ -11,6 +11,29 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
+
+def _inside_harness_container() -> bool:
+    # The runner container gets OBS_E2E_RUN_ID from launcher._runner_env and runs under
+    # `docker run --init`, so its PID 1 is docker-init; obs-test's PID 1 is supervisord.
+    try:
+        init = Path("/proc/1/comm").read_text().strip()
+    except OSError:
+        return False
+    return bool(os.environ.get("OBS_E2E_RUN_ID")) and init == "docker-init"
+
+
+# INVARIANT(side-effects): OBS tests run only inside an obs-e2e container (L9, AD-15). Collecting tests/e2e on obs-test starts nothing, so a pytest typed on the host never reaches production paths. There is no override switch. Breaking it lets a host pytest share obs-test's user and process tree with production.
+# Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
+if not _inside_harness_container():
+    pytest.exit(
+        "obs-e2e suites run only inside a harness container (L9, AD-15): use "
+        "`deploy/obs-e2e/obs-e2e run --code <worktree> --suite <name> --profile <profile>`; "
+        "see the OBS Platform Testing Protocol and the E2E Harness How to Run note.",
+        returncode=2,
+    )
+
 _REAL_KILL, _REAL_KILLPG = os.kill, os.killpg
 _PYTEST_PID = os.getpid()
 

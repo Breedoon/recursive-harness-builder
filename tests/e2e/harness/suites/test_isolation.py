@@ -1,5 +1,5 @@
-"""obs-e2e isolation proof, lane side (design-v3 §2.1 probes (i)–(iii), plus the lane
-halves of (v) and (vi)). The obs-test halves are tests/e2e/harness/isolation.py.
+"""obs-e2e isolation proof, lane side (design-v3 §2.1 probes (i)–(iii) and E-TP probe (vii),
+plus the lane halves of (v) and (vi)). The obs-test halves are tests/e2e/harness/isolation.py.
 
 Each test writes its record to ``<run>/isolation/lane-<lane>.json``; the launcher
 merges them into ``isolation/summary.json`` with the obs-test-side probes.
@@ -12,6 +12,8 @@ import time
 import uuid
 
 import pytest
+
+from ..isolation import probe_token
 
 pytestmark = [pytest.mark.suite("isolation"), pytest.mark.needs(all_lanes=True)]
 
@@ -194,3 +196,119 @@ async def test_vi_prod_send_is_update_free(lane):
                               "edit_ok": edited.get("ok"), "delete_ok": deleted.get("ok"),
                               "getUpdates_refused": refused, "topic_closed": closed})
     assert ok, {"me": me.get("ok"), "sent": sent.get("ok"), "edited": edited.get("ok"), "deleted": deleted.get("ok"), "refused": refused}
+
+
+# Probe (vii), lane half. Runs inside the lane (lane.exec): first the lane's own mount
+# table, then, only if every read-write bind is rooted at this run's directory on the
+# host, one NEW token-named file at each production-looking path: create, write, chmod,
+# rename, unlink. It never touches an existing file or directory.
+VII_PATHS = ("/workspace/runtime", "/workspace/runtime/state", "/workspace/obs", "/workspace/obs/.venv",
+             "/workspace/runtime/bin", "/home/agent")
+_NOT_HOST_FILESYSTEMS = {"proc", "sysfs", "tmpfs", "devpts", "mqueue", "cgroup", "cgroup2", "overlay", "shm",
+                         "devtmpfs", "securityfs", "debugfs", "tracefs", "fusectl", "pstore", "bpf"}
+_DOCKER_MANAGED = {"/etc/hostname", "/etc/hosts", "/etc/resolv.conf"}
+VII_SCRIPT = r"""
+import errno, json, os, re, sys
+host_run_dir, name, code_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+paths = json.loads(sys.argv[4])
+unescape = lambda text: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)
+mounts = []
+for line in open("/proc/self/mountinfo"):
+    left, right = line.rstrip("\n").split(" - ", 1)
+    fields, tail = left.split(" "), right.split(" ")
+    mounts.append({"root": unescape(fields[3]), "mountpoint": unescape(fields[4]), "opts": fields[5].split(","),
+                   "fstype": tail[0], "source": tail[1]})
+under = lambda path, root: path == root or path.startswith(root.rstrip("/") + "/")
+not_host = set(json.loads(sys.argv[5]))
+docker_managed = set(json.loads(sys.argv[6]))
+def classify(mount):
+    if "ro" in mount["opts"]:
+        return "read-only"
+    if mount["fstype"] in not_host:
+        return "lane-local:" + mount["fstype"]
+    if mount["mountpoint"] in docker_managed and "/containers/" in mount["root"] and os.path.basename(mount["root"]) in {"hostname", "hosts", "resolv.conf"}:
+        return "docker-managed"
+    if under(mount["root"], host_run_dir):
+        return "rw-bind-under-run-dir"
+    return "VIOLATION"
+table = [{**m, "class": classify(m)} for m in mounts]
+violations = [m for m in table if m["class"] == "VIOLATION"]
+result = {"mount_check_pass": not violations, "mounts": len(table), "violations": violations,
+          "rw_binds": [{"mountpoint": m["mountpoint"], "root": m["root"], "class": m["class"]}
+                       for m in table if "ro" not in m["opts"] and m["fstype"] not in not_host], "attempts": {}}
+def resolve(path):
+    best = None
+    for m in table:
+        if under(path, m["mountpoint"]) and (best is None or len(m["mountpoint"]) >= len(best["mountpoint"])):
+            best = m
+    return best
+if not violations:
+    for directory in paths + [code_dir]:
+        target, moved = os.path.join(directory, name), os.path.join(directory, name + ".r")
+        steps, fd = {}, None
+        def step(label, action):
+            try:
+                action()
+                steps[label] = "ok"
+                return True
+            except OSError as exc:
+                steps[label] = errno.errorcode.get(exc.errno, str(exc.errno))
+                return False
+        def create():
+            global fd
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        if step("create", create):
+            step("write", lambda: os.write(fd, b"obs-e2e probe vii\n"))
+            os.close(fd)
+            step("chmod", lambda: os.chmod(target, 0o640))
+            renamed = step("rename", lambda: os.rename(target, moved))
+            step("unlink", lambda: os.unlink(moved if renamed else target))
+        for leftover in (target, moved):
+            try:
+                os.unlink(leftover)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        landed = resolve(directory)
+        result["attempts"][directory] = {"steps": steps, "mount": {k: landed[k] for k in ("mountpoint", "root", "fstype", "class")} if landed else None,
+                                          "absent_after": not (os.path.lexists(target) or os.path.lexists(moved))}
+print(json.dumps(result))
+"""
+
+
+def _vii_verdict(result: dict) -> tuple[bool, list]:
+    problems = []
+    if not result.get("mount_check_pass"):
+        problems.append({"mount_violations": result.get("violations")})
+    for directory, attempt in (result.get("attempts") or {}).items():
+        landed = (attempt.get("mount") or {}).get("class")
+        wrote = any(outcome == "ok" for outcome in attempt["steps"].values())
+        if landed == "read-only" and wrote:
+            problems.append({"directory": directory, "wrote_on_read_only": attempt["steps"]})
+        if landed not in {"read-only", "docker-managed", "rw-bind-under-run-dir"} and not str(landed).startswith("lane-local:"):
+            problems.append({"directory": directory, "landed_on": landed})
+        if not attempt["absent_after"]:
+            problems.append({"directory": directory, "token_file_left_behind": True})
+    return not problems, problems
+
+
+async def test_vii_lane_cannot_touch_production_paths(lane):
+    host_run_dir = lane.manifest.get("host_run_dir")
+    assert host_run_dir, "manifest lacks host_run_dir (the launcher sets it when the isolation suite is selected)"
+    name = f"{probe_token(lane.manifest['run_id'])}-{lane.name}"
+    res = await lane.exec("/workspace/obs/.venv/bin/python", "-c", VII_SCRIPT, host_run_dir, name, lane.info["code_dir"],
+                          json.dumps(list(VII_PATHS)), json.dumps(sorted(_NOT_HOST_FILESYSTEMS)),
+                          json.dumps(sorted(_DOCKER_MANAGED)), timeout=60)
+    assert res.get("rc") == 0, {"rc": res.get("rc"), "stderr": (res.get("stderr") or "")[-400:]}
+    result = json.loads(res["stdout"])
+    passed, problems = _vii_verdict(result)
+    # The harness refuses to collect tests/e2e outside the runner (L9): in a lane there is no OBS_E2E_RUN_ID.
+    refusal = await lane.exec("/workspace/obs/.venv/bin/python", "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
+                              "-c", "tests/e2e/pytest.ini", "--rootdir", lane.info["harness_root"], "tests/e2e/harness/suites/test_isolation.py",
+                              timeout=60, cwd=lane.info["harness_root"], env={"PYTHONPATH": lane.info["harness_root"]})
+    refused = refusal.get("rc") not in (0, None) and "only inside a harness container" in (refusal.get("stdout", "") + refusal.get("stderr", ""))
+    result["conftest_refusal"] = {"pass": refused, "rc": refusal.get("rc"), "tail": (refusal.get("stdout", "") + refusal.get("stderr", ""))[-300:]}
+    passed = passed and refused
+    _record(lane, "vii", {"pass": passed, "token": name, "problems": problems, **result})
+    assert passed, {"problems": problems, "conftest_refusal": result["conftest_refusal"]}

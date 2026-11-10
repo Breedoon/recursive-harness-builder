@@ -45,7 +45,9 @@ def _atomic_json(path: Path, data) -> None:
 
 
 def _git(worktree: Path, *args: str) -> bytes:
-    return subprocess.run(["git", "-C", str(worktree), *args], check=True,
+    # INVARIANT(side-effects): the launcher only reads the --code checkout. GIT_OPTIONAL_LOCKS=0 stops `git status` from refreshing that checkout's index (which takes index.lock and would stall or race its owner). Breaking it makes a harness run write into a worktree it was only asked to test.
+    # Doc: vault:Projects/Personal Projects/OBS Platform/E2E Harness/Components/Container and Isolation
+    return subprocess.run(["git", "-C", str(worktree), *args], check=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
 
 
@@ -161,6 +163,12 @@ def _userbot_id(secret_env: dict[str, str]) -> int:
     if value is None:
         raise HarnessError("OBS_TEST_TELEGRAM_ALLOWED_USERS or OBS_TEST_TELEGRAM_PRINCIPAL_USER_ID is required")
     return int(value)
+
+
+def _start_container(docker, run_dir: Path, name: str, image: str, **kwargs) -> None:
+    """Start one container, then save its actual Docker mounts for isolation probe (vii)(a)."""
+    docker.run_container(name, image, **kwargs)
+    docker.record_mounts(name, kwargs["role"], run_dir / "isolation" / f"mounts-{name}.json")
 
 
 def _stream_runner(docker, name: str, run_dir: Path) -> int:
@@ -349,13 +357,14 @@ def _run_once(args) -> int:
                              "cpus": 8, "pids_limit": 8192, "user": "1000:1000", "init": True}
         if {"isolation", "all"}.intersection(part.strip() for part in args.suite.split(",")):
             from . import isolation
+            manifest["host_run_dir"] = docker.to_host_path(run_dir)  # probe (vii) lane half checks its mounts against it
             isolation_before = isolation.before_run(run_dir, with_sentinel=True)
             sentinel = isolation_before["host_sentinel"]["pid"]
             manifest["host_sentinel_pid"] = sentinel
         _atomic_json(run_dir / "manifest.json", manifest)
         common = _mounts(code_dir, run_dir, cli_path, (canary_cli,) if canary_cli else ())
         if any(row["needs_cliproxy"] for row in manifest["lanes"]):
-            docker.run_container(f"obs-e2e-{run_id}-relay", image, role="relay", run_id=run_id,
+            _start_container(docker, run_dir, f"obs-e2e-{run_id}-relay", image, role="relay", run_id=run_id,
                                  env_file=private / "relay.env", mounts=common, network="container:obs-test",
                                  add_host_gateway=False, workdir=str(HARNESS_ROOT),
                                  command=[PYTHON, "-m", "tests.e2e.harness.relay", "unix-to-tcp", "--unix",
@@ -366,7 +375,7 @@ def _run_once(args) -> int:
                       docker.Mount(lane_dir / "logs", "/workspace/runtime/logs"),
                       docker.Mount(lane_dir / "home", "/home/agent"),
                       docker.Mount(lane_dir / "vault", "/workspace/runtime/git/obs-vault-active")]
-            docker.run_container(row["container"], image, role="lane", run_id=run_id, lane=row["lane"],
+            _start_container(docker, run_dir, row["container"], image, role="lane", run_id=run_id, lane=row["lane"],
                                  env_file=private / f"{row['lane']}.env", mounts=mounts, workdir=str(HARNESS_ROOT),
                                  command=[PYTHON, "-m", "tests.e2e.harness.lanectl", "serve", "--lane-dir", str(lane_dir)])
         runner_name = f"obs-e2e-{run_id}-runner"
@@ -377,7 +386,7 @@ def _run_once(args) -> int:
                          docker.Mount(E2E_ROOT / "locks", str(E2E_ROOT / "locks")),
                          docker.Mount(HARNESS_ROOT, str(HARNESS_ROOT), ro=True),
                          docker.Mount(Path("/workspace/obs/.venv"), "/workspace/obs/.venv", ro=True)]
-        docker.run_container(runner_name, image, role="runner", run_id=run_id,
+        _start_container(docker, run_dir, runner_name, image, role="runner", run_id=run_id,
                              env_file=private / "runner.env", mounts=runner_mounts, add_host_gateway=False,
                              workdir=str(HARNESS_ROOT),
                              command=[PYTHON, "-m", "tests.e2e.harness.orchestrator", "--run-dir", str(run_dir),
@@ -424,7 +433,8 @@ def _run_once(args) -> int:
         if isolation_before is not None:
             try:
                 after = isolation.after_run(run_dir, isolation_before,
-                                             prod_send_exercised_required=bool(current.get("prod_send")))
+                                             prod_send_exercised_required=bool(current.get("prod_send")),
+                                             registry_dir=_registry_dir())
                 proof = isolation.summarize(run_dir, after)
                 current["isolation_all_pass"] = proof["all_pass"]
                 if result == 0 and "isolation" in current.get("selected_suites", []) and not proof["all_pass"]:
@@ -462,6 +472,9 @@ def _run_once(args) -> int:
 
 
 def run(args) -> int:
+    if {"isolation", "all"}.intersection(part.strip() for part in args.suite.split(",")):
+        from . import isolation
+        isolation.install_write_audit()  # probe (vii)(d): every write this launcher makes, from now on
     return _run_once(args)
 
 
