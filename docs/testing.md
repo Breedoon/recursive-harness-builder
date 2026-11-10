@@ -37,11 +37,13 @@ file keeps the essentials next to the code. If they disagree, the vault note win
 - **Never on obs-test** (the container production runs in), in `/workspace/obs`,
   in any worktree or clone: no `pytest`, collection, single file or single test.
   obs-test shares production's user, process tree and paths.
-- **Only through the launcher**, started from any worktree that contains the harness:
+- **Only through the launcher**, started from any worktree that contains the harness.
+  Write the worktree path out literally: no shell variable in an agent's Bash call
+  (`$VAR` is blanked in piped commands by Claude Code 2.1.59; L10).
 
   ```bash
-  deploy/obs-e2e/obs-e2e run --code "$PWD" --lanes 5 --suite smoke --profile dev
-  deploy/obs-e2e/obs-e2e run --code "$PWD" --lanes 5 --suite isolation --profile dev --prod-send \
+  deploy/obs-e2e/obs-e2e run --code /workspace/obs/worktrees/<your worktree> --lanes 5 --suite smoke --profile dev
+  deploy/obs-e2e/obs-e2e run --code /workspace/obs/worktrees/<your worktree> --lanes 5 --suite isolation --profile dev --prod-send \
     --tests tests/e2e/harness/suites/test_isolation.py
   ```
 
