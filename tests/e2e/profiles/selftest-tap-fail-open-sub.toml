@@ -1,0 +1,21 @@
+# selftest-tap-fail-open on the sub-1 route (GPT via CLIProxyAPI). obs-cli authenticates
+# with API keys only until subscription OAuth lands (obs-22 I13), so obs-cli pairs run here;
+# the tap path is deliberately unwritable, as in selftest-tap-fail-open.
+name = "selftest-tap-fail-open-sub"
+credential_class = "sub"
+route = "gpt"
+model = "luna"
+claude_credentials = "shared-lane-copy"
+bot_pool = "env:OBS_TEST_TELEGRAM_BOT_TOKENS"
+bot_pool_exclude = ["env:OBS_TEST_TELEGRAM_BOT_TOKEN"]
+userbot_id_ref = "env:OBS_TEST_TELEGRAM_ALLOWED_USERS#0"
+needs_cliproxy = true
+subcredential = "codex-oauth-1"
+spend_cap_usd = 5.0
+
+[lane_env]
+OBS_AGENT_MODEL = "luna"
+OBS_DEFAULT_MODEL = "luna"
+OBS_EFFORT_LEVEL = "low"
+OBS_NEW_SESSION_EFFORT_LEVEL = "low"
+OBS_E2E_EVENT_LOG = "/workspace/runtime/bin/obs-e2e-unwritable-events.jsonl"
