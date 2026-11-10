@@ -25,7 +25,7 @@ import uuid
 
 import pytest
 
-pytestmark = [pytest.mark.suite("rc2-percentage"), pytest.mark.needs(all_lanes=False, credential=("dev", "sub"))]
+pytestmark = [pytest.mark.suite("rc2-percentage"), pytest.mark.needs(all_lanes=True, credential=("dev", "sub"))]  # every lane draws: 8 x lanes
 
 BUNDLED_MARK = "claude_agent_sdk/_bundled/claude"
 RUNTIME_RE = re.compile(r"CLI runtime runtime=(\S+) reason=(.*?) model=(\S+) resume=(\S+) agent=(\S+) team=(\S+)")
