@@ -74,3 +74,8 @@ a promotion record. It refuses, naming each failed check; it never uses
 `--skip-cache-gate`, `--plain` or a freeze acknowledgement. A promotion on a
 partial gate (one provider waived by Daniel) stays the hand sequence of the
 vault's shared-changes procedure.
+
+The shared-changes hook reads `OPS_SHARED_ACK` from the outer command line, so
+the operator's command carries the approval id there too
+(`OPS_SHARED_ACK=<source id> /workspace/obs/.venv/bin/python scripts/promote.py …`);
+the script itself re-verifies both approvals and passes each id to its own step.
