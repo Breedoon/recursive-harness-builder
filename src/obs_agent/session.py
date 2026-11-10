@@ -222,11 +222,10 @@ class SessionManager:
         if pending is not None and pending.record:
             from obs_agent import cli_runtime
 
-            cli_runtime.put_record(
+            cli_runtime.put_selection(
                 cli_runtime.runtime_db_path(self.config.telegram_state_db_path),
                 session_id,
-                pending.runtime,
-                pending.cli_path,
+                pending,
             )
 
     def touch(self) -> None:
@@ -448,6 +447,8 @@ class SessionManager:
         cli_runtime and docs/cache-proxy-safety.md. With no canary file this does
         nothing but read it.
         """
+        import dataclasses
+
         from obs_agent import cli_runtime
         from obs_agent.config import is_claude_model, resolve_model_context
 
@@ -473,6 +474,7 @@ class SessionManager:
             eligible=eligible,
             resume_session_id=options.resume,
             db_path=cli_runtime.runtime_db_path(state_db),
+            model=clean_model,
         )
         runtime = selection.runtime
         if selection.cli_path:
@@ -490,13 +492,15 @@ class SessionManager:
             env.get("CLAUDE_CODE_TEAM_NAME"),
         )
         if selection.record:
-            recorded = cli_runtime.Selection(
-                runtime, str(options.cli_path) if options.cli_path else None, True, selection.reason
+            recorded = dataclasses.replace(
+                selection,
+                runtime=runtime,
+                cli_path=str(options.cli_path) if options.cli_path else None,
+                agent_name=env.get("CLAUDE_CODE_AGENT_NAME", "").strip() or None,
+                team_name=env.get("CLAUDE_CODE_TEAM_NAME", "").strip() or None,
             )
             if options.resume:
-                cli_runtime.put_record(
-                    cli_runtime.runtime_db_path(state_db), options.resume, recorded.runtime, recorded.cli_path
-                )
+                cli_runtime.put_selection(cli_runtime.runtime_db_path(state_db), options.resume, recorded)
             # Fresh sessions learn their id from the CLI's init message; a
             # resumed one may be re-keyed there too.
             self._pending_cli_runtime = recorded

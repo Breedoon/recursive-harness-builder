@@ -5,13 +5,35 @@ Production runs every Claude session on the Agent SDK's bundled Claude Code
 agents or root teams that should use it::
 
     {"cli_path": "/abs/path/obs-cli", "agents": ["name"], "teams": ["root-team-key"],
-     "new_sessions_only": true}
+     "new_sessions_only": true, "percentage": 5, "models": ["claude-opus-5-5"]}
 
 The file is read at every session build, so adding or removing an agent takes
 effect at that agent's next CLI spawn with no OBS restart.  Anything wrong with
 the file (missing, unreadable, bad JSON, a ``cli_path`` that is not an absolute
-executable file) falls back to the bundled CLI, with one warning per change.
-Without the file nothing changes: no record, no log line above debug.
+executable file, a ``percentage`` that is not a number from 0 to 100) falls
+back to the bundled CLI, with one warning per change.  Without the file nothing
+changes: no record, no log line above debug.
+
+Percentage stage (obs-22 rc2, Bead-4/R16): besides the named agents, each NEW
+conversation (a build with no resume id: a fresh root, ``/clear``, a
+``fork=false`` launch) of an eligible route whose model is listed in
+``models`` is drawn once, at random, onto ``cli_path`` with probability
+``percentage``/100.  ``percentage`` absent or 0, or ``models`` absent or empty,
+means no draw at all.  The draw is sticky through the per-session record:
+
+- won (``assignment`` = ``percentage``): every later build of that session
+  (resume, wake, restart, fork, recovery copy) stays on the recorded obs-cli
+  while a percentage above 0 is in force for its model; setting the
+  percentage to 0, dropping the model from ``models`` or removing the file
+  is the rollback and moves it to bundled at its next spawn (one prefix miss);
+- lost (``assignment`` = ``percentage-bundled``): it stays bundled for life;
+- a resumed conversation is never drawn, and a conversation that was rolled
+  back is never drawn again.  Raising the stage therefore only affects new
+  conversations; lowering it keeps the conversations already on obs-cli.
+
+A spawn that dies before the CLI reports its session id is drawn again at the
+next build: no conversation exists yet.  Named agents and teams are matched
+first and keep their own rules.
 
 CACHE-PREFIX WARNING: which CLI sends a request decides the request bytes.
 Moving a conversation between binaries costs one prefix miss (decision A13).
@@ -33,6 +55,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -128,6 +151,12 @@ class Canary:
     teams: frozenset[str] = frozenset()
     new_sessions_only: bool = True
     detail: str = ""
+    percentage: float = 0.0  # share of new eligible conversations drawn onto cli_path
+    models: frozenset[str] = frozenset()  # lower-case model ids the draw may apply to
+
+    def draws_for(self, model: str | None) -> bool:
+        """True when the percentage stage is in force for this model."""
+        return bool(self.percentage > 0 and model and model.strip().lower() in self.models)
 
 
 def _warn_once(path: Path, signature: str, message: str) -> None:
@@ -188,6 +217,14 @@ def load_canary(path: Path) -> Canary:
             f"obs-cli canary cli_path {cli_path!r} is not an absolute executable file; using bundled {BUNDLED_RUNTIME}",
         )
         return Canary("invalid", detail="cli_path")
+    percentage = data.get("percentage", 0)
+    if isinstance(percentage, bool) or not isinstance(percentage, (int, float)) or not 0 <= percentage <= 100:
+        _warn_once(
+            path,
+            f"percentage:{percentage!r}",
+            f"obs-cli canary percentage {percentage!r} is not a number from 0 to 100; using bundled {BUNDLED_RUNTIME}",
+        )
+        return Canary("invalid", detail="percentage")
     with _lock:
         _warned.pop(str(path), None)
         _seen_paths.add(cli_path)
@@ -198,6 +235,8 @@ def load_canary(path: Path) -> Canary:
         agents=_names(data.get("agents")),
         teams=_names(data.get("teams")),
         new_sessions_only=data.get("new_sessions_only", True) is not False,
+        percentage=float(percentage),
+        models=frozenset(name.lower() for name in _names(data.get("models"))),
     )
 
 
@@ -313,6 +352,28 @@ def wait_for_hashes() -> None:
 class RuntimeRecord:
     runtime: str
     cli_path: str | None
+    assignment: str | None = None
+    percentage: float | None = None
+
+
+# Columns added after increment 12 (obs-22 rc2), for the canary's daily check:
+# created_at  first time the session was recorded (never overwritten);
+# reason      the last build's selection reason (as in the "CLI runtime" log line);
+# assignment  how the session got its binary: named, percentage,
+#             percentage-bundled, unselected; kept while the binary stays the
+#             same and replaced when a build moves the session (rollback);
+# percentage  the stage in force when that assignment was made;
+# agent_name, team_name  of the last build.
+# CREATE TABLE IF NOT EXISTS does not add columns to an existing file, so they
+# are added on open; old rows keep NULL there.
+_ADDED_COLUMNS = (
+    ("created_at", "REAL"),
+    ("reason", "TEXT"),
+    ("assignment", "TEXT"),
+    ("percentage", "REAL"),
+    ("agent_name", "TEXT"),
+    ("team_name", "TEXT"),
+)
 
 
 def _connect(db_path: Path, *, create: bool) -> sqlite3.Connection | None:
@@ -343,7 +404,19 @@ def _connect(db_path: Path, *, create: bool) -> sqlite3.Connection | None:
             );
             """
         )
+        present = {row[1] for row in conn.execute("PRAGMA table_info(session_runtime)")}
+        for name, kind in _ADDED_COLUMNS:
+            if name not in present:
+                try:
+                    conn.execute(f"ALTER TABLE session_runtime ADD COLUMN {name} {kind}")
+                except sqlite3.OperationalError as exc:  # another process added it first
+                    if "duplicate column" not in str(exc).lower():
+                        raise
     return conn
+
+
+def _columns(conn: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in conn.execute("PRAGMA table_info(session_runtime)")}
 
 
 def get_record(db_path: Path, session_id: str | None) -> RuntimeRecord | None:
@@ -354,8 +427,9 @@ def get_record(db_path: Path, session_id: str | None) -> RuntimeRecord | None:
         if conn is None:
             return None
         try:
+            extra = "assignment, percentage" if {"assignment", "percentage"} <= _columns(conn) else "NULL, NULL"
             row = conn.execute(
-                "SELECT runtime, cli_path FROM session_runtime WHERE session_id = ?",
+                f"SELECT runtime, cli_path, {extra} FROM session_runtime WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
         finally:
@@ -363,10 +437,29 @@ def get_record(db_path: Path, session_id: str | None) -> RuntimeRecord | None:
     except (sqlite3.Error, OSError) as exc:
         _warn_once(db_path, f"db:{exc.__class__.__name__}", f"obs-cli runtime records unreadable ({exc}); treating as empty")
         return None
-    return RuntimeRecord(row[0], row[1]) if row else None
+    return RuntimeRecord(row[0], row[1], row[2], row[3]) if row else None
 
 
-def put_record(db_path: Path, session_id: str, runtime: str, cli_path: str | None) -> None:
+def put_record(
+    db_path: Path,
+    session_id: str,
+    runtime: str,
+    cli_path: str | None,
+    *,
+    reason: str | None = None,
+    assignment: str | None = None,
+    percentage: float | None = None,
+    agent_name: str | None = None,
+    team_name: str | None = None,
+) -> None:
+    """Insert or update one session's record.
+
+    ``assignment`` and ``percentage`` are written when the record is new, when
+    it has none yet, or when this write moves the session to another binary
+    (``cli_path`` differs); otherwise the existing assignment stays, which is
+    what keeps a percentage-drawn session sticky across resume builds whose
+    reason is "resume stays on ...". ``created_at`` is set once.
+    """
     try:
         conn = _connect(db_path, create=True)
         assert conn is not None
@@ -383,10 +476,21 @@ def put_record(db_path: Path, session_id: str, runtime: str, cli_path: str | Non
                 if row:
                     runtime = row[0]
             conn.execute(
-                "INSERT INTO session_runtime(session_id, runtime, cli_path, updated_at) VALUES (?,?,?,?) "
-                "ON CONFLICT(session_id) DO UPDATE SET runtime=excluded.runtime, "
-                "cli_path=excluded.cli_path, updated_at=excluded.updated_at",
-                (session_id, runtime, cli_path, now),
+                "INSERT INTO session_runtime(session_id, runtime, cli_path, updated_at, created_at, reason, "
+                "assignment, percentage, agent_name, team_name) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "assignment=CASE WHEN excluded.assignment IS NOT NULL AND (session_runtime.assignment IS NULL "
+                "OR session_runtime.cli_path IS NOT excluded.cli_path) THEN excluded.assignment "
+                "ELSE session_runtime.assignment END, "
+                "percentage=CASE WHEN excluded.assignment IS NOT NULL AND (session_runtime.assignment IS NULL "
+                "OR session_runtime.cli_path IS NOT excluded.cli_path) THEN excluded.percentage "
+                "ELSE session_runtime.percentage END, "
+                "runtime=excluded.runtime, cli_path=excluded.cli_path, updated_at=excluded.updated_at, "
+                "created_at=COALESCE(session_runtime.created_at, excluded.created_at), "
+                "reason=COALESCE(excluded.reason, session_runtime.reason), "
+                "agent_name=COALESCE(excluded.agent_name, session_runtime.agent_name), "
+                "team_name=COALESCE(excluded.team_name, session_runtime.team_name)",
+                (session_id, runtime, cli_path, now, now, reason, assignment, percentage, agent_name, team_name),
             )
             if cli_path:
                 conn.execute(
@@ -412,7 +516,13 @@ def inherit_record(source_session_id: str | None, new_session_id: str | None, *,
         db = runtime_db_path(state_db_path)
         record = get_record(db, source_session_id)
         if record is not None:
-            put_record(db, new_session_id, record.runtime, record.cli_path)
+            # The copy keeps the source's assignment, so a fork of a percentage-drawn
+            # conversation stays on obs-cli and a fork of a bundled one stays bundled.
+            put_record(
+                db, new_session_id, record.runtime, record.cli_path,
+                reason="inherited from the source session",
+                assignment=record.assignment, percentage=record.percentage,
+            )
     except Exception:
         logger.debug("obs-cli runtime inheritance failed", exc_info=True)
 
@@ -464,6 +574,28 @@ class Selection:
     cli_path: str | None  # None = leave the SDK's bundled CLI
     record: bool
     reason: str
+    # How this build assigns the session (named, percentage, percentage-bundled,
+    # unselected), or None when it only continues the recorded assignment.
+    assignment: str | None = None
+    percentage: float | None = None  # the stage in force at a percentage draw
+    agent_name: str | None = None
+    team_name: str | None = None
+
+
+def put_selection(db_path: Path, session_id: str, selection: Selection) -> None:
+    """Record a build's selection against a session id (with the fields the daily check reads)."""
+    put_record(
+        db_path, session_id, selection.runtime, selection.cli_path,
+        reason=selection.reason, assignment=selection.assignment, percentage=selection.percentage,
+        agent_name=selection.agent_name, team_name=selection.team_name,
+    )
+
+
+_rng = random.SystemRandom()
+
+
+def _draw(percentage: float) -> bool:
+    return _rng.random() * 100.0 < percentage
 
 
 def select_runtime(
@@ -474,6 +606,7 @@ def select_runtime(
     eligible: bool,
     resume_session_id: str | None,
     db_path: Path,
+    model: str | None = None,
 ) -> Selection:
     if canary.state != "valid" or not eligible:
         reason = canary.state if canary.state != "valid" else "route not eligible"
@@ -482,7 +615,9 @@ def select_runtime(
         (agent_name and agent_name in canary.agents) or (team_name and team_name in canary.teams)
     )
     if not matched:
-        return Selection(BUNDLED_RUNTIME, None, True, "not selected")
+        if not canary.draws_for(model):
+            return Selection(BUNDLED_RUNTIME, None, True, "not selected", "unselected")
+        return _select_by_percentage(canary, resume_session_id, db_path)
     if resume_session_id and canary.new_sessions_only:
         record = get_record(db_path, resume_session_id)
         if record is None or record.runtime == BUNDLED_RUNTIME:
@@ -496,4 +631,38 @@ def select_runtime(
             record.cli_path,
             resume_session_id,
         )
-    return Selection(runtime_id_for_path(canary.cli_path, db_path=db_path), canary.cli_path, True, "selected")
+    return Selection(runtime_id_for_path(canary.cli_path, db_path=db_path), canary.cli_path, True, "selected", "named")
+
+
+def _select_by_percentage(canary: Canary, resume_session_id: str | None, db_path: Path) -> Selection:
+    """The percentage stage for a route no name matched (the stage is in force for its model).
+
+    A resumed conversation is never drawn: it stays on obs-cli only when its
+    record says it won a percentage draw, and is bundled otherwise (lost the
+    draw, written before the canary, or rolled back once). A new conversation
+    is drawn once; the record written at its init keeps the result.
+    """
+    if resume_session_id:
+        record = get_record(db_path, resume_session_id)
+        if record is not None and record.assignment == "percentage" and record.runtime != BUNDLED_RUNTIME:
+            if record.cli_path and os.path.isfile(record.cli_path) and os.access(record.cli_path, os.X_OK):
+                return Selection(
+                    runtime_id_for_path(record.cli_path, db_path=db_path), record.cli_path, True,
+                    "resume stays on the recorded obs-cli (percentage)", "percentage", record.percentage,
+                )
+            logger.warning(
+                "recorded obs-cli %s for session %s is gone; resuming on the canary binary",
+                record.cli_path,
+                resume_session_id,
+            )
+            return Selection(
+                runtime_id_for_path(canary.cli_path, db_path=db_path), canary.cli_path, True,
+                "resume moves to the canary binary (percentage; recorded binary gone)", "percentage", record.percentage,
+            )
+        return Selection(BUNDLED_RUNTIME, None, True, "resume stays on the bundled CLI (never drawn)")
+    if _draw(canary.percentage):
+        return Selection(
+            runtime_id_for_path(canary.cli_path, db_path=db_path), canary.cli_path, True,
+            "selected by percentage", "percentage", canary.percentage,
+        )
+    return Selection(BUNDLED_RUNTIME, None, True, "percentage draw: bundled", "percentage-bundled", canary.percentage)
