@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "python3 /workspace/runtime/state/wp01-hook.py bash-guard", "timeout": 5},
+        {"type": "command", "command": "python3 /workspace/runtime/state/wp01-hook.py freeze", "timeout": 5},
+        {"type": "command", "command": "python3 /workspace/runtime/state/wp01-hook.py safe-sync", "timeout": 5},
+        {"type": "command", "command": "python3 /workspace/runtime/state/wp01-hook.py shared-bash", "timeout": 5}
+      ]},
+      {"matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [
+        {"type": "command", "command": "python3 /workspace/runtime/state/wp01-hook.py shared-edit", "timeout": 5}
+      ]},
+      {"matcher": "mcp__obs-agent__AgentTask", "hooks": [
+        {"type": "command", "command": "python3 /workspace/runtime/state/wp01-hook.py launch", "timeout": 5}
+      ]},
+      {"matcher": "*", "hooks": [
+        {"type": "command", "command": "python3 /workspace/runtime/state/wp01-hook.py checkpoint-pre", "timeout": 5}
+      ]},
+      {"matcher": "^Ba.*$", "hooks": [
+        {"type": "command", "command": "python3 /workspace/runtime/state/wp01-hook.py regex", "timeout": 5}
+      ]}
+    ],
+    "PostToolUse": [
+      {"matcher": "*", "hooks": [
+        {"type": "command", "command": "python3 /workspace/runtime/state/wp01-hook.py checkpoint-post", "timeout": 10}
+      ]}
+    ]
+  }
+}
