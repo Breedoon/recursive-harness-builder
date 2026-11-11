@@ -6,13 +6,17 @@ SDK callbacks remain OBS's real state/Fractals pipelines, not mocks.
 from __future__ import annotations
 
 import json
+import gzip
 from pathlib import Path
+from types import SimpleNamespace
+import datetime
+import time
 import uuid
 
 import pytest
 
 from tests.e2e.harness.suites.test_obs22_agent_shapes import _launch
-from tests.e2e.harness.suites.test_inc11_stability import _jsonl_rows, _tool_results
+from tests.e2e.harness.suites.test_inc11_stability import _jsonl_rows, _tool_results, _wait_tool_use
 
 pytestmark = [pytest.mark.suite("command-hooks"), pytest.mark.needs(all_lanes=False, credential=("dev", "sub"))]
 GUARD = {"PreToolUse": "Projects/Personal Projects/Agentic/Agentic Fractals/hooks/executor_guard.py::check"}
@@ -36,8 +40,34 @@ async def _setup(lane):
             "s=json.loads(p.read_text()); s['hooks']=" + repr(settings["hooks"]) + "; p.write_text(json.dumps(s)); "
             "pathlib.Path('/workspace/runtime/state/wp01-hook.py').write_text(" + repr(RECORDER) + "); "
             "pathlib.Path('/workspace/runtime/state/wp01-hooks.jsonl').write_text('')")
+    # Supervisor-authorized lane-local workaround until --cli-path wiring is repaired.
+    binary = lane.manifest.get("cli_path")
+    if binary:
+        code += "; pathlib.Path('/workspace/runtime/state/obs-cli-canary.json').write_text(" + repr(json.dumps({
+            "cli_path":binary,"agents":[],"teams":[],"new_sessions_only":True,
+            "percentage":100,"models":["claude-haiku-5-5"]})) + ")"
     result = await lane.exec("python3", "-c", code)
     assert result.get("returncode", result.get("rc", 0)) == 0, result
+
+
+async def _tool_turn(lane, child, session_id, prompt, tool):
+    sent = await lane.send(child["topic_id"], prompt)
+    start = await lane.wait("turn_start", match={"trigger_message_id":sent.message_id})
+    await _wait_tool_use(lane, session_id, start, tool)
+    procs = await lane.procs()
+    end = await lane.wait("turn_end", match={"trigger_message_id":sent.message_id}, after=start)
+    messages = await lane.telegram.messages(child["topic_id"], since=sent, from_bot=True)
+    binary = lane.manifest.get("cli_path")
+    expected = "cli:" + Path(binary).name if binary else "cc-2.1.59"
+    builds = [e for e in lane.find("session_build", agent=child["agent_name"])]
+    native = [{"pid":p["pid"],"argv0":p["args"][0]} for p in procs if p.get("args") and
+              (p["args"][0] == binary if binary else p["args"][0].endswith("/_bundled/claude"))]
+    identity={"requested":binary,"native":native,"session_build":builds,"turn_end":end}
+    _proof(lane, "identity-" + str(sent.message_id), identity)
+    assert native and end.get("cli_runtime") == expected, identity
+    assert builds and builds[-1].get("runtime") == ("cli-path" if binary else expected), identity
+    if binary: assert builds[-1].get("cli_path") == binary, identity
+    return SimpleNamespace(end=end,text="\n".join(m.get("text") or "" for m in messages),identity=identity)
 
 
 def _records(lane):
@@ -65,12 +95,12 @@ async def _child(lane, mode):
     return topic, parent, child, end
 
 
-@pytest.mark.parametrize("mode,reason", [("WP01_EXIT2", "WP01_EXIT2_REASON"), ("WP01_JSON", "WP01_JSON_REASON")])
+@pytest.mark.parametrize("mode,reason", [("WP01_EXIT2", "WP01_EXIT2_REASON"), ("WP01_JSON", "denied this tool")])
 async def test_deny_blocks_and_returns_reason(lane, mode, reason):
     topic, parent, child, prior = await _child(lane, mode)
     command = "printf " + mode + "; touch /workspace/runtime/state/" + mode
-    turn = await lane.turn(child["topic_id"], "Call Bash exactly once with command `" + command +
-                           "`. Do not retry or use another tool if denied. Reply with the exact hook reason you received.")
+    turn = await _tool_turn(lane, child, prior["session_id"], "Call Bash exactly once with command `" + command +
+                           "`. Do not retry or use another tool if denied. Reply with the exact hook reason you received.", "Bash")
     rows = _jsonl_rows(lane, prior["session_id"])
     results = _tool_results(rows)
     record = _records(lane)
@@ -96,7 +126,7 @@ async def test_production_shape_matching_stdin_and_post_count(lane):
                "Write file " + filename + " with content OLD; "
                "Read the whole file " + filename + "; "
                "Edit that file replacing OLD with NEW. Then reply exactly SHAPE-DONE. No other tools.")
-    turn = await lane.turn(child["topic_id"], request)
+    turn = await _tool_turn(lane, child, prior["session_id"], request, "Bash")
     rows = _jsonl_rows(lane, prior["session_id"])
     record = _records(lane)
     by_call = {}
@@ -127,7 +157,48 @@ async def test_production_shape_matching_stdin_and_post_count(lane):
     assert "SHAPE-DONE" in turn.text and not turn.end.get("failed"), turn.end
     assert (lane.lane_dir / "state" / ("wp01-edit-" + nonce)).read_text() == "NEW"
     # The real executor SDK guard ran too: its immutable-source denial is separate from project hooks.
-    denied = await lane.turn(child["topic_id"], "Call Write exactly once for /workspace/runtime/git/obs-vault-active/Sources/wp01-forbidden.md "
+    denied = await lane.turn(child["topic_id"], "Call Write exactly once for /workspace/runtime/git/obs-vault-active/Misc/Meeting Notes/wp01-forbidden.md "
                              "with content WP01. Do not retry. Then reply DONE.")
     assert not denied.end.get("failed"), denied.end
-    assert not (lane.lane_dir / "vault/Sources/wp01-forbidden.md").exists(), "real OBS SDK callback did not deny immutable source"
+    assert not (lane.lane_dir / "vault/Misc/Meeting Notes/wp01-forbidden.md").exists(), "real OBS SDK callback did not deny immutable source"
+
+
+def _wire(lane, rows):
+    result=[]
+    for row in rows:
+        if row.get("_source") != "proxy" or row.get("path", "").split("?")[0] != "/v1/messages":
+            continue
+        paths=list((lane.lane_dir / "logs/cache-proxy/requests").glob("*/" + row["req_id"] + ".wire.json.gz"))
+        if not paths: continue
+        with gzip.open(paths[0]) as f: body=json.load(f)
+        if not body.get("tools"): continue
+        result.append({"req_id":row["req_id"],"system_cc":[b.get("cache_control") for b in body.get("system",[]) if b.get("cache_control")],
+                       "usage":row.get("usage"),"http_status":row.get("http_status")})
+    return result
+
+
+async def test_restart_keeps_ttl_and_whole_prefix(lane):
+    topic,parent,child,prior=await _child(lane,"restart-cache")
+    sid=prior["session_id"]
+    # Bind executed identity with a real tool call before warming the prefix.
+    identity=await _tool_turn(lane,child,sid,"Call Bash exactly once with command `printf WP01_CACHE`. Then reply READY.","Bash")
+    for _ in range(2):
+        warm=await lane.turn(child["topic_id"],"Remember codeword WP01-CACHE. Reply exactly WP01-CACHE.")
+        assert not warm.end.get("failed"), warm.end
+    before=_wire(lane,lane.reqlog(agent=child["agent_name"]))
+    assert before,before
+    mark=time.time()
+    await lane.restart_obs("maintenance")
+    resumed=await lane.turn(child["topic_id"],"What codeword did I ask you to remember? Reply with the codeword only.")
+    after=_wire(lane,lane.reqlog(agent=child["agent_name"],since=mark))
+    tally=await lane.exec("/workspace/obs/.venv/bin/python",str(Path(__file__).resolve().parents[4]/"scripts/cache_tally.py"),
+                          "--since",datetime.datetime.fromtimestamp(mark,datetime.timezone.utc).isoformat())
+    _proof(lane,"restart-cache",{"identity":identity.identity,"before":before,"after":after,"resumed":resumed.end,"tally":tally})
+    assert resumed.end.get("session_id")==sid and "WP01-CACHE" in resumed.text,resumed.end
+    assert after and before[-1]["system_cc"]==after[0]["system_cc"] and before[-1]["system_cc"],(before,after)
+    usage=after[0]["usage"] or {}
+    read=usage.get("cache_read_input_tokens",0)
+    created=usage.get("cache_creation_input_tokens",0)
+    fresh=usage.get("input_tokens",0)
+    assert read>0 and read/(read+created+fresh)>=.95 and created/(read+created+fresh)<.05,usage
+    assert tally.get("returncode",tally.get("rc",0))==0,tally
