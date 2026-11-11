@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "wp02": {
+      "type": "http",
+      "url": "http://127.0.0.1:18755/mcp"
+    },
+    "wp02-disabled": {
+      "type": "http",
+      "url": "http://127.0.0.1:18755/mcp"
+    }
+  }
+}
