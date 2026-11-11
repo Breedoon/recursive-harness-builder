@@ -37,7 +37,7 @@ except Exception:  # pragma: no cover - optional import error surfaced on cron c
 from telegram import Bot, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, TelegramError, TimedOut
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ApplicationHandlerStop, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 from obs_agent.context_stats import (
@@ -9329,8 +9329,9 @@ class TelegramBot:
         try:
             result_text = await command_cb()
         except Exception as exc:
-            logger.exception("Telegram %s failed", action_name)
-            result_text = f"{action_name} failed: {exc}"
+            logger.error("Telegram %s failed (%s)", action_name, type(exc).__name__)
+            await self._report_command_error(update, context.bot, exc)
+            return
         await self._send_system_message(
             route=route,
             bot=context.bot,
@@ -9639,14 +9640,8 @@ class TelegramBot:
                 comment=comment,
             )
         except Exception as exc:
-            logger.exception("Failed writing /report case file")
-            await self._send_system_message(
-                route=route,
-                bot=context.bot,
-                text=f"report failed: {exc}",
-                disable_notification=True,
-                reply_to_message_id=update.effective_message.message_id,
-            )
+            logger.error("Failed writing /report case file (%s)", type(exc).__name__)
+            await self._report_command_error(update, context.bot, exc)
             return
 
         await self._send_system_message(
@@ -13909,7 +13904,60 @@ class TelegramBot:
     async def handle_fork(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /fork - create a new topic from current head or replied message."""
+        """Handle /fork and report failures in its originating topic."""
+        try:
+            await self._handle_fork(update, context)
+        except Exception as exc:
+            logger.exception("Error in /fork")
+            await self._report_command_error(update, context.bot, exc)
+
+    async def _report_command_error(self, update: object, bot: Bot, exc: BaseException) -> None:
+        if not isinstance(update, Update):
+            return
+        message = update.effective_message
+        user = update.effective_user
+        if message is None or user is None or not self._is_authorized(user.id):
+            return
+        cause = " ".join(str(exc).splitlines()).strip()
+        for name, value in os.environ.items():
+            if re.search(r"TOKEN|SECRET|PASSWORD|AUTH|API_?KEY|SESSION", name, re.IGNORECASE) and len(value) >= 8:
+                cause = cause.replace(value, "[redacted]")
+        for token in self._config.telegram_sender_bot_tokens:
+            if token:
+                cause = cause.replace(token, "[redacted]")
+        cause = re.sub(r"(?i)(/bot)\d+:[A-Za-z0-9_-]+", r"\1[redacted]", cause)
+        cause = re.sub(r"(?i)(bearer\s+)\S+", r"\1[redacted]", cause)
+        cause = re.sub(r'''(?i)\b(token|secret|password|authorization|api[_-]?key)(["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)''', r"\1\2[redacted]", cause)
+        cause = re.sub(r"(https?://)[^/@\s]+:[^/@\s]+@", r"\1[redacted]@", cause)
+        text = f"Command error (operation may have partially completed): {type(exc).__name__}: {cause[:200] or 'no details'}"
+        try:
+            sent = await asyncio.wait_for(message.reply_text(text, parse_mode=None), timeout=10)
+        except Exception as send_exc:
+            logger.error("Failed to send command error reply (%s)", type(send_exc).__name__)
+            return
+        try:
+            self._remember_system_message_id(route=self._route_for_message(message), message_id=self._sent_message_id(sent))
+        except Exception as store_exc:
+            logger.warning("Could not record delivered command error (%s)", type(store_exc).__name__)
+
+    async def handle_application_error(
+        self, update: object, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        exc = context.error
+        logger.error("Telegram update failed", exc_info=exc)
+        if (
+            exc is not None
+            and isinstance(update, Update)
+            and update.effective_message is not None
+            and (update.effective_message.text or "").startswith("/")
+        ):
+            await self._report_command_error(update, context.bot, exc)
+            raise ApplicationHandlerStop
+
+    async def _handle_fork(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Create a new topic from current head or replied message."""
         if update.effective_user is None or update.effective_message is None:
             return
         if not self._is_authorized(update.effective_user.id):
@@ -14148,6 +14196,7 @@ def create_telegram_app(config: OBSConfig) -> Application:
     )
     app.bot_data["obs_telegram_bot"] = bot
     app.bot_data["obs_polling_request"] = polling_request
+    app.add_error_handler(bot.handle_application_error)
     app.add_handler(MessageHandler(filters.COMMAND, bot.log_command_update), group=-1)
     app.add_handler(
         MessageHandler(
