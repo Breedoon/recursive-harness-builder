@@ -254,13 +254,19 @@ def _bundled_runtime() -> str:
     return f"cc-{_bundled_version()}"
 
 
+def cli_path(state: Any) -> str | None:
+    """Selected path, retained for an end event after the client has been torn down."""
+    manager = getattr(state, "session_manager", None)
+    client = getattr(manager, "_client", None)
+    path = (getattr(getattr(client, "options", None), "cli_path", None)
+            if client is not None else getattr(manager, "_e2e_cli_path", None))
+    return str(path) if path else None
+
+
 def cli_runtime(state: Any) -> str:
-    """``cc-2.1.59`` for the bundled CLI, else ``cli:<basename>`` of the client's cli_path."""
-    client = getattr(getattr(state, "session_manager", None), "_client", None)
-    cli_path = getattr(getattr(client, "options", None), "cli_path", None)
-    if not cli_path:
-        return _bundled_runtime()
-    return f"cli:{os.path.basename(str(cli_path))}"
+    """``cc-2.1.59`` for bundled, else ``cli:<basename>`` of the selected path."""
+    path = cli_path(state)
+    return f"cli:{os.path.basename(path)}" if path else _bundled_runtime()
 
 
 def result_subtype(runner: Any, *, failed: bool, interrupted: bool) -> str:

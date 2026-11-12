@@ -7,6 +7,7 @@ readback; timeouts only ever fail a test (R10).
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import uuid
 
@@ -64,12 +65,31 @@ async def test_stop_interrupts_running_turn(lane):
                    and (block.get("input") or {}).get("file_path") == fixture for block in blocks):
                 break
             cursor = output
+    before_processes = await lane.procs()
     stop = await lane.command(topic, "/stop")
     ack, end, cleanup = await asyncio.gather(
         lane.wait("telegram_send", agent=topic, match=lambda event: "interrupt sent" in (event.get("text_head") or "").lower(), after=float(output["ts"])),
         lane.wait("turn_end", match={"trigger_message_id": sent.message_id}, after=start),
         lane.wait("stop_cleanup", agent=topic, after=start),
     )
+    after_processes = await lane.procs()
+    owned = cleanup.get("owned_identities") or {}
+    evidence = []
+    for pid, birth in owned.items():
+        before = [p for p in before_processes if p["pid"] == int(pid) and p["start"] == birth]
+        after = [p for p in after_processes if p["pid"] == int(pid) and p["start"] == birth]
+        evidence.append({"pid": int(pid), "start": birth, "before": before, "after": after,
+                         "alive_after": any(p.get("state") != "Z" for p in after)})
+    proof = {"run_id": lane.manifest["run_id"], "lane": lane.name,
+             "requested_cli": lane.manifest.get("cli_path"), "before": before_processes,
+             "after": after_processes, "owned_identities": evidence, "stop_cleanup": cleanup,
+             "stopped_turn_end": end}
+    path = lane.run_dir / "tests" / lane.name / "stop-process-proof.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
+    assert owned and len(owned) == cleanup.get("owned"), proof
+    assert all(row["before"] for row in evidence), proof
+    assert not any(row["alive_after"] for row in evidence), proof
     assert cleanup.get("survivors") == 0, cleanup
     assert ack["ts"] >= output["ts"] and end["ts"] >= output["ts"]
     replies = await lane.telegram.messages(topic, since=sent, from_bot=True)

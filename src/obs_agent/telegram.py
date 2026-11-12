@@ -6166,7 +6166,7 @@ class TelegramBot:
             except Exception:
                 logger.warning("[stop_escalation] retained tree kill failed route=%s", state.route, exc_info=True)
         if not stopped_turn_active:
-            _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="turn_ended", owned=len(owned), survivors=lambda: sum(1 for p, s in _maint.refresh_process_tree(dict(owned)).items() if _maint.process_identity_matches(p, s)))
+            _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="turn_ended", owned=len(owned), owned_identities=lambda: dict(owned), survivors=lambda: sum(1 for p, s in _maint.refresh_process_tree(dict(owned)).items() if _maint.process_identity_matches(p, s)))
             return
         logger.warning("[stop_escalation] disconnecting stopped CLI pid=%s route=%s", pid, state.route)
         session_mgr = state.session_manager
@@ -6185,7 +6185,7 @@ class TelegramBot:
             # The owned OS tree was already reaped above. Bypassing this lock
             # could instead kill a replacement client or clobber its reference.
             logger.warning("[stop_escalation] stopped client teardown unavailable route=%s", state.route, exc_info=True)
-        _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="disconnected", owned=len(owned), survivors=lambda: sum(1 for p, s in _maint.refresh_process_tree(dict(owned)).items() if _maint.process_identity_matches(p, s)))
+        _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="disconnected", owned=len(owned), owned_identities=lambda: dict(owned), survivors=lambda: sum(1 for p, s in _maint.refresh_process_tree(dict(owned)).items() if _maint.process_identity_matches(p, s)))
 
     async def _request_route_interrupt(self, state: TelegramSessionState) -> bool:
         """Set interrupt intent and attempt SDK interrupt for one route."""
@@ -10658,7 +10658,7 @@ class TelegramBot:
                         )
                 except Exception:
                     logger.debug("Failed to send completion summary in finally", exc_info=True)
-            _event_tap.emit_route("turn_end", self, state.route, state=state, trigger_message=trigger_message, schedule_id=triggered_schedule_id, failed=failed, turns=turn_count, subtype=lambda: _event_tap.result_subtype(runner, failed=failed, interrupted=interrupt_discarded_count is not None), cli_runtime=lambda: _event_tap.cli_runtime(state), cost_usd=lambda: (state.hook_state.last_result_data or {}).get("total_cost_usd"))
+            _event_tap.emit_route("turn_end", self, state.route, state=state, trigger_message=trigger_message, schedule_id=triggered_schedule_id, failed=failed, turns=turn_count, subtype=lambda: _event_tap.result_subtype(runner, failed=failed, interrupted=interrupt_discarded_count is not None), cli_runtime=lambda: _event_tap.cli_runtime(state), cli_path=lambda: _event_tap.cli_path(state), cost_usd=lambda: (state.hook_state.last_result_data or {}).get("total_cost_usd"))
 
         if (
             not trigger_user_mapped

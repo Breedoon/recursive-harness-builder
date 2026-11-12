@@ -438,6 +438,16 @@ class SessionManager:
             self._pending_cli_runtime = None
             self.cli_runtime = cli_runtime.BUNDLED_RUNTIME
             cli_runtime.warn_fallback(exc)
+        if _event_tap.enabled():
+            from obs_agent.config import is_claude_model, resolve_model_context
+
+            # Observation only; retain the selected path when stop tears the client down.
+            self._e2e_cli_path = options.cli_path
+            _event_tap.emit_session_build(
+                options, env_overrides=self._sdk_env_overrides,
+                session_id=options.resume or self._session_id, model=options.model,
+                claude_route=is_claude_model(resolve_model_context(self.effective_model).model),
+            )
         return options
 
     def _apply_cli_runtime(self, options: ClaudeAgentOptions) -> None:
@@ -743,7 +753,6 @@ class SessionManager:
         else:
             options.resume = None
 
-        _event_tap.emit_session_build(options, env_overrides=self._sdk_env_overrides, session_id=options.resume or self._session_id, model=cli_model, claude_route=is_claude_model(clean_model))
         return options
 
     def _session_is_unborn(self) -> bool:

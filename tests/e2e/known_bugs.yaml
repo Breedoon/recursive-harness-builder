@@ -9,6 +9,12 @@
   obs_telegram_blob: "755dcec2cd0889a1c1f7474f39c4db2bbb912389"
   cli_runtime: "cc-2.1.59"
   test: "tests/e2e/harness/suites/test_stop_escalation.py::test_stop_escalation_reaps_owned_cli_obs_22_43 (suite incident-stop-escalation, profile incident-stop-grace)"
+- bead: obs-22.138
+  classification: "Inherited product bug in maintenance_restart.refresh_process_tree and telegram._escalate_stop: a double-forked CLI descendant reparents before capture and survives outside retained ownership. Supervisor section9 withdraws U2 as a release blocker; no detached fix in D1."
+  runs: ["20261111T071526Z-0214e9", "20261111T072453Z-309d7c"]
+  cli_runtime: "cc-2.1.59 (both historical runs; the second requested obs-cli but executed bundled)"
+  test: "tests/e2e/harness/suites/test_vrc2_descendant.py::test_stop_detached_grandchild_obs_22_138"
+  status: "Strict typed xfail catches only DetachedDescendantSurvived, never setup/identity failures; source-equivalent production algorithm, no exact-production runtime control."
 - bead: "F1 - Registry owner bead pending"
   classification: "Product bug, owner outside obs-22 (cache-proxy stream relay or provider stream without message_stop): a dev fork child's API stream delivered its text but never completed, so the turn stayed open with no DoneEvent and no proxy index row."
   runs: ["20261022T181903Z-b6ecc9"]

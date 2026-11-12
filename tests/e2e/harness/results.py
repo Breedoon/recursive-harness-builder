@@ -125,7 +125,15 @@ def write_summary(run_dir: Path, *, junit: ET.ElementTree | None = None,
         setup_error = error or any(code not in (0, 1) for code in worker_exitcodes.values())
         exit_code = 2 if setup_error else (1 if any(worker_exitcodes.values()) or
                     any(totals[k] for k in ("failed", "error", "skipped")) or not cases else 0)
+    from .identity import run_identity
+
+    identity = run_identity(run_dir, manifest)
+    (run_dir / "cli-identity.json").write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
+    if identity["status"] == "SETUP-INVALID":
+        exit_code = 2
+        error = "SETUP-INVALID: requested/executed CLI identity is missing or mismatched; see cli-identity.json"
     result = {"run_id": manifest.get("run_id", run_dir.name), "exit_code": exit_code,
+              "cli_identity_status": identity["status"], "cli_identity_file": "cli-identity.json",
               "tests": cases, "totals": {**totals, "total": len(cases)},
               "worker_exitcodes": worker_exitcodes, "lanes_excluded": manifest.get("lanes_excluded", []),
               "bots_excluded": manifest.get("bots_excluded", []),

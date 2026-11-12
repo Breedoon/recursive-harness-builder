@@ -13,6 +13,7 @@ import socket
 import socketserver
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -62,7 +63,8 @@ def _proc_rows() -> list[dict]:
             args = [part.decode("utf-8", "replace") for part in (entry / "cmdline").read_bytes().split(b"\0") if part]
             rows.append({
                 "pid": int(entry.name), "ppid": int(fields[1]), "pgid": int(fields[2]),
-                "sid": int(fields[3]), "uid": entry.stat().st_uid, "start": int(fields[19]), "args": args,
+                "sid": int(fields[3]), "uid": entry.stat().st_uid, "start": int(fields[19]),
+                "state": fields[0], "args": args,
             })
         except (OSError, ValueError, IndexError):
             continue  # Processes can exit between any two /proc reads.
@@ -397,9 +399,52 @@ def _remove_socket(path: Path) -> None:
     path.unlink()
 
 
+def _cli_canary(lane_dir: Path, config: dict) -> None:
+    """Lane-only provisioning: use the existing percentage route, never a new OBS switch."""
+    if not config.get("cli_path"):
+        return
+    sys.path.insert(0, str(Path(config["code_dir"]) / "src"))
+    from obs_agent.config import MODEL_CONTEXT_WINDOWS, MODEL_RESOLUTION, resolve_model_context
+
+    models = {m for m in (*MODEL_CONTEXT_WINDOWS, *MODEL_RESOLUTION.values()) if m.startswith("claude-")}
+    models.add(resolve_model_context(config["model"]).model)
+    (lane_dir / "state" / "obs-cli-canary.json").write_text(json.dumps({
+        "cli_path": config["cli_path"], "percentage": 100, "models": sorted(models),
+        "agents": [], "teams": [], "new_sessions_only": False,
+    }) + "\n", encoding="utf-8")
+
+
+def _observe_cli_processes(lane_dir: Path, stopping: threading.Event) -> None:
+    """Independent kernel evidence, outside OBS and its tap; only public identity fields."""
+    seen = set()
+    with (lane_dir / "cli-processes.jsonl").open("a", encoding="utf-8") as out:
+        while not stopping.is_set():
+            for row in _proc_rows():
+                args = row["args"]
+                key = (row["pid"], row["start"])
+                if key in seen or "--output-format" not in args or "stream-json" not in args:
+                    continue
+                try:
+                    env = dict(item.split(b"=", 1) for item in
+                               (Path("/proc") / str(row["pid"]) / "environ").read_bytes().split(b"\0") if b"=" in item)
+                    identity = {name: env.get(name.encode(), b"").decode("utf-8", "replace")
+                                for name in ("CLAUDE_CODE_AGENT_NAME", "CLAUDE_CODE_TEAM_NAME")}
+                except OSError:
+                    continue
+                record = {"ts": time.time(), **{k: row[k] for k in ("pid", "ppid", "start", "state")},
+                          "argv0": args[0], "agent_name": identity["CLAUDE_CODE_AGENT_NAME"],
+                          "team": identity["CLAUDE_CODE_TEAM_NAME"],
+                          "resume": args[args.index("--resume") + 1] if "--resume" in args else None}
+                out.write(json.dumps(record) + "\n")
+                out.flush()
+                seen.add(key)
+            stopping.wait(0.05)
+
+
 def serve(lane_dir: Path) -> int:
     lane_dir = Path(lane_dir).resolve()
     config = json.loads((lane_dir / "lane.json").read_text(encoding="utf-8"))
+    _cli_canary(lane_dir, config)
     config_path = _write_supervisor_config(lane_dir, config)
     socket_path = lane_dir / "lanectl.sock"
     _remove_socket(socket_path)
@@ -411,6 +456,8 @@ def serve(lane_dir: Path) -> int:
     control = None
     server = None
     server_thread = None
+    observer = threading.Thread(target=_observe_cli_processes, args=(lane_dir, stopping), daemon=True)
+    observer.start()
     unexpected_exit = False
     try:
         with (lane_dir / "supervisor/process.log").open("ab") as log:
@@ -430,6 +477,8 @@ def serve(lane_dir: Path) -> int:
         stopping.wait()
         unexpected_exit = supervisor.poll() is not None
     finally:
+        stopping.set()
+        observer.join(timeout=5)
         if server is not None:
             server.shutdown()
             server.server_close()
