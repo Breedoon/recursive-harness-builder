@@ -120,9 +120,10 @@ real break mechanisms in live traffic; none was caught by a unit test:
 
 Not a mechanism (checked 2026-10-16, bead `vault-1r7n.9`): the "Continue from
 where you left off." block the CLI adds to the last user message when a fork or
-recovery ends on a tool result. Anthropic caches by block prefix, so adding a
-block after cached ones costs nothing (live A/B below, under the
-`recovery_multi` shape). On the GPT route the block comes after the shared
+recovery ends on a tool result. The block preserves the earlier block prefix;
+removing it did not repair Haiku's model-specific thinking loss (live A/B below,
+under the `recovery_multi` shape). This is not a claim of tail retention on every
+model. On the GPT route the block comes after the shared
 prefix too; the short GPT fork reads seen in production also happen on pure
 appends (the parent's own request just before one fork read 135k of 177k), and
 the fork-vs-parent ratio compares against a parent request that already holds
@@ -293,6 +294,44 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
 
 **Rollback:** `git revert <commit>`, push, maintenance restart, re-run step 6.
 
+### Recovery fixture and model boundary (obs-22.133)
+
+The Claude `recovery_multi` acceptance uses `claude-opus-5-5`, a thinking-preserving
+model actually observed in production, rather than treating Haiku's thinking
+policy as a generic OBS regression. Its 0.95 threshold is unchanged. A short
+private arithmetic task seeds thinking; each completed tool result discloses the
+next random script path, preventing the nominal stages from being batched into
+one interrupted assistant round. The recorded shape must show three distinct,
+completed, cache-writing rounds (two parallel Reads, Bash step3, Bash step4),
+message breakpoints and cache reads, thinking in that tool turn, an observed
+in-flight sleep, and recovery to a user tool-result tail. Side effects alone do
+not prove this. Missing shape is `SETUP-INVALID`, with the observed rounds and
+target recorded: neither PASS nor cache failure. The runner treats that as
+inconclusive and the unchanged admission rules reject it.
+
+Every Claude recovery run through `cache_regression.py` also writes a separately
+named `anthropic-recovery_multi_haiku.json` characterization of that same fixture,
+including its retained fraction and observed shape. Its result is printed and
+copied into the report's `characterizations`, but is not a gate scenario, a PASS
+waiver or a rerun that can clear recovery acceptance. `prefix_repro.py
+recovery_multi_haiku` runs that characterization directly. Explicitly choosing
+Haiku for `recovery_multi` is setup-invalid; use the named characterization.
+Other scenarios retain their existing model defaults. Legacy Haiku failures and
+their existing rerun history remain evidence; the accepted-shape table and all
+rerun rules below are unchanged. No tail bridge is introduced.
+
+A direct SDK cache capture records independent `/proc` CLI argv[0], executable,
+start ticks and binary hash, plus native terminal result/cost records. It is not
+an OBS daemon lane: it does not emit the lane-only `session_build`/`turn_end`
+events and cannot stand in for that lane identity proof. A requested path alone
+is never executed identity.
+
+Authority: Registry ADDENDUM 186, leader epoch 34, 2026-11-11T08:32:15Z; scoped
+scenario revision only. Claude Strict verification is required before merge.
+This text does not authorize a gate, merge or restart. Diagnosis and primary
+capture pointers: obs-artifacts `Drafts/Artifacts/2026-10-17-11-36-proc-work/
+1802d99948-obs-22-recovery-multi-diagnosis-sol-high-r3/report.md`.
+
 ### How to read the runner's result
 
 - `PASS` — every request pair was a pure append with at least 95% cache read.
@@ -337,8 +376,14 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
     OBS. A/B with a fork that ends on a large tool result: Haiku read 0.7394
     with the CLI's "Continue" block and 0.7396 without it (OBS writing the CLI's
     own "No response requested." row instead, a pure `append`). Opus 4.6, which
-    keeps earlier thinking, read 1.0 both ways. Production runs on Opus 4.5 or
-    later, which keeps earlier thinking, so production forks do not lose this.
+    keeps earlier thinking, read 1.0 both ways. November 10 production samples
+    on Opus 5.5 retained 646,158/646,160 and 263,834/263,836 tokens; two Fable 5.2
+    children of one parent retained 402,327/402,329. Those warm tool-tail samples
+    support Opus/Fable only, not all production routes or every crash recovery.
+    A same-shape Haiku conversation can lose the earlier thinking tail, including
+    a run labelled PASS when the loss is under 5% of its prior prompt. Warm
+    same-shape Sonnet retention has not been established. Do not extrapolate the
+    sampled Opus/Fable result to Sonnet, Haiku or the entire fleet.
     Reports: `/workspace/runtime/cache-regression/20261016T-p1forktail-*`; the
     rejected fork-tail patch and the A/B scenario are in obs-artifacts
     `Drafts/Artifacts/2026-10-16-opus-p1-fixes/fork-tail/`.
