@@ -74,11 +74,13 @@ async def test_stop_interrupts_running_turn(lane):
     )
     after_processes = await lane.procs()
     owned = cleanup.get("owned_identities") or {}
+    captured = cleanup.get("captured_owned_identities") or {}
     evidence = []
-    for pid, birth in owned.items():
+    for pid, birth in {**captured, **owned}.items():
         before = [p for p in before_processes if p["pid"] == int(pid) and p["start"] == birth]
         after = [p for p in after_processes if p["pid"] == int(pid) and p["start"] == birth]
         evidence.append({"pid": int(pid), "start": birth, "before": before, "after": after,
+                         "retained_owned": str(pid) in owned,
                          "alive_after": any(p.get("state") != "Z" for p in after)})
     proof = {"run_id": lane.manifest["run_id"], "lane": lane.name,
              "requested_cli": lane.manifest.get("cli_path"), "before": before_processes,
@@ -87,9 +89,11 @@ async def test_stop_interrupts_running_turn(lane):
     path = lane.run_dir / "tests" / lane.name / "stop-process-proof.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
-    assert owned and len(owned) == cleanup.get("owned"), proof
+    assert captured and len(owned) == cleanup.get("owned"), proof
     assert all(row["before"] for row in evidence), proof
-    assert not any(row["alive_after"] for row in evidence), proof
+    # A gracefully interrupted CLI may stay idle for the next turn. _escalate_stop
+    # releases that root, but must reap every identity it still owns.
+    assert not any(row["alive_after"] and row["retained_owned"] for row in evidence), proof
     assert cleanup.get("survivors") == 0, cleanup
     assert ack["ts"] >= output["ts"] and end["ts"] >= output["ts"]
     replies = await lane.telegram.messages(topic, since=sent, from_bot=True)

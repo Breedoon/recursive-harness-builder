@@ -6139,6 +6139,7 @@ class TelegramBot:
         self, state: TelegramSessionState, *, stamp: float, grace: float,
         client: Any, pid: object, owned: dict[int, int],
     ) -> None:
+        captured_owned = dict(owned) if _event_tap.enabled() else {}
         deadline = asyncio.get_running_loop().time() + grace
         while True:
             stopped_turn_active = (
@@ -6166,7 +6167,7 @@ class TelegramBot:
             except Exception:
                 logger.warning("[stop_escalation] retained tree kill failed route=%s", state.route, exc_info=True)
         if not stopped_turn_active:
-            _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="turn_ended", owned=len(owned), owned_identities=lambda: dict(owned), survivors=lambda: sum(1 for p, s in _maint.refresh_process_tree(dict(owned)).items() if _maint.process_identity_matches(p, s)))
+            _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="turn_ended", owned=len(owned), owned_identities=lambda: dict(owned), captured_owned_identities=lambda: captured_owned, survivors=lambda: sum(1 for p, s in _maint.refresh_process_tree(dict(owned)).items() if _maint.process_identity_matches(p, s)))
             return
         logger.warning("[stop_escalation] disconnecting stopped CLI pid=%s route=%s", pid, state.route)
         session_mgr = state.session_manager
@@ -6185,7 +6186,7 @@ class TelegramBot:
             # The owned OS tree was already reaped above. Bypassing this lock
             # could instead kill a replacement client or clobber its reference.
             logger.warning("[stop_escalation] stopped client teardown unavailable route=%s", state.route, exc_info=True)
-        _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="disconnected", owned=len(owned), owned_identities=lambda: dict(owned), survivors=lambda: sum(1 for p, s in _maint.refresh_process_tree(dict(owned)).items() if _maint.process_identity_matches(p, s)))
+        _event_tap.emit_route("stop_cleanup", self, state.route, state=state, outcome="disconnected", owned=len(owned), owned_identities=lambda: dict(owned), captured_owned_identities=lambda: captured_owned, survivors=lambda: sum(1 for p, s in _maint.refresh_process_tree(dict(owned)).items() if _maint.process_identity_matches(p, s)))
 
     async def _request_route_interrupt(self, state: TelegramSessionState) -> bool:
         """Set interrupt intent and attempt SDK interrupt for one route."""
