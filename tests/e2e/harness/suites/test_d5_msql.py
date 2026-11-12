@@ -46,7 +46,9 @@ async def test_d5_old_schema_migration_and_native_restore(lane):
         assert f'BASE-{nonce}' in first.text
         agent = first.end['agent_name']
         canary_file = lane.lane_dir / 'state' / 'obs-cli-canary.json'
-        model = lane.find('session_build', agent=agent)[-1]['model']
+        observed_model = lane.find('session_build', agent=agent)[-1]['model']
+        proof['model_input'] = await _operation(lane, 'resolve-model', observed_model)
+        model = proof['model_input']['resolved_model']
         canary_file.write_text(json.dumps({'cli_path': target, 'agents': [], 'teams': [], 'percentage': 100,
                                           'models': [model], 'new_sessions_only': True}))
         await lane.command(topic, '/clear')

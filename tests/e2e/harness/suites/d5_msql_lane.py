@@ -263,6 +263,9 @@ def main():
         result = inspect(sys.argv[2])
     elif op == 'production-rollback':
         result = production_rollback()
+    elif op == 'resolve-model':
+        from obs_agent.config import resolve_model_context
+        result = {'observed_model': sys.argv[2], 'resolved_model': resolve_model_context(sys.argv[2]).model}
     elif op == 'assert-absent':
         assert not DB.exists()
         result = {'runtime_db_exists': False, 'path': str(DB)}
