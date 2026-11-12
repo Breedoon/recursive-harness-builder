@@ -81,13 +81,21 @@ from claude_agent_sdk import ClaudeSDKClient as _SDKClient  # noqa: E402
 # argv[0] of every CLI process a scenario really spawned (read from /proc right after
 # the client connects), so a run can prove which binary sent its requests (obs-22 inc12b).
 CLI_ARGV0S: list[str] = []
+CLI_PROCESSES: list[dict] = []
+CLI_RESULTS: list[dict] = []
 
 
 def _record_cli_argv0(client) -> None:
     try:
         pid = client._transport._process.pid
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        CLI_ARGV0S.append(raw.split(b"\0", 1)[0].decode("utf-8", "replace"))
+        argv0 = raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+        CLI_ARGV0S.append(argv0)
+        import hashlib
+        CLI_PROCESSES.append({"pid": pid, "argv0": argv0,
+                              "exe": os.readlink(f"/proc/{pid}/exe"),
+                              "binary_sha256": hashlib.sha256(Path(argv0).read_bytes()).hexdigest(),
+                              "start_ticks": Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]})
     except Exception:  # a transport without a /proc entry records nothing; a --cli-path run then fails
         pass
 
@@ -98,12 +106,24 @@ class ClaudeSDKClient(_SDKClient):
         _record_cli_argv0(self)
         return result
 
+    async def receive_messages(self):
+        async for message in super().receive_messages():
+            if isinstance(message, ResultMessage):
+                CLI_RESULTS.append({"session_id": message.session_id, "subtype": message.subtype,
+                                    "is_error": message.is_error,
+                                    "total_cost_usd": message.total_cost_usd,
+                                    "usage": message.usage})
+            yield message
+
 from obs_agent._sdk_patch import ensure_production_bot_env_patch  # noqa: E402
 
 ensure_production_bot_env_patch()
 
 DEFAULT_BASE_URL = "http://127.0.0.1:28925"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+# Warm production Opus 5.5 tool-tail samples preserve thinking; Haiku does not.
+# Keep the cheaper Haiku policy measurement separate from recovery acceptance.
+RECOVERY_MODEL = "claude-opus-5-5"
 WORK_ROOT = Path(os.environ.get("PREFIX_REPRO_ROOT", "/workspace/runtime/prefix-repro"))
 # Built at runtime so this file never contains the literal placeholder itself
 # (the CLI would rewrite it if an agent ever reads this file into context).
@@ -555,6 +575,51 @@ async def sc_parallel_fork(args):
                             "original_source_sha256": before, "source_unchanged": source_unchanged}
 
 
+def _recovery_multi_shape(log_dir, rows_p, rows_c, meta):
+    """Observe completed, separately cached rounds, not merely their side effects."""
+    rounds = []
+    previous_ids = set()
+    for row in rows_p:
+        body = pd.load_request(row["req_id"], "wire", log_dir)
+        messages = body.get("messages") or []
+        tail = messages[-1] if messages else {}
+        blocks = pd._as_blocks(tail.get("content"))
+        result_ids = {b.get("tool_use_id") for b in blocks
+                      if isinstance(b, dict) and b.get("type") == "tool_result"}
+        if tail.get("role") != "user" or not result_ids or result_ids == previous_ids:
+            continue
+        uses = {b.get("id"): b.get("name") for message in messages[:-1]
+                for b in pd._as_blocks(message.get("content"))
+                if isinstance(b, dict) and b.get("type") == "tool_use"}
+        usage = row.get("usage") or {}
+        rounds.append({"req_id": row["req_id"], "message_count": len(messages),
+                       "tool_names": sorted(uses.get(i, "MISSING") for i in result_ids),
+                       "tool_result_ids": sorted(result_ids),
+                       "cache_read": usage.get("cache_read") or 0,
+                       "cache_creation": usage.get("cache_creation") or 0,
+                       "message_breakpoints": [p for p in pd.breakpoints(body) if p.startswith("messages[")]})
+        previous_ids = result_ids
+    child_body = pd.load_request(rows_c[0]["req_id"], "wire", log_dir) if rows_c else {}
+    parent_body = pd.load_request(rows_p[-1]["req_id"], "wire", log_dir) if rows_p else {}
+    observed = {"completed_rounds": rounds, "completed_round_count": len(rounds),
+                "parent_messages": len(parent_body.get("messages") or []),
+                "child_messages": len(child_body.get("messages") or []),
+                "target_type": meta.get("target_type"),
+                "target_block_types": meta.get("target_block_types"),
+                "sleep_tool_seen": meta.get("sleep_tool_seen", False),
+                "parent_thinking_blocks": sum(pd.thinking_counts(parent_body)),
+                "tool_turn_thinking_blocks": sum(pd.thinking_counts(parent_body)[3:])}
+    observed["valid"] = bool(
+        len(rounds) >= 3 and rounds[0]["tool_names"] == ["Read", "Read"]
+        and rounds[1]["tool_names"] == ["Bash"] and rounds[2]["tool_names"] == ["Bash"]
+        and all(r["cache_read"] > 0 and r["cache_creation"] > 0 and r["message_breakpoints"] for r in rounds)
+        and meta.get("effects_before") == ["step3", "step4"]
+        and meta.get("needs_recovery") and meta.get("sleep_tool_seen")
+        and meta.get("target_type") == "user" and "tool_result" in (meta.get("target_block_types") or [])
+        and rows_c and observed["tool_turn_thinking_blocks"] > 0)
+    return observed
+
+
 async def sc_recovery_multi(args):
     """Like recovery, but the killed turn already completed several tool rounds
     (text, parallel reads, more tools) before the in-flight one — the shape of
@@ -568,17 +633,33 @@ async def sc_recovery_multi(args):
     sid = str(uuid.uuid4())
     cwd = WORK_ROOT / "cwd"
     effect_path = cwd / f"effects-{sid}.txt"
-    for name in ("a.txt", "b.txt", "c.txt"):
-        (cwd / name).parent.mkdir(parents=True, exist_ok=True)
-        (cwd / name).write_text(name + "\n")
+    cwd.mkdir(parents=True, exist_ok=True)
+    # Each completed result reveals the next random path. The next call cannot
+    # be batched in the same assistant message before that result is observed.
+    step3 = cwd / f"step3-{uuid.uuid4().hex}.py"
+    step4 = cwd / f"step4-{uuid.uuid4().hex}.py"
+    step3.write_text("from pathlib import Path\n"
+                     f"with Path({str(effect_path)!r}).open('a') as handle: handle.write('step3\\n')\n"
+                     f"print({('Next, in a NEW assistant message, run Bash: python3 ' + str(step4))!r})\n")
+    step4.write_text("from pathlib import Path\n"
+                     f"with Path({str(effect_path)!r}).open('a') as handle: handle.write('step4\\n')\n"
+                     "print('Next, in a NEW assistant message, run Bash: sleep 60')\n")
+    first_files = [cwd / f"{name}-{sid}.txt" for name in ("a", "b")]
+    first_files[0].write_text("Round-one input A. Read both inputs before the next call.\n")
+    first_files[1].write_text(f"After BOTH Reads complete, in a NEW assistant message run Bash: python3 {step3}\n")
     client = ClaudeSDKClient(options=_options(args, session_id=sid))
     await client.connect()
     try:
         await _turn(client, _initial_user_prompt("Reply with the single word: ready.", sid))
         await client.query(
-            "Do these steps in order without pausing: (1) say 'working', (2) in ONE message call the "
-            f"Read tool on a.txt and b.txt in parallel, (3) run Bash `echo step3 >> {effect_path.name}`, "
-            f"(4) run Bash `echo step4 >> {effect_path.name}`, (5) run Bash `sleep 60`.")
+            "Before using tools, reason privately through the 24 puzzle for the numbers 3, 3, 8, 8: "
+            "find an exact expression using each number once and only +, -, *, / and parentheses, "
+            "and verify it with rational arithmetic. Do not print the reasoning or solution. "
+            "Then say 'working', and in ONE assistant message call Read on these TWO files in parallel: "
+            f"{first_files[0]} and {first_files[1]}. "
+            "Follow the next-step instruction returned by the tools, one NEW assistant message per "
+            "completed tool round. Do not combine commands or predict an undisclosed next path. "
+            "Continue without asking me, until the final sleep command completes.")
         seen = 0
         async for msg in client.receive_messages():
             if isinstance(msg, AssistantMessage):
@@ -594,15 +675,22 @@ async def sc_recovery_multi(args):
         await client.disconnect()
     target = resolve_safe_jsonl_target(session_id=sid, cwd=cwd)
     if target is None or not target.target_uuid:
-        raise RuntimeError("recovery_multi: no safe target")
+        return [sid], {"parent": sid, "child": None, "setup_error": "no safe recovery target",
+                       "sleep_tool_seen": bool(seen)}
     effects_before = effect_path.read_text().splitlines() if effect_path.exists() else []
     source = find_session_jsonl(session_id=sid, cwd=cwd)
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    target_row = next((json.loads(line) for line in source.read_text().splitlines()
+                       if json.loads(line).get("uuid") == target.target_uuid), {})
+    target_content = (target_row.get("message") or {}).get("content", [])
+    target_types = [b.get("type") for b in target_content if isinstance(b, dict)] if isinstance(target_content, list) else ["text"]
     new_sid = fork_session_jsonl(session_id=sid, target_uuid=target.target_uuid, cwd=cwd,
                                  new_session_id=str(uuid.uuid4()))
     await _session(args, ["(recovered) Do not rerun prior tools. Reply with the single word: back."], resume=new_sid)
     effects_after = effect_path.read_text().splitlines() if effect_path.exists() else []
     return [sid, new_sid], {"parent": sid, "child": new_sid,
+                            "sleep_tool_seen": bool(seen), "target_uuid": target.target_uuid,
+                            "target_type": target_row.get("type"), "target_block_types": target_types,
                             "needs_recovery": target.health.needs_recovery,
                             "reason": target.health.unsafe_tail_reason,
                             "effects_before": effects_before, "effects_after": effects_after,
@@ -1039,7 +1127,8 @@ SCENARIOS = {
     "boundary_marker": (sc_boundary_marker, "exact standalone dynamic marker; expect FAIL on unfixed proxy"),
     "resume_new_proc": (sc_resume_new_proc, "wake/new-process resume (--gap for >5 min)"),
     "recovery": (sc_recovery, "real fork recovery, kill during the first tool call"),
-    "recovery_multi": (sc_recovery_multi, "real fork recovery after several tool rounds; expect FAIL"),
+    "recovery_multi": (sc_recovery_multi, "completed cached tool rounds, tool-tail recovery; Claude acceptance on production Opus"),
+    "recovery_multi_haiku": (sc_recovery_multi, "same-shape Haiku retained-prefix characterization; not gate acceptance"),
     "queued_resume": (sc_queued_resume, "mid-turn queued message then new-process resume"),
     "parallel_resume": (sc_parallel_resume, "parallel tool calls then new-process resume; expect FAIL"),
     "parallel_fork": (sc_parallel_fork, "parallel same-ID resume then verbatim-source fork"),
@@ -1062,7 +1151,7 @@ def _provider_errors(log_dir, since):
 
 
 ANTHROPIC_ONLY = {"volatile_flip", "ws_resume", "recovered_poison", "ttl_flip", "ttl_flip_down",
-                  "image_cap"}
+                  "image_cap", "recovery_multi_haiku"}
 
 
 def run(args, name):
@@ -1073,21 +1162,38 @@ def run(args, name):
     Without it nothing is asserted and the default path is unchanged.
     """
     CLI_ARGV0S.clear()
+    CLI_PROCESSES.clear()
+    CLI_RESULTS.clear()
     res = _run(args, name)
     used = sorted(set(CLI_ARGV0S))
     res["cli_argv0s"] = used
+    res["cli_processes"] = list(CLI_PROCESSES)
+    res["cli_results"] = list(CLI_RESULTS)
     want = getattr(args, "cli_path", None)
     if want:
         res["cli_path_expected"] = want
-        if used != [want]:
+        if used != [want] or len(CLI_PROCESSES) != len(CLI_ARGV0S):
             res["ok"] = False
-            res["status"] = "FAIL"
+            res["status"] = "SETUP-INVALID"
             res["error"] = f"CLI argv[0] check: expected only {want!r}, saw {used!r}"
     return res
 
 
 def _run(args, name):
+    import copy
+    args = copy.copy(args)
     fn, note = SCENARIOS[name]
+    characterization = name == "recovery_multi_haiku"
+    if characterization:
+        args.model = DEFAULT_MODEL
+    elif name == "recovery_multi" and args.provider == "anthropic":
+        if not getattr(args, "model_explicit", False):
+            args.model = RECOVERY_MODEL
+        if args.model != RECOVERY_MODEL:
+            return {"scenario": name, "ok": False, "status": "SETUP-INVALID", "pairs": [],
+                    "provider": args.provider, "model": args.model,
+                    "error": f"recovery acceptance requires the qualified production model {RECOVERY_MODEL}; "
+                             "use recovery_multi_haiku for Haiku characterization"}
     since = time.time() - 1
     try:
         sids, meta = asyncio.run(asyncio.wait_for(fn(args), timeout=args.scenario_timeout))
@@ -1100,7 +1206,7 @@ def _run(args, name):
                 "error": f"{type(e).__name__}: {e}",
                 "provider_errors": errs[:20]}
     pairs = None
-    if name in ("recovery", "recovery_multi", "parallel_fork", "poisoned_recovery", "recovered_poison",
+    if name in ("recovery", "recovery_multi", "recovery_multi_haiku", "parallel_fork", "poisoned_recovery", "recovered_poison",
                 "resumed_poison"):
         rows_p = _rows(args.log_dir, [meta["parent"]], since)
         time.sleep(3)
@@ -1110,6 +1216,14 @@ def _run(args, name):
         if rows_p and rows_c:
             pairs.append((rows_p[-1], rows_c[0]))  # the recovery boundary
         pairs += list(zip(rows_c, rows_c[1:]))
+        if name in ("recovery_multi", "recovery_multi_haiku"):
+            shape = _recovery_multi_shape(args.log_dir, rows_p, rows_c, meta)
+            meta["observed_shape"] = shape
+            if not shape["valid"]:
+                return {"scenario": name, "note": note, "sessions": sids, "meta": meta,
+                        "provider": args.provider, "model": args.model, "ok": False,
+                        "status": "SETUP-INVALID", "pairs": [], "requests": [r["req_id"] for r in rows_p + rows_c],
+                        "error": "fixture did not reach completed separately cached tool rounds and a tool-result recovery tail"}
     if name == "image_cap":
         time.sleep(3)
         pairs, counts = _image_cap_pairs(args.log_dir, sids, since)
@@ -1141,7 +1255,15 @@ def _run(args, name):
     # A FAIL whose sessions also hit 5xx upstream errors is reported separately:
     # it may be provider overload, not a cache-prefix regression. Read the pairs.
     status = "PASS" if ok else ("PROVIDER-ERROR" if errs else "FAIL")
+    if characterization:
+        # Report the measured ratio even below 0.95; it never clears a gate FAIL.
+        ok = bool(verdicts) and route_ok and meta_ok and not errs and all(
+            v["class"] in ("append", "tail-block-append", "identical")
+            and not v["no_breakpoint"] and v["original_tool_blocks_exactly_once"] for v in verdicts)
+        status = "CHARACTERIZATION" if ok else ("PROVIDER-ERROR" if errs else "FAIL")
     return {"scenario": name, "note": note, "sessions": sids, "meta": meta, "status": status,
+            "gate_eligible": not characterization,
+            "retained_fraction": verdicts[0]["ratio"] if verdicts else None,
             "provider_errors": errs,
             "provider": args.provider, "model": args.model, "route_ok": route_ok,
             "routes": sorted({r.get("route", "") for r in rows}),
@@ -1183,6 +1305,7 @@ def main(argv=None):
             print(f"{k:16s} {note}")
         return 0
     from obs_agent.config import resolve_model
+    args.model_explicit = args.model is not None
     args.model = resolve_model(args.model or ("sol" if args.provider == "codex" else DEFAULT_MODEL))
     if args.provider == "codex" and not args.model.startswith("gpt-"):
         ap.error("--provider codex requires an explicit GPT model, not a Claude/local fallback")

@@ -29,6 +29,8 @@ Statuses
                   errors meanwhile -- probably provider overload, not the proxy;
                   rerun later before trusting a PASS
   SKIPPED         not run because the route kept returning provider errors
+  SETUP-INVALID   fixture/CLI identity precondition absent; inconclusive, never PASS
+  CHARACTERIZATION  separately reported Haiku recovery retention, not gate acceptance
 
 Exit status: 0 all PASS; 1 at least one FAIL; 2 no FAIL but some
 PROVIDER-ERROR/SKIPPED (inconclusive -- rerun that route later).
@@ -95,7 +97,8 @@ def identity(base_url: str) -> dict:
 def scenario_names(provider: str) -> list[str]:
     listing = subprocess.run([sys.executable, str(PREFIX_REPRO), "--list"],
                              capture_output=True, text=True, check=True).stdout
-    names = [ln.split()[0] for ln in listing.splitlines() if ln.strip()]
+    names = [ln.split()[0] for ln in listing.splitlines() if ln.strip()
+             and ln.split()[0] != "recovery_multi_haiku"]
     return [n for n in names if provider == "anthropic" or n not in ANTHROPIC_ONLY]
 
 
@@ -127,12 +130,18 @@ def run_one(args, provider: str, name: str, out_dir: Path) -> dict:
                    provider_errors=len(r.get("provider_errors") or []),
                    bad_pairs=[{"b": p.get("b"), "class": p.get("class"), "ratio": p.get("ratio")}
                               for p in r.get("pairs", []) if not p.get("ok")],
-                   requests=r.get("requests") or [], cli_argv0s=r.get("cli_argv0s") or [])
+                   requests=r.get("requests") or [], cli_argv0s=r.get("cli_argv0s") or [],
+                   cli_processes=r.get("cli_processes") or [], observed_shape=(r.get("meta") or {}).get("observed_shape"),
+                   retained_fraction=r.get("retained_fraction"))
         if res["status"] == "ERROR":  # driver error without upstream 5xx: treat as a failure
             res["status"] = "FAIL"
     except Exception:
         res.update(status="FAIL", error="no result written (runner crashed or was killed)",
                    sessions=[], provider_errors=0, bad_pairs=[], requests=[])
+    if provider == "anthropic" and name == "recovery_multi":
+        # This is always a separate report, never a gate scenario or a rerun
+        # capable of clearing recovery_multi's acceptance result.
+        res["haiku_characterization"] = run_one(args, provider, "recovery_multi_haiku", out_dir)
     return res
 
 
@@ -150,6 +159,9 @@ def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, re
                        overall: str) -> None:
     """gate.json: what scripts/cache_gate.py (vault-3px5) matches before a restart or merge."""
     code = ident.get("code") or _code_identity()
+    characterizations = [r["haiku_characterization"] for r in results if "haiku_characterization" in r]
+    characterizations += [r for r in results if r["scenario"] == "recovery_multi_haiku"]
+    results = [r for r in results if r["scenario"] != "recovery_multi_haiku"]
     providers_run = sorted({r["provider"] for r in results if r.get("status") != "SKIPPED"})
     route_ok = {p: all(r.get("status") == "PASS" for r in results if r["provider"] == p)
                 for p in {r["provider"] for r in results}}
@@ -168,6 +180,7 @@ def _write_gate_report(out_dir: Path, *, args, ident: dict, live: str | None, re
     report = {
         "result": overall,
         "scenario_results": scenario_results,
+        "characterizations": characterizations,
         "scenario_failures": scenario_failures,
         # every route that actually ran; the gate refuses a report missing either required route
         "providers": providers_run,
@@ -196,7 +209,8 @@ def main(argv=None) -> int:
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL)
     ap.add_argument("--log-dir", default=DEFAULT_LOG_DIR,
                     help="the request log dir OF THE PROXY UNDER TEST (scratch proxies have their own)")
-    ap.add_argument("--model", default=None, help="Claude model for the anthropic route (default: harness Haiku)")
+    ap.add_argument("--model", default=None, help="Claude model for the anthropic route (default: Haiku, "
+                    "except recovery_multi acceptance uses qualified production Opus)")
     ap.add_argument("--codex-model", default=None,
                     help="GPT model for the codex route, for example terra (default: prefix_repro.py's own "
                          "default, sol); passed to every codex-route run, reruns included, and recorded as "
@@ -251,12 +265,17 @@ def main(argv=None) -> int:
             elif res["status"] == "PROVIDER-ERROR":
                 extra = f"  upstream 5xx: {res['provider_errors']}"
             print(f"[{provider}] {name:20s} {res['status']:14s} {res['seconds']:4d}s{extra}", flush=True)
+            if "haiku_characterization" in res:
+                char = res["haiku_characterization"]
+                print(f"[{provider}] recovery_multi_haiku {char['status']} "
+                      f"retained_fraction={char.get('retained_fraction')} (not gate acceptance)", flush=True)
             (out_dir / "results.json").write_text(json.dumps(results, indent=1))
 
     (out_dir / "results.json").write_text(json.dumps(results, indent=1))
     # session ids of this run, so fleet tallies can exclude harness traffic
     (out_dir / "harness_sessions.txt").write_text(
-        "\n".join(s for r in results for s in r.get("sessions", [])) + "\n")
+        "\n".join(s for r in results for sample in (r, r.get("haiku_characterization", {}))
+                  for s in sample.get("sessions", [])) + "\n")
 
     counts: dict[str, int] = {}
     for r in results:
@@ -264,16 +283,17 @@ def main(argv=None) -> int:
     print("\nSUMMARY " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) + f"   (files: {out_dir})")
     fails = [r for r in results if r["status"] == "FAIL"]
     overall = ("FAIL" if fails else "INCONCLUSIVE"
-               if any(r["status"] in ("PROVIDER-ERROR", "SKIPPED") for r in results) else "PASS")
+               if any(r["status"] in ("PROVIDER-ERROR", "SKIPPED", "SETUP-INVALID", "CHARACTERIZATION") for r in results) else "PASS")
     _write_gate_report(out_dir, args=args, ident=ident, live=live, results=results, overall=overall)
     if fails:
         print("RESULT: FAIL -- cache-prefix regression. For each bad pair run:\n"
               f"  .venv/bin/python scripts/prefix_diff.py --log-dir {args.log_dir} --prev-any <request id>\n"
               "  (or prefix_diff.py <earlier req id> <later req id>) and read the first divergence.")
         return 1
-    if any(r["status"] in ("PROVIDER-ERROR", "SKIPPED") for r in results):
-        print("RESULT: INCONCLUSIVE -- no cache FAIL, but some scenarios hit provider errors or were "
-              "skipped. Rerun that route later; do not call it a PASS.")
+    if any(r["status"] in ("PROVIDER-ERROR", "SKIPPED", "SETUP-INVALID", "CHARACTERIZATION") for r in results):
+        print("RESULT: INCONCLUSIVE -- no cache FAIL, but a scenario had provider errors, was "
+              "skipped, had an invalid fixture, or was characterization only. Inspect the recorded result; "
+              "do not call it a gate PASS.")
         return 2
     print("RESULT: PASS")
     return 0
