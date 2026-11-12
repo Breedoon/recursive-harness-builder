@@ -67,7 +67,7 @@ async def test_stop_detached_grandchild_obs_22_138(lane):
             tagged = [r for r in rows if (r.get("args") or [None])[0] == tag]
             if tagged and receipt.exists():
                 break
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.2)  # obs-e2e-lint: allow — poll kernel identity and birth receipt; timeout only fails setup
     born = json.loads(receipt.read_text())
     before = rows
     birth = next(r["start"] for r in tagged if r["pid"] == born["pid"])
