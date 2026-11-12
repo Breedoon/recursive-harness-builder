@@ -1,0 +1,14 @@
+{
+  "source_run": "20261108T224413Z-2c5f39",
+  "source_commit": "395f2b775aaadd0f122989c5c6f9bfd18a7d16ec",
+  "prior_store_commit": "5adcd336c84a21d3e6dd31dbbdb9bc900ff74b27",
+  "tables": {
+    "session_runtime": [
+      {"session_id":"01640bec-c7ca-44f2-9b49-66fe402f2bbb","runtime":"bundled-2.1.59","cli_path":null,"updated_at":1794177992.8675015},
+      {"session_id":"67cdaf12-bbfb-477b-81b1-758b324775c1","runtime":"bundled-2.1.59","cli_path":null,"updated_at":1794177984.281859},
+      {"session_id":"c5c4ce19-a9a9-48a9-b5f5-88ba90d76deb","runtime":"obs-cli:accd6bb64ef3","cli_path":"/workspace/runtime/e2e/obs-cli-inc11b-c5","updated_at":1794177904.0189312}
+    ],
+    "binary_hash": [{"path":"/workspace/runtime/e2e/obs-cli-inc11b-c5","mtime_ns":1794171618012143853,"size":17930584,"runtime":"obs-cli:accd6bb64ef3"}],
+    "cli_path_seen": [{"path":"/workspace/runtime/e2e/obs-cli-inc11b-c5","updated_at":1794177967.4979587}]
+  }
+}
