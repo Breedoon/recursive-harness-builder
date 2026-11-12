@@ -221,7 +221,7 @@ def production_rollback():
                         break
                 except (OSError, ValueError):
                     pass
-                time.sleep(0.05)  # e2e-lint: allow-sleep -- polls external production control socket, never elapsed-time success
+                time.sleep(0.05)  # obs-e2e-lint: allow — polls external production control socket; timeout only fails readiness
             assert ready is not None, 'actual production entrypoint did not become ready'
             entry = json.loads(receipt_path.read_text())
             assert entry['entrypoint'] == str(root / 'src/obs_agent/telegram_main.py')
