@@ -55,12 +55,14 @@ MODEL_RESOLUTION: dict[str, str] = {
     "haiku": "claude-haiku-5-5",
     "claude-haiku": "claude-haiku-5-5",
     # OpenAI tiers – "gpt" resolves to the ordinary-work default; explicit
-    # pro/Sol handles retain GPT-6.1 Sol for more complex work.
+    # pro/Sol handles select GPT-6.2 Sol for more complex work. Astra/Sol moved
+    # to 6.2 on 2026-11-17 (Daniel: "6.2 astra and sol dropped update obs please");
+    # IDs from the native Codex catalog on his Pro account.
     "gpt": "gpt-6.1-terra",
-    "gpt-pro": "gpt-6.1-sol",
-    "astra": "gpt-6-astra",
-    "sol": "gpt-6.1-sol",
-    "gpt-sol": "gpt-6.1-sol",
+    "gpt-pro": "gpt-6.2-sol",
+    "astra": "gpt-6.2-astra",
+    "sol": "gpt-6.2-sol",
+    "gpt-sol": "gpt-6.2-sol",
     "terra": "gpt-6.1-terra",
     "luna": "gpt-6-luna",
     "gpt-mini": "gpt-5.4-mini",
@@ -108,6 +110,9 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "local-sparks-glm-5.3-flash-exl3-abliterated": 1_048_576,
     "local-sparks-glm-5.3-flash-exl3-4bpw": 1_048_576,
     "local-gemma4-31b": 48_000,
+    # 6.2 Astra/Sol: native Codex catalog max_context_window 872K (2026-11-17).
+    "gpt-6.2-astra": 872_000,
+    "gpt-6.2-sol": 872_000,
     "gpt-6-astra": 900_000,
     "gpt-6.1-sol": 900_000,
     # The API model has a 1.05M total window and 922K maximum input; the paid
@@ -142,6 +147,8 @@ MODEL_EFFORT_LEVELS: dict[str, str] = {
     "claude-haiku-5-5": "max",
     "local-qwen3.8-27b": "medium",
     SPARK_QWEN_MODEL: "max",
+    "gpt-6.2-astra": "medium",
+    "gpt-6.2-sol": "medium",
     "gpt-6-astra": "medium",
     "gpt-6.1-sol": "medium",
     "gpt-6.1-terra": "medium",

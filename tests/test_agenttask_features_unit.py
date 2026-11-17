@@ -56,9 +56,9 @@ class TestModelResolution:
         assert resolve_model("openai") == resolve_model("gpt")
 
     @pytest.mark.parametrize(("alias", "model"), [
-        ("astra", "gpt-6-astra"),
-        ("sol", "gpt-6.1-sol"),
-        ("gpt-sol", "gpt-6.1-sol"),
+        ("astra", "gpt-6.2-astra"),
+        ("sol", "gpt-6.2-sol"),
+        ("gpt-sol", "gpt-6.2-sol"),
         ("terra", "gpt-6.1-terra"),
         ("luna", "gpt-6-luna"),
     ])
@@ -158,6 +158,13 @@ class TestModelContextBoundary:
     ])
     def test_current_gpt_models_default_to_900k(self, model):
         assert normalize_model_for_claude_code(model) == f"{model}[900k]"
+
+    @pytest.mark.parametrize("alias,model", [("astra", "gpt-6.2-astra"), ("sol", "gpt-6.2-sol")])
+    def test_62_astra_sol_use_native_codex_context_budget(self, alias, model):
+        resolved = resolve_model_context(alias)
+        assert resolved.model == model
+        assert resolved.context_tokens == 872_000
+        assert normalize_model_for_claude_code(alias) == f"{model}[872k]"
 
     def test_terra_uses_paid_codex_route_context_budget(self):
         resolved = resolve_model_context("terra")

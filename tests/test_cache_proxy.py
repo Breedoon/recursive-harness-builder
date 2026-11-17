@@ -1165,9 +1165,9 @@ class TestNormalizeModelName:
     def test_resolves_non_claude_shorthands(self):
         assert cache_proxy._normalize_model_name("gpt") == "gpt-6.1-terra"
         assert cache_proxy._normalize_model_name("gpt[200k]") == "gpt-6.1-terra"
-        assert cache_proxy._normalize_model_name("astra") == "gpt-6-astra"
+        assert cache_proxy._normalize_model_name("astra") == "gpt-6.2-astra"
         assert cache_proxy._normalize_model_name("terra[872k]") == "gpt-6.1-terra"
-        assert cache_proxy._normalize_model_name("sol") == "gpt-6.1-sol"
+        assert cache_proxy._normalize_model_name("sol") == "gpt-6.2-sol"
         assert cache_proxy._normalize_model_name("luna") == "gpt-6-luna"
         assert cache_proxy._normalize_model_name("qwen-27b") == "local-qwen3.8-27b"
 

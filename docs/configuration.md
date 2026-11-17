@@ -112,7 +112,7 @@ Supported shorthands in current code include:
 
 - `claude` and `opus` → `claude-opus-5-5`
 - `sonnet` → `claude-sonnet-5-5` (1M context, 128K output); `fable` → `claude-fable-5-2` (1M context, 128K output; `claude-fable-5-1` stays addressable by its full name); `haiku` → `claude-haiku-5-5`
-- `gpt`/`terra`/`openai`/`chatgpt` → `gpt-6.1-terra` (ordinary-work default); `sol`/`gpt-sol`/`gpt-pro` → `gpt-6.1-sol`; `astra` → `gpt-6-astra`; `luna` → `gpt-6-luna`. Older model IDs, including `gpt-5.6-terra`, remain available by full name.
+- `gpt`/`terra`/`openai`/`chatgpt` → `gpt-6.1-terra` (ordinary-work default); `sol`/`gpt-sol`/`gpt-pro` → `gpt-6.2-sol`; `astra` → `gpt-6.2-astra` (both since 2026-11-17); `luna` → `gpt-6-luna`. Older model IDs, including `gpt-6.1-sol`, `gpt-6-astra` and `gpt-5.6-terra`, remain available by full name.
 - `gpt-mini`
 - Local Qwen: `qwen`/`qwen-fn`/`qwen-flash-next`/`qwen3.8-flash-next` → the DGX Sparks Qwen3.8 Flash Next (`local-sparks-qwen3.8-flash-next-abliterated`); `qwen-27b`/`qwen3.8-27b`/`local-qwen` → the 3090 Qwen (`local-qwen3.8-27b`). Plain `qwen` is a single switch, `DEFAULT_QWEN_MODEL` in `config.py`.
 - Local GLM: `glm`/`glm-flash`/`glm-5.3-flash`/`glm-5.3-flash-uncensored` → the Sparks GLM (`local-sparks-glm-5.3-flash-uncensored`). The hosted `glm-5.3` (Z.AI through CLIProxyAPI) is a different model and keeps its own name.
@@ -442,12 +442,12 @@ OBS_FORK_CACHE_WARMUP_DELAY_SECONDS=1.0
 `OBS_CONTEXT_WINDOW_ESTIMATE_TOKENS` is telemetry for context reporting and
 model suffix resolution. The fallback OBS context follows the default Terra
 route at 872k. OpenAI documents a 1.05M total window and 922k maximum input for
-GPT-6.1 Terra; the paid Codex catalog used by CLIProxyAPI advertises an 872k
+GPT-6.1 Terra, GPT-6.2 Sol and GPT-6.2 Astra; the paid Codex catalog used by CLIProxyAPI advertises an 872k
 maximum context budget, so OBS uses that route ceiling. Other current GPT models
 retain their 900k defaults, while Qwen uses 262k. At the Claude Code boundary, a
 model without an explicit suffix is sent with the resolved model-specific
 context suffix, for example `terra` becomes `gpt-6.1-terra[872k]`, `sol` becomes
-`gpt-6.1-sol[900k]`, and `claude` becomes `claude-opus-5-5[1m]`. Local Qwen keeps
+`gpt-6.2-sol[872k]`, and `claude` becomes `claude-opus-5-5[1m]`. Local Qwen keeps
 its canonical unsuffixed provider model ID while receiving the 262k context limit
 through the SDK environment.
 `OBS_AUTO_COMPACT_WINDOW_TOKENS` optionally caps the Claude Code auto-compact
