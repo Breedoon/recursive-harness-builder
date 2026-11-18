@@ -52,6 +52,7 @@ MODEL_RESOLUTION: dict[str, str] = {
     "claude-sonnet": "claude-sonnet-5-5",
     "fable": "claude-fable-5-2",
     "claude-fable": "claude-fable-5-2",
+    "mythos": "claude-mythos-5-2",
     "haiku": "claude-haiku-5-5",
     "claude-haiku": "claude-haiku-5-5",
     # OpenAI tiers – "gpt" resolves to the ordinary-work default; explicit
@@ -140,6 +141,7 @@ MODEL_EFFORT_LEVELS: dict[str, str] = {
     "claude-fable-5": "high",
     "claude-fable-5-2": "high",
     "claude-fable-5-1": "high",
+    "claude-mythos-5-2": "high",
     "claude-opus-4-8": "high",
     "claude-opus-4-7": "xhigh",
     "claude-opus-4-6": "high",
