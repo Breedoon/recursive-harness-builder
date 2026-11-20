@@ -101,7 +101,7 @@ class AgyClient:
             if denied:
                 text = "Antigravity tool access was denied: this initial OBS Gemini provider supports reasoning only."
             elif failed:
-                text = "Antigravity request failed: " + str(result.get("error") or "unknown error")
+                text = "Antigravity request failed; check provider availability or authentication."
             if text and not failed:
                 yield AssistantMessage(content=[TextBlock(text=text)], model=self.model)
             yield AgyResultMessage(

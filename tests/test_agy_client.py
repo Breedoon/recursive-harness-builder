@@ -41,6 +41,29 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
+async def test_provider_error_does_not_disclose_arbitrary_text(tmp_path, monkeypatch):
+    executable = tmp_path / "agy"
+    executable.write_text('''#!/usr/bin/env python3
+import json, sys
+print(json.dumps({"event":"init","conversation_id":"test-session","init":{"model":"gemini-3.8-flash-low","permission_mode":"strict"}}), flush=True)
+for line in sys.stdin:
+    print(json.dumps({"event":"result","result":{"conversation_id":"test-session","status":"ERROR","error":"SYNTHETIC-SECRET-DO-NOT-DISCLOSE"}}), flush=True)
+''')
+    executable.chmod(0o755)
+    monkeypatch.setattr(agy_client, "AGY_BINARY", str(executable))
+    client = AgyClient("gemini-3.8-flash-low", tmp_path, {})
+    await client.connect()
+    try:
+        await client.query("test")
+        messages = [message async for message in client.receive_response()]
+        assert messages[-1].is_error
+        assert messages[-1].result == "Antigravity request failed; check provider availability or authentication."
+        assert "SYNTHETIC-SECRET" not in repr(messages)
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_unverified_permissions_fail_closed(tmp_path, monkeypatch):
     executable = tmp_path / "agy"
     executable.write_text('''#!/usr/bin/env python3
