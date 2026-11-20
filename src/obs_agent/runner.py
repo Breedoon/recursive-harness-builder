@@ -174,6 +174,8 @@ def _message_role(message) -> str | None:
 
 def _error_message_text(message, text_parts: list[str]) -> str | None:
     text = "\n".join(part for part in text_parts if part).strip()
+    if type(message).__name__ == "AgyResultMessage" and getattr(message, "is_error", False):
+        return str(getattr(message, "result", None) or "Antigravity request failed")
     if getattr(message, "isApiErrorMessage", False) is True:
         if text:
             return text

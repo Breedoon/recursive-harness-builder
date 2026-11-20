@@ -71,3 +71,37 @@ async def test_manager_rejects_hooks_and_existing_session(tmp_path):
     manager.set_session_id("existing-session")
     with pytest.raises(agy_client.AgyError, match="resume"):
         await manager.get_client()
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_get_client
+async def test_denied_tool_result_fails_runner_turn(tmp_path, monkeypatch):
+    from obs_agent.config import OBSConfig
+    from obs_agent.hooks import HookState
+    from obs_agent.runner import ConversationRunner, TextEvent, TurnEndEvent
+    from obs_agent.session import SessionManager
+
+    executable = tmp_path / "agy"
+    executable.write_text('''#!/usr/bin/env python3
+import json, sys
+print(json.dumps({"event":"init","conversation_id":"test-session","init":{"model":"gemini-3.8-flash-low","permission_mode":"strict"}}), flush=True)
+for line in sys.stdin:
+    print(json.dumps({"event":"result","result":{"conversation_id":"test-session","status":"SUCCESS","response":"","denied_actions":[{"action":"read_file"}]}}), flush=True)
+''')
+    executable.chmod(0o755)
+    monkeypatch.setattr(agy_client, "AGY_BINARY", str(executable))
+    config = OBSConfig(vault_path=tmp_path)
+    state = HookState()
+    manager = SessionManager(config=config, hook_state=state)
+    manager.model_override = "gemini-3.8-flash-low"
+    manager.effort_override = "low"
+    runner = ConversationRunner(manager, state, config)
+    try:
+        events = [event async for event in runner.run("Read a file")]
+        errors = [event for event in events if isinstance(event, TurnEndEvent) and event.is_error]
+        text = [event.text for event in events if isinstance(event, TextEvent)]
+        assert len(errors) == 1
+        assert "tool access was denied" in errors[0].error_text
+        assert len(text) == 1 and "tool access was denied" in text[0]
+    finally:
+        await manager.disconnect()
