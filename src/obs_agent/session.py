@@ -771,6 +771,28 @@ class SessionManager:
                 logger.info("Cache window expired, reconnecting")
                 await self._disconnect_unlocked()
 
+            # Gemini's official CLI is initially supported only for fresh,
+            # reasoning-only sessions. Never replay a Claude JSONL as agy history.
+            from obs_agent.agy_client import AgyClient, AgyError, is_agy_model
+
+            if is_agy_model(self.effective_model):
+                if self._session_id is not None:
+                    raise AgyError("Antigravity session resume is not yet supported by OBS")
+                if self.user_hooks or self.explicit_env_overrides:
+                    raise AgyError("Antigravity does not yet support OBS user hooks or env overrides")
+                client = AgyClient(self.effective_model, self.config.vault_path, self._sdk_env_overrides)
+                if self.effective_effort not in ("auto", client.model.rsplit("-", 1)[-1]):
+                    raise AgyError("Gemini effort must match the selected model slug's low, medium or high tier")
+                try:
+                    await client.connect()
+                except Exception as exc:
+                    raise AgyError(f"Antigravity connection failed: {exc}") from exc
+                self._client = client
+                self._connected = True
+                self.hook_state.client_interrupter = client.interrupt
+                self._entry_file_context_pending = True
+                return client
+
             # Create fresh client
             options = self._build_options()
             return await self._connect_client_with_retry(options=options)

@@ -70,9 +70,9 @@ MODEL_RESOLUTION: dict[str, str] = {
     "openai": "gpt-6.1-terra",
     "chatgpt": "gpt-6.1-terra",
     # Google tiers
-    "gemini": "gemini-3.1-flash-lite-preview",
+    "gemini": "gemini-3.8-flash-high",
     "gemini-pro": "gemini-3.1-pro-preview",
-    "gemini-flash": "gemini-2.5-flash",
+    "gemini-flash": "gemini-3.8-flash-high",
     # Local durable aliases. The 3090 names (local-qwen, qwen-27b) and the Spark
     # names are separate backends; the Spark ones are configured by model name in
     # obs_agent.spark. Full served names pass through unchanged.

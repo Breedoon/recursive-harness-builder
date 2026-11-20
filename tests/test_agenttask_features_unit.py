@@ -115,7 +115,7 @@ class TestModelResolution:
         assert "gemini" in resolved.lower()
 
     def test_gemini_flash_shorthand(self):
-        assert resolve_model("gemini-flash") == "gemini-2.5-flash"
+        assert resolve_model("gemini-flash") == "gemini-3.8-flash-high"
 
     def test_explicit_model_passes_through(self):
         assert resolve_model("gpt-5.4-mini") == "gpt-5.4-mini"
@@ -150,7 +150,7 @@ class TestModelContextBoundary:
         assert normalize_model_for_claude_code("gpt") == "gpt-6.1-terra[872k]"
         assert normalize_model_for_claude_code("claude") == "claude-opus-5-5[1m]"
         assert normalize_model_for_claude_code("haiku") == "claude-haiku-5-5[1m]"
-        assert normalize_model_for_claude_code("gemini") == "gemini-3.1-flash-lite-preview[1m]"
+        assert normalize_model_for_claude_code("gemini") == "gemini-3.8-flash-high[1m]"
 
     @pytest.mark.parametrize("model", [
         "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra",

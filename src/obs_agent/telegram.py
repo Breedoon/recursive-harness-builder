@@ -11419,6 +11419,15 @@ class TelegramBot:
         from obs_agent.effort import child_effort_override, build_effort_env, resolve_effort
 
         child_model = resolve_model(model) if model else parent_state.session_manager.effective_model
+        from obs_agent.agy_client import AGY_MODELS, is_agy_model
+
+        if is_agy_model(child_model):
+            if is_fork:
+                raise RuntimeError("Antigravity AgentTask supports fresh sessions only; forks are not yet supported")
+            if user_hooks or inherit_hooks or env_override or temperature is not None:
+                raise RuntimeError("Antigravity AgentTask does not yet support hooks, env overrides or temperature")
+            if parse_context_suffix(child_model)[0].lower() not in AGY_MODELS:
+                raise RuntimeError("Requested Gemini model is not available in the verified Antigravity account")
         if model:
             # A Spark alias for a model the Sparks are not serving (or a window
             # larger than the serving profile) fails here with a clear message,

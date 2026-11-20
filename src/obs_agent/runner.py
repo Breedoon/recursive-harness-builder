@@ -135,7 +135,9 @@ def _is_recoverable(exc: BaseException) -> bool:
     The only truly unrecoverable case is ``CLINotFoundError`` — the ``claude``
     binary isn't installed, so no reconnect can succeed.
     """
-    if isinstance(exc, CLINotFoundError):
+    from obs_agent.agy_client import AgyError
+
+    if isinstance(exc, (CLINotFoundError, AgyError)):
         return False
     return True
 
@@ -194,7 +196,9 @@ def _is_error_message(message, text_parts: list[str]) -> bool:
 def _is_result_message(message) -> bool:
     num_turns = getattr(message, "num_turns", None)
     total_cost = getattr(message, "total_cost_usd", None)
-    return isinstance(num_turns, int) and isinstance(total_cost, (int, float))
+    return isinstance(num_turns, int) and (
+        isinstance(total_cost, (int, float)) or type(message).__name__ == "AgyResultMessage"
+    )
 
 
 def _init_session_id(message) -> str | None:
