@@ -56,10 +56,10 @@ MODEL_REGISTRY = {
         "deprecated": True,
     },
     "ltx": {
-        "label": "LTX 2.5 (retired)",
+        "label": "LTX 2.5",
         "media_kind": "video",
         "qualified": True,
-        "deprecated": True,
+        "deprecated": False,
     },
 }
 SELECTABLE_MODELS = tuple(name for name, spec in MODEL_REGISTRY.items() if spec["qualified"] and not spec["deprecated"])
@@ -268,6 +268,9 @@ class StateStore:
             elif settings.model == "h3-beta1" and settings.variant != "beta1":
                 settings = replace(settings, variant="beta1", lora=None, lora_strength=None)
                 self.put_settings(user_id, settings)
+            elif settings.model == "ltx" and (settings.steps != 8 or not 1 <= settings.seconds <= 161 / 24 or settings.variant != "uncensored" or settings.lora is not None or settings.lora_strength is not None):
+                settings = replace(settings, steps=8, seconds=settings.seconds if 1 <= settings.seconds <= 161 / 24 else 6.0, variant="uncensored", lora=None, lora_strength=None)
+                self.put_settings(user_id, settings)
             return settings
         except (TypeError, ValueError, KeyError):
             return Settings()
@@ -426,7 +429,7 @@ class MediaBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
             return await self.deny(update)
-        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3 (H3 Eros Max beta6).")
+        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3|ltx (H3 Eros Max beta6).")
 
     @staticmethod
     def _display_strength(settings: Settings) -> float | str:
@@ -442,8 +445,10 @@ class MediaBot:
             [InlineKeyboardButton(f"Model: {MODEL_REGISTRY.get(settings.model, {}).get('label', settings.model)}", callback_data=f"s:{user_id}:model")],
             [InlineKeyboardButton(f"Steps: {settings.steps}", callback_data=f"s:{user_id}:steps")],
             [InlineKeyboardButton(f"Mode: {settings.mode}", callback_data=f"s:{user_id}:mode")],
-            [InlineKeyboardButton(f"LoRA: {settings.lora or 'none'}", callback_data=f"s:{user_id}:lora")],
-            [InlineKeyboardButton(f"Strength: {MediaBot._display_strength(settings)}", callback_data=f"s:{user_id}:strength")],
+            *([] if settings.model == "ltx" else [
+                [InlineKeyboardButton(f"LoRA: {settings.lora or 'none'}", callback_data=f"s:{user_id}:lora")],
+                [InlineKeyboardButton(f"Strength: {MediaBot._display_strength(settings)}", callback_data=f"s:{user_id}:strength")],
+            ]),
             [InlineKeyboardButton(f"Width: {settings.width if not settings.auto_size and settings.width is not None else 'auto'}", callback_data=f"s:{user_id}:width")],
             [InlineKeyboardButton(f"Height: {settings.height if not settings.auto_size and settings.height is not None else 'auto'}", callback_data=f"s:{user_id}:height")],
             [InlineKeyboardButton(f"Longest: {settings.longest}", callback_data=f"s:{user_id}:longest")],
@@ -485,6 +490,8 @@ class MediaBot:
             if value not in SELECTABLE_MODELS: raise ValueError
             data.update(model=value, media_kind="image" if value == "qwen-image-2.1" else "video", mode="t2i" if value == "qwen-image-2.1" else "t2v", auto_size=True, width=None, height=None)
             data.update(variant="beta6" if value == "h3" else "beta1" if value == "h3-beta1" else "uncensored", steps=20 if value == "qwen-image-2.1" else 4 if value == "h3-beta1" else 8, lora=None, lora_strength=None)
+            if value == "ltx" and not 1 <= settings.seconds <= 161 / 24:
+                data["seconds"] = 6.0
         elif key == "mode":
             valid = {"t2i", "edit"} if settings.media_kind == "image" else {"t2v", "i2v"}
             if value not in valid: raise ValueError
@@ -508,11 +515,12 @@ class MediaBot:
         elif key in {"steps", "duration", "seconds", "strength", "lora_strength", "variant", "lora"}:
             if key == "steps":
                 data["steps"] = int(raw)
-                if not 1 <= data["steps"] <= 40: raise ValueError
+                if not 1 <= data["steps"] <= 40 or (settings.model == "ltx" and data["steps"] != 8): raise ValueError
             elif key in {"duration", "seconds"}:
                 data["seconds"] = float(raw)
-                if not 1.0 <= data["seconds"] <= 15.0: raise ValueError
+                if not 1.0 <= data["seconds"] <= (161 / 24 if settings.model == "ltx" else 15.0): raise ValueError
             elif key in {"strength", "lora_strength"}:
+                if settings.model == "ltx": raise ValueError
                 target = "lora_strength" if settings.media_kind == "video" and key == "strength" else key
                 data[target] = None if value == "none" else float(raw)
                 if data[target] is not None and not 0.0 <= data[target] <= 2.0: raise ValueError
@@ -527,13 +535,21 @@ class MediaBot:
             raise ValueError
         return Settings(**data)
 
+    @staticmethod
+    def _setting_response(settings: Settings, new_settings: Settings, key: str) -> str:
+        text = MediaBot._settings_text(new_settings)
+        if key.lower().lstrip("/") == "model" and new_settings.model == "ltx" and new_settings.seconds != settings.seconds:
+            text += (f"\nDuration changed from {settings.seconds:g}s to {new_settings.seconds:g}s for LTX. "
+                     "This is the saved duration and will not be restored when switching models.")
+        return text
+
     async def setting_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
             return await self.deny(update)
         args = context.args
         cmd = update.effective_message.text.split()[0].split("@", 1)[0].lower()
         settings = self.state.get_settings(update.effective_user.id)
-        usage = "Usage: /set KEY VALUE (model, mode, preset, longest, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|h3"
+        usage = "Usage: /set KEY VALUE (model, mode, preset, longest, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|h3|ltx"
         if cmd == "/set":
             if len(args) != 2:
                 return await update.effective_message.reply_text(usage)
@@ -549,7 +565,7 @@ class MediaBot:
         except (ValueError, TypeError):
             return await update.effective_message.reply_text("Invalid setting. Use /settings or /set KEY VALUE; /set auto reset restores adaptive sizing.")
         self.state.put_settings(update.effective_user.id, new_settings)
-        await update.effective_message.reply_text(self._settings_text(new_settings), reply_markup=self._settings_keyboard(update.effective_user.id, new_settings))
+        await update.effective_message.reply_text(self._setting_response(settings, new_settings, key), reply_markup=self._settings_keyboard(update.effective_user.id, new_settings))
 
     async def callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -591,7 +607,7 @@ class MediaBot:
             await query.answer("Unsupported setting", show_alert=True); return
         self.state.put_settings(user.id, new_settings)
         await query.answer("Saved")
-        await query.edit_message_text(self._settings_text(new_settings), reply_markup=self._settings_keyboard(user.id, new_settings))
+        await query.edit_message_text(self._setting_response(settings, new_settings, key), reply_markup=self._settings_keyboard(user.id, new_settings))
 
     async def result_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
