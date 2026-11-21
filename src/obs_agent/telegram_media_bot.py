@@ -65,6 +65,7 @@ MODEL_REGISTRY = {
 SELECTABLE_MODELS = tuple(name for name, spec in MODEL_REGISTRY.items() if spec["qualified"] and not spec["deprecated"])
 SELECTABLE_VIDEO_MODELS = tuple(name for name in SELECTABLE_MODELS if MODEL_REGISTRY[name]["media_kind"] == "video")
 PRESET_LONGEST = {"low": 500, "medium": 700, "high": 1000}
+DURATION_SECONDS = (3, 5, 10, 15)
 VIDEO_LORAS = {"aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"}
 ABANDONED_JOB_SECONDS = 24 * 60 * 60
 DIAGNOSTIC_STAGES = {"received", "preflight", "rejected", "download", "image_probe", "normalize", "upload", "submit", "queued", "status", "result", "delivery", "cleanup", "delivered", "restart"}
@@ -451,7 +452,7 @@ class MediaBot:
             ]),
             [InlineKeyboardButton(f"Width: {settings.width if not settings.auto_size and settings.width is not None else 'auto'}", callback_data=f"s:{user_id}:width")],
             [InlineKeyboardButton(f"Height: {settings.height if not settings.auto_size and settings.height is not None else 'auto'}", callback_data=f"s:{user_id}:height")],
-            [InlineKeyboardButton(f"Longest: {settings.longest}", callback_data=f"s:{user_id}:longest")],
+            [InlineKeyboardButton(f"Duration: {settings.seconds:g}s", callback_data=f"s:{user_id}:seconds")],
         ])
 
     async def settings_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -467,7 +468,7 @@ class MediaBot:
     def _settings_text(settings: Settings) -> str:
         model_label = MODEL_REGISTRY.get(settings.model, {}).get("label", settings.model)
         width, height = _resolve_dimensions(settings)
-        size = f"auto {width}x{height} longest={settings.longest}" if settings.auto_size else f"manual {width}x{height}"
+        size = f"auto {width}x{height}" if settings.auto_size else f"manual {width}x{height}"
         strength = MediaBot._display_strength(settings)
         strength_text = f"{strength:g}" if isinstance(strength, float) else strength
         return (f"kind={settings.media_kind} model={model_label} mode={settings.mode}\n"
@@ -499,11 +500,6 @@ class MediaBot:
         elif key == "preset":
             if value not in PRESET_LONGEST: raise ValueError
             data.update(preset=value, longest=PRESET_LONGEST[value], auto_size=True, width=None, height=None)
-        elif key == "longest":
-            longest = int(raw)
-            if not 256 <= longest <= 2048: raise ValueError
-            data.update(longest=longest, auto_size=True, width=None, height=None)
-            data["preset"] = min(PRESET_LONGEST, key=lambda name: abs(PRESET_LONGEST[name] - longest))
         elif key in {"width", "height"}:
             if value == "auto":
                 data[key] = None
@@ -549,7 +545,7 @@ class MediaBot:
         args = context.args
         cmd = update.effective_message.text.split()[0].split("@", 1)[0].lower()
         settings = self.state.get_settings(update.effective_user.id)
-        usage = "Usage: /set KEY VALUE (model, mode, preset, longest, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|h3|ltx"
+        usage = "Usage: /set KEY VALUE (model, mode, preset, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|h3|ltx"
         if cmd == "/set":
             if len(args) != 2:
                 return await update.effective_message.reply_text(usage)
@@ -578,17 +574,18 @@ class MediaBot:
             return
         settings = self.state.get_settings(user.id)
         step_values = [8, 12, 20] if settings.model == "h3" else [4, 20] if settings.model == "h3-beta1" else [8] if settings.model == "ltx" else [12, 20]
+        seconds_values = [value for value in DURATION_SECONDS if value <= 161 / 24] if settings.model == "ltx" else list(DURATION_SECONDS)
         choices = {
             "kind": ["image", "video"],
             "preset": list(PRESET_LONGEST),
             "model": list(SELECTABLE_MODELS),
             "steps": step_values,
+            "seconds": seconds_values,
             "mode": ["t2i", "edit"] if settings.media_kind == "image" else ["t2v", "i2v"],
             "lora": ["none", *sorted(VIDEO_LORAS)],
             "strength": ["none", 0.25, 0.5, 0.75, 1.0, 1.5, 2.0],
             "width": ["auto", 512, 704, 992],
             "height": ["auto", 512, 704, 992],
-            "longest": [500, 700, 1000],
         }
         key = parts[2]
         values = choices.get(key)
@@ -949,8 +946,7 @@ class MediaBot:
             ("kind", "set image or video kind"),
             ("model", "select a qualified model"),
             ("mode", "select t2i, edit, t2v, or i2v"),
-            ("preset", "select low, medium, or high longest side"),
-            ("longest", "set adaptive longest side"),
+            ("preset", "select low, medium, or high adaptive size"),
             ("width", "set manual width or auto"),
             ("height", "set manual height or auto"),
             ("steps", "set sampling steps"),
@@ -973,7 +969,7 @@ class MediaBot:
         app.add_error_handler(self.error_handler)
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("settings", self.settings_cmd))
-        for command in ("set", "auto", "kind", "model", "mode", "preset", "longest", "width", "height", "steps", "duration", "variant", "lora", "strength"):
+        for command in ("set", "auto", "kind", "model", "mode", "preset", "width", "height", "steps", "duration", "variant", "lora", "strength"):
             app.add_handler(CommandHandler(command, self.setting_command))
         app.add_handler(CommandHandler("result", self.result_command))
         app.add_handler(CallbackQueryHandler(self.callback, pattern=r"^s:"))

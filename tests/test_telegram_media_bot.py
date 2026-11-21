@@ -32,6 +32,56 @@ def test_settings_keyboard_rebuilds_model_label_after_cycle(tmp_path):
     assert image_keyboard.inline_keyboard[6][0].text == "Strength: 0.5"
 
 
+def test_duration_button_present_and_cycles_three_five_ten_fifteen(tmp_path):
+    bot = MediaBot(token="", state=StateStore(tmp_path / "state.sqlite3"), api=None, result_root=tmp_path / "results")
+    keyboard = bot._settings_keyboard(5129431382, Settings(model="h3", media_kind="video", mode="t2v", seconds=5.0))
+    assert keyboard.inline_keyboard[-1][0].text == "Duration: 5s"
+    assert keyboard.inline_keyboard[-1][0].callback_data == "s:5129431382:seconds"
+    current = 5.0
+    for expected in (10, 15, 3, 5):
+        current = MediaBot._apply_setting(Settings(model="h3", media_kind="video", mode="t2v", seconds=current), "seconds", str(expected)).seconds
+        assert current == expected
+
+
+def test_duration_cycle_respects_ltx_contract_cap():
+    ltx = MediaBot._apply_setting(Settings(model="h3", media_kind="video", mode="t2v"), "model", "ltx")
+    assert ltx.seconds == 4.0  # in-contract duration preserved by the model switch
+    clamped = MediaBot._apply_setting(Settings(model="h3", media_kind="video", mode="t2v", seconds=10.0), "model", "ltx")
+    assert clamped.seconds == 6.0  # clamped to the LTX default when out of contract
+    five = MediaBot._apply_setting(ltx, "seconds", "5")
+    assert five.seconds == 5.0
+    try:
+        MediaBot._apply_setting(ltx, "seconds", "10")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("LTX accepted a duration beyond its 161/24 s contract")
+
+
+def test_longest_artifact_is_unreachable_from_every_entry_point(tmp_path):
+    bot = MediaBot(token="", state=StateStore(tmp_path / "state.sqlite3"), api=None, result_root=tmp_path / "results")
+    settings = Settings(model="h3", media_kind="video", mode="t2v")
+    assert "longest" not in bot._settings_text(settings)
+    keyboard = bot._settings_keyboard(5129431382, settings)
+    for row in keyboard.inline_keyboard:
+        for button in row:
+            assert "longest" not in (button.callback_data or "")
+            assert "Longest" not in button.text
+    try:
+        MediaBot._apply_setting(settings, "longest", "700")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("manual longest setter still reachable")
+
+
+def test_adaptive_presets_still_drive_longest_side():
+    medium = MediaBot._apply_setting(Settings(model="h3", media_kind="video", mode="t2v", longest=500), "preset", "medium")
+    assert (medium.preset, medium.longest, medium.auto_size) == ("medium", 700, True)
+    high = MediaBot._apply_setting(medium, "preset", "high")
+    assert (high.preset, high.longest) == ("high", 1000)
+
+
 def test_adaptive_presets_preserve_portrait_aspect_and_align_model():
     settings = Settings(media_kind="video", model="h3", mode="i2v", longest=500, auto_size=True, width=None, height=None)
     low = _resolve_dimensions(settings, (2, 3))
