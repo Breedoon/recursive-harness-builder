@@ -12,10 +12,11 @@ def test_allowlist_is_exact_and_excludes_third_identity():
 
 
 def test_model_registry_only_advertises_qualified_nondeprecated_paths():
-    assert SELECTABLE_MODELS == ("qwen-image-2.1", "h3")
+    assert SELECTABLE_MODELS == ("qwen-image-2.1", "h3", "ltx")
     assert MODEL_REGISTRY["h3"]["label"] == "H3 Eros Max beta6 (checkpoint)"
     assert MODEL_REGISTRY["wan"]["deprecated"] is True
-    assert MODEL_REGISTRY["ltx"]["deprecated"] is True and MODEL_REGISTRY["h3-beta1"]["deprecated"] is True
+    assert MODEL_REGISTRY["ltx"]["deprecated"] is False and MODEL_REGISTRY["ltx"]["label"] == "LTX 2.5"
+    assert MODEL_REGISTRY["h3-beta1"]["deprecated"] is True
 
 
 def test_settings_keyboard_rebuilds_model_label_after_cycle(tmp_path):
@@ -281,7 +282,7 @@ def test_metadata_and_events_survive_restart_without_content(tmp_path, caplog):
 def test_checkpoints_default_to_correct_sampling_without_loras(tmp_path):
     selected = MediaBot._apply_setting(Settings(lora="hmnsfw"), "model", "h3")
     assert (selected.variant, selected.steps, selected.lora) == ("beta6", 8, None)
-    for retired in ("h3-beta1", "ltx", "wan"):
+    for retired in ("h3-beta1", "wan"):
         try:
             MediaBot._apply_setting(selected, "model", retired)
         except ValueError:
