@@ -103,6 +103,15 @@ def test_image_publisher_contract_constants_match_deployed_capabilities():
     assert IMAGE_MODEL_STEPS == {"qwen-image-2.1": 35, "minimax-h3-image": 6}
 
 
+def test_minimax_h3_image_dimensions_align_to_the_api_32_grid():
+    from obs_agent.telegram_media_bot import _alignment, _resolve_dimensions
+
+    assert _alignment("minimax-h3-image", "t2i") == 32
+    assert _alignment("minimax-h3-image", "edit") == 32
+    width, height = _resolve_dimensions(Settings(model="minimax-h3-image", mode="t2i", longest=700, auto_size=True, width=None, height=None))
+    assert width % 32 == 0 and height % 32 == 0 and max(width, height) <= 1000
+
+
 def test_longest_artifact_is_unreachable_from_every_entry_point(tmp_path):
     bot = MediaBot(token="", state=StateStore(tmp_path / "state.sqlite3"), api=None, result_root=tmp_path / "results")
     settings = Settings(model="h3", media_kind="video", mode="t2v")

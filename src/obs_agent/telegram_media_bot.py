@@ -132,7 +132,7 @@ def _alignment(model: str, mode: str) -> int:
         return 32 if mode == "i2v" else 16
     if model == "ltx":
         return 64
-    if model == "qwen-image-2.1":
+    if model in {"qwen-image-2.1", "minimax-h3-image"}:
         return 32
     return 16
 
@@ -664,8 +664,8 @@ class MediaBot:
             rejection = ("invalid_upload", "Only image documents are supported as media input.")
         elif has_image and not message.caption:
             rejection = ("invalid_prompt", "Add a caption describing the edit or image-to-video request; a photo alone is not generated.")
-        elif settings.media_kind == "image" and settings.model != "qwen-image-2.1":
-            rejection = ("unsupported_model_mode", "Image mode requires qwen-image-2.1.")
+        elif settings.media_kind == "image" and settings.model not in {"qwen-image-2.1", "minimax-h3-image"}:
+            rejection = ("unsupported_model_mode", "Image mode requires a qualified image model.")
         elif settings.media_kind == "video" and settings.model == "qwen-image-2.1":
             rejection = ("unsupported_model_mode", "Video mode requires a qualified video checkpoint.")
         elif not has_image and settings.mode in {"edit", "i2v"}:
