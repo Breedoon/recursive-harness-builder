@@ -32,22 +32,22 @@ ALLOWLIST = frozenset({227177188, 5129431382})
 # A model remains hidden until its backend path has real qualification evidence.
 MODEL_REGISTRY = {
     "qwen-image-2.1": {
-        "label": "Qwen Image 2.1",
+        "label": "Qwen Image 2.1 (uncensored)",
         "media_kind": "image",
         "qualified": True,
         "deprecated": False,
     },
     "h3": {
-        "label": "H3 Eros Max beta6 (checkpoint)",
+        "label": "H3 Eros Max beta7 (checkpoint)",
         "media_kind": "video",
         "qualified": True,
         "deprecated": False,
     },
-    "h3-beta1": {
-        "label": "H3 Eros Max beta1 (retired)",
-        "media_kind": "video",
+    "minimax-h3-image": {
+        "label": "MiniMax H3 Image",
+        "media_kind": "image",
         "qualified": True,
-        "deprecated": True,
+        "deprecated": False,
     },
     "wan": {
         "label": "Wan 2.2 (deprecated)",
@@ -66,6 +66,11 @@ SELECTABLE_MODELS = tuple(name for name, spec in MODEL_REGISTRY.items() if spec[
 SELECTABLE_VIDEO_MODELS = tuple(name for name in SELECTABLE_MODELS if MODEL_REGISTRY[name]["media_kind"] == "video")
 PRESET_LONGEST = {"low": 500, "medium": 700, "high": 1000}
 DURATION_SECONDS = (3, 5, 10, 15)
+# Publisher contracts for the deployed image builds (E3 addendum): uncensored
+# Qwen runs 35 steps / true CFG 5.0; MiniMax H3 image runs 6 steps / CFG 1.0.
+# The backend graph honors request steps/cfg, so the bot must send these.
+IMAGE_MODEL_CFG = {"qwen-image-2.1": 5.0, "minimax-h3-image": 1.0}
+IMAGE_MODEL_STEPS = {"qwen-image-2.1": 35, "minimax-h3-image": 6}
 VIDEO_LORAS = {"aftermidnight", "aftermidnight-softer", "hmnsfw", "naughtytimes"}
 ABANDONED_JOB_SECONDS = 24 * 60 * 60
 DIAGNOSTIC_STAGES = {"received", "preflight", "rejected", "download", "image_probe", "normalize", "upload", "submit", "queued", "status", "result", "delivery", "cleanup", "delivered", "restart"}
@@ -182,11 +187,11 @@ class Settings:
     media_kind: str = "image"
     model: str = "qwen-image-2.1"
     mode: str = "t2i"
-    variant: str = "turbo"
+    variant: str = "uncensored"
     lora: str | None = None
     lora_strength: float | None = None
     strength: float = 0.75
-    steps: int = 20
+    steps: int = 35
     seconds: float = 4.0
     width: int | None = 512
     height: int | None = 512
@@ -261,13 +266,19 @@ class StateStore:
         try:
             data = json.loads(row[0])
             settings = Settings(**{k: data[k] for k in asdict(Settings()) if k in data})
-            if settings.model not in SELECTABLE_MODELS:
-                return Settings(media_kind="video", model="h3", mode="t2v", variant="beta6", steps=8, width=640, height=384)
-            if settings.model == "h3" and settings.variant != "beta6":
-                settings = replace(settings, variant="beta6", steps=8 if settings.steps == 4 else settings.steps, lora=None, lora_strength=None)
+            if settings.model == "h3-beta1":
+                settings = replace(settings, model="h3", variant="beta7", steps=8, lora=None, lora_strength=None)
                 self.put_settings(user_id, settings)
-            elif settings.model == "h3-beta1" and settings.variant != "beta1":
-                settings = replace(settings, variant="beta1", lora=None, lora_strength=None)
+            if settings.model not in SELECTABLE_MODELS:
+                return Settings(media_kind="video", model="h3", mode="t2v", variant="beta7", steps=8, width=640, height=384)
+            if settings.model == "h3" and settings.variant != "beta7":
+                settings = replace(settings, variant="beta7", steps=8 if settings.steps == 4 else settings.steps, lora=None, lora_strength=None)
+                self.put_settings(user_id, settings)
+            elif settings.model == "qwen-image-2.1" and (settings.steps != IMAGE_MODEL_STEPS["qwen-image-2.1"] or settings.variant != "uncensored"):
+                settings = replace(settings, steps=IMAGE_MODEL_STEPS["qwen-image-2.1"], variant="uncensored")
+                self.put_settings(user_id, settings)
+            elif settings.model == "minimax-h3-image" and settings.steps != IMAGE_MODEL_STEPS["minimax-h3-image"]:
+                settings = replace(settings, steps=IMAGE_MODEL_STEPS["minimax-h3-image"])
                 self.put_settings(user_id, settings)
             elif settings.model == "ltx" and (settings.steps != 8 or not 1 <= settings.seconds <= 161 / 24 or settings.variant != "uncensored" or settings.lora is not None or settings.lora_strength is not None):
                 settings = replace(settings, steps=8, seconds=settings.seconds if 1 <= settings.seconds <= 161 / 24 else 6.0, variant="uncensored", lora=None, lora_strength=None)
@@ -430,7 +441,7 @@ class MediaBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.authorized(update):
             return await self.deny(update)
-        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|h3|ltx (H3 Eros Max beta6).")
+        await update.effective_message.reply_text("Private media bot ready. Send a prompt or /settings. Use /kind image|video and /model qwen-image-2.1|minimax-h3-image|h3|ltx (H3 Eros Max beta7).")
 
     @staticmethod
     def _display_strength(settings: Settings) -> float | str:
@@ -486,11 +497,11 @@ class MediaBot:
         elif key in {"kind", "media_kind"}:
             if value not in {"image", "video"}: raise ValueError
             data.update(media_kind=value, model="qwen-image-2.1" if value == "image" else "h3", mode="t2i" if value == "image" else "t2v", auto_size=True, width=None, height=None)
-            data.update(steps=20 if value == "image" else 8, variant="turbo" if value == "image" else "beta6", lora=None, lora_strength=None)
+            data.update(steps=35 if value == "image" else 8, variant="uncensored" if value == "image" else "beta7", lora=None, lora_strength=None)
         elif key == "model":
             if value not in SELECTABLE_MODELS: raise ValueError
-            data.update(model=value, media_kind="image" if value == "qwen-image-2.1" else "video", mode="t2i" if value == "qwen-image-2.1" else "t2v", auto_size=True, width=None, height=None)
-            data.update(variant="beta6" if value == "h3" else "beta1" if value == "h3-beta1" else "uncensored", steps=20 if value == "qwen-image-2.1" else 4 if value == "h3-beta1" else 8, lora=None, lora_strength=None)
+            data.update(model=value, media_kind="image" if value in {"qwen-image-2.1", "minimax-h3-image"} else "video", mode="t2i" if value in {"qwen-image-2.1", "minimax-h3-image"} else "t2v", auto_size=True, width=None, height=None)
+            data.update(variant="beta7" if value == "h3" else "uncensored", steps=IMAGE_MODEL_STEPS.get(value, 8), lora=None, lora_strength=None)
             if value == "ltx" and not 1 <= settings.seconds <= 161 / 24:
                 data["seconds"] = 6.0
         elif key == "mode":
@@ -511,7 +522,7 @@ class MediaBot:
         elif key in {"steps", "duration", "seconds", "strength", "lora_strength", "variant", "lora"}:
             if key == "steps":
                 data["steps"] = int(raw)
-                if not 1 <= data["steps"] <= 40 or (settings.model == "ltx" and data["steps"] != 8): raise ValueError
+                if not 1 <= data["steps"] <= 40 or (settings.model == "ltx" and data["steps"] != 8) or (settings.model in IMAGE_MODEL_STEPS and data["steps"] != IMAGE_MODEL_STEPS[settings.model]): raise ValueError
             elif key in {"duration", "seconds"}:
                 data["seconds"] = float(raw)
                 if not 1.0 <= data["seconds"] <= (161 / 24 if settings.model == "ltx" else 15.0): raise ValueError
@@ -521,7 +532,7 @@ class MediaBot:
                 data[target] = None if value == "none" else float(raw)
                 if data[target] is not None and not 0.0 <= data[target] <= 2.0: raise ValueError
             elif key == "variant":
-                valid = {"h3": {"beta6"}, "h3-beta1": {"beta1"}, "ltx": {"uncensored"}, "qwen-image-2.1": set()}.get(settings.model, set())
+                valid = {"h3": {"beta7"}, "ltx": {"uncensored"}, "qwen-image-2.1": {"uncensored"}, "minimax-h3-image": set()}.get(settings.model, set())
                 if value not in valid: raise ValueError
                 data["variant"] = value
             else:
@@ -545,7 +556,7 @@ class MediaBot:
         args = context.args
         cmd = update.effective_message.text.split()[0].split("@", 1)[0].lower()
         settings = self.state.get_settings(update.effective_user.id)
-        usage = "Usage: /set KEY VALUE (model, mode, preset, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|h3|ltx"
+        usage = "Usage: /set KEY VALUE (model, mode, preset, width, height, steps, duration, variant, lora, strength, auto); /kind image|video; /model qwen-image-2.1|minimax-h3-image|h3|ltx"
         if cmd == "/set":
             if len(args) != 2:
                 return await update.effective_message.reply_text(usage)
@@ -573,7 +584,7 @@ class MediaBot:
             await query.answer("This control belongs to another user", show_alert=True)
             return
         settings = self.state.get_settings(user.id)
-        step_values = [8, 12, 20] if settings.model == "h3" else [4, 20] if settings.model == "h3-beta1" else [8] if settings.model == "ltx" else [12, 20]
+        step_values = [8, 12, 20] if settings.model == "h3" else [IMAGE_MODEL_STEPS[settings.model]] if settings.model in IMAGE_MODEL_STEPS else [8] if settings.model == "ltx" else [12, 20]
         seconds_values = [value for value in DURATION_SECONDS if value <= 161 / 24] if settings.model == "ltx" else list(DURATION_SECONDS)
         choices = {
             "kind": ["image", "video"],
@@ -639,13 +650,13 @@ class MediaBot:
         mode = ("edit" if settings.media_kind == "image" else "i2v") if has_image else settings.mode
         effective_settings = replace(settings, mode=mode)
         width, height = _resolve_dimensions(effective_settings)
-        request = {"model": "h3" if settings.model == "h3-beta1" else settings.model, "mode": mode, "prompt": prompt, "width": width, "height": height, "steps": settings.steps}
+        request = {"model": settings.model, "mode": mode, "prompt": prompt, "width": width, "height": height, "steps": settings.steps}
         if settings.media_kind == "video":
             request.update(seconds=settings.seconds, variant=settings.variant)
             if settings.lora:
                 request.update(lora=settings.lora, lora_strength=settings.lora_strength)
         else:
-            request.update(cfg=4.0, strength=settings.strength)
+            request.update(cfg=IMAGE_MODEL_CFG[settings.model], strength=settings.strength)
         job_id = self.state.create_job(user_id=update.effective_user.id, chat_id=message.chat_id, message_id=message.message_id, prompt=prompt, request=request)
         self.state.record_diagnostics(job_id, stage="preflight", metadata={**asdict(settings), "has_image": has_image})
         rejection = None

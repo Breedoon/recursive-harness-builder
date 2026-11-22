@@ -12,19 +12,21 @@ def test_allowlist_is_exact_and_excludes_third_identity():
 
 
 def test_model_registry_only_advertises_qualified_nondeprecated_paths():
-    assert SELECTABLE_MODELS == ("qwen-image-2.1", "h3", "ltx")
-    assert MODEL_REGISTRY["h3"]["label"] == "H3 Eros Max beta6 (checkpoint)"
+    assert SELECTABLE_MODELS == ("qwen-image-2.1", "h3", "minimax-h3-image", "ltx")
+    assert MODEL_REGISTRY["h3"]["label"] == "H3 Eros Max beta7 (checkpoint)"
+    assert MODEL_REGISTRY["qwen-image-2.1"]["label"] == "Qwen Image 2.1 (uncensored)"
+    assert MODEL_REGISTRY["minimax-h3-image"]["media_kind"] == "image"
     assert MODEL_REGISTRY["wan"]["deprecated"] is True
     assert MODEL_REGISTRY["ltx"]["deprecated"] is False and MODEL_REGISTRY["ltx"]["label"] == "LTX 2.5"
-    assert MODEL_REGISTRY["h3-beta1"]["deprecated"] is True
+    assert "h3-beta1" not in MODEL_REGISTRY
 
 
 def test_settings_keyboard_rebuilds_model_label_after_cycle(tmp_path):
     bot = MediaBot(token="", state=StateStore(tmp_path / "state.sqlite3"), api=None, result_root=tmp_path / "results")
     h3_keyboard = bot._settings_keyboard(5129431382, Settings(model="h3", media_kind="video"))
     qwen_keyboard = bot._settings_keyboard(5129431382, Settings(model="qwen-image-2.1", media_kind="image"))
-    assert h3_keyboard.inline_keyboard[2][0].text == "Model: H3 Eros Max beta6 (checkpoint)"
-    assert qwen_keyboard.inline_keyboard[2][0].text == "Model: Qwen Image 2.1"
+    assert h3_keyboard.inline_keyboard[2][0].text == "Model: H3 Eros Max beta7 (checkpoint)"
+    assert qwen_keyboard.inline_keyboard[2][0].text == "Model: Qwen Image 2.1 (uncensored)"
     assert h3_keyboard.inline_keyboard[2][0].callback_data == qwen_keyboard.inline_keyboard[2][0].callback_data
     h3_settings = Settings(model="h3", media_kind="video")
     assert "strength=default" in bot._settings_text(h3_settings)
@@ -56,6 +58,49 @@ def test_duration_cycle_respects_ltx_contract_cap():
         pass
     else:
         raise AssertionError("LTX accepted a duration beyond its 161/24 s contract")
+
+
+def test_model_selectors_expose_exactly_two_video_and_two_image_models():
+    video = [name for name in SELECTABLE_MODELS if MODEL_REGISTRY[name]["media_kind"] == "video"]
+    image = [name for name in SELECTABLE_MODELS if MODEL_REGISTRY[name]["media_kind"] == "image"]
+    assert video == ["h3", "ltx"]
+    assert image == ["qwen-image-2.1", "minimax-h3-image"]
+
+
+def test_steps_locked_to_deployed_model_contracts():
+    for model, steps in (("ltx", 8), ("qwen-image-2.1", 35), ("minimax-h3-image", 6)):
+        kind = "video" if model == "ltx" else "image"
+        mode = "t2v" if kind == "video" else "t2i"
+        try:
+            MediaBot._apply_setting(Settings(model=model, media_kind=kind, mode=mode), "steps", str(steps + 1))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{model} accepted off-contract steps")
+        assert MediaBot._apply_setting(Settings(model=model, media_kind=kind, mode=mode), "steps", str(steps)).steps == steps
+
+
+def test_stored_settings_migrate_to_deployed_contracts(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.put_settings(5129431382, Settings(model="h3", media_kind="video", mode="t2v", variant="beta6", steps=12))
+    migrated = store.get_settings(5129431382)
+    assert (migrated.model, migrated.variant, migrated.steps) == ("h3", "beta7", 12)
+    store.put_settings(5129431382, Settings(model="h3-beta1", media_kind="video", mode="t2v", variant="beta1", steps=4))
+    remapped = store.get_settings(5129431382)
+    assert (remapped.model, remapped.variant, remapped.steps) == ("h3", "beta7", 8)
+    store.put_settings(5129431382, Settings(model="qwen-image-2.1", media_kind="image", mode="t2i", variant="turbo", steps=20))
+    qwen = store.get_settings(5129431382)
+    assert (qwen.model, qwen.variant, qwen.steps) == ("qwen-image-2.1", "uncensored", 35)
+    store.put_settings(5129431382, Settings(model="minimax-h3-image", media_kind="image", mode="t2i", variant="", steps=12))
+    minimax = store.get_settings(5129431382)
+    assert (minimax.model, minimax.steps) == ("minimax-h3-image", 6)
+
+
+def test_image_publisher_contract_constants_match_deployed_capabilities():
+    from obs_agent.telegram_media_bot import IMAGE_MODEL_CFG, IMAGE_MODEL_STEPS
+
+    assert IMAGE_MODEL_CFG == {"qwen-image-2.1": 5.0, "minimax-h3-image": 1.0}
+    assert IMAGE_MODEL_STEPS == {"qwen-image-2.1": 35, "minimax-h3-image": 6}
 
 
 def test_longest_artifact_is_unreachable_from_every_entry_point(tmp_path):
@@ -126,7 +171,7 @@ def test_stale_hidden_model_settings_fall_back_to_h3(tmp_path):
 def test_settings_and_job_snapshots_survive_restart(tmp_path):
     path = tmp_path / "state.sqlite3"
     store = StateStore(path)
-    settings = Settings(media_kind="video", model="h3", mode="t2v", variant="beta6", width=640, height=384, steps=8, seconds=2.0)
+    settings = Settings(media_kind="video", model="h3", mode="t2v", variant="beta7", width=640, height=384, steps=8, seconds=2.0)
     store.put_settings(5129431382, settings)
     job = store.create_job(user_id=5129431382, chat_id=99, message_id=7, prompt="boat", request={"model": "h3", "mode": "t2v", "steps": 4})
     store.update_job(job, backend_job_id="backend-1", state="starting_comfyui")
@@ -331,7 +376,7 @@ def test_metadata_and_events_survive_restart_without_content(tmp_path, caplog):
 
 def test_checkpoints_default_to_correct_sampling_without_loras(tmp_path):
     selected = MediaBot._apply_setting(Settings(lora="hmnsfw"), "model", "h3")
-    assert (selected.variant, selected.steps, selected.lora) == ("beta6", 8, None)
+    assert (selected.variant, selected.steps, selected.lora) == ("beta7", 8, None)
     for retired in ("h3-beta1", "wan"):
         try:
             MediaBot._apply_setting(selected, "model", retired)
@@ -342,7 +387,7 @@ def test_checkpoints_default_to_correct_sampling_without_loras(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     store.put_settings(5129431382, Settings(model="h3", media_kind="video", mode="t2v", variant="turbo", steps=4, lora="hmnsfw"))
     migrated = store.get_settings(5129431382)
-    assert (migrated.variant, migrated.steps, migrated.lora) == ("beta6", 8, None)
+    assert (migrated.variant, migrated.steps, migrated.lora) == ("beta7", 8, None)
     store.put_settings(5129431382, MediaBot._apply_setting(migrated, "steps", "4"))
     assert store.get_settings(5129431382).steps == 4
 
