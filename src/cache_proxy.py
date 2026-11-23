@@ -832,6 +832,61 @@ def sanitize_tool_schemas_for_openai(body: dict) -> int:
     return count
 
 
+# ── Per-model output ceiling (ops-599) ───────────────────────────────────
+# Claude Code 2.1.59 sends max_tokens=32,000 on every main request and caps
+# CLAUDE_CODE_MAX_OUTPUT_TOKENS at 64,000 for every current model (function
+# Dg), so long answers or long reasoning die with "exceeded the 32000 output
+# token maximum". CLAUDE_CODE_EXTRA_BODY cannot carry a higher value: the CLI
+# spreads it over every request, including its max_tokens=1 token counts and
+# Haiku side calls. So the proxy lifts exactly the CLI default to the model's
+# own maximum, by model-id prefix. Any other value (a token count's 1, the
+# CLI's overflow retry, an explicit CLAUDE_CODE_MAX_OUTPUT_TOKENS) is left alone.
+# Maxima measured 2026-11-23 by sending max_tokens=10,000,000; the 400 names
+# the limit: 128,000 for opus-4-6/4-7/4-8/5/5-5, sonnet-4-6/5/5-5,
+# fable-5/5-1/5-2, mythos-5-2 and haiku-5-5; 64,000 for haiku-4-5. The
+# Anthropic API accepted 146,572 input + 64,000 max_tokens on the 200K Haiku
+# 4.5, so hosted compaction targets need not move. The local GLM server rejects
+# prompt + max_tokens > 1,048,576; 64,000 keeps OBS's 967,000 compaction target
+# under window - max_tokens - 13K (claude_context.safe_compaction_threshold;
+# tests/test_cache_proxy_max_tokens.py). Raise a local value only after
+# moving that target.
+# CACHE-PREFIX: max_tokens is not part of the prompt-cache key (a 146,562-token
+# Haiku prompt cached at max_tokens 64,000 was read in full at 32,000).
+CLI_DEFAULT_MAX_TOKENS = 32000
+MODEL_MAX_OUTPUT_TOKENS = (
+    ("claude-haiku-4-5", 64000),
+    ("claude-haiku-5", 128000),
+    ("claude-opus-4-6", 128000),
+    ("claude-opus-4-7", 128000),
+    ("claude-opus-4-8", 128000),
+    ("claude-opus-5", 128000),
+    ("claude-sonnet-4-6", 128000),
+    ("claude-sonnet-5", 128000),
+    ("claude-fable-5", 128000),
+    ("claude-mythos-5", 128000),
+    ("local-sparks-glm-5.3-flash", 64000),
+)
+
+
+def model_max_output_tokens(model: str) -> int | None:
+    m = str(model or "").lower()
+    for prefix, limit in MODEL_MAX_OUTPUT_TOKENS:
+        if m.startswith(prefix):
+            return limit
+    return None
+
+
+def raise_default_max_tokens(body: dict) -> int:
+    """Lift the CLI's default max_tokens to the model's maximum; return the new value or 0."""
+    if body.get("max_tokens") != CLI_DEFAULT_MAX_TOKENS:
+        return 0
+    limit = model_max_output_tokens(body.get("model", ""))
+    if not limit or limit <= CLI_DEFAULT_MAX_TOKENS:
+        return 0
+    body["max_tokens"] = limit
+    return limit
+
+
 def strip_unsupported_effort(body: dict) -> int:
     """Drop harness-injected effort fields from Haiku side requests.
 
@@ -2730,6 +2785,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # norm.* field in the request index and a prefix_repro scenario.
             # Live check: scripts/cache_regression.py (docs/cache-proxy-safety.md).
             data, info = normalize_request(data)
+            try:
+                info["max_tokens"] = raise_default_max_tokens(data)
+            except Exception as e:
+                log(f"max_tokens raise error, sending as-is: {e}")
             if upstream == ANTHROPIC_UPSTREAM:
                 try:
                     media_floor = pin_media_floor(data)
@@ -2886,7 +2945,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                      ("action", "billing", "strings", "reminders", "git_status",
                       "tools", "metadata", "effort_stripped", "schema_sanitized",
                       "dynamic_boundary", "ws_trimmed", "volatile_pin", "ttl_pin", "cache_key",
-                      "local_compact", "media_floor")
+                      "local_compact", "media_floor", "max_tokens")
                      if isinstance(info, dict) and k in info},
             # which proxy code produced these bytes (load-time hash, short)
             "proxy_source": _LOADED_SOURCE_SHA256[:12],
