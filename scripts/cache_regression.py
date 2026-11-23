@@ -105,6 +105,8 @@ def run_one(args, provider: str, name: str, out_dir: Path) -> dict:
            "--json-out", str(json_out)]
     if args.model and provider == "anthropic":
         cmd += ["--model", args.model]
+    if getattr(args, "codex_model", None) and provider == "codex":  # None = prefix_repro's own default (sol)
+        cmd += ["--model", args.codex_model]
     t0 = time.time()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -183,6 +185,9 @@ def main(argv=None) -> int:
     ap.add_argument("--log-dir", default=DEFAULT_LOG_DIR,
                     help="the request log dir OF THE PROXY UNDER TEST (scratch proxies have their own)")
     ap.add_argument("--model", default=None, help="Claude model for the anthropic route (default: harness Haiku)")
+    ap.add_argument("--codex-model", default=None,
+                    help="GPT model for the codex route, for example luna (default: prefix_repro.py's own "
+                         "default, sol); passed to every codex-route run (ported from obs-22.86, 5adcd33)")
     ap.add_argument("--threshold", type=float, default=0.95)
     ap.add_argument("--scenario-timeout", type=int, default=600)
     ap.add_argument("--max-provider-errors", type=int, default=2,
