@@ -148,3 +148,62 @@ def test_teardown_grace_reads_env_and_falls_back_on_bad_values(monkeypatch: pyte
     for bad in ("", "nope", "0", "-3"):
         monkeypatch.setenv("OBS_TELEGRAM_TEARDOWN_GRACE_SECONDS", bad)
         assert _teardown_grace_seconds() == _DEFAULT_TEARDOWN_GRACE_SECONDS
+
+
+_FAKE_TOKEN = "1234567890:AAFakeFakeFakeFakeFakeFakeFakeFake12"
+
+
+def test_redact_bot_tokens_masks_url_and_bare_forms() -> None:
+    from obs_agent.telegram_main import redact_bot_tokens
+
+    url = f"POST https://api.telegram.org/bot{_FAKE_TOKEN}/sendMessage"
+    assert redact_bot_tokens(url) == "POST https://api.telegram.org/bot<redacted>/sendMessage"
+    assert _FAKE_TOKEN not in redact_bot_tokens(f"token={_FAKE_TOKEN} end")
+    plain = "route=TelegramRoute(chat_id=-1003780712622, thread_id=743440) 2026-11-24 10:48:03"
+    assert redact_bot_tokens(plain) == plain
+
+
+def test_configure_logging_quiets_http_clients_and_redacts_tokens(tmp_path, monkeypatch) -> None:
+    log_file = tmp_path / "telegram-prod.log"
+    monkeypatch.setenv("OBS_RUNTIME_LOG_FILE", str(log_file))
+    monkeypatch.delenv("OBS_TELEGRAM_LOG_FILE", raising=False)
+    monkeypatch.delenv("OBS_TELEGRAM_LOG_POLLING", raising=False)
+
+    root_logger = logging.getLogger()
+    original_handlers = list(root_logger.handlers)
+    original_formatters = {h: h.formatter for h in original_handlers}
+    original_level = root_logger.level
+    client_levels = {n: logging.getLogger(n).level for n in ("httpx", "httpcore", "telegram.request")}
+    for name in client_levels:
+        logging.getLogger(name).setLevel(logging.NOTSET)
+    root_logger.setLevel(logging.INFO)
+
+    try:
+        _configure_logging()
+        for name in client_levels:
+            assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING
+        logging.getLogger("httpx").info("HTTP Request: POST https://api.telegram.org/bot%s/sendMessage", _FAKE_TOKEN)
+        logging.getLogger("telegram.ext").warning("NetworkError at https://api.telegram.org/bot%s/getMe", _FAKE_TOKEN)
+        try:
+            raise RuntimeError(f"boom https://api.telegram.org/bot{_FAKE_TOKEN}/sendMessage")
+        except RuntimeError:
+            logging.getLogger("obs_agent.telegram").exception("send failed")
+        _configure_logging()  # idempotent: no double wrapping
+        for handler in root_logger.handlers:
+            handler.flush()
+        text = log_file.read_text(encoding="utf-8")
+        assert _FAKE_TOKEN not in text
+        assert "HTTP Request" not in text
+        assert "NetworkError at https://api.telegram.org/bot<redacted>/getMe" in text
+        assert "boom https://api.telegram.org/bot<redacted>/sendMessage" in text
+        assert "send failed" in text
+    finally:
+        for handler in list(root_logger.handlers):
+            if handler not in original_handlers:
+                root_logger.removeHandler(handler)
+                handler.close()
+        for handler, formatter in original_formatters.items():
+            handler.setFormatter(formatter)
+        root_logger.setLevel(original_level)
+        for name, level in client_levels.items():
+            logging.getLogger(name).setLevel(level)

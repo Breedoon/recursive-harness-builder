@@ -7,6 +7,7 @@ Usage:
 import asyncio
 import logging
 import os
+import re
 import threading
 from collections.abc import Awaitable
 from pathlib import Path
@@ -57,6 +58,40 @@ async def _run_with_bounded_teardown(runtime: Awaitable[None], grace_seconds: fl
         await runtime
     finally:
         _arm_teardown_deadline(grace_seconds)
+
+
+# Bot API URLs embed the bot token (https://api.telegram.org/bot<id>:<secret>/...).
+# A launch without the runtime sitecustomize logged them via httpx INFO lines
+# (ops-614), so the entrypoint itself quiets those loggers and masks any token
+# that still reaches a handler, tracebacks included.
+_TOKEN_URL_RE = re.compile(r"bot\d{5,}:[A-Za-z0-9_-]{20,}")
+_BARE_TOKEN_RE = re.compile(r"\b\d{5,}:AA[A-Za-z0-9_-]{30,}")
+_HTTP_CLIENT_LOGGERS = ("httpx", "httpcore", "telegram.request")
+
+
+def redact_bot_tokens(text: str) -> str:
+    return _BARE_TOKEN_RE.sub("<redacted-bot-token>", _TOKEN_URL_RE.sub("bot<redacted>", text))
+
+
+class _RedactingFormatter(logging.Formatter):
+    """Wrap a handler's formatter so no formatted line carries a bot token."""
+
+    def __init__(self, inner: logging.Formatter | None) -> None:
+        super().__init__()
+        self._inner = inner or logging.Formatter()
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_bot_tokens(self._inner.format(record))
+
+
+def _install_token_redaction(root_logger: logging.Logger) -> None:
+    for name in _HTTP_CLIENT_LOGGERS:
+        logger = logging.getLogger(name)
+        if logger.level < logging.WARNING:
+            logger.setLevel(logging.WARNING)
+    for handler in root_logger.handlers:
+        if not isinstance(handler.formatter, _RedactingFormatter):
+            handler.setFormatter(_RedactingFormatter(handler.formatter))
 
 
 class _DropGetUpdatesFilter(logging.Filter):
@@ -110,6 +145,7 @@ def _configure_logging() -> None:
         "on",
     }
     root_logger = logging.getLogger()
+    _install_token_redaction(root_logger)
     if not root_logger.handlers:
         return
     if keep_poll_logs:
