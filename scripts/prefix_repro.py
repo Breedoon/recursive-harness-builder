@@ -743,8 +743,10 @@ async def sc_refusal_parallel_resume(args):
     stand in for the refusal and the turn the live process answered after it
     (no prompt can produce a real refusal on demand, and none should be tried).
     Old replay policy freezes everything before the error row: the resume drops
-    the sibling and misses the cache (FAIL). With OBS_REPLAY_REFUSAL_REPAIR_SINCE
-    set before the error row, the whole history is relinked (append, PASS)."""
+    the sibling and misses the cache (FAIL). The scenario sets its own
+    OBS_REPLAY_REFUSAL_REPAIR_SINCE (the start of this run) so a gate run does
+    not depend on the operator's environment; PREFIX_REPRO_REFUSAL_REPAIR_OFF=1
+    leaves it unset to show the unfixed FAIL."""
     from datetime import datetime, timezone
     from obs_agent.context_jsonl import find_session_jsonl
     from obs_agent.jsonl_health import resolve_safe_jsonl_target
@@ -754,6 +756,11 @@ async def sc_refusal_parallel_resume(args):
     for name in ("a.txt", "b.txt", "c.txt"):
         (cwd / name).parent.mkdir(parents=True, exist_ok=True)
         (cwd / name).write_text(name + "\n")
+    saved = os.environ.get("OBS_REPLAY_REFUSAL_REPAIR_SINCE")
+    if os.environ.get("PREFIX_REPRO_REFUSAL_REPAIR_OFF") == "1":
+        os.environ.pop("OBS_REPLAY_REFUSAL_REPAIR_SINCE", None)
+    else:
+        os.environ["OBS_REPLAY_REFUSAL_REPAIR_SINCE"] = datetime.now(timezone.utc).isoformat()
 
     def row(kind, parent, content, **extra):
         out = {"type": kind, "uuid": str(uuid.uuid4()), "parentUuid": parent, "sessionId": sid,
@@ -779,8 +786,15 @@ async def sc_refusal_parallel_resume(args):
     with path.open("a") as handle:
         for injected in (refused, asked, answered):
             handle.write(json.dumps(injected) + "\n")
-    await _session(args, ["Reply with the single word: woke."], resume=sid)
-    return [sid], {"repair_since": os.environ.get("OBS_REPLAY_REFUSAL_REPAIR_SINCE"),
+    try:
+        await _session(args, ["Reply with the single word: woke."], resume=sid)
+        repair_since = os.environ.get("OBS_REPLAY_REFUSAL_REPAIR_SINCE")
+    finally:
+        if saved is None:
+            os.environ.pop("OBS_REPLAY_REFUSAL_REPAIR_SINCE", None)
+        else:
+            os.environ["OBS_REPLAY_REFUSAL_REPAIR_SINCE"] = saved
+    return [sid], {"repair_since": repair_since,
                    "test_injections": ["mid synthetic refusal row", "user row chained to it", "its answer"]}
 
 

@@ -23,7 +23,8 @@ def _row(kind, parent, content, ts, **extra):
     return out
 
 
-def _session(tmp_path: Path, *, orphan_tool_use: bool = False) -> Path:
+def _session(tmp_path: Path, *, orphan_tool_use: bool = False, refusal_thinking: bool = False,
+             synthetic: bool = True, early_error: bool = False) -> Path:
     t = "2026-11-25T03:{:02d}:00Z".format
     rows = []
     u0 = _row("user", None, "start", t(0)); rows.append(u0)
@@ -40,15 +41,26 @@ def _session(tmp_path: Path, *, orphan_tool_use: bool = False) -> Path:
     rc = _row("user", c["uuid"], [{"type": "tool_result", "tool_use_id": "tC", "content": "c"}], t(3)); rows.append(rc)
     done = _row("assistant", rc["uuid"], [{"type": "text", "text": "read"}], t(4),
                 model="claude-sonnet-5-5", id="m2", stop_reason="end_turn"); rows.append(done)
-    u1 = _row("user", done["uuid"], "next", t(10)); rows.append(u1)
+    parent = done["uuid"]
+    if early_error:
+        early = _row("assistant", parent, [{"type": "text", "text": "API Error: Request timed out"}], t(5),
+                     isApiErrorMessage=True, model="<synthetic>", stop_reason="stop_sequence"); rows.append(early)
+        parent = early["uuid"]
+    u1 = _row("user", parent, "next", t(10)); rows.append(u1)
     parent = u1["uuid"]
     if orphan_tool_use:
         dangling = _row("assistant", parent, [{"type": "tool_use", "id": "tX", "name": "Bash", "input": {}}], t(11),
                         model="claude-sonnet-5-5", id="m3", stop_reason="tool_use"); rows.append(dangling)
         parent = dangling["uuid"]
-    refused = _row("assistant", parent, [{"type": "text", "text": "API Error: ... Usage Policy"}], t(13),
-                   isApiErrorMessage=True, model="<synthetic>", stop_reason="stop_sequence"); rows.append(refused)
-    u2 = _row("user", refused["uuid"], "again", t(20)); rows.append(u2)
+    if refusal_thinking:
+        stopped = _row("assistant", parent, [{"type": "thinking", "thinking": "", "signature": "r"}], t(12),
+                       model="claude-sonnet-5-5", id="m3r", stop_reason="refusal"); rows.append(stopped)
+        parent = stopped["uuid"]
+    if synthetic:
+        refused = _row("assistant", parent, [{"type": "text", "text": "API Error: ... Usage Policy"}], t(13),
+                       isApiErrorMessage=True, model="<synthetic>", stop_reason="stop_sequence"); rows.append(refused)
+        parent = refused["uuid"]
+    u2 = _row("user", parent, "again", t(20)); rows.append(u2)
     again = _row("assistant", u2["uuid"], [{"type": "text", "text": "again"}], t(21),
                  model="claude-sonnet-5-5", id="m4", stop_reason="end_turn"); rows.append(again)
     path = tmp_path / f"{SID}.jsonl"
@@ -118,3 +130,59 @@ def test_unanswered_tool_use_damage_stays_opaque(tmp_path, monkeypatch):
     except ValueError:
         return  # refused outright, also not repaired
     assert result["refusal_repair"] is None
+
+
+def test_refusal_thinking_row_plus_synthetic_row_is_relinked(tmp_path, monkeypatch):
+    monkeypatch.setenv(jsonl_replay.REFUSAL_REPAIR_SINCE_ENV, "2026-11-25T00:00:00Z")
+    path = _session(tmp_path, refusal_thinking=True)
+    result = jsonl_replay.prepare_session_replay(session_id=SID, cwd=tmp_path, source_path=path)
+    assert result["refusal_repair"] is not None
+    assert _chain_tool_results(path) == {"tA", "tB", "tC"}
+
+
+def test_refusal_row_without_synthetic_row_is_not_legacy_damage(tmp_path, monkeypatch):
+    monkeypatch.delenv(jsonl_replay.REFUSAL_REPAIR_SINCE_ENV, raising=False)
+    path = _session(tmp_path, refusal_thinking=True, synthetic=False)
+    result = jsonl_replay.prepare_session_replay(session_id=SID, cwd=tmp_path, source_path=path)
+    assert result["legacy_prefix"] is None and result["refusal_repair"] is None
+    assert _chain_tool_results(path) == {"tA", "tB", "tC"}  # the healthy path already relinks
+
+
+def test_errors_on_both_sides_of_the_epoch_stay_opaque(tmp_path, monkeypatch):
+    monkeypatch.setenv(jsonl_replay.REFUSAL_REPAIR_SINCE_ENV, "2026-11-25T03:08:00Z")
+    path = _session(tmp_path, early_error=True)
+    result = jsonl_replay.prepare_session_replay(session_id=SID, cwd=tmp_path, source_path=path)
+    assert result["refusal_repair"] is None
+    assert "tB" not in _chain_tool_results(path)
+
+
+@pytest.mark.parametrize("value", ["2026-11-25 00:00", "2026-11-25T00:00:00", "yesterday", ""])
+def test_unparsable_or_naive_epoch_is_unset(tmp_path, monkeypatch, value):
+    monkeypatch.setenv(jsonl_replay.REFUSAL_REPAIR_SINCE_ENV, value)
+    path = _session(tmp_path)
+    result = jsonl_replay.prepare_session_replay(session_id=SID, cwd=tmp_path, source_path=path)
+    assert result["refusal_repair"] is None
+
+
+def test_offset_epoch_is_compared_as_a_time(tmp_path, monkeypatch):
+    # 2026-11-24T23:30:00-05:00 is 04:30Z, after the 03:13Z error row: no repair.
+    monkeypatch.setenv(jsonl_replay.REFUSAL_REPAIR_SINCE_ENV, "2026-11-24T23:30:00-05:00")
+    path = _session(tmp_path)
+    assert jsonl_replay.prepare_session_replay(session_id=SID, cwd=tmp_path, source_path=path)["refusal_repair"] is None
+    # 2026-11-24T21:30:00-05:00 is 02:30Z, before it: repaired.
+    other = tmp_path / "b"
+    other.mkdir()
+    path2 = _session(other)
+    monkeypatch.setenv(jsonl_replay.REFUSAL_REPAIR_SINCE_ENV, "2026-11-24T21:30:00-05:00")
+    assert jsonl_replay.prepare_session_replay(session_id=SID, cwd=tmp_path, source_path=path2)["refusal_repair"] is not None
+
+
+def test_fork_of_a_post_epoch_refusal_session_keeps_the_siblings(tmp_path, monkeypatch):
+    from obs_agent.jsonl_fork import fork_session_jsonl
+    monkeypatch.setenv(jsonl_replay.REFUSAL_REPAIR_SINCE_ENV, "2026-11-25T00:00:00Z")
+    path = _session(tmp_path)
+    original = path.read_bytes()
+    last = [json.loads(line) for line in path.read_text().splitlines()][-1]["uuid"]
+    child = fork_session_jsonl(session_id=SID, target_uuid=last, cwd=tmp_path, source_path=path)
+    assert path.read_bytes() == original  # the source is never touched
+    assert _chain_tool_results(path.parent / f"{child}.jsonl") == {"tA", "tB", "tC"}

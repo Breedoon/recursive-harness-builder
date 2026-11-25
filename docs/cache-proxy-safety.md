@@ -416,6 +416,25 @@ Any change to one of these (each carries a `CACHE-PREFIX WARNING` comment;
   usage shows `ephemeral_1h_input_tokens > 0`. If only 5-minute entries were
   written, a zero read after the gap is expiry, not a prefix break. The same
   applies to the fleet: never set that variable for production agents.
+- **Refusal rows and the replay epoch (obs-97).** A Usage Policy refusal (or any
+  other API error) leaves a `<synthetic>` row mid-session. Before obs-97 the
+  replay preparer (`jsonl_replay.prepare_session_replay`) froze the whole history
+  before such a row. The CLI's chain-only reader then dropped the off-chain
+  siblings of every earlier parallel tool batch on the first new-process resume
+  or fork. That caused a full miss, and on thinking-heavy conversations it also
+  lost the prior-turn thinking, which is billed only from the cache (2026-11-25
+  `b53f19ab`: 692k → 434k). Rows timestamped at or after
+  `OBS_REPLAY_REFUSAL_REPAIR_SINCE` (ISO 8601 with a timezone; unset or
+  unparsable = old behaviour) are relinked across.
+  - **At deploy:** set it in the production supervisor environment to the instant
+    the new OBS process starts.
+  - **After any fallback or rollback to an older release:** reset it to the
+    instant the new code starts again. Sessions with refusals while the older code
+    ran were resumed under the old policy.
+  - **Accepted cost:** an older process still running at the epoch, or a
+    fallback, costs at most one miss per affected session.
+  - **Live check:** `scripts/prefix_repro.py refusal_parallel_resume` sets its own
+    epoch. `PREFIX_REPRO_REFUSAL_REPAIR_OFF=1` shows the unfixed FAIL.
 - **Every request is logged** with what the proxy did to it (`norm.*` fields in
   the request index: `ws_trimmed`, `volatile_pin`, `cache_key`,
   `dynamic_boundary`, plus `proxy_source`, the hash of the loaded code). The

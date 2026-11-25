@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -129,19 +130,36 @@ def record_terminal_completion(
 
 
 # obs-97: synthetic API-error rows (e.g. Usage Policy refusals) timestamped at or
-# after this ISO instant are repaired across instead of freezing the history
-# before them. Unset (the default) keeps the opaque policy for every session.
-# Set it to the deploy time of the release that carries this code: a session
-# whose error rows predate it may already have been resumed under the opaque
-# policy (its cached prefix lacks the parallel siblings), so relinking it now
-# would itself break the cache once. Errors after the epoch were first resumed
-# by this code, so every resume of them is consistent.
+# after this instant are repaired across instead of freezing the history before
+# them. Unset or unparsable keeps the opaque policy for every session.
+# Set it to the instant the OBS process carrying this code starts (and reset it
+# after any fallback or rollback to an older release): a session whose error
+# rows predate it may already have been resumed under the opaque policy, so its
+# cached prefix lacks the parallel siblings and relinking it would cost one
+# cache miss. Error rows after the epoch are normally first resumed by this
+# code; an older process still running at the epoch, or a later fallback, costs
+# at most one miss per affected session. See docs/cache-proxy-safety.md.
 REFUSAL_REPAIR_SINCE_ENV = "OBS_REPLAY_REFUSAL_REPAIR_SINCE"
 
 
+def _parse_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None  # ambiguous local time: treat as unset rather than guess
+    return parsed.astimezone(timezone.utc)
+
+
 def _refusal_damage_repairable(selected: list[tuple[dict[str, Any], str]], invalid_groups: set) -> bool:
-    since = os.environ.get(REFUSAL_REPAIR_SINCE_ENV, "").strip()
-    if not since or not invalid_groups:
+    since = _parse_utc(os.environ.get(REFUSAL_REPAIR_SINCE_ENV, ""))
+    if since is None or not invalid_groups:
         return False
     for entry, _raw in selected:
         group = entry.get("message", {}).get("id") or entry["uuid"]
@@ -154,7 +172,8 @@ def _refusal_damage_repairable(selected: list[tuple[dict[str, Any], str]], inval
         # differently; only pure synthetic error rows are transparent.
         if not synthetic or has_tool_use:
             return False
-        if str(entry.get("timestamp", "")) < since:
+        stamp = _parse_utc(entry.get("timestamp"))
+        if stamp is None or stamp < since:
             return False
     return True
 
