@@ -735,6 +735,55 @@ async def sc_resumed_poison(args):
                          "test_injections": ["mid synthetic row", "user row chained to it", "its answer", "tail poison"]}
 
 
+async def sc_refusal_parallel_resume(args):
+    """obs-97: a mid-session synthetic API-error row (the shape a Usage Policy
+    refusal leaves: the CLI writes a <synthetic> row and the live process goes
+    on) after a parallel tool batch. The live process kept the batch's off-chain
+    sibling; the first new-process resume must replay it too. The injected rows
+    stand in for the refusal and the turn the live process answered after it
+    (no prompt can produce a real refusal on demand, and none should be tried).
+    Old replay policy freezes everything before the error row: the resume drops
+    the sibling and misses the cache (FAIL). With OBS_REPLAY_REFUSAL_REPAIR_SINCE
+    set before the error row, the whole history is relinked (append, PASS)."""
+    from datetime import datetime, timezone
+    from obs_agent.context_jsonl import find_session_jsonl
+    from obs_agent.jsonl_health import resolve_safe_jsonl_target
+
+    sid = str(uuid.uuid4())
+    cwd = WORK_ROOT / "cwd"
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (cwd / name).parent.mkdir(parents=True, exist_ok=True)
+        (cwd / name).write_text(name + "\n")
+
+    def row(kind, parent, content, **extra):
+        out = {"type": kind, "uuid": str(uuid.uuid4()), "parentUuid": parent, "sessionId": sid,
+               "timestamp": datetime.now(timezone.utc).isoformat(), "message": {"role": kind, "content": content}}
+        for key, value in extra.items():
+            (out["message"] if key in ("model", "stop_reason", "id") else out)[key] = value
+        return out
+
+    await _session(args, [
+        "Reply with the single word: ready.",
+        "In ONE message call the Read tool three times in parallel on a.txt, b.txt and c.txt "
+        "(relative to the current directory), then reply with the single word: read.",
+        "Reply with the single word: warm.",
+    ], session_id=sid)
+    path = find_session_jsonl(session_id=sid, cwd=cwd)
+    head = resolve_safe_jsonl_target(session_id=sid, cwd=cwd).target_uuid
+    refused = row("assistant", head, [{"type": "text", "text": "API Error: Claude Code is unable to respond to this request, "
+                                       "which appears to violate our Usage Policy (test injection)."}],
+                  isApiErrorMessage=True, model="<synthetic>", stop_reason="stop_sequence")
+    asked = row("user", refused["uuid"], "Reply with the single word: again.")
+    answered = row("assistant", asked["uuid"], [{"type": "text", "text": "again"}],
+                   model=args.model or "claude-haiku-4-5", stop_reason="end_turn", id=f"msg_{uuid.uuid4().hex}")
+    with path.open("a") as handle:
+        for injected in (refused, asked, answered):
+            handle.write(json.dumps(injected) + "\n")
+    await _session(args, ["Reply with the single word: woke."], resume=sid)
+    return [sid], {"repair_since": os.environ.get("OBS_REPLAY_REFUSAL_REPAIR_SINCE"),
+                   "test_injections": ["mid synthetic refusal row", "user row chained to it", "its answer"]}
+
+
 async def sc_utility_route(args):
     sid = str(uuid.uuid4())
     cwd = WORK_ROOT / "cwd"
@@ -1023,6 +1072,7 @@ SCENARIOS = {
     "parallel_fork": (sc_parallel_fork, "parallel same-ID resume then verbatim-source fork"),
     "poisoned_recovery": (sc_poisoned_recovery, "test-injected synthetic API-error tail excluded on recovery"),
     "recovered_poison": (sc_recovered_poison, "mid-session API error already recovered from; tail recovery keeps the continuation (vault-1bc2)"),
+    "refusal_parallel_resume": (sc_refusal_parallel_resume, "parallel batch, then a mid-session synthetic refusal row, then new-process resume (obs-97)"),
     "resumed_poison": (sc_resumed_poison, "resumed turn chained to an injected API-error row; tail recovery keeps it, both routes (vault-1bc2)"),
     "ws_resume": (sc_ws_resume, "whitespace-edged tool output + spliced reminder, then new-process resume"),
     "volatile_flip": (sc_volatile_flip, "server flag flips system section/context_management mid-conversation (Anthropic)"),

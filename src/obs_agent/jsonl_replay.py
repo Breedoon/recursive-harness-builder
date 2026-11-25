@@ -128,6 +128,37 @@ def record_terminal_completion(
     return receipt
 
 
+# obs-97: synthetic API-error rows (e.g. Usage Policy refusals) timestamped at or
+# after this ISO instant are repaired across instead of freezing the history
+# before them. Unset (the default) keeps the opaque policy for every session.
+# Set it to the deploy time of the release that carries this code: a session
+# whose error rows predate it may already have been resumed under the opaque
+# policy (its cached prefix lacks the parallel siblings), so relinking it now
+# would itself break the cache once. Errors after the epoch were first resumed
+# by this code, so every resume of them is consistent.
+REFUSAL_REPAIR_SINCE_ENV = "OBS_REPLAY_REFUSAL_REPAIR_SINCE"
+
+
+def _refusal_damage_repairable(selected: list[tuple[dict[str, Any], str]], invalid_groups: set) -> bool:
+    since = os.environ.get(REFUSAL_REPAIR_SINCE_ENV, "").strip()
+    if not since or not invalid_groups:
+        return False
+    for entry, _raw in selected:
+        group = entry.get("message", {}).get("id") or entry["uuid"]
+        if group not in invalid_groups:
+            continue
+        synthetic = entry.get("isApiErrorMessage") or entry.get("message", {}).get("model") == "<synthetic>"
+        has_tool_use = any(isinstance(block, dict) and block.get("type") == "tool_use"
+                           for block in entry.get("message", {}).get("content", []) or [])
+        # An unanswered tool_use is real damage the CLI may have resumed around
+        # differently; only pure synthetic error rows are transparent.
+        if not synthetic or has_tool_use:
+            return False
+        if str(entry.get("timestamp", "")) < since:
+            return False
+    return True
+
+
 LEGACY_REPLAY_ERRORS = (
     "Selected replay contains an incomplete tool round",
     "Selected replay contains a synthetic API-error row",
@@ -241,6 +272,7 @@ def prepare_session_replay(
         legacy_boundary = -1
         repair_limit = None
         legacy_error = None
+        transparent: set[str] = set()
         try:
             selected = select_replay_entries(entries, target_uuid)
         except ValueError as exc:
@@ -269,12 +301,26 @@ def prepare_session_replay(
             }
             legacy_boundary = max(index for index, (entry, _raw) in enumerate(selected)
                                   if (entry.get("message", {}).get("id") or entry["uuid"]) in invalid_groups)
+            if _refusal_damage_repairable(selected, invalid_groups):
+                # obs-97: the only damage is synthetic API-error rows (Usage Policy
+                # refusals and similar) created after the repair epoch, so no
+                # process has resumed past them under the opaque policy. The live
+                # CLI kept the parallel siblings before them; the chain-only reader
+                # drops them unless the whole history is relinked, and the first
+                # resume then misses the cache from the first parallel batch on.
+                transparent = set(invalid_groups) | {
+                    entry.get("message", {}).get("id") or entry["uuid"]
+                    for entry, _raw in selected
+                    if entry.get("type") == "assistant" and entry.get("message", {}).get("stop_reason") == "refusal"
+                }
+                legacy_boundary = -1
             # Already-inherited legacy damage is opaque: do not relink, remove or
             # fabricate it. Only a later healthy, complete suffix may be repaired.
             # Unknown terminal text is preserved by health, not certified complete.
             # Leave that entire tail opaque rather than reparent any of its rows.
             repair_limit = next((index for index, (entry, _raw) in enumerate(selected)
                                  if index > legacy_boundary and entry.get("type") == "assistant"
+                                 and (entry.get("message", {}).get("id") or entry["uuid"]) not in transparent
                                  and entry["uuid"] not in health.complete_message_targets), len(selected))
             suffix = selected[legacy_boundary + 1:repair_limit]
             if suffix and not any(entry["uuid"] in health.complete_message_targets for entry, _raw in suffix):
@@ -282,7 +328,8 @@ def prepare_session_replay(
             suffix_results = {block.get("tool_use_id") for entry, _raw in suffix
                               for block in entry.get("message", {}).get("content", [])
                               if isinstance(block, dict) and block.get("type") == "tool_result"}
-            if any(entry.get("isApiErrorMessage") or entry.get("message", {}).get("model") == "<synthetic>"
+            if any(((entry.get("isApiErrorMessage") or entry.get("message", {}).get("model") == "<synthetic>")
+                    and (entry.get("message", {}).get("id") or entry["uuid"]) not in transparent)
                    or any(isinstance(block, dict) and block.get("type") == "tool_use"
                           and block.get("id") not in suffix_results
                           for block in entry.get("message", {}).get("content", []))
@@ -320,6 +367,10 @@ def prepare_session_replay(
                   "path": str(path), "prefix_bytes": len(original),
                   "prefix_sha256": prefix_sha, "selected_uuids": [e["uuid"] for e, _raw in selected],
                   "overlays": manifest, "overlay_count": len(overlays),
+                  "refusal_repair": None if not transparent else {
+                      "transparent_groups": sorted(transparent), "validation_error": legacy_error,
+                      "policy": "synthetic_error_rows_after_epoch_relinked_whole_history",
+                  },
                   "legacy_prefix": None if legacy_boundary < 0 else {
                       "boundary_uuid": selected[legacy_boundary][0]["uuid"],
                       "selected_entries_preserved": legacy_boundary + 1,
